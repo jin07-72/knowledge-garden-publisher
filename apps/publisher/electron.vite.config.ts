@@ -1,20 +1,32 @@
+import { builtinModules } from "node:module"
 import { resolve } from "node:path"
-import { defineConfig, externalizeDepsPlugin } from "electron-vite"
+import { defineConfig } from "electron-vite"
+
+const runtimeExternals = [
+  "electron",
+  /^electron\/.+/,
+  ...builtinModules.flatMap((moduleName) => [moduleName, `node:${moduleName}`])
+]
 
 export default defineConfig({
   main: {
-    plugins: [externalizeDepsPlugin()],
     build: {
+      externalizeDeps: false,
       rollupOptions: {
-        input: resolve(__dirname, "src/main/index.ts")
+        input: resolve(__dirname, "src/main/index.ts"),
+        external: runtimeExternals
       }
     }
   },
   preload: {
-    plugins: [externalizeDepsPlugin()],
     build: {
+      externalizeDeps: false,
       rollupOptions: {
-        input: resolve(__dirname, "src/preload/index.ts")
+        input: resolve(__dirname, "src/preload/index.ts"),
+        output: {
+          format: "cjs",
+          entryFileNames: "[name].js"
+        }
       }
     }
   },
