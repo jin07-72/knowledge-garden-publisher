@@ -32,6 +32,10 @@ export type AppErrorCode =
   | "GIT_STATUS_FAILED"
   | "COMMAND_FAILED"
   | "COMMAND_CANCELLED"
+  | "NOTE_INDEX_INVALID"
+  | "NOTE_INDEX_UNSAFE_PATH"
+  | "NOTE_INDEX_ACCESS_FAILED"
+  | "NOTE_INDEX_DUPLICATE"
 
 export type AppError = {
   readonly [Code in AppErrorCode]: {
@@ -41,7 +45,9 @@ export type AppError = {
   }
 }[AppErrorCode]
 
-export type WorkspaceIssue = AppError & {
+type NoteIndexError = Extract<AppError, { readonly code: `NOTE_INDEX_${string}` }>
+
+export type WorkspaceIssue = Exclude<AppError, NoteIndexError> & {
   readonly path?: string
 }
 
@@ -68,9 +74,14 @@ export type WorkspaceInspection =
 
 export interface NoteSummary {
   readonly path: string
+  readonly domain: "technology" | "reading" | "language" | "life"
+  readonly slug: string
   readonly title: string
+  readonly date: string
+  readonly description: string
   readonly visibility: Visibility
   readonly modifiedAt: string
+  readonly updatedAt: string
   readonly tags: readonly string[]
 }
 
