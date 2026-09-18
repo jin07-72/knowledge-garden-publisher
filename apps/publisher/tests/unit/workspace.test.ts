@@ -9,7 +9,12 @@ import {
 } from "../../src/main/lib/commandRunner"
 import { inspectWorkspace } from "../../src/main/services/workspace"
 import { exists, removeTemporaryDirectory } from "../helpers/fs"
-import { createTemporaryGitRepository, git, type TemporaryGitRepository } from "../helpers/git"
+import {
+  createTemporaryGitRepository,
+  git,
+  type GitFixtureDependencies,
+  type TemporaryGitRepository
+} from "../helpers/git"
 
 const temporaryDirectories: string[] = []
 const temporaryRepositories: TemporaryGitRepository[] = []
@@ -333,5 +338,46 @@ describe("runCommand", () => {
         cwd: process.cwd()
       })
     ).rejects.toMatchObject({ code: "COMMAND_FAILED", message: "Could not start command." })
+  })
+})
+
+describe("createTemporaryGitRepository", () => {
+  it("uses an isolated configuration and explicit Git initialization options", async () => {
+    const requests: Parameters<NonNullable<GitFixtureDependencies["runGit"]>>[0][] = []
+    const repository = await createTemporaryGitRepository({
+      runGit: async (request) => {
+        requests.push(request)
+        return { exitCode: 0, stdout: "", stderr: "" }
+      }
+    })
+    temporaryRepositories.push(repository)
+
+    expect(requests).toHaveLength(5)
+    expect(requests[0]).toMatchObject({
+      args: ["init", "--bare", "--initial-branch=main", "--object-format=sha1", repository.remote],
+      env: {
+        GIT_CONFIG_NOSYSTEM: "1",
+        GIT_CONFIG_GLOBAL: expect.stringContaining("empty-global.gitconfig")
+      }
+    })
+    expect(requests[1]).toMatchObject({
+      args: ["init", "--initial-branch=main", "--object-format=sha1"],
+      env: {
+        GIT_CONFIG_NOSYSTEM: "1",
+        GIT_CONFIG_GLOBAL: expect.stringContaining("empty-global.gitconfig")
+      }
+    })
+  })
+
+  it("cleans its allocated temporary directory when setup fails", async () => {
+    const base = await mkdtemp(join(tmpdir(), "garden-git-cleanup-"))
+    temporaryDirectories.push(base)
+    const repository = createTemporaryGitRepository({
+      createTempDirectory: async () => base,
+      runGit: async () => ({ exitCode: 1, stdout: "", stderr: "failure" })
+    })
+
+    await expect(repository).rejects.toThrow("git init failed")
+    expect(await exists(base)).toBe(false)
   })
 })
