@@ -1,4 +1,4 @@
-import { mkdir, mkdtemp, rm, symlink, writeFile } from "node:fs/promises"
+import { mkdir, mkdtemp, readdir, rm, symlink, writeFile } from "node:fs/promises"
 import { EventEmitter } from "node:events"
 import { tmpdir } from "node:os"
 import { join } from "node:path"
@@ -438,6 +438,93 @@ describe("runCommand", () => {
     await expect(command).rejects.toMatchObject({ code: "COMMAND_CANCELLED" })
   })
 
+  it("reports a termination failure when the child errors after a successful kill request", async () => {
+    const child = new EventEmitter() as EventEmitter & CommandProcess
+    child.stdout = new PassThrough()
+    child.stderr = new PassThrough()
+    child.kill = () => true
+    const runner = createCommandRunner(() => child)
+    const controller = new AbortController()
+    const command = runner.run({ executable: "ignored", args: [], cwd: process.cwd(), signal: controller.signal })
+
+    controller.abort()
+    child.emit("error")
+
+    await expect(command).rejects.toMatchObject({
+      code: "COMMAND_FAILED",
+      message: "Command termination was not confirmed.",
+      details: { reason: "termination" }
+    })
+  })
+
+  it.each([
+    ["returns false", () => false],
+    ["throws", () => {
+      throw new Error("kill failed")
+    }]
+  ])("reports a termination failure when kill %s", async (_description, kill) => {
+    const child = new EventEmitter() as EventEmitter & CommandProcess
+    child.stdout = new PassThrough()
+    child.stderr = new PassThrough()
+    child.kill = kill
+    const runner = createCommandRunner(() => child)
+    const controller = new AbortController()
+
+    const command = runner.run({ executable: "ignored", args: [], cwd: process.cwd(), signal: controller.signal })
+    controller.abort()
+
+    await expect(command).rejects.toMatchObject({
+      code: "COMMAND_FAILED",
+      message: "Command termination was not confirmed.",
+      details: { reason: "termination" }
+    })
+  })
+
+  it("settles as cancelled when close fires synchronously during kill", async () => {
+    const child = new EventEmitter() as EventEmitter & CommandProcess
+    child.stdout = new PassThrough()
+    child.stderr = new PassThrough()
+    child.kill = () => {
+      child.emit("close", null)
+      return true
+    }
+    const runner = createCommandRunner(() => child)
+    const controller = new AbortController()
+    const command = runner.run({ executable: "ignored", args: [], cwd: process.cwd(), signal: controller.signal })
+
+    controller.abort()
+
+    await expect(command).rejects.toMatchObject({ code: "COMMAND_CANCELLED" })
+  })
+
+  it("settles once and removes abort handling after cancellation closes", async () => {
+    const child = new EventEmitter() as EventEmitter & CommandProcess
+    child.stdout = new PassThrough()
+    child.stderr = new PassThrough()
+    let killCalls = 0
+    child.kill = () => {
+      killCalls += 1
+      return true
+    }
+    const runner = createCommandRunner(() => child)
+    const controller = new AbortController()
+    const command = runner.run({ executable: "ignored", args: [], cwd: process.cwd(), signal: controller.signal })
+    let rejectionCount = 0
+    void command.catch(() => {
+      rejectionCount += 1
+    })
+
+    controller.abort()
+    controller.abort()
+    child.emit("close", null)
+    await command.catch(() => undefined)
+    controller.abort()
+    await Promise.resolve()
+
+    expect(killCalls).toBe(1)
+    expect(rejectionCount).toBe(1)
+  })
+
   it("honors an explicit cwd instead of the process cwd", async () => {
     const cwd = await mkdtemp(join(tmpdir(), "garden-command-cwd-"))
     temporaryDirectories.push(cwd)
@@ -537,6 +624,58 @@ describe("createTemporaryGitRepository", () => {
     })
 
     expect(result.exitCode).toBe(1)
+  })
+
+  it("does not create a Git configuration artifact in the command cwd", async () => {
+    const root = await createGarden()
+    const before = await readdir(root)
+
+    const result = await git(root, ["--version"])
+
+    expect(result.exitCode).toBe(0)
+    expect(await readdir(root)).toEqual(before)
+  })
+
+  it("neutralizes command-scope Git configuration inherited through the helper arguments", async () => {
+    const root = await createGarden()
+
+    const result = await git(root, ["config", "user.name"], {
+      GIT_CONFIG_COUNT: "1",
+      GIT_CONFIG_KEY_0: "user.name",
+      GIT_CONFIG_VALUE_0: "Caller Injection",
+      GIT_CONFIG_PARAMETERS: "'user.name'='Caller Parameters'"
+    })
+
+    expect(result.exitCode).toBe(1)
+    expect(result.stdout).toBe("")
+  })
+
+  it("neutralizes command-scope Git configuration inherited from the process environment", async () => {
+    const root = await createGarden()
+    const previous = {
+      count: process.env.GIT_CONFIG_COUNT,
+      key: process.env.GIT_CONFIG_KEY_0,
+      value: process.env.GIT_CONFIG_VALUE_0,
+      parameters: process.env.GIT_CONFIG_PARAMETERS
+    }
+    Object.assign(process.env, {
+      GIT_CONFIG_COUNT: "1",
+      GIT_CONFIG_KEY_0: "user.name",
+      GIT_CONFIG_VALUE_0: "Process Injection",
+      GIT_CONFIG_PARAMETERS: "'user.name'='Process Parameters'"
+    })
+    try {
+      const result = await git(root, ["config", "user.name"])
+
+      expect(result.exitCode).toBe(1)
+      expect(result.stdout).toBe("")
+    } finally {
+      for (const [name, value] of Object.entries(previous)) {
+        const key = `GIT_CONFIG_${name === "count" ? "COUNT" : name === "key" ? "KEY_0" : name === "value" ? "VALUE_0" : "PARAMETERS"}`
+        if (value === undefined) delete process.env[key]
+        else process.env[key] = value
+      }
+    }
   })
 
   it("cleans its allocated temporary directory when setup fails", async () => {

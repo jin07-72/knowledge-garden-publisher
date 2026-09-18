@@ -13,10 +13,20 @@ function isolatedGitEnvironment(
   emptyGlobalConfig?: string
 ): Record<string, string | undefined> {
   if (!emptyGlobalConfig) throw new Error("An isolated Git configuration path is required.")
-  return {
+  const sanitizedEnvironment: Record<string, string | undefined> = {
     ...env,
+    GIT_CONFIG_PARAMETERS: undefined
+  }
+  for (const key of [...Object.keys(process.env), ...Object.keys(env ?? {})]) {
+    if (/^GIT_CONFIG_(?:KEY|VALUE)_\d+$/.test(key)) {
+      sanitizedEnvironment[key] = undefined
+    }
+  }
+  return {
+    ...sanitizedEnvironment,
     GIT_CONFIG_NOSYSTEM: "1",
-    GIT_CONFIG_GLOBAL: emptyGlobalConfig
+    GIT_CONFIG_GLOBAL: emptyGlobalConfig,
+    GIT_CONFIG_COUNT: "0"
   }
 }
 
@@ -25,9 +35,14 @@ export async function git(
   args: readonly string[],
   env?: Record<string, string | undefined>
 ): Promise<CommandResult> {
-  const emptyGlobalConfig = join(cwd, `.publisher-test-git-config-${crypto.randomUUID()}`)
-  await writeFile(emptyGlobalConfig, "")
-  return runCommand({ executable: "git", args, cwd, env: isolatedGitEnvironment(env, emptyGlobalConfig) })
+  const configDirectory = await mkdtemp(join(tmpdir(), "garden-git-command-config-"))
+  const emptyGlobalConfig = join(configDirectory, "empty-global.gitconfig")
+  try {
+    await writeFile(emptyGlobalConfig, "")
+    return await runCommand({ executable: "git", args, cwd, env: isolatedGitEnvironment(env, emptyGlobalConfig) })
+  } finally {
+    await removeTemporaryDirectory(configDirectory)
+  }
 }
 
 export interface TemporaryGitRepository {

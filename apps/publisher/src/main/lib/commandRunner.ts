@@ -42,7 +42,8 @@ export class CommandRunnerError extends Error {
 
   constructor(
     readonly code: "COMMAND_FAILED" | "COMMAND_CANCELLED",
-    message: string
+    message: string,
+    readonly details?: Readonly<{ reason: "termination" }>
   ) {
     super(message)
   }
@@ -50,6 +51,14 @@ export class CommandRunnerError extends Error {
 
 function cancelledError(): CommandRunnerError {
   return new CommandRunnerError("COMMAND_CANCELLED", "Command was cancelled.")
+}
+
+function terminationError(): CommandRunnerError {
+  return new CommandRunnerError(
+    "COMMAND_FAILED",
+    "Command termination was not confirmed.",
+    { reason: "termination" }
+  )
 }
 
 function commandSpawner(
@@ -98,10 +107,10 @@ export function createCommandRunner(spawner: CommandSpawner = commandSpawner): C
           try {
             // This runner owns only the direct child; process-tree termination belongs to Task 6.
             if (!child.kill()) {
-              fail(new CommandRunnerError("COMMAND_FAILED", "Command could not be terminated."))
+              fail(terminationError())
             }
           } catch {
-            fail(new CommandRunnerError("COMMAND_FAILED", "Command could not be terminated."))
+            fail(terminationError())
           }
         }
 
@@ -121,7 +130,7 @@ export function createCommandRunner(spawner: CommandSpawner = commandSpawner): C
           stderr += chunk
         })
         child.on("error", () => {
-          fail(cancellationRequested ? cancelledError() : new CommandRunnerError("COMMAND_FAILED", "Could not start command."))
+          fail(cancellationRequested ? terminationError() : new CommandRunnerError("COMMAND_FAILED", "Could not start command."))
         })
         child.on("close", (code) => {
           if (settled) return
