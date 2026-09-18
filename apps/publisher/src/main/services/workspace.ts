@@ -1,5 +1,5 @@
-import { stat } from "node:fs/promises"
-import { resolve } from "node:path"
+import { lstat, realpath, stat } from "node:fs/promises"
+import { isAbsolute, relative, resolve } from "node:path"
 import {
   type WorkspaceCapabilities,
   type WorkspaceInspection,
@@ -82,19 +82,68 @@ function issue(code: WorkspaceIssue["code"], message: string, path?: string): Wo
   return path === undefined ? { code, message } : { code, message, path }
 }
 
+function errorCode(error: unknown): string | undefined {
+  return (error as NodeJS.ErrnoException).code
+}
+
+function pathsEqual(left: string, right: string): boolean {
+  return process.platform === "win32" ? left.toLowerCase() === right.toLowerCase() : left === right
+}
+
+function isInsideWorkspace(root: string, candidate: string): boolean {
+  const pathFromRoot = relative(root, candidate)
+  return pathFromRoot === "" || (!pathFromRoot.startsWith("..") && !isAbsolute(pathFromRoot))
+}
+
+async function canonicalWorkspaceRoot(rootPath: string): Promise<{ root: string; issues: WorkspaceIssue[] }> {
+  const normalizedRoot = resolve(rootPath)
+  try {
+    const rootDetails = await stat(normalizedRoot)
+    if (!rootDetails.isDirectory()) {
+      return {
+        root: normalizedRoot,
+        issues: [issue("INVALID_WORKSPACE", "Select an existing workspace directory.", normalizedRoot)]
+      }
+    }
+    return { root: await realpath(normalizedRoot), issues: [] }
+  } catch {
+    return {
+      root: normalizedRoot,
+      issues: [issue("INVALID_WORKSPACE", "Select an existing workspace directory.", normalizedRoot)]
+    }
+  }
+}
+
 async function inspectRequiredPaths(root: string): Promise<WorkspaceIssue[]> {
   const issues: WorkspaceIssue[] = []
   for (const requirement of requiredPaths) {
     const path = resolve(root, requirement.relativePath)
     try {
-      const details = await stat(path)
+      const linkDetails = await lstat(path)
+      if (linkDetails.isSymbolicLink()) {
+        issues.push(issue("UNSAFE_PATH", "Replace linked required paths with workspace-owned entries.", path))
+        continue
+      }
+      const canonicalPath = await realpath(path)
+      if (!isInsideWorkspace(root, canonicalPath)) {
+        issues.push(issue("UNSAFE_PATH", "Required paths must remain inside the selected workspace.", path))
+        continue
+      }
+      const details = await stat(canonicalPath)
       const hasExpectedType =
         requirement.expectedType === "directory" ? details.isDirectory() : details.isFile()
       if (!hasExpectedType) {
         issues.push(issue(requirement.wrongTypeCode, requirement.wrongTypeMessage, path))
       }
-    } catch {
-      issues.push(issue(requirement.missingCode, requirement.missingMessage, path))
+    } catch (error) {
+      const code = errorCode(error)
+      if (code === "ENOENT") {
+        issues.push(issue(requirement.missingCode, requirement.missingMessage, path))
+      } else if (code === "ENOTDIR") {
+        issues.push(issue(requirement.wrongTypeCode, requirement.wrongTypeMessage, path))
+      } else {
+        issues.push(issue("WORKSPACE_ACCESS_FAILED", "Could not inspect a required workspace path.", path))
+      }
     }
   }
   return issues
@@ -121,33 +170,41 @@ async function inspectGit(root: string, runner: CommandRunner): Promise<Workspac
   if (!didSucceed(topLevel)) {
     return [issue("GIT_NOT_REPOSITORY", "Initialize this folder as a Git repository.")]
   }
-  if (resolve(topLevel.stdout.trim()) !== root) {
+  let gitRoot: string
+  try {
+    gitRoot = await realpath(resolve(topLevel.stdout.trim()))
+  } catch {
+    return [issue("GIT_ROOT_MISMATCH", "Git reported a repository root outside this workspace.")]
+  }
+  if (!pathsEqual(gitRoot, root)) {
     return [issue("GIT_ROOT_MISMATCH", "Open the Git repository root, not a nested folder.")]
   }
 
-  let origin: CommandResult
+  let remotes: CommandResult
   try {
-    origin = await runner.run({
-      executable: "git",
-      args: ["remote", "get-url", "origin"],
-      cwd: root,
-      env: readOnlyGitEnv
-    })
+    remotes = await runner.run({ executable: "git", args: ["remote"], cwd: root, env: readOnlyGitEnv })
   } catch {
     return [issue("GIT_UNAVAILABLE", "Git is unavailable. Install Git and try again.")]
   }
-  if (!didSucceed(origin) || origin.stdout.trim() === "") {
-    const code = /no such remote|does not appear to be a git repository/i.test(origin.stderr)
-      ? "GIT_ORIGIN_MISSING"
-      : "GIT_ORIGIN_FAILED"
-    issues.push(
-      issue(
-        code,
-        code === "GIT_ORIGIN_MISSING"
-          ? "Add an origin remote before publishing."
-          : "Could not read the origin remote. Check the repository configuration."
-      )
-    )
+  if (!didSucceed(remotes)) {
+    issues.push(issue("GIT_ORIGIN_FAILED", "Could not list repository remotes."))
+  } else if (!remotes.stdout.split(/\r?\n/).some((remote) => remote === "origin")) {
+    issues.push(issue("GIT_ORIGIN_MISSING", "Add an origin remote before publishing."))
+  } else {
+    let origin: CommandResult
+    try {
+      origin = await runner.run({
+        executable: "git",
+        args: ["remote", "get-url", "origin"],
+        cwd: root,
+        env: readOnlyGitEnv
+      })
+    } catch {
+      return [issue("GIT_UNAVAILABLE", "Git is unavailable. Install Git and try again.")]
+    }
+    if (!didSucceed(origin) || origin.stdout.trim() === "") {
+      issues.push(issue("GIT_ORIGIN_FAILED", "Could not read the origin remote. Check the repository configuration."))
+    }
   }
 
   let status: CommandResult
@@ -171,12 +228,18 @@ export async function inspectWorkspace(
   rootPath: string,
   options: InspectWorkspaceOptions
 ): Promise<WorkspaceInspection> {
-  const root = resolve(rootPath)
-  const issues = await inspectRequiredPaths(root)
+  const workspaceRoot = await canonicalWorkspaceRoot(rootPath)
+  const root = workspaceRoot.root
+  const issues = [...workspaceRoot.issues]
+  if (workspaceRoot.issues.length === 0) {
+    issues.push(...(await inspectRequiredPaths(root)))
+  }
   const files = issues.length === 0
-  const gitIssues = options.checkGit ? await inspectGit(root, options.runner ?? systemCommandRunner) : []
+  const gitIssues = options.checkGit && workspaceRoot.issues.length === 0
+    ? await inspectGit(root, options.runner ?? systemCommandRunner)
+    : []
   issues.push(...gitIssues)
-  const git = options.checkGit && gitIssues.length === 0
+  const git = options.checkGit && workspaceRoot.issues.length === 0 && gitIssues.length === 0
   const capabilities: WorkspaceCapabilities = {
     files,
     preview: files,

@@ -1,10 +1,14 @@
-import { mkdir, mkdtemp, rm, writeFile } from "node:fs/promises"
+import { mkdir, mkdtemp, rm, symlink, writeFile } from "node:fs/promises"
+import { EventEmitter } from "node:events"
 import { tmpdir } from "node:os"
 import { join } from "node:path"
+import { PassThrough } from "node:stream"
 import { afterEach, describe, expect, it } from "vitest"
 import {
   CommandRunnerError,
+  createCommandRunner,
   runCommand,
+  type CommandProcess,
   type CommandRunner
 } from "../../src/main/lib/commandRunner"
 import { inspectWorkspace } from "../../src/main/services/workspace"
@@ -67,6 +71,19 @@ describe("inspectWorkspace", () => {
       ])
     )
     expect(result.capabilities).toMatchObject({ files: false, preview: false })
+  })
+
+  it("does not advertise Git capability when the selected root is not a directory", async () => {
+    const parent = await mkdtemp(join(tmpdir(), "garden-workspace-parent-"))
+    temporaryDirectories.push(parent)
+    const root = join(parent, "not-a-workspace")
+    await writeFile(root, "not a directory")
+
+    const result = await inspectWorkspace(root, { checkGit: true })
+
+    expect(result.ok).toBe(false)
+    expect(result.issues.map((issue) => issue.code)).toContain("INVALID_WORKSPACE")
+    expect(result.capabilities.git).toBe(false)
   })
 
   it.each([
@@ -182,7 +199,8 @@ describe("inspectWorkspace", () => {
     const runner: CommandRunner = {
       run: async ({ args }) => {
         if (args[0] === "rev-parse") return { exitCode: 0, stdout: `${root}\n`, stderr: "" }
-        if (args[0] === "remote") return { exitCode: 1, stdout: "", stderr: "permission denied" }
+        if (args[0] === "remote" && args.length === 1) return { exitCode: 0, stdout: "origin\n", stderr: "" }
+        if (args[0] === "remote") return { exitCode: 1, stdout: "", stderr: "任意语言的失败" }
         return { exitCode: 0, stdout: "", stderr: "" }
       }
     }
@@ -194,6 +212,22 @@ describe("inspectWorkspace", () => {
     expect(result.capabilities.git).toBe(false)
   })
 
+  it("does not mistake a failed remote listing for a missing origin", async () => {
+    const root = await createGarden()
+    const runner: CommandRunner = {
+      run: async ({ args }) => {
+        if (args[0] === "rev-parse") return { exitCode: 0, stdout: `${root}\n`, stderr: "" }
+        if (args[0] === "remote") return { exitCode: 1, stdout: "", stderr: "任意语言的失败" }
+        return { exitCode: 0, stdout: "", stderr: "" }
+      }
+    }
+
+    const result = await inspectWorkspace(root, { checkGit: true, runner })
+
+    expect(result.issues.map((issue) => issue.code)).toContain("GIT_ORIGIN_FAILED")
+    expect(result.issues.map((issue) => issue.code)).not.toContain("GIT_ORIGIN_MISSING")
+  })
+
   it("reports git status failures from an injected runner", async () => {
     const root = await createGarden()
     const requests: Parameters<CommandRunner["run"]>[0][] = []
@@ -202,6 +236,7 @@ describe("inspectWorkspace", () => {
         requests.push(request)
         const { args } = request
         if (args[0] === "rev-parse") return { exitCode: 0, stdout: `${root}\n`, stderr: "" }
+        if (args[0] === "remote" && args.length === 1) return { exitCode: 0, stdout: "origin\n", stderr: "" }
         if (args[0] === "remote") return { exitCode: 0, stdout: "https://example.invalid/garden.git\n", stderr: "" }
         return { exitCode: 1, stdout: "", stderr: "git status failed" }
       }
@@ -216,6 +251,12 @@ describe("inspectWorkspace", () => {
       {
         executable: "git",
         args: ["rev-parse", "--show-toplevel"],
+        cwd: root,
+        env: { GIT_OPTIONAL_LOCKS: "0" }
+      },
+      {
+        executable: "git",
+        args: ["remote"],
         cwd: root,
         env: { GIT_OPTIONAL_LOCKS: "0" }
       },
@@ -246,6 +287,78 @@ describe("inspectWorkspace", () => {
 
     expect(result.ok).toBe(false)
     expect(result.issues.map((issue) => issue.code)).toContain("GIT_UNAVAILABLE")
+  })
+
+  it("accepts a canonical Git root reached through a directory alias", async ({ skip }) => {
+    const repository = await createTemporaryGitRepository()
+    temporaryRepositories.push(repository)
+    await createGarden(repository.root)
+    const alias = join(repository.root, "..", "garden-alias")
+    try {
+      await symlink(repository.root, alias, process.platform === "win32" ? "junction" : "dir")
+    } catch (error: unknown) {
+      if ((error as NodeJS.ErrnoException).code === "EPERM") return skip()
+      throw error
+    }
+
+    const result = await inspectWorkspace(alias, { checkGit: true })
+
+    expect(result.ok).toBe(true)
+  })
+
+  it.skipIf(process.platform !== "win32")("accepts a Git root whose reported path differs only by case", async () => {
+    const root = await createGarden()
+    const runner: CommandRunner = {
+      run: async ({ args }) => {
+        if (args[0] === "rev-parse") return { exitCode: 0, stdout: `${root.toUpperCase()}\n`, stderr: "" }
+        if (args[0] === "remote" && args.length === 1) return { exitCode: 0, stdout: "origin\n", stderr: "" }
+        return { exitCode: 0, stdout: "https://example.invalid/garden.git\n", stderr: "" }
+      }
+    }
+
+    const result = await inspectWorkspace(root, { checkGit: true, runner })
+
+    expect(result.ok).toBe(true)
+  })
+
+  it("rejects a required file symlink even when it resolves inside the workspace", async ({ skip }) => {
+    const root = await createGarden()
+    const target = join(root, "quartz.config.real.yaml")
+    const linkedPath = join(root, "quartz.config.yaml")
+    await writeFile(target, "configuration: {}")
+    await rm(linkedPath)
+    try {
+      await symlink(target, linkedPath, "file")
+    } catch (error: unknown) {
+      if ((error as NodeJS.ErrnoException).code === "EPERM") return skip()
+      throw error
+    }
+
+    const result = await inspectWorkspace(root, { checkGit: false })
+
+    expect(result.ok).toBe(false)
+    expect(result.issues.map((issue) => issue.code)).toContain("UNSAFE_PATH")
+    expect(result.capabilities).toMatchObject({ files: false, preview: false })
+  })
+
+  it("rejects a required directory junction or symlink outside the workspace", async ({ skip }) => {
+    const root = await createGarden()
+    const outside = await mkdtemp(join(tmpdir(), "garden-outside-"))
+    temporaryDirectories.push(outside)
+    const content = join(root, "content")
+    await rm(content, { force: true, recursive: true })
+    try {
+      await symlink(outside, content, process.platform === "win32" ? "junction" : "dir")
+    } catch (error: unknown) {
+      if ((error as NodeJS.ErrnoException).code === "EPERM") return skip()
+      throw error
+    }
+
+    const result = await inspectWorkspace(root, { checkGit: false })
+
+    expect(result.ok).toBe(false)
+    expect(result.issues.map((issue) => issue.code)).toContain("UNSAFE_PATH")
+    expect(result.capabilities.files).toBe(false)
   })
 })
 
@@ -299,6 +412,32 @@ describe("runCommand", () => {
     await expect(command).rejects.toMatchObject({ code: "COMMAND_CANCELLED" })
   })
 
+  it("waits for the direct child to close before settling cancellation", async () => {
+    const child = new EventEmitter() as EventEmitter & CommandProcess
+    child.stdout = new PassThrough()
+    child.stderr = new PassThrough()
+    let killCalls = 0
+    child.kill = () => {
+      killCalls += 1
+      return true
+    }
+    const runner = createCommandRunner(() => child)
+    const controller = new AbortController()
+    const command = runner.run({ executable: "ignored", args: [], cwd: process.cwd(), signal: controller.signal })
+    let settled = false
+    void command.catch(() => {
+      settled = true
+    })
+
+    controller.abort()
+    await Promise.resolve()
+    expect(killCalls).toBe(1)
+    expect(settled).toBe(false)
+
+    child.emit("close", null)
+    await expect(command).rejects.toMatchObject({ code: "COMMAND_CANCELLED" })
+  })
+
   it("honors an explicit cwd instead of the process cwd", async () => {
     const cwd = await mkdtemp(join(tmpdir(), "garden-command-cwd-"))
     temporaryDirectories.push(cwd)
@@ -328,6 +467,21 @@ describe("runCommand", () => {
       })
     ).rejects.toMatchObject({ code: "COMMAND_CANCELLED" })
     expect(await exists(marker)).toBe(false)
+  })
+
+  it("does not invoke an injected spawner for an already-aborted signal", async () => {
+    const controller = new AbortController()
+    controller.abort()
+    let spawnCalls = 0
+    const runner = createCommandRunner(() => {
+      spawnCalls += 1
+      throw new Error("must not spawn")
+    })
+
+    await expect(
+      runner.run({ executable: "ignored", args: [], cwd: process.cwd(), signal: controller.signal })
+    ).rejects.toMatchObject({ code: "COMMAND_CANCELLED" })
+    expect(spawnCalls).toBe(0)
   })
 
   it("rejects spawn failures without echoing unsafe executable text", async () => {
@@ -367,6 +521,22 @@ describe("createTemporaryGitRepository", () => {
         GIT_CONFIG_GLOBAL: expect.stringContaining("empty-global.gitconfig")
       }
     })
+    expect(requests.every((request) => request.env?.GIT_CONFIG_NOSYSTEM === "1")).toBe(true)
+    expect(requests.every((request) => request.env?.GIT_CONFIG_GLOBAL === join(repository.root, "..", "empty-global.gitconfig"))).toBe(true)
+    expect(await exists(join(repository.root, "..", "empty-global.gitconfig"))).toBe(true)
+  })
+
+  it("does not permit caller Git configuration overrides", async () => {
+    const root = await createGarden()
+    const callerGlobalConfig = join(root, "caller-global.gitconfig")
+    await writeFile(callerGlobalConfig, "[user]\nname = Caller Override\n")
+
+    const result = await git(root, ["config", "--global", "--get", "user.name"], {
+      GIT_CONFIG_NOSYSTEM: "0",
+      GIT_CONFIG_GLOBAL: callerGlobalConfig
+    })
+
+    expect(result.exitCode).toBe(1)
   })
 
   it("cleans its allocated temporary directory when setup fails", async () => {

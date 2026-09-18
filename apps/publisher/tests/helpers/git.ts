@@ -1,4 +1,4 @@
-import { mkdir, mkdtemp } from "node:fs/promises"
+import { mkdir, mkdtemp, writeFile } from "node:fs/promises"
 import { tmpdir } from "node:os"
 import { join } from "node:path"
 import {
@@ -8,25 +8,26 @@ import {
 } from "../../src/main/lib/commandRunner"
 import { removeTemporaryDirectory } from "./fs"
 
-const defaultEmptyGlobalConfig = join(tmpdir(), "knowledge-garden-publisher-empty-global.gitconfig")
-
 function isolatedGitEnvironment(
   env?: Record<string, string | undefined>,
-  emptyGlobalConfig = defaultEmptyGlobalConfig
+  emptyGlobalConfig?: string
 ): Record<string, string | undefined> {
+  if (!emptyGlobalConfig) throw new Error("An isolated Git configuration path is required.")
   return {
+    ...env,
     GIT_CONFIG_NOSYSTEM: "1",
-    GIT_CONFIG_GLOBAL: emptyGlobalConfig,
-    ...env
+    GIT_CONFIG_GLOBAL: emptyGlobalConfig
   }
 }
 
-export function git(
+export async function git(
   cwd: string,
   args: readonly string[],
   env?: Record<string, string | undefined>
 ): Promise<CommandResult> {
-  return runCommand({ executable: "git", args, cwd, env: isolatedGitEnvironment(env) })
+  const emptyGlobalConfig = join(cwd, `.publisher-test-git-config-${crypto.randomUUID()}`)
+  await writeFile(emptyGlobalConfig, "")
+  return runCommand({ executable: "git", args, cwd, env: isolatedGitEnvironment(env, emptyGlobalConfig) })
 }
 
 export interface TemporaryGitRepository {
@@ -47,9 +48,11 @@ export async function createTemporaryGitRepository(
   try {
     const root = join(base, "workspace")
     const remote = join(base, "origin.git")
-    const env = isolatedGitEnvironment(undefined, join(base, "empty-global.gitconfig"))
+    const emptyGlobalConfig = join(base, "empty-global.gitconfig")
+    const env = isolatedGitEnvironment(undefined, emptyGlobalConfig)
     const runGit = dependencies.runGit ?? runCommand
     await mkdir(root)
+    await writeFile(emptyGlobalConfig, "")
 
     for (const [cwd, args] of [
       [base, ["init", "--bare", "--initial-branch=main", "--object-format=sha1", remote]],
