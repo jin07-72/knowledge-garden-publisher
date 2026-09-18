@@ -58,6 +58,7 @@ Modify:
 ## Task 1: Scaffold the Electron Package and Test Harness
 
 **Files:**
+
 - Create: `apps/publisher/package.json`
 - Create: `apps/publisher/electron.vite.config.ts`
 - Create: `apps/publisher/tsconfig.json`
@@ -149,6 +150,7 @@ git commit -m "feat: scaffold garden publisher desktop app"
 ## Task 2: Define Contracts and Workspace Diagnostics
 
 **Files:**
+
 - Create: `apps/publisher/src/shared/contracts.ts`
 - Create: `apps/publisher/src/main/lib/commandRunner.ts`
 - Create: `apps/publisher/src/main/services/workspace.ts`
@@ -226,6 +228,7 @@ git commit -m "feat: add publisher workspace diagnostics"
 ## Task 3: Index Public and Private Notes
 
 **Files:**
+
 - Create: `apps/publisher/src/main/services/noteIndex.ts`
 - Create: `apps/publisher/tests/unit/noteIndex.test.ts`
 - Create: `apps/publisher/tests/fixtures/garden/content/technology/css-grid.md`
@@ -278,6 +281,7 @@ git commit -m "feat: index public and private garden notes"
 ## Task 4: Atomic Save, Recovery, and External-Edit Protection
 
 **Files:**
+
 - Create: `apps/publisher/src/main/services/noteFiles.ts`
 - Create: `apps/publisher/tests/unit/noteFiles.test.ts`
 
@@ -286,7 +290,9 @@ git commit -m "feat: index public and private garden notes"
 Test that `createNote` writes valid frontmatter only under an allowed domain/visibility root and rejects collisions. Test that `saveNote` rejects a stale expected modification time, preserves the external file, atomically replaces a current file, and writes a recovery copy under `.garden-publisher/recovery/` before replacement.
 
 ```ts
-await expect(saveNote({ path, markdown: "new", expectedMtimeMs: 1, workspace })).rejects.toMatchObject({ code: "EXTERNAL_EDIT" })
+await expect(
+  saveNote({ path, markdown: "new", expectedMtimeMs: 1, workspace }),
+).rejects.toMatchObject({ code: "EXTERNAL_EDIT" })
 expect(await readFile(path, "utf8")).toBe("external")
 ```
 
@@ -316,6 +322,7 @@ git commit -m "feat: add safe note saving and recovery"
 ## Task 5: Visibility, Attachments, and Rename Transactions
 
 **Files:**
+
 - Modify: `apps/publisher/src/main/services/noteFiles.ts`
 - Create: `apps/publisher/tests/integration/noteTransactions.test.ts`
 
@@ -324,7 +331,11 @@ git commit -m "feat: add safe note saving and recovery"
 Cover public-to-private moves, owned attachment moves, collision rollback, ambiguous shared attachment rejection, pending public deletion reporting, private-to-public moves, slug rename with incoming Wiki-link updates, and alias preservation.
 
 ```ts
-const result = await changeVisibility({ workspace, path: "content/life/weekly-review.md", visibility: "private" })
+const result = await changeVisibility({
+  workspace,
+  path: "content/life/weekly-review.md",
+  visibility: "private",
+})
 expect(result.pendingPublicDeletion).toBe("content/life/weekly-review.md")
 expect(await exists(join(workspace, "private/life/weekly-review.md"))).toBe(true)
 expect(await exists(join(workspace, "content/_assets/weekly-review/chart.png"))).toBe(false)
@@ -356,6 +367,7 @@ git commit -m "feat: add safe note visibility and rename transactions"
 ## Task 6: Manage Exact Quartz Preview
 
 **Files:**
+
 - Create: `apps/publisher/src/main/services/preview.ts`
 - Create: `apps/publisher/tests/unit/preview.test.ts`
 
@@ -389,6 +401,7 @@ git commit -m "feat: manage local Quartz preview"
 ## Task 7: Register Secure IPC and Preload API
 
 **Files:**
+
 - Create: `apps/publisher/src/main/ipc.ts`
 - Modify: `apps/publisher/src/main/index.ts`
 - Modify: `apps/publisher/src/preload/index.ts`
@@ -429,6 +442,7 @@ git commit -m "feat: expose secure publisher IPC API"
 ## Task 8: Build the Approved Three-Pane Interface
 
 **Files:**
+
 - Modify: `apps/publisher/src/renderer/src/App.tsx`
 - Create: `apps/publisher/src/renderer/src/app.css`
 - Create: `apps/publisher/src/renderer/src/components/NoteSidebar.tsx`
@@ -466,6 +480,7 @@ git commit -m "feat: build publisher three-pane interface"
 ## Task 9: Add CodeMirror Editing, Autosave, and Wiki Completion
 
 **Files:**
+
 - Create: `apps/publisher/src/renderer/src/components/MarkdownEditor.tsx`
 - Create: `apps/publisher/src/renderer/src/hooks/useAutosave.ts`
 - Create: `apps/publisher/src/renderer/src/editor/wikiCompletion.ts`
@@ -501,6 +516,7 @@ git commit -m "feat: add Markdown editing and autosave"
 ## Task 10: Group Changes and Build the Publish Review
 
 **Files:**
+
 - Create: `apps/publisher/src/main/services/changes.ts`
 - Create: `apps/publisher/src/renderer/src/components/PublishReview.tsx`
 - Create: `apps/publisher/tests/unit/changes.test.ts`
@@ -536,6 +552,7 @@ git commit -m "feat: review selectable publication changes"
 ## Task 11: Implement Exact-Tree Verification and Publishing
 
 **Files:**
+
 - Create: `apps/publisher/src/main/services/publish.ts`
 - Create: `apps/publisher/tests/integration/publish.test.ts`
 
@@ -544,8 +561,12 @@ git commit -m "feat: review selectable publication changes"
 Create a bare remote and working repository per test. Assert selected files only, no private paths in the temporary index, synthetic tree equals final commit tree, failed validation creates no commit, unrelated edits remain, existing real staged changes block publishing, remote divergence blocks pushing, and push retry keeps the local commit.
 
 ```ts
-expect(await git(workspace, ["diff", "--name-only", "HEAD^", "HEAD"])).toContain("content/technology/css-grid.md")
-expect(await git(workspace, ["diff", "--name-only", "HEAD^", "HEAD"])).not.toContain("content/life/weekly-review.md")
+expect(await git(workspace, ["diff", "--name-only", "HEAD^", "HEAD"])).toContain(
+  "content/technology/css-grid.md",
+)
+expect(await git(workspace, ["diff", "--name-only", "HEAD^", "HEAD"])).not.toContain(
+  "content/life/weekly-review.md",
+)
 expect(await git(workspace, ["ls-tree", "-r", "--name-only", "HEAD"])).not.toContain("private/")
 ```
 
@@ -575,6 +596,7 @@ git commit -m "feat: publish verified selected garden changes"
 ## Task 12: Add Git and GitHub Deployment History
 
 **Files:**
+
 - Create: `apps/publisher/src/main/services/deployments.ts`
 - Create: `apps/publisher/src/renderer/src/components/HistoryView.tsx`
 - Create: `apps/publisher/tests/unit/deployments.test.ts`
@@ -610,6 +632,7 @@ git commit -m "feat: show garden publish history and deployment status"
 ## Task 13: Add Recycle-Bin Deletion and First-Run Repair
 
 **Files:**
+
 - Create: `apps/publisher/src/main/services/trash.ts`
 - Create: `apps/publisher/src/renderer/src/components/FirstRun.tsx`
 - Create: `apps/publisher/src/renderer/src/components/DeleteNoteDialog.tsx`
@@ -646,6 +669,7 @@ git commit -m "feat: add safe deletion and startup diagnostics"
 ## Task 14: Package the Windows Application and Run End-to-End Tests
 
 **Files:**
+
 - Create: `apps/publisher/electron-builder.yml`
 - Create: `apps/publisher/playwright.config.ts`
 - Create: `apps/publisher/scripts/download-node-runtime.mjs`
@@ -714,16 +738,16 @@ git commit -m "feat: package garden publisher for Windows"
 
 ## Specification Coverage Check
 
-| Approved requirement | Implemented and verified in |
-|---|---|
-| Built-in Markdown editor, autosave, Wiki completion, conflict recovery | Tasks 4 and 9 |
-| Physical public/private storage and owned attachments | Tasks 3 and 5 |
-| Three-pane A layout and compact visibility selector | Task 8 |
-| Exact Quartz note preview, full local site, and live site | Tasks 6 and 8 |
-| Public changes selected, private changes locked, pending unpublish | Task 10 |
-| Exact selected-tree validation with no unrelated/private publication | Task 11 |
-| Push to `origin/main` without force/reset and preserve working edits | Task 11 |
-| Git history and GitHub Actions deployment status | Task 12 |
-| Recycle-bin deletion and guided first-run repair | Task 13 |
-| Per-user Windows installer with verified bundled Node/npm | Task 14 |
-| End-to-end daily workflow and privacy boundary | Task 14 and Final Review |
+| Approved requirement                                                   | Implemented and verified in |
+| ---------------------------------------------------------------------- | --------------------------- |
+| Built-in Markdown editor, autosave, Wiki completion, conflict recovery | Tasks 4 and 9               |
+| Physical public/private storage and owned attachments                  | Tasks 3 and 5               |
+| Three-pane A layout and compact visibility selector                    | Task 8                      |
+| Exact Quartz note preview, full local site, and live site              | Tasks 6 and 8               |
+| Public changes selected, private changes locked, pending unpublish     | Task 10                     |
+| Exact selected-tree validation with no unrelated/private publication   | Task 11                     |
+| Push to `origin/main` without force/reset and preserve working edits   | Task 11                     |
+| Git history and GitHub Actions deployment status                       | Task 12                     |
+| Recycle-bin deletion and guided first-run repair                       | Task 13                     |
+| Per-user Windows installer with verified bundled Node/npm              | Task 14                     |
+| End-to-end daily workflow and privacy boundary                         | Task 14 and Final Review    |
