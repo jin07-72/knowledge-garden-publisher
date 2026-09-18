@@ -25,6 +25,8 @@ interface RequiredPath {
   readonly wrongTypeMessage: string
 }
 
+const readOnlyGitEnv = { GIT_OPTIONAL_LOCKS: "0" } as const
+
 const requiredPaths: readonly RequiredPath[] = [
   {
     relativePath: "content",
@@ -106,7 +108,12 @@ async function inspectGit(root: string, runner: CommandRunner): Promise<Workspac
   const issues: WorkspaceIssue[] = []
   let topLevel: CommandResult
   try {
-    topLevel = await runner.run({ executable: "git", args: ["rev-parse", "--show-toplevel"], cwd: root })
+    topLevel = await runner.run({
+      executable: "git",
+      args: ["rev-parse", "--show-toplevel"],
+      cwd: root,
+      env: readOnlyGitEnv
+    })
   } catch {
     return [issue("GIT_UNAVAILABLE", "Git is unavailable. Install Git and try again.")]
   }
@@ -120,7 +127,12 @@ async function inspectGit(root: string, runner: CommandRunner): Promise<Workspac
 
   let origin: CommandResult
   try {
-    origin = await runner.run({ executable: "git", args: ["remote", "get-url", "origin"], cwd: root })
+    origin = await runner.run({
+      executable: "git",
+      args: ["remote", "get-url", "origin"],
+      cwd: root,
+      env: readOnlyGitEnv
+    })
   } catch {
     return [issue("GIT_UNAVAILABLE", "Git is unavailable. Install Git and try again.")]
   }
@@ -140,7 +152,12 @@ async function inspectGit(root: string, runner: CommandRunner): Promise<Workspac
 
   let status: CommandResult
   try {
-    status = await runner.run({ executable: "git", args: ["status", "--porcelain=v2"], cwd: root })
+    status = await runner.run({
+      executable: "git",
+      args: ["status", "--porcelain=v2"],
+      cwd: root,
+      env: readOnlyGitEnv
+    })
   } catch {
     return [...issues, issue("GIT_UNAVAILABLE", "Git is unavailable. Install Git and try again.")]
   }

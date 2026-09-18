@@ -8,7 +8,7 @@ import {
   type CommandRunner
 } from "../../src/main/lib/commandRunner"
 import { inspectWorkspace } from "../../src/main/services/workspace"
-import { removeTemporaryDirectory } from "../helpers/fs"
+import { exists, removeTemporaryDirectory } from "../helpers/fs"
 import { createTemporaryGitRepository, git, type TemporaryGitRepository } from "../helpers/git"
 
 const temporaryDirectories: string[] = []
@@ -191,8 +191,11 @@ describe("inspectWorkspace", () => {
 
   it("reports git status failures from an injected runner", async () => {
     const root = await createGarden()
+    const requests: Parameters<CommandRunner["run"]>[0][] = []
     const runner: CommandRunner = {
-      run: async ({ args }) => {
+      run: async (request) => {
+        requests.push(request)
+        const { args } = request
         if (args[0] === "rev-parse") return { exitCode: 0, stdout: `${root}\n`, stderr: "" }
         if (args[0] === "remote") return { exitCode: 0, stdout: "https://example.invalid/garden.git\n", stderr: "" }
         return { exitCode: 1, stdout: "", stderr: "git status failed" }
@@ -204,6 +207,26 @@ describe("inspectWorkspace", () => {
     expect(result.ok).toBe(false)
     expect(result.issues.map((issue) => issue.code)).toContain("GIT_STATUS_FAILED")
     expect(result.capabilities.git).toBe(false)
+    expect(requests).toEqual([
+      {
+        executable: "git",
+        args: ["rev-parse", "--show-toplevel"],
+        cwd: root,
+        env: { GIT_OPTIONAL_LOCKS: "0" }
+      },
+      {
+        executable: "git",
+        args: ["remote", "get-url", "origin"],
+        cwd: root,
+        env: { GIT_OPTIONAL_LOCKS: "0" }
+      },
+      {
+        executable: "git",
+        args: ["status", "--porcelain=v2"],
+        cwd: root,
+        env: { GIT_OPTIONAL_LOCKS: "0" }
+      }
+    ])
   })
 
   it("reports an unavailable git executable from an injected runner", async () => {
@@ -223,22 +246,29 @@ describe("inspectWorkspace", () => {
 
 describe("runCommand", () => {
   it("passes literal arguments, captures streams separately, and merges environment overrides", async () => {
-    const result = await runCommand({
-      executable: process.execPath,
-      args: [
-        "-e",
-        "process.stdout.write(process.argv[1]); process.stderr.write(process.env.GARDEN_TEST_VALUE)",
-        "literal && not-a-shell-command"
-      ],
-      cwd: process.cwd(),
-      env: { GARDEN_TEST_VALUE: "stderr-value" }
-    })
+    const inheritedValue = process.env.GARDEN_INHERITED_VALUE
+    process.env.GARDEN_INHERITED_VALUE = "inherited-value"
+    try {
+      const result = await runCommand({
+        executable: process.execPath,
+        args: [
+          "-e",
+          "process.stdout.write(process.argv[1] + ':' + process.env.GARDEN_INHERITED_VALUE); process.stderr.write(process.env.GARDEN_TEST_VALUE)",
+          "literal && not-a-shell-command"
+        ],
+        cwd: process.cwd(),
+        env: { GARDEN_TEST_VALUE: "stderr-value" }
+      })
 
-    expect(result).toEqual({
-      exitCode: 0,
-      stdout: "literal && not-a-shell-command",
-      stderr: "stderr-value"
-    })
+      expect(result).toEqual({
+        exitCode: 0,
+        stdout: "literal && not-a-shell-command:inherited-value",
+        stderr: "stderr-value"
+      })
+    } finally {
+      if (inheritedValue === undefined) delete process.env.GARDEN_INHERITED_VALUE
+      else process.env.GARDEN_INHERITED_VALUE = inheritedValue
+    }
   })
 
   it("resolves non-zero process exits with their exit code and stderr", async () => {
@@ -262,6 +292,37 @@ describe("runCommand", () => {
     controller.abort()
 
     await expect(command).rejects.toMatchObject({ code: "COMMAND_CANCELLED" })
+  })
+
+  it("honors an explicit cwd instead of the process cwd", async () => {
+    const cwd = await mkdtemp(join(tmpdir(), "garden-command-cwd-"))
+    temporaryDirectories.push(cwd)
+
+    const result = await runCommand({
+      executable: process.execPath,
+      args: ["-e", "process.stdout.write(process.cwd())"],
+      cwd
+    })
+
+    expect(result.stdout).toBe(cwd)
+  })
+
+  it("returns stable cancellation without starting an already-aborted command", async () => {
+    const cwd = await mkdtemp(join(tmpdir(), "garden-command-abort-"))
+    temporaryDirectories.push(cwd)
+    const marker = join(cwd, "spawned.txt")
+    const controller = new AbortController()
+    controller.abort()
+
+    await expect(
+      runCommand({
+        executable: process.execPath,
+        args: ["-e", `require('node:fs').writeFileSync(${JSON.stringify(marker)}, 'spawned')`],
+        cwd,
+        signal: controller.signal
+      })
+    ).rejects.toMatchObject({ code: "COMMAND_CANCELLED" })
+    expect(await exists(marker)).toBe(false)
   })
 
   it("rejects spawn failures without echoing unsafe executable text", async () => {
