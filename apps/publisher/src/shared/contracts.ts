@@ -37,6 +37,16 @@ export type AppErrorCode =
   | "NOTE_INDEX_ACCESS_FAILED"
   | "NOTE_INDEX_DUPLICATE"
   | "NOTE_INDEX_CHANGED"
+  | "NOTE_FILE_INVALID"
+  | "NOTE_FILE_UNSAFE_PATH"
+  | "NOTE_FILE_ACCESS_FAILED"
+  | "NOTE_FILE_WRITE_FAILED"
+  | "NOTE_ALREADY_EXISTS"
+  | "EXTERNAL_EDIT"
+  | "RECOVERY_NOT_FOUND"
+  | "RECOVERY_INVALID"
+  | "RECOVERY_CONFLICT"
+  | "RECOVERY_DISCARD_FAILED"
 
 export type AppError = {
   readonly [Code in AppErrorCode]: {
@@ -47,8 +57,15 @@ export type AppError = {
 }[AppErrorCode]
 
 type NoteIndexError = Extract<AppError, { readonly code: `NOTE_INDEX_${string}` }>
+type NoteFileError = Extract<
+  AppError,
+  {
+    readonly code:
+      `NOTE_FILE_${string}` | "NOTE_ALREADY_EXISTS" | "EXTERNAL_EDIT" | `RECOVERY_${string}`
+  }
+>
 
-export type WorkspaceIssue = Exclude<AppError, NoteIndexError> & {
+export type WorkspaceIssue = Exclude<AppError, NoteIndexError | NoteFileError> & {
   readonly path?: string
 }
 
