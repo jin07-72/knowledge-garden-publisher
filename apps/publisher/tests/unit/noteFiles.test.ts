@@ -1,9 +1,11 @@
 import { createHash } from "node:crypto"
 import {
   lstat,
+  mkdir,
   mkdtemp,
   readFile,
   readdir,
+  rename as fsRename,
   rm,
   stat,
   symlink,
@@ -101,11 +103,34 @@ describe("note files", () => {
     })
 
     expect(publicNote.path).toBe("content/technology/safe-note.md")
-    expect(await readFile(join(root, publicNote.path), "utf8")).toContain(
-      'title: "Title: kept literal"',
+    expect(await readFile(join(root, publicNote.path), "utf8")).toBe(
+      [
+        "---",
+        'title: "Title: kept literal"',
+        "date: 2026-09-19",
+        'description: "A: description"',
+        "tags:",
+        "  - one",
+        "  - false",
+        "---",
+        "",
+        "Body",
+      ].join("\n"),
     )
-    expect(await readFile(join(root, publicNote.path), "utf8")).toContain("---\n\nBody")
     expect(privateNote.path).toBe("private/life/private-note.md")
+    expect(await readFile(join(root, privateNote.path), "utf8")).toBe(
+      [
+        "---",
+        "title: Private",
+        "date: 2026-09-19",
+        "description: Private description",
+        "tags:",
+        "  - journal",
+        "---",
+        "",
+        "",
+      ].join("\n"),
+    )
     expect(publicNote.contentHash).toHaveLength(64)
   })
 
@@ -131,6 +156,13 @@ describe("note files", () => {
     await expect(createNote({ ...input, slug: "index" })).rejects.toMatchObject({
       code: "NOTE_FILE_INVALID",
     })
+    await expect(createNote({ ...input, tags: [] })).rejects.toMatchObject({
+      code: "NOTE_FILE_INVALID",
+    })
+    await expect(createNote({ ...input, visibility: "secret" as never })).rejects.toMatchObject({
+      code: "NOTE_FILE_INVALID",
+    })
+    expect(await readdir(join(root, "private"))).toEqual([])
     const results = await Promise.allSettled([
       createNote(input),
       createNote({ ...input, body: "second" }),
@@ -194,6 +226,29 @@ describe("note files", () => {
         ),
       ),
     })
+  })
+
+  it("creates recovery before the replacement hook and rejects a save race without overwriting", async () => {
+    const root = await createGarden()
+    const path = await createPublicNote(root)
+    await expect(
+      saveNote(
+        {
+          workspace: root,
+          path: "content/technology/first-note.md",
+          markdown: "new buffer",
+          ...(await revision(path)),
+        },
+        {
+          beforeReplace: async () => {
+            expect(await listRecoveries(root)).toHaveLength(1)
+            await writeFile(path, "external edit")
+          },
+        },
+      ),
+    ).rejects.toMatchObject({ code: "EXTERNAL_EDIT" })
+    expect(await readFile(path, "utf8")).toBe("external edit")
+    expect(await listRecoveries(root)).toHaveLength(1)
   })
 
   it("rejects stale and same-mtime external edits without overwriting source", async () => {
@@ -315,6 +370,90 @@ describe("note files", () => {
     ).toBe(0)
   })
 
+  it("cleans temporary files when flush fails", async () => {
+    const root = await createGarden()
+    const path = await createPublicNote(root)
+    await expect(
+      saveNote(
+        {
+          workspace: root,
+          path: "content/technology/first-note.md",
+          markdown: "new",
+          ...(await revision(path)),
+        },
+        {
+          beforeTempSync: async () => {
+            throw new Error("no flush")
+          },
+        },
+      ),
+    ).rejects.toMatchObject({ code: "NOTE_FILE_WRITE_FAILED" })
+    expect(await readFile(path, "utf8")).toContain("# Body")
+  })
+
+  it("rolls back both rename failures, including a rename that mutates before throwing", async () => {
+    const root = await createGarden()
+    const path = await createPublicNote(root)
+    let calls = 0
+    const adapter: NoteFileAdapter = {
+      rename: async (from, to) => {
+        calls += 1
+        await fsRename(from, to)
+        if (calls === 2) throw new Error("second rename mutated")
+      },
+    }
+    await expect(
+      saveNote(
+        {
+          workspace: root,
+          path: "content/technology/first-note.md",
+          markdown: "new",
+          ...(await revision(path)),
+        },
+        adapter,
+      ),
+    ).rejects.toMatchObject({ code: "NOTE_FILE_WRITE_FAILED" })
+    expect(calls).toBeGreaterThanOrEqual(2)
+    expect(await readFile(path, "utf8")).toContain("# Body")
+    expect(
+      (await readdir(join(root, "content", "technology"))).filter(
+        (name) =>
+          name.includes(".garden-publisher-tmp-") || name.includes(".garden-publisher-rollback-"),
+      ),
+    ).toEqual([])
+  })
+
+  it("restores the original when the first rollback rename mutates then throws", async () => {
+    const root = await createGarden()
+    const path = await createPublicNote(root)
+    let calls = 0
+    await expect(
+      saveNote(
+        {
+          workspace: root,
+          path: "content/technology/first-note.md",
+          markdown: "new",
+          ...(await revision(path)),
+        },
+        {
+          rename: async (from, to) => {
+            calls += 1
+            await fsRename(from, to)
+            throw new Error("first rename mutated")
+          },
+        },
+      ),
+    ).rejects.toMatchObject({ code: "NOTE_FILE_WRITE_FAILED" })
+    expect(calls).toBe(1)
+    expect(await readFile(path, "utf8")).toContain("# Body")
+    expect(
+      (await readdir(join(root, "content", "technology"))).filter(
+        (name) =>
+          name.includes(".garden-publisher-tmp-") || name.includes(".garden-publisher-rollback-"),
+      ),
+    ).toEqual([])
+  })
+
   it("lists metadata only, restores with undo recovery, and refuses stale restoration", async () => {
     const root = await createGarden()
     const path = await createPublicNote(root)
@@ -338,6 +477,54 @@ describe("note files", () => {
     expect(await readFile(path, "utf8")).toContain("# Body")
     expect(restored.contentHash).not.toBe(saved.contentHash)
     expect(await listRecoveries(root)).toHaveLength(2)
+  })
+
+  it("rejects a restore race after its undo recovery is captured", async () => {
+    const root = await createGarden()
+    const path = await createPublicNote(root)
+    await saveNote({
+      workspace: root,
+      path: "content/technology/first-note.md",
+      markdown: "saved",
+      ...(await revision(path)),
+    })
+    const [recovery] = await listRecoveries(root)
+    await expect(
+      restoreRecovery(
+        { workspace: root, id: recovery!.id, expectedCurrentHash: hash("saved") },
+        { beforeReplace: async () => writeFile(path, "external restore edit") },
+      ),
+    ).rejects.toMatchObject({ code: "RECOVERY_CONFLICT" })
+    expect(await readFile(path, "utf8")).toBe("external restore edit")
+    expect(await listRecoveries(root)).toHaveLength(2)
+  })
+
+  it("initializes recovery storage safely under concurrent saves and orders metadata deterministically", async () => {
+    const root = await createGarden()
+    const first = await createPublicNote(root, "first")
+    const second = await createPublicNote(root, "second")
+    await Promise.all([
+      saveNote({
+        workspace: root,
+        path: "content/technology/first.md",
+        markdown: "one",
+        ...(await revision(first)),
+      }),
+      saveNote({
+        workspace: root,
+        path: "content/technology/second.md",
+        markdown: "two",
+        ...(await revision(second)),
+      }),
+    ])
+    const recoveries = await listRecoveries(root)
+    expect(recoveries).toHaveLength(2)
+    expect(
+      [...recoveries].sort(
+        (left, right) =>
+          right.createdAt.localeCompare(left.createdAt) || left.id.localeCompare(right.id),
+      ),
+    ).toEqual(recoveries)
   })
 
   it("rejects corrupt recoveries and trashes only the exact contained recovery target", async () => {
@@ -390,6 +577,97 @@ describe("note files", () => {
     await expect(restoreRecovery({ workspace: root, id: recovery!.id })).rejects.toMatchObject({
       code: "RECOVERY_INVALID",
     })
+  })
+
+  it("authenticates recovery metadata and rejects orphans without leaking private source", async () => {
+    const root = await createGarden()
+    const privatePath = await createNote({
+      workspace: root,
+      visibility: "private",
+      domain: "life",
+      slug: "secret",
+      title: "Secret",
+      date: "2026-09-19",
+      description: "Private",
+      tags: ["private"],
+      body: "PRIVATE_BODY_SENTINEL",
+    })
+    const path = join(root, privatePath.path)
+    await saveNote({
+      workspace: root,
+      path: privatePath.path,
+      markdown: "saved private",
+      ...(await revision(path)),
+    })
+    const [recovery] = await listRecoveries(root)
+    const manifestPath = join(root, ".garden-publisher", "recovery", recovery!.id, "manifest.json")
+    const manifest = JSON.parse(await readFile(manifestPath, "utf8")) as Record<string, unknown>
+    manifest.originalPath = "private/life/other.md"
+    await writeFile(manifestPath, JSON.stringify(manifest))
+    await expect(restoreRecovery({ workspace: root, id: recovery!.id })).rejects.toSatisfy(
+      (error: unknown) => {
+        expect((error as { code?: string }).code).toBe("RECOVERY_INVALID")
+        expect(JSON.stringify(error)).not.toContain("PRIVATE_BODY_SENTINEL")
+        expect(JSON.stringify(error)).not.toContain(root)
+        return true
+      },
+    )
+    await mkdir(join(root, ".garden-publisher", "recovery", "1234567890abcdef"))
+    await expect(listRecoveries(root)).rejects.toMatchObject({ code: "RECOVERY_INVALID" })
+  })
+
+  it("rejects tampered recovery snapshots and swapped recovery links", async ({ skip }) => {
+    const root = await createGarden()
+    const path = await createPublicNote(root)
+    await saveNote({
+      workspace: root,
+      path: "content/technology/first-note.md",
+      markdown: "saved",
+      ...(await revision(path)),
+    })
+    const [recovery] = await listRecoveries(root)
+    const snapshot = join(root, ".garden-publisher", "recovery", recovery!.id, "content.md")
+    await writeFile(snapshot, "snapshot tamper")
+    await expect(listRecoveries(root)).rejects.toMatchObject({ code: "RECOVERY_INVALID" })
+
+    const root2 = await createGarden()
+    const second = await createPublicNote(root2)
+    await saveNote({
+      workspace: root2,
+      path: "content/technology/first-note.md",
+      markdown: "saved",
+      ...(await revision(second)),
+    })
+    const [secondRecovery] = await listRecoveries(root2)
+    const secondSnapshot = join(
+      root2,
+      ".garden-publisher",
+      "recovery",
+      secondRecovery!.id,
+      "content.md",
+    )
+    try {
+      await rm(secondSnapshot)
+      await symlink(join(root2, "private", "missing.md"), secondSnapshot, "file")
+    } catch (error: unknown) {
+      if ((error as NodeJS.ErrnoException).code === "EPERM") return skip()
+      throw error
+    }
+    await expect(listRecoveries(root2)).rejects.toMatchObject({ code: "RECOVERY_INVALID" })
+  })
+
+  it("requires the recovery integrity digest stored separately from its manifest", async () => {
+    const root = await createGarden()
+    const path = await createPublicNote(root)
+    await saveNote({
+      workspace: root,
+      path: "content/technology/first-note.md",
+      markdown: "saved",
+      ...(await revision(path)),
+    })
+    const [recovery] = await listRecoveries(root)
+    await rm(join(root, ".garden-publisher", "recovery", recovery!.id, "integrity.sha256"))
+    await expect(listRecoveries(root)).rejects.toMatchObject({ code: "RECOVERY_INVALID" })
   })
 
   it("maps recovery trash adapter failures to typed errors", async () => {

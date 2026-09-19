@@ -6,6 +6,7 @@ import {
   mkdir,
   open,
   readdir,
+  readFile,
   realpath,
   rename as nodeRename,
   rm,
@@ -96,6 +97,7 @@ interface CheckedFile {
   readonly bytes: Buffer
   readonly revision: NoteRevision
   readonly mode: number
+  readonly identity: string
 }
 
 interface RecoveryManifest {
@@ -106,6 +108,8 @@ interface RecoveryManifest {
   readonly contentHash: string
   readonly mtimeMs: number
   readonly sourceFile: "content.md"
+  readonly integrityFile: "integrity.sha256"
+  readonly integrity: string
 }
 
 interface RecoveryEntry {
@@ -203,6 +207,7 @@ async function canonicalWorkspace(workspacePath: string): Promise<string> {
 }
 
 function rootName(visibility: Visibility): "content" | "private" {
+  if (visibility !== "public" && visibility !== "private") throw invalidPath(".")
   return visibility === "public" ? "content" : "private"
 }
 
@@ -341,6 +346,7 @@ async function readCheckedFile(
       bytes,
       revision: { mtimeMs: openedTimes.mtimeMs, contentHash: hash(bytes) },
       mode: Number(opened.mode),
+      identity: identity(opened),
     }
   } catch (error) {
     if (isNoteError(error)) throw error
@@ -396,12 +402,33 @@ async function recoveryRoot(workspace: string, create: boolean): Promise<string>
       if (isNoteError(error)) throw error
       if ((error as NodeJS.ErrnoException).code !== "ENOENT" || !create)
         throw appError("RECOVERY_NOT_FOUND", "Recovery data was not found.")
-      await mkdir(path, { mode: 0o700 })
+      try {
+        await mkdir(path, { mode: 0o700 })
+      } catch (mkdirError) {
+        if ((mkdirError as NodeJS.ErrnoException).code !== "EEXIST") {
+          throw appError("RECOVERY_INVALID", "Recovery storage could not be initialized.")
+        }
+      }
       return directory(path, parent)
     }
   }
   const canonicalState = await directory(state, workspace)
   return directory(recovery, canonicalState)
+}
+
+function manifestIntegrity(manifest: Omit<RecoveryManifest, "integrity">): string {
+  return hash(
+    JSON.stringify({
+      version: manifest.version,
+      id: manifest.id,
+      originalPath: manifest.originalPath,
+      createdAt: manifest.createdAt,
+      contentHash: manifest.contentHash,
+      mtimeMs: manifest.mtimeMs,
+      sourceFile: manifest.sourceFile,
+      integrityFile: manifest.integrityFile,
+    }),
+  )
 }
 
 async function createRecovery(
@@ -412,7 +439,7 @@ async function createRecovery(
   const root = await recoveryRoot(workspace, true)
   const id = `${Date.now()}-${randomUUID()}`
   const directory = resolve(root, id)
-  const manifest: RecoveryManifest = {
+  const manifestData: Omit<RecoveryManifest, "integrity"> = {
     version: 1,
     id,
     originalPath,
@@ -420,7 +447,9 @@ async function createRecovery(
     contentHash: checked.revision.contentHash,
     mtimeMs: checked.revision.mtimeMs,
     sourceFile: "content.md",
+    integrityFile: "integrity.sha256",
   }
+  const manifest: RecoveryManifest = { ...manifestData, integrity: manifestIntegrity(manifestData) }
   try {
     await mkdir(directory, { mode: 0o700 })
     await writeFile(resolve(directory, manifest.sourceFile), checked.bytes, {
@@ -428,6 +457,10 @@ async function createRecovery(
       flag: "wx",
     })
     await writeFile(resolve(directory, "manifest.json"), JSON.stringify(manifest), {
+      mode: 0o600,
+      flag: "wx",
+    })
+    await writeFile(resolve(directory, manifest.integrityFile), `${manifest.integrity}\n`, {
       mode: 0o600,
       flag: "wx",
     })
@@ -470,12 +503,54 @@ async function writeTempAndReplace(
   bytes: Buffer,
   mode: number | undefined,
   adapter: NoteFileAdapter,
+  original: Buffer | undefined,
+  verifyBeforeCommit: () => Promise<void>,
 ): Promise<void> {
   const temp = `${target}.garden-publisher-tmp-${randomUUID()}`
+  const rollback = `${target}.garden-publisher-rollback-${randomUUID()}`
   let handle
+  let originalMoved = false
+  let replacementMoved = false
+  let committed = false
+
+  async function bytesAt(path: string): Promise<Buffer | undefined> {
+    try {
+      const details = await lstat(path)
+      if (details.isSymbolicLink() || !details.isFile()) return undefined
+      return await readFile(path)
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code === "ENOENT") return undefined
+      return undefined
+    }
+  }
+
+  async function restoreOriginal(): Promise<void> {
+    if (original === undefined) {
+      if (replacementMoved && (await bytesAt(target))?.equals(bytes))
+        await rm(target, { force: true })
+      return
+    }
+    const rollbackBytes = await bytesAt(rollback)
+    const targetBytes = await bytesAt(target)
+    if (rollbackBytes?.equals(original)) {
+      if (targetBytes !== undefined && !targetBytes.equals(original)) {
+        const displaced = `${target}.garden-publisher-tmp-${randomUUID()}`
+        await nodeRename(target, displaced)
+        await rm(displaced, { force: true })
+      }
+      await nodeRename(rollback, target)
+      originalMoved = false
+      replacementMoved = false
+      return
+    }
+    if (targetBytes?.equals(original)) {
+      originalMoved = false
+      replacementMoved = false
+    }
+  }
+
   try {
     handle = await open(temp, "wx", 0o600)
-    if (mode !== undefined) await chmod(temp, mode & 0o777)
     await adapter.beforeTempWrite?.(temp)
     await handle.writeFile(bytes)
     await adapter.beforeTempSync?.(temp)
@@ -483,21 +558,57 @@ async function writeTempAndReplace(
     await handle.close()
     handle = undefined
     await adapter.beforeReplace?.(displayPath)
+    await verifyBeforeCommit()
+    // Keep staged content owner-only until it has been completely written,
+    // flushed, closed, and revalidated immediately before the final swap.
+    if (mode !== undefined) await chmod(temp, mode & 0o777)
+    if (original !== undefined) {
+      await (adapter.rename ?? nodeRename)(target, rollback)
+      originalMoved = true
+    }
     await (adapter.rename ?? nodeRename)(temp, target)
+    replacementMoved = true
+    const installed = await bytesAt(target)
+    if (!installed?.equals(bytes)) throw new Error("replacement identity changed")
     await syncContainingDirectory(target)
+    committed = true
   } catch (error) {
+    try {
+      await restoreOriginal()
+    } catch {
+      // The recovery snapshot is retained. Do not delete an unverified rollback.
+    }
     if (isNoteError(error)) throw error
     throw writeFailure(displayPath)
   } finally {
     await handle?.close().catch(() => undefined)
-    // A failed rename leaves the original target intact. The temporary is disposable;
-    // the preceding recovery snapshot remains available once replacement was attempted.
     await rm(temp, { force: true }).catch(() => undefined)
+    if (committed || (!originalMoved && !replacementMoved)) {
+      await rm(rollback, { force: true }).catch(() => undefined)
+    }
   }
 }
 
 function result(path: string, bytes: Buffer, mtimeMs: number): NoteWriteResult {
   return { path, updatedAt: new Date(mtimeMs).toISOString(), mtimeMs, contentHash: hash(bytes) }
+}
+
+async function verifyUnchanged(
+  root: ManagedRoot,
+  domain: NoteDomain,
+  filename: string,
+  expected: CheckedFile,
+): Promise<boolean> {
+  try {
+    const current = await readCheckedFile(root, domain, filename)
+    return (
+      current.identity === expected.identity &&
+      current.revision.mtimeMs === expected.revision.mtimeMs &&
+      current.revision.contentHash === expected.revision.contentHash
+    )
+  } catch {
+    return false
+  }
 }
 
 export async function createNote(input: CreateNoteInput): Promise<NoteWriteResult> {
@@ -538,7 +649,21 @@ export async function saveNote(
   const directory = await checkedDomain(root, parsed.domain, false)
   const target = resolve(directory, parsed.filename)
   const bytes = Buffer.from(input.markdown, "utf8")
-  await writeTempAndReplace(target, parsed.displayPath, bytes, current.mode, adapter)
+  await writeTempAndReplace(
+    target,
+    parsed.displayPath,
+    bytes,
+    current.mode,
+    adapter,
+    current.bytes,
+    async () => {
+      if (!(await verifyUnchanged(root, parsed.domain, parsed.filename, current))) {
+        throw appError("EXTERNAL_EDIT", "The note changed outside the editor.", {
+          path: parsed.displayPath,
+        })
+      }
+    },
+  )
   const details = await stat(target)
   return result(parsed.displayPath, bytes, details.mtimeMs)
 }
@@ -556,7 +681,10 @@ function isManifest(value: unknown): value is RecoveryManifest {
     typeof manifest.contentHash === "string" &&
     /^[a-f0-9]{64}$/i.test(manifest.contentHash) &&
     typeof manifest.mtimeMs === "number" &&
-    manifest.sourceFile === "content.md"
+    manifest.sourceFile === "content.md" &&
+    manifest.integrityFile === "integrity.sha256" &&
+    typeof manifest.integrity === "string" &&
+    /^[a-f0-9]{64}$/i.test(manifest.integrity)
   )
 }
 
@@ -569,11 +697,34 @@ async function readRecovery(workspace: string, id: string): Promise<RecoveryEntr
     throw appError("RECOVERY_INVALID", "The recovery identifier is invalid.")
   let manifestBytes: Buffer
   let bytes: Buffer
+  let storedIntegrity: Buffer
   async function readRecoveryFile(path: string): Promise<Buffer> {
     const flags = process.platform === "win32" ? "r" : constants.O_RDONLY | constants.O_NOFOLLOW
+    const before = await lstat(path, { bigint: true })
+    if (before.isSymbolicLink() || !before.isFile())
+      throw appError("RECOVERY_INVALID", "Recovery data is invalid.")
+    const canonical = await realpath(path)
+    if (!isInside(directory, canonical))
+      throw appError("RECOVERY_INVALID", "Recovery data is invalid.")
     const handle = await open(path, flags)
     try {
-      return await handle.readFile()
+      const opened = await handle.stat({ bigint: true })
+      if (!opened.isFile() || identity(before) !== identity(opened))
+        throw appError("RECOVERY_INVALID", "Recovery data is invalid.")
+      const content = await handle.readFile()
+      const after = await lstat(path, { bigint: true })
+      const afterCanonical = await realpath(path)
+      if (
+        after.isSymbolicLink() ||
+        !after.isFile() ||
+        identity(before) !== identity(after) ||
+        identity(opened) !== identity(after) ||
+        !pathsEqual(canonical, afterCanonical) ||
+        !isInside(directory, afterCanonical)
+      ) {
+        throw appError("RECOVERY_INVALID", "Recovery data is invalid.")
+      }
+      return content
     } finally {
       await handle.close().catch(() => undefined)
     }
@@ -593,7 +744,7 @@ async function readRecovery(workspace: string, id: string): Promise<RecoveryEntr
     throw appError("RECOVERY_INVALID", "Recovery data is invalid.")
   }
   try {
-    for (const name of ["manifest.json", "content.md"]) {
+    for (const name of ["manifest.json", "content.md", "integrity.sha256"]) {
       const file = resolve(directory, name)
       const details = await lstat(file)
       if (
@@ -605,6 +756,7 @@ async function readRecovery(workspace: string, id: string): Promise<RecoveryEntr
     }
     manifestBytes = await readRecoveryFile(resolve(directory, "manifest.json"))
     bytes = await readRecoveryFile(resolve(directory, "content.md"))
+    storedIntegrity = await readRecoveryFile(resolve(directory, "integrity.sha256"))
   } catch (error) {
     if (isNoteError(error)) throw error
     throw appError("RECOVERY_INVALID", "Recovery data is invalid.")
@@ -615,7 +767,23 @@ async function readRecovery(workspace: string, id: string): Promise<RecoveryEntr
   } catch {
     throw appError("RECOVERY_INVALID", "Recovery data is invalid.")
   }
-  if (!isManifest(manifest) || manifest.id !== id || hash(bytes) !== manifest.contentHash)
+  if (
+    !isManifest(manifest) ||
+    manifest.id !== id ||
+    hash(bytes) !== manifest.contentHash ||
+    manifest.integrity !==
+      manifestIntegrity({
+        version: manifest.version,
+        id: manifest.id,
+        originalPath: manifest.originalPath,
+        createdAt: manifest.createdAt,
+        contentHash: manifest.contentHash,
+        mtimeMs: manifest.mtimeMs,
+        sourceFile: manifest.sourceFile,
+        integrityFile: manifest.integrityFile,
+      }) ||
+    storedIntegrity.toString("utf8").trim() !== manifest.integrity
+  )
     throw appError("RECOVERY_INVALID", "Recovery data is invalid.")
   try {
     parseManagedPath(workspace, manifest.originalPath)
@@ -681,7 +849,31 @@ export async function restoreRecovery(
     }
     await createRecovery(workspace, parsed.displayPath, current)
   }
-  await writeTempAndReplace(target, parsed.displayPath, entry.bytes, current?.mode, adapter)
+  await writeTempAndReplace(
+    target,
+    parsed.displayPath,
+    entry.bytes,
+    current?.mode,
+    adapter,
+    current?.bytes,
+    async () => {
+      if (current === undefined) {
+        try {
+          await readCheckedFile(root, parsed.domain, parsed.filename)
+        } catch {
+          return
+        }
+        throw appError("RECOVERY_CONFLICT", "The note changed since this recovery was created.", {
+          path: parsed.displayPath,
+        })
+      }
+      if (!(await verifyUnchanged(root, parsed.domain, parsed.filename, current))) {
+        throw appError("RECOVERY_CONFLICT", "The note changed since this recovery was created.", {
+          path: parsed.displayPath,
+        })
+      }
+    },
+  )
   const details = await stat(target)
   return result(parsed.displayPath, entry.bytes, details.mtimeMs)
 }
