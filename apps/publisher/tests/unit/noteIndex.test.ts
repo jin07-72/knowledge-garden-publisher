@@ -1,12 +1,16 @@
-import { cp, mkdir, mkdtemp, rm, symlink, utimes, writeFile } from "node:fs/promises"
+import { execFile } from "node:child_process"
+import { cp, mkdir, mkdtemp, rename, rm, symlink, utimes, writeFile } from "node:fs/promises"
 import { tmpdir } from "node:os"
 import { join, resolve } from "node:path"
+import { pathToFileURL } from "node:url"
+import { promisify } from "node:util"
 import { afterEach, describe, expect, it } from "vitest"
 import { scanNotes } from "../../src/main/services/noteIndex"
 import type { AppError } from "../../src/shared/contracts"
 import { removeTemporaryDirectory } from "../helpers/fs"
 
 const temporaryDirectories: string[] = []
+const executeFile = promisify(execFile)
 
 afterEach(async () => {
   await Promise.all(temporaryDirectories.splice(0).map(removeTemporaryDirectory))
@@ -49,6 +53,21 @@ function errorCode(error: unknown): AppError["code"] | undefined {
   return (error as Partial<AppError>).code
 }
 
+async function publicationErrors(source: string): Promise<readonly string[]> {
+  const validatorPath = pathToFileURL(
+    resolve(process.cwd(), "../..", "scripts/content-validation.mjs"),
+  )
+  const script = `import { validateNote } from ${JSON.stringify(validatorPath.href)}; process.stdout.write(JSON.stringify(validateNote("content/technology/note.md", process.argv[1])))`
+  const { stdout } = await executeFile(process.execPath, [
+    "--input-type=module",
+    "-e",
+    script,
+    "--",
+    source,
+  ])
+  return JSON.parse(stdout) as readonly string[]
+}
+
 describe("scanNotes", () => {
   it("indexes public and private notes without leaking private source", async () => {
     const fixtureRoot = resolve("tests/fixtures/garden")
@@ -74,10 +93,12 @@ describe("scanNotes", () => {
       ["css-grid", "public"],
     ])
     expect(notes.find((note) => note.slug === "journal")).not.toHaveProperty("body")
+    expect(JSON.stringify(notes)).not.toContain("PRIVATE_JOURNAL_SENTINEL")
     for (const note of notes) {
       expect(note).not.toHaveProperty("markdown")
       expect(note).not.toHaveProperty("raw")
       expect(note).not.toHaveProperty("content")
+      expect(note).not.toHaveProperty("modifiedAt")
     }
   })
 
@@ -200,21 +221,34 @@ describe("scanNotes", () => {
       "---\ntitle: Note\ndate: 2026-09-18\ndescription: Scalar tags.\ntags: test\n---",
     ],
     [
-      "non-string tag",
-      "---\ntitle: Note\ndate: 2026-09-18\ndescription: Number tag.\ntags: [1]\n---",
-    ],
-    [
       "invalid YAML",
       "---\ntitle: [\ndate: 2026-09-18\ndescription: Broken YAML.\ntags: [test]\n---",
     ],
   ])("rejects %s metadata without source leakage", async (_description, source) => {
     const root = await createGarden()
-    await writeNote(root, "content", "technology", "note.md", `${source}\nPRIVATE BODY`)
+    await writeNote(
+      root,
+      "content",
+      "technology",
+      "note.md",
+      `${source}\nPRIVATE_METADATA_SENTINEL`,
+    )
 
     await expect(scanNotes(root)).rejects.toSatisfy((error: unknown) => {
       expect(errorCode(error)).toBe("NOTE_INDEX_INVALID")
-      expect(JSON.stringify(error)).not.toContain("PRIVATE BODY")
+      expect(JSON.stringify(error)).not.toContain("PRIVATE_METADATA_SENTINEL")
       return true
+    })
+  })
+
+  it("reports canonical-root failures in content then private order", async () => {
+    const root = await createGarden()
+    await rm(join(root, "content"), { recursive: true })
+    await rm(join(root, "private"), { recursive: true })
+
+    await expect(scanNotes(root)).rejects.toMatchObject({
+      code: "NOTE_INDEX_ACCESS_FAILED",
+      details: { path: "content" },
     })
   })
 
@@ -244,6 +278,64 @@ describe("scanNotes", () => {
 
     expect(note.date).toBe("not-a-calendar-date")
     expect(typeof note.date).toBe("string")
+  })
+
+  it("accepts exactly the metadata accepted by the publication validator", async () => {
+    const corpus = [
+      ["BOM", "\uFEFF---\ntitle: Note\ndate: 2026-09-18\ndescription: Valid.\ntags: [test]\n---"],
+      [
+        "unquoted date",
+        "---\ntitle: Note\ndate: 2026-09-18\ndescription: Valid.\ntags: [test]\n---",
+      ],
+      [
+        "quoted date",
+        '---\ntitle: Note\ndate: "2026-09-18"\ndescription: Valid.\ntags: [test]\n---',
+      ],
+      ["scalar tags", "---\ntitle: Note\ndate: 2026-09-18\ndescription: Invalid.\ntags: test\n---"],
+      ["missing tags", "---\ntitle: Note\ndate: 2026-09-18\ndescription: Invalid.\n---"],
+      ["empty tags", "---\ntitle: Note\ndate: 2026-09-18\ndescription: Invalid.\ntags: []\n---"],
+      ["numeric tags", "---\ntitle: Note\ndate: 2026-09-18\ndescription: Valid.\ntags: [1]\n---"],
+      [
+        "mixed tags",
+        "---\ntitle: Note\ndate: 2026-09-18\ndescription: Valid.\ntags: [1, mixed, false]\n---",
+      ],
+      ["malformed", "---\ntitle: [\ndate: 2026-09-18\ndescription: Invalid.\ntags: [test]\n---"],
+      ["unclosed", "---\ntitle: Note\ndate: 2026-09-18\ndescription: Invalid.\ntags: [test]"],
+      ["empty title", "---\ntitle: \ndate: 2026-09-18\ndescription: Invalid.\ntags: [test]\n---"],
+      ["empty date", "---\ntitle: Note\ndate: \ndescription: Invalid.\ntags: [test]\n---"],
+      ["empty description", "---\ntitle: Note\ndate: 2026-09-18\ndescription: \ntags: [test]\n---"],
+    ] as const
+    const acceptedDates = new Map<string, string>()
+
+    for (const [name, source] of corpus) {
+      const root = await createGarden()
+      await writeNote(root, "content", "technology", "note.md", source)
+      const acceptedByPublication = (await publicationErrors(source)).length === 0
+      const scanned = scanNotes(root)
+      if (acceptedByPublication) {
+        const [note] = await scanned
+        expect(note, name).toBeDefined()
+        expect(typeof note?.date, name).toBe("string")
+        acceptedDates.set(name, note!.date)
+      } else {
+        await expect(scanned, name).rejects.toMatchObject({ code: "NOTE_INDEX_INVALID" })
+      }
+    }
+
+    expect(acceptedDates.get("unquoted date")).toBe("2026-09-18")
+    expect(acceptedDates.get("quoted date")).toBe(acceptedDates.get("unquoted date"))
+
+    const root = await createGarden()
+    await writeNote(
+      root,
+      "content",
+      "technology",
+      "numeric.md",
+      "---\ntitle: Note\ndate: 2026-09-18\ndescription: Valid.\ntags: [1, mixed, false]\n---",
+    )
+    const [note] = await scanNotes(root)
+    expect(note.date).toBe("2026-09-18")
+    expect(note.tags).toEqual(["1", "mixed", "false"])
   })
 
   it("sorts by updatedAt descending and title with a stable code-point tie-breaker", async () => {
@@ -320,6 +412,145 @@ describe("scanNotes", () => {
     })
   })
 
+  it("rejects a deterministic replacement with an outside link before reading it", async ({
+    skip,
+  }) => {
+    const root = await createGarden()
+    const outside = await mkdtemp(join(tmpdir(), "garden-note-index-outside-"))
+    temporaryDirectories.push(outside)
+    const target = join(outside, "outside.md")
+    const notePath = await writeNote(root, "content", "technology", "note.md")
+    await writeFile(
+      target,
+      "---\ntitle: Outside\ndate: 2026-09-18\ndescription: Outside.\ntags: [test]\n---\nOUTSIDE_BODY_SENTINEL",
+    )
+
+    await expect(
+      scanNotes(root, {
+        beforeOpen: async (path) => {
+          if (path !== "content/technology/note.md") return
+          await rm(notePath)
+          try {
+            await symlink(target, notePath, "file")
+          } catch (error: unknown) {
+            if ((error as NodeJS.ErrnoException).code === "EPERM") return skip()
+            throw error
+          }
+        },
+      }),
+    ).rejects.toSatisfy((error: unknown) => {
+      expect(errorCode(error)).toBe("NOTE_INDEX_UNSAFE_PATH")
+      expect(JSON.stringify(error)).not.toContain("OUTSIDE_BODY_SENTINEL")
+      return true
+    })
+  })
+
+  it("rejects a parent-directory replacement that resolves the candidate outside the root", async () => {
+    const root = await createGarden()
+    const outside = await mkdtemp(join(tmpdir(), "garden-note-index-outside-"))
+    temporaryDirectories.push(outside)
+    const domainPath = join(root, "content", "technology")
+    const originalDomainPath = join(root, "content", "technology-original")
+    await writeNote(root, "content", "technology", "note.md")
+    await writeFile(
+      join(outside, "note.md"),
+      "---\ntitle: Outside\ndate: 2026-09-18\ndescription: Outside.\ntags: [test]\n---\nOUTSIDE_DIRECTORY_SENTINEL",
+    )
+
+    await expect(
+      scanNotes(root, {
+        beforeOpen: async (path) => {
+          if (path !== "content/technology/note.md") return
+          await rename(domainPath, originalDomainPath)
+          await symlink(outside, domainPath, process.platform === "win32" ? "junction" : "dir")
+        },
+      }),
+    ).rejects.toSatisfy((error: unknown) => {
+      expect(errorCode(error)).toBe("NOTE_INDEX_UNSAFE_PATH")
+      expect(JSON.stringify(error)).not.toContain("OUTSIDE_DIRECTORY_SENTINEL")
+      return true
+    })
+  })
+
+  it("rejects a regular-file identity change between the pre-check and open", async () => {
+    const root = await createGarden()
+    const notePath = await writeNote(root, "content", "technology", "note.md")
+    const replacementPath = await writeNote(
+      root,
+      "content",
+      "technology",
+      "replacement.md",
+      "---\ntitle: Replacement\ndate: 2026-09-18\ndescription: Replacement.\ntags: [test]\n---\nPRE_OPEN_REPLACEMENT_SENTINEL",
+    )
+
+    await expect(
+      scanNotes(root, {
+        beforeOpen: async (path) => {
+          if (path !== "content/technology/note.md") return
+          await rm(notePath)
+          await rename(replacementPath, notePath)
+        },
+      }),
+    ).rejects.toSatisfy((error: unknown) => {
+      expect(errorCode(error)).toBe("NOTE_INDEX_CHANGED")
+      expect(JSON.stringify(error)).not.toContain("PRE_OPEN_REPLACEMENT_SENTINEL")
+      return true
+    })
+  })
+
+  it("rejects a deterministic regular-file replacement after reading", async () => {
+    const root = await createGarden()
+    const notePath = await writeNote(root, "content", "technology", "note.md")
+    const replacementPath = await writeNote(
+      root,
+      "content",
+      "technology",
+      "replacement.md",
+      "---\ntitle: Replacement\ndate: 2026-09-18\ndescription: Replacement.\ntags: [test]\n---\nREPLACEMENT_BODY_SENTINEL",
+    )
+
+    await expect(
+      scanNotes(root, {
+        afterRead: async (path) => {
+          if (path !== "content/technology/note.md") return
+          await rm(notePath)
+          await rename(replacementPath, notePath)
+        },
+      }),
+    ).rejects.toSatisfy((error: unknown) => {
+      expect(errorCode(error)).toBe("NOTE_INDEX_CHANGED")
+      expect(JSON.stringify(error)).not.toContain("REPLACEMENT_BODY_SENTINEL")
+      return true
+    })
+  })
+
+  it("rejects an in-place same-size rewrite even when the mtime is restored", async () => {
+    const root = await createGarden()
+    const source = [
+      "---",
+      "title: Note",
+      "date: 2026-09-18",
+      "description: A valid note.",
+      "tags: [test]",
+      "---",
+      "",
+      "# Note",
+    ].join("\n")
+    const notePath = await writeNote(root, "content", "technology", "note.md", source)
+    const fixedTime = new Date("2026-09-18T10:00:00.000Z")
+    await utimes(notePath, fixedTime, fixedTime)
+
+    await expect(
+      scanNotes(root, {
+        afterRead: async (path) => {
+          if (path !== "content/technology/note.md") return
+          await writeFile(notePath, source.replace("# Note", "# Evil"))
+          await utimes(notePath, fixedTime, fixedTime)
+        },
+      }),
+    ).rejects.toMatchObject({ code: "NOTE_INDEX_CHANGED" })
+  })
+
   it("rejects linked directories without traversing them", async ({ skip }) => {
     const root = await createGarden()
     const outside = await mkdtemp(join(tmpdir(), "garden-note-index-outside-"))
@@ -352,6 +583,23 @@ describe("scanNotes", () => {
     await expect(scanNotes(root)).rejects.toSatisfy((error: unknown) => {
       expect(errorCode(error)).toBe("NOTE_INDEX_ACCESS_FAILED")
       expect(JSON.stringify(error)).not.toContain("# Note")
+      return true
+    })
+  })
+
+  it("does not leak a private body sentinel through a serialized indexing error", async () => {
+    const root = await createGarden()
+    await writeNote(
+      root,
+      "private",
+      "life",
+      "invalid.md",
+      "---\ntitle: \ndate: 2026-09-18\ndescription: Invalid private note.\ntags: [test]\n---\nPRIVATE_ERROR_SENTINEL",
+    )
+
+    await expect(scanNotes(root)).rejects.toSatisfy((error: unknown) => {
+      expect(errorCode(error)).toBe("NOTE_INDEX_INVALID")
+      expect(JSON.stringify(error)).not.toContain("PRIVATE_ERROR_SENTINEL")
       return true
     })
   })

@@ -9,4 +9,4 @@ tags:
 
 # Journal
 
-Private reflection that must never enter a summary.
+PRIVATE_JOURNAL_SENTINEL must never enter a summary.

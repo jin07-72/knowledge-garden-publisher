@@ -36,6 +36,7 @@ export type AppErrorCode =
   | "NOTE_INDEX_UNSAFE_PATH"
   | "NOTE_INDEX_ACCESS_FAILED"
   | "NOTE_INDEX_DUPLICATE"
+  | "NOTE_INDEX_CHANGED"
 
 export type AppError = {
   readonly [Code in AppErrorCode]: {
@@ -80,7 +81,6 @@ export interface NoteSummary {
   readonly date: string
   readonly description: string
   readonly visibility: Visibility
-  readonly modifiedAt: string
   readonly updatedAt: string
   readonly tags: readonly string[]
 }
