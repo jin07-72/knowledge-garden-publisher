@@ -50,6 +50,21 @@ function hash(source: string): string {
   return createHash("sha256").update(source).digest("hex")
 }
 
+function unkeyedManifestTag(manifest: Record<string, unknown>): string {
+  return hash(
+    JSON.stringify({
+      version: manifest.version,
+      id: manifest.id,
+      originalPath: manifest.originalPath,
+      createdAt: manifest.createdAt,
+      contentHash: manifest.contentHash,
+      mtimeMs: manifest.mtimeMs,
+      sourceFile: manifest.sourceFile,
+      integrityFile: manifest.integrityFile,
+    }),
+  )
+}
+
 async function revision(
   path: string,
 ): Promise<{ expectedMtimeMs: number; expectedContentHash: string }> {
@@ -204,6 +219,27 @@ describe("note files", () => {
     ).rejects.toMatchObject({ code: "NOTE_FILE_UNSAFE_PATH" })
   })
 
+  it.runIf(process.platform === "win32")(
+    "rejects a recovery-root directory junction escape",
+    async () => {
+      const root = await createGarden()
+      const path = await createPublicNote(root)
+      await saveNote({
+        workspace: root,
+        path: "content/technology/first-note.md",
+        markdown: "saved",
+        ...(await revision(path)),
+      })
+      const recovery = join(root, ".garden-publisher", "recovery")
+      const original = join(root, ".garden-publisher", "recovery-original")
+      const outside = await mkdtemp(join(tmpdir(), "garden-recovery-outside-"))
+      temporaryDirectories.push(outside)
+      await fsRename(recovery, original)
+      await symlink(outside, recovery, "junction")
+      await expect(listRecoveries(root)).rejects.toMatchObject({ code: "NOTE_FILE_UNSAFE_PATH" })
+    },
+  )
+
   it("saves atomically after making a recovery snapshot and returns a new hash", async () => {
     const root = await createGarden()
     const path = await createPublicNote(root)
@@ -251,6 +287,69 @@ describe("note files", () => {
     expect(await listRecoveries(root)).toHaveLength(1)
   })
 
+  it("serializes same-revision writers so exactly one reported winner installs bytes", async () => {
+    for (let run = 0; run < 3; run += 1) {
+      const root = await createGarden()
+      const path = await createPublicNote(root)
+      let entered!: () => void
+      const enteredPromise = new Promise<void>((resolve) => {
+        entered = resolve
+      })
+      let release!: () => void
+      const releasePromise = new Promise<void>((resolve) => {
+        release = resolve
+      })
+      const first = saveNote(
+        {
+          workspace: root,
+          path: "content/technology/first-note.md",
+          markdown: "writer one",
+          ...(await revision(path)),
+        },
+        {
+          beforeReplace: async () => {
+            entered()
+            await releasePromise
+          },
+        },
+      )
+      await enteredPromise
+      const second = saveNote({
+        workspace: root,
+        path: "content/technology/first-note.md",
+        markdown: "writer two",
+        ...(await revision(path)),
+      })
+      await expect(second).rejects.toMatchObject({ code: "NOTE_FILE_LOCKED" })
+      release()
+      const winner = await first
+      expect(await readFile(path, "utf8")).toBe("writer one")
+      expect(winner.contentHash).toBe(hash("writer one"))
+    }
+  })
+
+  it("keeps the live target present and restrictive temp mode before commit", async () => {
+    const root = await createGarden()
+    const path = await createPublicNote(root)
+    let inspected = false
+    await saveNote(
+      {
+        workspace: root,
+        path: "content/technology/first-note.md",
+        markdown: "new",
+        ...(await revision(path)),
+      },
+      {
+        beforeCommit: async (temp) => {
+          inspected = true
+          expect(await readFile(path, "utf8")).toContain("# Body")
+          if (process.platform !== "win32") expect((await stat(temp)).mode & 0o777).toBe(0o600)
+        },
+      },
+    )
+    expect(inspected).toBe(true)
+  })
+
   it("rejects stale and same-mtime external edits without overwriting source", async () => {
     const root = await createGarden()
     const path = await createPublicNote(root)
@@ -280,9 +379,26 @@ describe("note files", () => {
     expect(await readFile(path, "utf8")).toBe("changed!")
   })
 
-  it("rejects unmanaged paths and linked files without exposing private source", async ({
-    skip,
-  }) => {
+  it("rejects a same-size rewrite with restored millisecond mtime", async () => {
+    const root = await createGarden()
+    const path = await createPublicNote(root)
+    const source = await readFile(path, "utf8")
+    const fixed = new Date(Math.floor((await stat(path)).mtimeMs))
+    await utimes(path, fixed, fixed)
+    const before = await revision(path)
+    await writeFile(path, source.replace("# Body", "# Evil"))
+    await utimes(path, fixed, fixed)
+    await expect(
+      saveNote({
+        workspace: root,
+        path: "content/technology/first-note.md",
+        markdown: "new",
+        ...before,
+      }),
+    ).rejects.toMatchObject({ code: "EXTERNAL_EDIT" })
+  })
+
+  it("rejects traversal and absolute unmanaged paths without a privileged symlink", async () => {
     const root = await createGarden()
     const path = await createPublicNote(root)
     await expect(
@@ -296,6 +412,11 @@ describe("note files", () => {
     await expect(
       saveNote({ workspace: root, path, markdown: "new", ...(await revision(path)) }),
     ).rejects.toMatchObject({ code: "NOTE_FILE_INVALID" })
+  })
+
+  it("rejects a direct linked file without reading through it", async ({ skip }) => {
+    const root = await createGarden()
+    const path = await createPublicNote(root)
     const outside = await mkdtemp(join(tmpdir(), "garden-note-outside-"))
     temporaryDirectories.push(outside)
     try {
@@ -391,30 +512,26 @@ describe("note files", () => {
     expect(await readFile(path, "utf8")).toContain("# Body")
   })
 
-  it("rolls back both rename failures, including a rename that mutates before throwing", async () => {
+  it("treats a rename that mutates then throws as a completed atomic save", async () => {
     const root = await createGarden()
     const path = await createPublicNote(root)
-    let calls = 0
     const adapter: NoteFileAdapter = {
       rename: async (from, to) => {
-        calls += 1
         await fsRename(from, to)
-        if (calls === 2) throw new Error("second rename mutated")
+        throw new Error("rename mutated")
       },
     }
-    await expect(
-      saveNote(
-        {
-          workspace: root,
-          path: "content/technology/first-note.md",
-          markdown: "new",
-          ...(await revision(path)),
-        },
-        adapter,
-      ),
-    ).rejects.toMatchObject({ code: "NOTE_FILE_WRITE_FAILED" })
-    expect(calls).toBeGreaterThanOrEqual(2)
-    expect(await readFile(path, "utf8")).toContain("# Body")
+    const saved = await saveNote(
+      {
+        workspace: root,
+        path: "content/technology/first-note.md",
+        markdown: "new",
+        ...(await revision(path)),
+      },
+      adapter,
+    )
+    expect(await readFile(path, "utf8")).toBe("new")
+    expect(saved.contentHash).toBe(hash("new"))
     expect(
       (await readdir(join(root, "content", "technology"))).filter(
         (name) =>
@@ -423,7 +540,7 @@ describe("note files", () => {
     ).toEqual([])
   })
 
-  it("restores the original when the first rollback rename mutates then throws", async () => {
+  it("keeps a normal first rename failure from removing the live target", async () => {
     const root = await createGarden()
     const path = await createPublicNote(root)
     let calls = 0
@@ -436,10 +553,9 @@ describe("note files", () => {
           ...(await revision(path)),
         },
         {
-          rename: async (from, to) => {
+          rename: async () => {
             calls += 1
-            await fsRename(from, to)
-            throw new Error("first rename mutated")
+            throw new Error("first rename failed")
           },
         },
       ),
@@ -614,6 +730,51 @@ describe("note files", () => {
     )
     await mkdir(join(root, ".garden-publisher", "recovery", "1234567890abcdef"))
     await expect(listRecoveries(root)).rejects.toMatchObject({ code: "RECOVERY_INVALID" })
+  })
+
+  it("rejects a coherently retagged manifest without the workspace HMAC key", async () => {
+    const root = await createGarden()
+    const path = await createPublicNote(root)
+    await saveNote({
+      workspace: root,
+      path: "content/technology/first-note.md",
+      markdown: "saved",
+      ...(await revision(path)),
+    })
+    const [recovery] = await listRecoveries(root)
+    const entry = join(root, ".garden-publisher", "recovery", recovery!.id)
+    const manifestPath = join(entry, "manifest.json")
+    const manifest = JSON.parse(await readFile(manifestPath, "utf8")) as Record<string, unknown>
+    manifest.originalPath = "content/technology/other.md"
+    manifest.integrity = unkeyedManifestTag(manifest)
+    await writeFile(manifestPath, JSON.stringify(manifest))
+    await writeFile(join(entry, "integrity.sha256"), `${manifest.integrity as string}\n`)
+    await expect(listRecoveries(root)).rejects.toMatchObject({ code: "RECOVERY_INVALID" })
+  })
+
+  it("rejects missing or corrupt workspace recovery HMAC keys", async () => {
+    const root = await createGarden()
+    const path = await createPublicNote(root)
+    await saveNote({
+      workspace: root,
+      path: "content/technology/first-note.md",
+      markdown: "saved",
+      ...(await revision(path)),
+    })
+    const key = join(root, ".garden-publisher", "keys", "recovery-hmac.key")
+    await rm(key)
+    await expect(listRecoveries(root)).rejects.toMatchObject({ code: "RECOVERY_INVALID" })
+
+    const root2 = await createGarden()
+    const second = await createPublicNote(root2)
+    await saveNote({
+      workspace: root2,
+      path: "content/technology/first-note.md",
+      markdown: "saved",
+      ...(await revision(second)),
+    })
+    await writeFile(join(root2, ".garden-publisher", "keys", "recovery-hmac.key"), "corrupt")
+    await expect(listRecoveries(root2)).rejects.toMatchObject({ code: "RECOVERY_INVALID" })
   })
 
   it("rejects tampered recovery snapshots and swapped recovery links", async ({ skip }) => {
