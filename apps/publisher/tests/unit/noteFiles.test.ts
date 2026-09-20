@@ -18,6 +18,14 @@ import { tmpdir } from "node:os"
 import { afterEach, describe, expect, it, vi } from "vitest"
 import {
   createNote,
+  DEFAULT_RECOVERY_GLOBAL_LIMIT,
+  DEFAULT_RECOVERY_PER_NOTE_LIMIT,
+  MAX_RECOVERY_GLOBAL_LIMIT,
+  MAX_RECOVERY_PER_NOTE_LIMIT,
+  RECOVERY_RETENTION_MAX_AUTH_ATTEMPTS,
+  RECOVERY_RETENTION_MAX_DIRECTORY_ENTRIES,
+  RECOVERY_RETENTION_MAX_SNAPSHOT_READS,
+  RECOVERY_RETENTION_MAX_TRASH_CALLS,
   discardRecovery,
   listRecoveries,
   restoreRecovery as restoreRecoveryService,
@@ -263,7 +271,6 @@ describe("note files", () => {
   it("never removes a successor that replaces a failed exclusive destination", async () => {
     const root = await createGarden()
     const destination = join(root, "content", "technology", "exclusive-successor.md")
-    const displaced = `${destination}.displaced`
     const probe = join(root, "exclusive-successor-probe")
     const probeHandle = await open(probe, "wx", 0o600)
     const prototype = Object.getPrototypeOf(probeHandle) as {
@@ -272,7 +279,6 @@ describe("note files", () => {
     await probeHandle.close()
     await rm(probe)
     vi.spyOn(prototype, "writeFile").mockImplementationOnce(async () => {
-      await fsRename(destination, displaced)
       await writeFile(destination, "successor bytes")
       throw Object.assign(new Error("injected write failure after replacement"), { code: "EIO" })
     })
@@ -292,6 +298,76 @@ describe("note files", () => {
     expect(await readFile(destination, "utf8")).toBe("successor bytes")
   })
 
+  it("never publishes a final note when temp identity stat fails and allows retry", async () => {
+    const root = await createGarden()
+    const destination = join(root, "content", "technology", "exclusive-stat.md")
+    const probe = join(root, "exclusive-stat-probe")
+    const probeHandle = await open(probe, "wx", 0o600)
+    const prototype = Object.getPrototypeOf(probeHandle) as {
+      stat: (options?: { bigint?: boolean }) => Promise<unknown>
+    }
+    await probeHandle.close()
+    await rm(probe)
+    vi.spyOn(prototype, "stat").mockRejectedValueOnce(
+      Object.assign(new Error("injected identity stat failure"), { code: "EIO" }),
+    )
+    const input = {
+      workspace: root,
+      visibility: "public" as const,
+      domain: "technology" as const,
+      slug: "exclusive-stat",
+      title: "Exclusive stat",
+      date: "2026-09-20",
+      description: "Fails before publication.",
+      tags: ["test"],
+    }
+
+    await expect(createNote(input)).rejects.toMatchObject({ code: "NOTE_FILE_WRITE_FAILED" })
+    await expect(lstat(destination)).rejects.toMatchObject({ code: "ENOENT" })
+    vi.restoreAllMocks()
+    await expect(createNote(input)).resolves.toMatchObject({
+      path: "content/technology/exclusive-stat.md",
+    })
+  })
+
+  it("removes a published note when its final directory sync fails and allows retry", async () => {
+    const root = await createGarden()
+    const destination = join(root, "content", "technology", "exclusive-directory-sync.md")
+    const probe = join(root, "exclusive-directory-sync-probe")
+    const probeHandle = await open(probe, "wx", 0o600)
+    const prototype = Object.getPrototypeOf(probeHandle) as { sync: () => Promise<void> }
+    const originalSync = prototype.sync
+    await probeHandle.close()
+    await rm(probe)
+    let syncCalls = 0
+    const spy = vi.spyOn(prototype, "sync").mockImplementation(async function (
+      this: typeof prototype,
+    ) {
+      syncCalls += 1
+      if (syncCalls === 3) {
+        throw Object.assign(new Error("injected final directory sync failure"), { code: "EIO" })
+      }
+      await Reflect.apply(originalSync, this, [])
+    })
+    const input = {
+      workspace: root,
+      visibility: "public" as const,
+      domain: "technology" as const,
+      slug: "exclusive-directory-sync",
+      title: "Exclusive directory sync",
+      date: "2026-09-20",
+      description: "Fails after no-replace publication.",
+      tags: ["test"],
+    }
+
+    await expect(createNote(input)).rejects.toMatchObject({ code: "NOTE_FILE_WRITE_FAILED" })
+    await expect(lstat(destination)).rejects.toMatchObject({ code: "ENOENT" })
+    spy.mockRestore()
+    await expect(createNote(input)).resolves.toMatchObject({
+      path: "content/technology/exclusive-directory-sync.md",
+    })
+  })
+
   it("rejects a malformed expected content hash before workspace access or locking", async () => {
     const root = await createGarden()
     const missingWorkspace = join(root, "missing")
@@ -303,6 +379,56 @@ describe("note files", () => {
         markdown: "new",
         expectedMtimeMs: 0,
         expectedContentHash: "not-a-sha-256",
+      }),
+    ).rejects.toMatchObject({ code: "INVALID_INPUT" })
+    await expect(lstat(join(root, ".garden-publisher"))).rejects.toMatchObject({ code: "ENOENT" })
+  })
+
+  it.each([
+    { perNoteLimit: MAX_RECOVERY_PER_NOTE_LIMIT + 1, globalLimit: MAX_RECOVERY_GLOBAL_LIMIT },
+    { perNoteLimit: MAX_RECOVERY_PER_NOTE_LIMIT, globalLimit: MAX_RECOVERY_GLOBAL_LIMIT + 1 },
+  ])("rejects an oversized retention policy before workspace access or locking", async (policy) => {
+    const root = await createGarden()
+
+    await expect(
+      saveNote({
+        workspace: join(root, "missing"),
+        path: "content/technology/first-note.md",
+        markdown: "new",
+        expectedMtimeMs: 0,
+        expectedContentHash: hash("revision"),
+        recoveryPolicy: policy,
+      }),
+    ).rejects.toMatchObject({ code: "INVALID_INPUT" })
+    await expect(lstat(join(root, ".garden-publisher"))).rejects.toMatchObject({ code: "ENOENT" })
+  })
+
+  it("keeps the documented default and maximum retention policy values", () => {
+    expect({
+      defaultPerNote: DEFAULT_RECOVERY_PER_NOTE_LIMIT,
+      defaultGlobal: DEFAULT_RECOVERY_GLOBAL_LIMIT,
+      maximumPerNote: MAX_RECOVERY_PER_NOTE_LIMIT,
+      maximumGlobal: MAX_RECOVERY_GLOBAL_LIMIT,
+    }).toEqual({
+      defaultPerNote: 20,
+      defaultGlobal: 500,
+      maximumPerNote: 100,
+      maximumGlobal: 2_000,
+    })
+  })
+
+  it("rejects a null retention policy with the same deterministic input error", async () => {
+    const root = await createGarden()
+
+    await expect(
+      saveNoteService({
+        workspace: join(root, "missing"),
+        path: "content/technology/first-note.md",
+        markdown: "new",
+        expectedMtimeMs: 0,
+        expectedContentHash: hash("revision"),
+        recoveryTrash: defaultRecoveryTrash,
+        recoveryPolicy: null as never,
       }),
     ).rejects.toMatchObject({ code: "INVALID_INPUT" })
     await expect(lstat(join(root, ".garden-publisher"))).rejects.toMatchObject({ code: "ENOENT" })
@@ -361,6 +487,11 @@ describe("note files", () => {
     expect(results.find((result) => result.status === "rejected")).toMatchObject({
       reason: { code: "NOTE_ALREADY_EXISTS" },
     })
+    expect(
+      (await readdir(join(root, "content", "technology"))).filter((name) =>
+        name.includes(".garden-publisher-create-"),
+      ),
+    ).toEqual([])
     expect(["first", "second"]).toContain(
       (await readFile(join(root, "content/technology/same-note.md"), "utf8")).split("\n").at(-1),
     )
@@ -1869,11 +2000,14 @@ describe("note files", () => {
       recoveryPolicy,
     })
 
-    expect(trashed).toEqual([join(root, ".garden-publisher", "recovery", oldest!.id)])
+    expect(trashed).toHaveLength(1)
+    expect(trashed[0]).toMatch(new RegExp(`[/\\\\]\\.retention-${oldest!.id}-[a-f0-9-]{36}$`, "i"))
     expect(await listRecoveries(root)).toHaveLength(2)
-    await expect(lstat(join(trashRoot, oldest!.id))).resolves.toMatchObject({
-      isDirectory: expect.any(Function),
-    })
+    await expect(lstat(join(trashRoot, trashed[0]!.split(/[/\\]/).at(-1)!))).resolves.toMatchObject(
+      {
+        isDirectory: expect.any(Function),
+      },
+    )
   })
 
   it("enforces the global recovery cap across notes through the same Trash adapter", async () => {
@@ -1905,15 +2039,22 @@ describe("note files", () => {
       if (index === 0) oldestId = (await listRecoveries(root))[0]!.id
     }
 
-    expect(trashed).toEqual([join(root, ".garden-publisher", "recovery", oldestId)])
+    expect(trashed).toHaveLength(1)
+    expect(trashed[0]).toMatch(new RegExp(`[/\\\\]\\.retention-${oldestId}-[a-f0-9-]{36}$`, "i"))
     expect(await listRecoveries(root)).toHaveLength(3)
   })
 
   it("commits the save and returns a serializable warning when retention Trash fails", async () => {
     const root = await createGarden()
     const path = await createPublicNote(root)
+    const lock = targetLockPath(root, "content/technology/first-note.md")
+    let lockPresentDuringMaintenance = false
     const recoveryTrash: TrashAdapter = {
       trashItem: async () => {
+        lockPresentDuringMaintenance = await lstat(lock).then(
+          () => true,
+          () => false,
+        )
         throw new Error("Trash unavailable")
       },
     }
@@ -1938,12 +2079,441 @@ describe("note files", () => {
 
     expect(await readFile(path, "utf8")).toBe("version two")
     expect(saved.warnings).toEqual([
-      expect.objectContaining({
+      {
         code: "RECOVERY_RETENTION_FAILED",
-        details: expect.objectContaining({ id: expect.any(String) }),
-      }),
+        message: "The save completed, but bounded recovery maintenance needs another pass.",
+        details: { attemptedCount: 1, failureCount: 1, operation: "save" },
+      },
     ])
+    expect(lockPresentDuringMaintenance).toBe(false)
     expect(() => JSON.stringify(saved)).not.toThrow()
+  })
+
+  it("never auto-trashes a recovery whose snapshot file is structurally corrupt", async () => {
+    const root = await createGarden()
+    const path = await createPublicNote(root)
+    const displayPath = "content/technology/first-note.md"
+    const setupPolicy = { perNoteLimit: MAX_RECOVERY_PER_NOTE_LIMIT, globalLimit: 100 }
+    for (const markdown of ["version one", "version two"]) {
+      await saveNote({
+        workspace: root,
+        path: displayPath,
+        markdown,
+        ...(await revision(path)),
+        recoveryPolicy: setupPolicy,
+      })
+    }
+    const recoveries = await listRecoveries(root)
+    const corruptId = recoveries.at(-1)!.id
+    await rm(join(root, ".garden-publisher", "recovery", corruptId, "content.md"))
+    await rm(join(root, ".garden-publisher", "recovery-retention-state.json"), { force: true })
+    const attemptedPaths: string[] = []
+
+    await saveNote({
+      workspace: root,
+      path: displayPath,
+      markdown: "version three",
+      ...(await revision(path)),
+      recoveryPolicy: { perNoteLimit: 1, globalLimit: 100 },
+      recoveryTrash: {
+        trashItem: async (value) => {
+          attemptedPaths.push(value)
+        },
+      },
+    })
+
+    expect(attemptedPaths).not.toContain(join(root, ".garden-publisher", "recovery", corruptId))
+  })
+
+  it("parameterizes bounded retention warnings for restore after releasing its lock", async () => {
+    const root = await createGarden()
+    const path = await createPublicNote(root)
+    const displayPath = "content/technology/first-note.md"
+    await saveNote({
+      workspace: root,
+      path: displayPath,
+      markdown: "current target",
+      ...(await revision(path)),
+    })
+    const [recovery] = await listRecoveries(root)
+    const lock = targetLockPath(root, displayPath)
+    let lockPresentDuringMaintenance = false
+    const restored = await restoreRecovery({
+      workspace: root,
+      id: recovery!.id,
+      expectedCurrentHash: hash("current target"),
+      recoveryTrash: {
+        trashItem: async () => {
+          lockPresentDuringMaintenance = await lstat(lock).then(
+            () => true,
+            () => false,
+          )
+          throw new Error("Trash unavailable")
+        },
+      },
+      recoveryPolicy: { perNoteLimit: 1, globalLimit: 10 },
+    })
+
+    expect(restored.warnings).toEqual([
+      {
+        code: "RECOVERY_RETENTION_FAILED",
+        message: "The restore completed, but bounded recovery maintenance needs another pass.",
+        details: { attemptedCount: 1, failureCount: 1, operation: "restore" },
+      },
+    ])
+    expect(lockPresentDuringMaintenance).toBe(false)
+  })
+
+  it("bounds degraded retention work, skips bodies and corrupt IDs, and advances its cursor", async () => {
+    const root = await createGarden()
+    const path = await createPublicNote(root)
+    const displayPath = "content/technology/first-note.md"
+    const setupPolicy = { perNoteLimit: 100, globalLimit: 2_000 }
+    for (let index = 0; index < RECOVERY_RETENTION_MAX_DIRECTORY_ENTRIES * 2 + 6; index += 1) {
+      await saveNote({
+        workspace: root,
+        path: displayPath,
+        markdown: `stress-version-${index}`,
+        ...(await revision(path)),
+        recoveryPolicy: setupPolicy,
+      })
+    }
+    const recoveryRoot = join(root, ".garden-publisher", "recovery")
+    const validIds = (await readdir(recoveryRoot))
+      .filter((name) => /^\d+-/.test(name))
+      .sort()
+      .reverse()
+    const corruptIds = validIds.slice(4, 7).map((id, index) => {
+      const timestamp = id.split("-")[0]
+      return `${timestamp}-${String(index + 1).repeat(8)}-ffff-4fff-8fff-${String(index + 1).repeat(12)}`
+    })
+    for (const id of corruptIds) await mkdir(join(recoveryRoot, id), { mode: 0o700 })
+    const statePath = join(root, ".garden-publisher", "recovery-retention-state.json")
+    await rm(statePath, { force: true })
+    const lock = targetLockPath(root, displayPath)
+    const probe = join(root, "retention-read-probe")
+    const probeHandle = await open(probe, "wx", 0o600)
+    type ProbeHandle = {
+      readFile: () => Promise<Buffer>
+      read: (
+        buffer: Buffer,
+        offset: number,
+        length: number,
+        position: number,
+      ) => Promise<{ bytesRead: number; buffer: Buffer }>
+    }
+    const prototype = Object.getPrototypeOf(probeHandle) as ProbeHandle
+    await probeHandle.close()
+    await rm(probe)
+    const originalReadFile = prototype.readFile
+    const originalRead = prototype.read
+    let keyReadsAfterRelease = 0
+    let manifestReadsAfterRelease = 0
+    let snapshotReadsAfterRelease = 0
+    vi.spyOn(prototype, "readFile").mockImplementation(async function (this: typeof prototype) {
+      const lockPresent = await lstat(lock).then(
+        () => true,
+        () => false,
+      )
+      const bytes = await Reflect.apply(originalReadFile, this, [])
+      if (!lockPresent) {
+        const text = bytes.toString("utf8")
+        if (text.startsWith("stress-version-")) snapshotReadsAfterRelease += 1
+      }
+      return bytes
+    })
+    vi.spyOn(prototype, "read").mockImplementation(async function (
+      this: typeof prototype,
+      buffer,
+      offset,
+      length,
+      position,
+    ) {
+      const lockPresent = await lstat(lock).then(
+        () => true,
+        () => false,
+      )
+      const result = await Reflect.apply(originalRead, this, [buffer, offset, length, position])
+      if (!lockPresent) {
+        const bytes = buffer.subarray(offset, offset + result.bytesRead)
+        const text = bytes.toString("utf8")
+        if (buffer.length === 33 && result.bytesRead === 32) keyReadsAfterRelease += 1
+        if (text.includes('"originalPath":"content/technology/first-note.md"')) {
+          manifestReadsAfterRelease += 1
+        }
+      }
+      return result
+    })
+    const attemptedPaths: string[] = []
+    let lockPresentDuringTrash = false
+    const recoveryTrash: TrashAdapter = {
+      trashItem: async (value) => {
+        attemptedPaths.push(value)
+        lockPresentDuringTrash ||= await lstat(lock).then(
+          () => true,
+          () => false,
+        )
+        throw new Error("persistent Trash failure")
+      },
+    }
+    const degradedPolicy = { perNoteLimit: 3, globalLimit: 3 }
+
+    const first = await saveNote({
+      workspace: root,
+      path: displayPath,
+      markdown: "stress-final-one",
+      ...(await revision(path)),
+      recoveryTrash,
+      recoveryPolicy: degradedPolicy,
+    })
+    const firstState = JSON.parse(await readFile(statePath, "utf8")) as { cursor?: string }
+
+    expect(first.warnings).toHaveLength(1)
+    expect(first.warnings?.[0]).toMatchObject({
+      code: "RECOVERY_RETENTION_FAILED",
+      details: {
+        attemptedCount: RECOVERY_RETENTION_MAX_TRASH_CALLS,
+        failureCount: RECOVERY_RETENTION_MAX_TRASH_CALLS,
+        operation: "save",
+      },
+    })
+    expect(attemptedPaths).toHaveLength(RECOVERY_RETENTION_MAX_TRASH_CALLS)
+    expect(attemptedPaths.some((value) => corruptIds.some((id) => value.includes(id)))).toBe(false)
+    expect(lockPresentDuringTrash).toBe(false)
+    expect(keyReadsAfterRelease).toBe(1)
+    expect(manifestReadsAfterRelease).toBeLessThanOrEqual(RECOVERY_RETENTION_MAX_AUTH_ATTEMPTS)
+    expect(snapshotReadsAfterRelease).toBe(RECOVERY_RETENTION_MAX_SNAPSHOT_READS)
+    expect(firstState.cursor).toEqual(expect.any(String))
+    const firstAttemptedIds = attemptedPaths.map(
+      (value) =>
+        /\.retention-(.+)-[a-f0-9]{8}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{12}$/i.exec(
+          value,
+        )?.[1],
+    )
+
+    vi.restoreAllMocks()
+    attemptedPaths.length = 0
+    const second = await saveNote({
+      workspace: root,
+      path: displayPath,
+      markdown: "stress-final-two",
+      ...(await revision(path)),
+      recoveryTrash,
+      recoveryPolicy: degradedPolicy,
+    })
+    const secondState = JSON.parse(await readFile(statePath, "utf8")) as { cursor?: string }
+
+    expect(second.warnings).toHaveLength(1)
+    expect(attemptedPaths).toHaveLength(RECOVERY_RETENTION_MAX_TRASH_CALLS)
+    expect(
+      attemptedPaths.some((value) => {
+        const id =
+          /\.retention-(.+)-[a-f0-9]{8}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{12}$/i.exec(
+            value,
+          )?.[1]
+        return id !== undefined && !firstAttemptedIds.includes(id)
+      }),
+    ).toBe(true)
+    expect(secondState.cursor).toEqual(expect.any(String))
+    expect(secondState.cursor).not.toBe(firstState.cursor)
+  }, 30_000)
+
+  it("cleans only old recovery quarantines within the maintenance entry budget", async () => {
+    const root = await createGarden()
+    const path = await createPublicNote(root)
+    const displayPath = "content/technology/first-note.md"
+    await saveNote({
+      workspace: root,
+      path: displayPath,
+      markdown: "initialize",
+      ...(await revision(path)),
+    })
+    const recoveryRoot = join(root, ".garden-publisher", "recovery")
+    const old = new Date(Date.now() - 25 * 60 * 60 * 1_000)
+    const oldQuarantines: string[] = []
+    for (let index = 0; index < RECOVERY_RETENTION_MAX_DIRECTORY_ENTRIES + 4; index += 1) {
+      const directory = join(
+        recoveryRoot,
+        `.quarantine-${String(index).padStart(8, "0")}-0000-4000-8000-${String(index).padStart(12, "0")}`,
+      )
+      oldQuarantines.push(directory)
+      await mkdir(directory, { mode: 0o700 })
+      await utimes(directory, old, old)
+    }
+    const fresh = join(recoveryRoot, ".quarantine-ffffffff-ffff-4fff-8fff-ffffffffffff")
+    await mkdir(fresh, { mode: 0o700 })
+
+    await saveNote({
+      workspace: root,
+      path: displayPath,
+      markdown: "trigger bounded cleanup",
+      ...(await revision(path)),
+    })
+
+    const remaining = await readdir(recoveryRoot)
+    const removedCount = oldQuarantines.filter(
+      (directory) => !remaining.includes(directory.split(/[/\\]/).at(-1)!),
+    ).length
+    expect(removedCount).toBeGreaterThan(0)
+    expect(removedCount).toBeLessThanOrEqual(RECOVERY_RETENTION_MAX_DIRECTORY_ENTRIES)
+    await expect(lstat(fresh)).resolves.toMatchObject({ isDirectory: expect.any(Function) })
+  })
+
+  it("resets corrupt cursor state without following untrusted backlog paths", async () => {
+    const root = await createGarden()
+    const path = await createPublicNote(root)
+    const displayPath = "content/technology/first-note.md"
+    await saveNote({
+      workspace: root,
+      path: displayPath,
+      markdown: "initialize retention state",
+      ...(await revision(path)),
+    })
+    const statePath = join(root, ".garden-publisher", "recovery-retention-state.json")
+    await writeFile(
+      statePath,
+      JSON.stringify({
+        version: 1,
+        cursor: "../../outside",
+        globalSeen: 50_000,
+        perNoteCounts: { "../../outside": 50_000 },
+        backlog: ["../../outside"],
+        integrity: "0".repeat(64),
+      }),
+    )
+    const attemptedPaths: string[] = []
+
+    const saved = await saveNote({
+      workspace: root,
+      path: displayPath,
+      markdown: "continue after corrupt state reset",
+      ...(await revision(path)),
+      recoveryTrash: {
+        trashItem: async (value) => {
+          attemptedPaths.push(value)
+        },
+      },
+    })
+
+    expect(saved.warnings).toBeUndefined()
+    expect(attemptedPaths).toEqual([])
+    await expect(readFile(statePath, "utf8")).resolves.toContain('"integrity"')
+  })
+
+  it("resets an oversized retention state without reading its body", async () => {
+    const root = await createGarden()
+    const path = await createPublicNote(root)
+    const displayPath = "content/technology/first-note.md"
+    await saveNote({
+      workspace: root,
+      path: displayPath,
+      markdown: "initialize retention state",
+      ...(await revision(path)),
+    })
+    const statePath = join(root, ".garden-publisher", "recovery-retention-state.json")
+    await writeFile(statePath, "x".repeat(256 * 1_024 + 1))
+    const probe = join(root, "oversized-state-read-probe")
+    const probeHandle = await open(probe, "wx", 0o600)
+    const prototype = Object.getPrototypeOf(probeHandle) as { readFile: () => Promise<Buffer> }
+    await probeHandle.close()
+    await rm(probe)
+    const originalReadFile = prototype.readFile
+    let oversizedBodyReads = 0
+    vi.spyOn(prototype, "readFile").mockImplementation(async function (this: typeof prototype) {
+      const bytes = await Reflect.apply(originalReadFile, this, [])
+      if (bytes.length > 256 * 1_024) oversizedBodyReads += 1
+      return bytes
+    })
+
+    await saveNote({
+      workspace: root,
+      path: displayPath,
+      markdown: "continue after state reset",
+      ...(await revision(path)),
+    })
+
+    expect(oversizedBodyReads).toBe(0)
+  })
+
+  it("rejects an oversized recovery key without reading its body", async () => {
+    const root = await createGarden()
+    const path = await createPublicNote(root)
+    const stateDirectory = join(root, ".garden-publisher")
+    await mkdir(join(stateDirectory, "recovery"), { recursive: true, mode: 0o700 })
+    await mkdir(join(stateDirectory, "keys"), { recursive: true, mode: 0o700 })
+    await writeFile(join(stateDirectory, "keys", "recovery-hmac.key"), Buffer.alloc(256 * 1_024))
+    const probe = join(root, "oversized-key-read-probe")
+    const probeHandle = await open(probe, "wx", 0o600)
+    const prototype = Object.getPrototypeOf(probeHandle) as { readFile: () => Promise<Buffer> }
+    await probeHandle.close()
+    await rm(probe)
+    const originalReadFile = prototype.readFile
+    let oversizedBodyReads = 0
+    vi.spyOn(prototype, "readFile").mockImplementation(async function (this: typeof prototype) {
+      const bytes = await Reflect.apply(originalReadFile, this, [])
+      if (bytes.length > 128 * 1_024) oversizedBodyReads += 1
+      return bytes
+    })
+
+    await expect(
+      saveNote({
+        workspace: root,
+        path: "content/technology/first-note.md",
+        markdown: "must not read an oversized key",
+        ...(await revision(path)),
+      }),
+    ).rejects.toMatchObject({ code: "RECOVERY_INVALID" })
+    expect(oversizedBodyReads).toBe(0)
+  })
+
+  it("rejects oversized retention metadata without reading its body", async () => {
+    const root = await createGarden()
+    const path = await createPublicNote(root)
+    const displayPath = "content/technology/first-note.md"
+    for (const markdown of ["version one", "version two"]) {
+      await saveNote({
+        workspace: root,
+        path: displayPath,
+        markdown,
+        ...(await revision(path)),
+        recoveryPolicy: { perNoteLimit: MAX_RECOVERY_PER_NOTE_LIMIT, globalLimit: 100 },
+      })
+    }
+    const corruptId = (await listRecoveries(root)).at(-1)!.id
+    await writeFile(
+      join(root, ".garden-publisher", "recovery", corruptId, "manifest.json"),
+      Buffer.alloc(256 * 1_024),
+    )
+    await rm(join(root, ".garden-publisher", "recovery-retention-state.json"), { force: true })
+    const probe = join(root, "oversized-metadata-read-probe")
+    const probeHandle = await open(probe, "wx", 0o600)
+    const prototype = Object.getPrototypeOf(probeHandle) as { readFile: () => Promise<Buffer> }
+    await probeHandle.close()
+    await rm(probe)
+    const originalReadFile = prototype.readFile
+    let oversizedBodyReads = 0
+    vi.spyOn(prototype, "readFile").mockImplementation(async function (this: typeof prototype) {
+      const bytes = await Reflect.apply(originalReadFile, this, [])
+      if (bytes.length > 64 * 1_024) oversizedBodyReads += 1
+      return bytes
+    })
+    const attemptedPaths: string[] = []
+
+    await saveNote({
+      workspace: root,
+      path: displayPath,
+      markdown: "version three",
+      ...(await revision(path)),
+      recoveryPolicy: { perNoteLimit: 1, globalLimit: 100 },
+      recoveryTrash: {
+        trashItem: async (value) => {
+          attemptedPaths.push(value)
+        },
+      },
+    })
+
+    expect(oversizedBodyReads).toBe(0)
+    expect(attemptedPaths.some((value) => value.includes(corruptId))).toBe(false)
   })
 
   it("bounds recovery authentication with a deterministic newest-ID-first limit", async () => {

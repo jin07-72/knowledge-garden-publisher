@@ -2,6 +2,8 @@ import { randomBytes, randomUUID, createHash, createHmac, timingSafeEqual } from
 import { constants, type BigIntStats } from "node:fs"
 import {
   chmod,
+  type FileHandle,
+  link,
   lstat,
   mkdir,
   open,
@@ -23,12 +25,25 @@ const recoveryDirectoryName = "recovery"
 const recoveryKeyDirectory = "keys"
 const recoveryKeyName = "recovery-hmac.key"
 const recoveryStagingPattern = /^\.staging-([a-z0-9-]{16,128})-([a-f0-9-]{36})$/i
-const recoveryQuarantinePattern = /^\.quarantine-/i
+const recoveryQuarantinePattern = /^\.quarantine-[a-f0-9-]{36}$/i
+const recoveryRetentionQuarantinePattern = /^\.retention-([a-z0-9-]{16,128})-([a-f0-9-]{36})$/i
 const abandonedRecoveryStagingAgeMs = 24 * 60 * 60 * 1_000
 export const DEFAULT_RECOVERY_PER_NOTE_LIMIT = 20
 export const DEFAULT_RECOVERY_GLOBAL_LIMIT = 500
 export const DEFAULT_RECOVERY_LIST_LIMIT = 100
+export const MAX_RECOVERY_PER_NOTE_LIMIT = 100
+export const MAX_RECOVERY_GLOBAL_LIMIT = 2_000
+export const RECOVERY_RETENTION_MAX_DIRECTORY_ENTRIES = 16
+export const RECOVERY_RETENTION_MAX_AUTH_ATTEMPTS = 16
+export const RECOVERY_RETENTION_MAX_TRASH_CALLS = 4
+export const RECOVERY_RETENTION_MAX_BACKLOG = 4
+export const RECOVERY_RETENTION_MAX_WARNINGS = 1
+export const RECOVERY_RETENTION_MAX_SNAPSHOT_READS = 0
 const maximumRecoveryListLimit = 500
+const recoveryRetentionStateName = "recovery-retention-state.json"
+const maximumRecoveryRetentionStateBytes = 256 * 1_024
+const maximumRecoveryManifestBytes = 64 * 1_024
+const maximumRecoveryIntegrityBytes = 128
 
 export type NoteDomain = "technology" | "reading" | "language" | "life"
 
@@ -182,6 +197,13 @@ interface RecoveryEntry {
   readonly bytes: Buffer
 }
 
+interface RecoveryMetadata {
+  readonly directory: string
+  readonly directoryName: string
+  readonly directoryIdentity: DirectoryIdentity
+  readonly manifest: RecoveryManifest
+}
+
 interface LeaseLock {
   assertOwned(): Promise<void>
   release(): Promise<void>
@@ -251,13 +273,20 @@ function invalidInput(path: string): AppError {
   return appError("INVALID_INPUT", "The request is invalid.", { path })
 }
 
-function isValidRecoveryPolicy(policy: RecoveryRetentionPolicy | undefined): boolean {
+function isValidRecoveryPolicy(policy: unknown): policy is RecoveryRetentionPolicy | undefined {
+  if (policy === undefined) return true
+  if (typeof policy !== "object" || policy === null) return false
+  const candidate = policy as Partial<RecoveryRetentionPolicy>
+  const { perNoteLimit, globalLimit } = candidate
   return (
-    policy === undefined ||
-    (Number.isInteger(policy.perNoteLimit) &&
-      policy.perNoteLimit >= 1 &&
-      Number.isInteger(policy.globalLimit) &&
-      policy.globalLimit >= 1)
+    typeof perNoteLimit === "number" &&
+    Number.isInteger(perNoteLimit) &&
+    perNoteLimit >= 1 &&
+    perNoteLimit <= MAX_RECOVERY_PER_NOTE_LIMIT &&
+    typeof globalLimit === "number" &&
+    Number.isInteger(globalLimit) &&
+    globalLimit >= 1 &&
+    globalLimit <= MAX_RECOVERY_GLOBAL_LIMIT
   )
 }
 
@@ -506,6 +535,20 @@ function stableFileIdentity(details: BigIntStats): string {
   return `${details.dev}:${details.ino}:${details.birthtimeNs}`
 }
 
+async function readBoundedHandle(
+  handle: FileHandle,
+  maximumBytes: number,
+): Promise<Buffer | undefined> {
+  const bounded = Buffer.alloc(maximumBytes + 1)
+  let offset = 0
+  while (offset < bounded.length) {
+    const { bytesRead } = await handle.read(bounded, offset, bounded.length - offset, offset)
+    if (bytesRead === 0) break
+    offset += bytesRead
+  }
+  return offset > maximumBytes ? undefined : bounded.subarray(0, offset)
+}
+
 async function removeFailedExclusiveFile(path: string, createdIdentity: string): Promise<void> {
   let before: BigIntStats
   try {
@@ -540,33 +583,75 @@ async function removeFailedExclusiveFile(path: string, createdIdentity: string):
 }
 
 async function exclusiveWrite(path: string, bytes: Buffer, displayPath: string): Promise<void> {
+  const temporary = `${path}.garden-publisher-create-${randomUUID()}`
   let handle
-  let createdIdentity: string | undefined
+  let temporaryIdentity: string | undefined
+  let publishedIdentity: string | undefined
   try {
     const flags =
       process.platform === "win32"
         ? "wx"
         : constants.O_WRONLY | constants.O_CREAT | constants.O_EXCL | constants.O_NOFOLLOW
-    handle = await open(path, flags, 0o600)
-    createdIdentity = stableFileIdentity(await handle.stat({ bigint: true }))
+    handle = await open(temporary, flags, 0o600)
+    const created = await lstat(temporary, { bigint: true })
+    if (created.isSymbolicLink() || !created.isFile()) throw new Error("invalid create staging")
+    temporaryIdentity = stableFileIdentity(created)
     await handle.writeFile(bytes)
     await handle.sync()
+    const opened = await handle.stat({ bigint: true })
+    if (!opened.isFile() || stableFileIdentity(opened) !== temporaryIdentity) {
+      throw new Error("create staging identity changed")
+    }
     await handle.close()
     handle = undefined
+    const parent = dirname(path)
+    const parentDetails = await lstat(parent)
+    if (
+      parentDetails.isSymbolicLink() ||
+      !parentDetails.isDirectory() ||
+      !pathsEqual(await realpath(parent), parent)
+    ) {
+      throw unsafePath(displayPath)
+    }
+    await link(temporary, path)
+    publishedIdentity = temporaryIdentity
+    const installed = await lstat(path, { bigint: true })
+    if (
+      installed.isSymbolicLink() ||
+      !installed.isFile() ||
+      stableFileIdentity(installed) !== temporaryIdentity
+    ) {
+      throw new Error("created destination identity changed")
+    }
+    await removeFailedExclusiveFile(temporary, temporaryIdentity)
+    temporaryIdentity = undefined
+    await syncContainingDirectory(path)
   } catch (error) {
+    await handle?.close().catch(() => undefined)
+    handle = undefined
+    if (publishedIdentity !== undefined) {
+      try {
+        await removeFailedExclusiveFile(path, publishedIdentity)
+        publishedIdentity = undefined
+      } catch {
+        throw uncertainCommit()
+      }
+    }
+    if (temporaryIdentity !== undefined) {
+      await removeFailedExclusiveFile(temporary, temporaryIdentity).catch(() => undefined)
+    }
     if ((error as NodeJS.ErrnoException).code === "EEXIST") {
       throw appError("NOTE_ALREADY_EXISTS", "A note with that path already exists.", {
         path: displayPath,
       })
     }
-    await handle?.close().catch(() => undefined)
-    handle = undefined
-    if (createdIdentity !== undefined) {
-      await removeFailedExclusiveFile(path, createdIdentity).catch(() => undefined)
-    }
+    if (isNoteError(error)) throw error
     throw writeFailure(displayPath)
   } finally {
     await handle?.close().catch(() => undefined)
+    if (temporaryIdentity !== undefined) {
+      await removeFailedExclusiveFile(temporary, temporaryIdentity).catch(() => undefined)
+    }
   }
 }
 
@@ -628,7 +713,7 @@ async function stateChild(state: string, name: string, create: boolean): Promise
 
 async function readProtectedKey(path: string, keysDirectory: string): Promise<Buffer> {
   const before = await lstat(path, { bigint: true })
-  if (before.isSymbolicLink() || !before.isFile())
+  if (before.isSymbolicLink() || !before.isFile() || before.size !== 32n)
     throw appError("RECOVERY_INVALID", "Recovery key is invalid.")
   const canonical = await realpath(path)
   if (!isInside(keysDirectory, canonical))
@@ -637,12 +722,12 @@ async function readProtectedKey(path: string, keysDirectory: string): Promise<Bu
   const handle = await open(path, flags)
   try {
     const opened = await handle.stat({ bigint: true })
-    if (!opened.isFile() || identity(before) !== identity(opened))
+    if (!opened.isFile() || opened.size !== 32n || identity(before) !== identity(opened))
       throw appError("RECOVERY_INVALID", "Recovery key is invalid.")
     if (process.platform !== "win32" && (Number(opened.mode) & 0o777) !== 0o600) {
       throw appError("RECOVERY_INVALID", "Recovery key is invalid.")
     }
-    const key = await handle.readFile()
+    const key = await readBoundedHandle(handle, 32)
     const after = await lstat(path, { bigint: true })
     if (
       after.isSymbolicLink() ||
@@ -651,7 +736,8 @@ async function readProtectedKey(path: string, keysDirectory: string): Promise<Bu
     ) {
       throw appError("RECOVERY_INVALID", "Recovery key is invalid.")
     }
-    if (key.length !== 32) throw appError("RECOVERY_INVALID", "Recovery key is invalid.")
+    if (key === undefined || key.length !== 32)
+      throw appError("RECOVERY_INVALID", "Recovery key is invalid.")
     return key
   } finally {
     await handle.close().catch(() => undefined)
@@ -1323,11 +1409,6 @@ async function removeOwnedRecoveryStaging(
   await rm(quarantine, { force: true, recursive: true })
 }
 
-interface RecoveryCreation {
-  readonly summary: RecoverySummary
-  readonly warnings: readonly NoteOperationWarning[]
-}
-
 function resolvedRecoveryPolicy(policy?: RecoveryRetentionPolicy): RecoveryRetentionPolicy {
   return {
     perNoteLimit: Math.max(1, Math.floor(policy?.perNoteLimit ?? DEFAULT_RECOVERY_PER_NOTE_LIMIT)),
@@ -1335,82 +1416,399 @@ function resolvedRecoveryPolicy(policy?: RecoveryRetentionPolicy): RecoveryReten
   }
 }
 
-function retentionWarning(id: string): NoteOperationWarning {
-  return {
-    code: "RECOVERY_RETENTION_FAILED",
-    message: "The note was saved, but an old recovery could not be moved to Trash.",
-    details: { id },
+interface RecoveryRetentionStatePayload {
+  readonly version: 1
+  readonly cursor?: string
+  readonly globalSeen: number
+  readonly perNoteCounts: Readonly<Record<string, number>>
+  readonly backlog: readonly string[]
+}
+
+interface RecoveryRetentionState extends RecoveryRetentionStatePayload {
+  readonly integrity: string
+}
+
+function emptyRecoveryRetentionState(): RecoveryRetentionStatePayload {
+  return { version: 1, globalSeen: 0, perNoteCounts: {}, backlog: [] }
+}
+
+function retentionStatePayload(state: RecoveryRetentionStatePayload): string {
+  const perNoteCounts = Object.fromEntries(
+    Object.entries(state.perNoteCounts).sort(([left], [right]) => left.localeCompare(right)),
+  )
+  return JSON.stringify({
+    version: state.version,
+    cursor: state.cursor ?? null,
+    globalSeen: state.globalSeen,
+    perNoteCounts,
+    backlog: state.backlog,
+  })
+}
+
+function retentionStateIntegrity(key: Buffer, state: RecoveryRetentionStatePayload): string {
+  return createHmac("sha256", key).update(retentionStatePayload(state)).digest("hex")
+}
+
+function isRetentionCursor(value: unknown): value is string {
+  return (
+    typeof value === "string" &&
+    (recoveryIdPattern.test(value) ||
+      recoveryStagingPattern.test(value) ||
+      recoveryQuarantinePattern.test(value) ||
+      recoveryRetentionQuarantinePattern.test(value))
+  )
+}
+
+function isRecoveryMaintenanceName(value: unknown): value is string {
+  return (
+    typeof value === "string" &&
+    (recoveryIdPattern.test(value) || recoveryRetentionQuarantinePattern.test(value))
+  )
+}
+
+function parseRecoveryRetentionState(
+  value: unknown,
+  key: Buffer,
+): RecoveryRetentionStatePayload | undefined {
+  if (typeof value !== "object" || value === null) return undefined
+  const state = value as Partial<RecoveryRetentionState>
+  if (
+    state.version !== 1 ||
+    (state.cursor !== undefined && state.cursor !== null && !isRetentionCursor(state.cursor)) ||
+    typeof state.globalSeen !== "number" ||
+    !Number.isSafeInteger(state.globalSeen) ||
+    state.globalSeen < 0 ||
+    typeof state.perNoteCounts !== "object" ||
+    state.perNoteCounts === null ||
+    Array.isArray(state.perNoteCounts) ||
+    !Array.isArray(state.backlog) ||
+    state.backlog.length > RECOVERY_RETENTION_MAX_BACKLOG ||
+    !state.backlog.every(isRecoveryMaintenanceName) ||
+    new Set(state.backlog).size !== state.backlog.length ||
+    typeof state.integrity !== "string"
+  ) {
+    return undefined
+  }
+  const countEntries = Object.entries(state.perNoteCounts)
+  if (
+    countEntries.length > MAX_RECOVERY_GLOBAL_LIMIT ||
+    countEntries.some(
+      ([pathHash, count]) =>
+        !/^[a-f0-9]{64}$/.test(pathHash) || !Number.isSafeInteger(count) || count < 1,
+    )
+  ) {
+    return undefined
+  }
+  const payload: RecoveryRetentionStatePayload = {
+    version: 1,
+    ...(typeof state.cursor === "string" ? { cursor: state.cursor } : {}),
+    globalSeen: state.globalSeen,
+    perNoteCounts: Object.fromEntries(countEntries),
+    backlog: [...state.backlog],
+  }
+  return sameIntegrity(state.integrity, retentionStateIntegrity(key, payload)) ? payload : undefined
+}
+
+async function readRecoveryRetentionState(
+  stateDirectory: string,
+  key: Buffer,
+): Promise<RecoveryRetentionStatePayload> {
+  const path = resolve(stateDirectory, recoveryRetentionStateName)
+  const file = await readContainedRegularFile(
+    path,
+    stateDirectory,
+    maximumRecoveryRetentionStateBytes,
+  )
+  if (file === undefined || (process.platform !== "win32" && (file.mode & 0o777) !== 0o600)) {
+    return emptyRecoveryRetentionState()
+  }
+  try {
+    return (
+      parseRecoveryRetentionState(JSON.parse(file.bytes.toString("utf8")), key) ??
+      emptyRecoveryRetentionState()
+    )
+  } catch {
+    return emptyRecoveryRetentionState()
   }
 }
 
-async function pruneRecoveries(
+async function writeRecoveryRetentionState(
+  stateDirectory: string,
+  key: Buffer,
+  payload: RecoveryRetentionStatePayload,
+): Promise<void> {
+  const path = resolve(stateDirectory, recoveryRetentionStateName)
+  const temporary = resolve(stateDirectory, `.${recoveryRetentionStateName}.tmp-${randomUUID()}`)
+  let temporaryIdentity: string | undefined
+  try {
+    const state: RecoveryRetentionState = {
+      ...payload,
+      integrity: retentionStateIntegrity(key, payload),
+    }
+    await writeSyncedExclusiveFile(temporary, JSON.stringify(state))
+    const details = await lstat(temporary, { bigint: true })
+    if (details.isSymbolicLink() || !details.isFile()) throw new Error("invalid retention state")
+    temporaryIdentity = stableFileIdentity(details)
+    await nodeRename(temporary, path)
+    temporaryIdentity = undefined
+    await syncExactDirectory(stateDirectory)
+  } finally {
+    if (temporaryIdentity !== undefined) {
+      await removeFailedExclusiveFile(temporary, temporaryIdentity).catch(() => undefined)
+    }
+  }
+}
+
+function retentionWarning(
+  operation: "save" | "restore",
+  attemptedCount: number,
+  failureCount: number,
+): NoteOperationWarning {
+  return {
+    code: "RECOVERY_RETENTION_FAILED",
+    message: `The ${operation} completed, but bounded recovery maintenance needs another pass.`,
+    details: { operation, attemptedCount, failureCount },
+  }
+}
+
+async function cleanupAbandonedRecoveryQuarantine(root: string, name: string): Promise<void> {
+  if (!recoveryQuarantinePattern.test(name)) return
+  const candidate = resolve(root, name)
+  if (!isInside(root, candidate) || safeRelative(root, candidate) !== name) return
+  const before = await lstat(candidate, { bigint: true }).catch(() => undefined)
+  if (
+    before === undefined ||
+    before.isSymbolicLink() ||
+    !before.isDirectory() ||
+    Date.now() - Number(before.mtimeMs) < abandonedRecoveryStagingAgeMs ||
+    (process.platform !== "win32" && (Number(before.mode) & 0o777) !== 0o700)
+  ) {
+    return
+  }
+  const ownedIdentity = directoryIdentity(before)
+  const movedPath = resolve(root, `.quarantine-${randomUUID()}`)
+  await nodeRename(candidate, movedPath)
+  const moved = await lstat(movedPath, { bigint: true }).catch(() => undefined)
+  if (
+    moved === undefined ||
+    moved.isSymbolicLink() ||
+    !moved.isDirectory() ||
+    !sameDirectory(directoryIdentity(moved), ownedIdentity)
+  ) {
+    return
+  }
+  await rm(movedPath, { force: true, recursive: true })
+}
+
+interface RecoveryTrashAttempt {
+  readonly attempted: boolean
+  readonly failed: boolean
+  readonly retryName?: string
+}
+
+async function trashAuthenticatedRecovery(
+  root: string,
+  entry: RecoveryMetadata,
+  trash: TrashAdapter,
+): Promise<RecoveryTrashAttempt> {
+  const source = resolve(root, entry.directoryName)
+  if (
+    !isInside(root, source) ||
+    safeRelative(root, source) !== entry.directoryName ||
+    !isRecoveryMaintenanceName(entry.directoryName)
+  ) {
+    return { attempted: false, failed: true }
+  }
+  const before = await lstat(source, { bigint: true }).catch(() => undefined)
+  if (
+    before === undefined ||
+    before.isSymbolicLink() ||
+    !before.isDirectory() ||
+    !sameDirectory(directoryIdentity(before), entry.directoryIdentity)
+  ) {
+    return { attempted: false, failed: true, retryName: entry.directoryName }
+  }
+  const movedName = `.retention-${entry.manifest.id}-${randomUUID()}`
+  const movedPath = resolve(root, movedName)
+  try {
+    await nodeRename(source, movedPath)
+  } catch {
+    return { attempted: false, failed: true, retryName: entry.directoryName }
+  }
+  const moved = await lstat(movedPath, { bigint: true }).catch(() => undefined)
+  if (
+    moved === undefined ||
+    moved.isSymbolicLink() ||
+    !moved.isDirectory() ||
+    !sameDirectory(directoryIdentity(moved), entry.directoryIdentity) ||
+    !isInside(root, await realpath(movedPath).catch(() => ""))
+  ) {
+    return { attempted: false, failed: true, retryName: movedName }
+  }
+  try {
+    await trash.trashItem(movedPath)
+    return { attempted: true, failed: false }
+  } catch {
+    return { attempted: true, failed: true, retryName: movedName }
+  }
+}
+
+async function maintainRecoveryRetention(
   workspace: string,
-  newestId: string,
   trash: TrashAdapter,
   requestedPolicy?: RecoveryRetentionPolicy,
+  operation: "save" | "restore" = "save",
 ): Promise<readonly NoteOperationWarning[]> {
   const policy = resolvedRecoveryPolicy(requestedPolicy)
-  let root: string
-  let ids: string[]
+  let attemptedCount = 0
+  let failureCount = 0
   try {
-    root = await recoveryRoot(workspace, false)
-    ids = (await readdir(root))
-      .filter((id) => recoveryIdPattern.test(id))
+    const root = await recoveryRoot(workspace, false)
+    const stateDirectory = dirname(root)
+    // The key is intentionally loaded once for the whole maintenance pass.
+    const key = await recoveryKey(stateDirectory, false)
+    const previous = await readRecoveryRetentionState(stateDirectory, key)
+    const backlog = [...previous.backlog]
+    const deferredBacklog: string[] = []
+    const failedBacklog: string[] = []
+    let authenticationAttempts = 0
+    let trashCalls = 0
+    let backlogEntriesProcessed = 0
+
+    for (const name of backlog) {
+      if (
+        authenticationAttempts >= RECOVERY_RETENTION_MAX_AUTH_ATTEMPTS ||
+        backlogEntriesProcessed >= Math.ceil(RECOVERY_RETENTION_MAX_TRASH_CALLS / 2)
+      ) {
+        deferredBacklog.push(name)
+        continue
+      }
+      backlogEntriesProcessed += 1
+      authenticationAttempts += 1
+      try {
+        const entry = await readRecoveryMetadata(workspace, root, key, name)
+        const outcome = await trashAuthenticatedRecovery(root, entry, trash)
+        if (outcome.attempted) {
+          attemptedCount += 1
+          trashCalls += 1
+        }
+        if (outcome.failed) {
+          failureCount += 1
+          if (outcome.retryName !== undefined) failedBacklog.push(outcome.retryName)
+        }
+      } catch {
+        // Missing or corrupt backlog entries are forgotten, never trashed.
+      }
+    }
+    const nextBacklog = [...deferredBacklog, ...failedBacklog].slice(
+      0,
+      RECOVERY_RETENTION_MAX_BACKLOG,
+    )
+    function enqueueBacklog(name: string): void {
+      if (!isRecoveryMaintenanceName(name) || nextBacklog.includes(name)) return
+      if (nextBacklog.length >= RECOVERY_RETENTION_MAX_BACKLOG) nextBacklog.shift()
+      nextBacklog.push(name)
+    }
+
+    const names = (await readdir(root))
+      .filter(
+        (name) =>
+          recoveryIdPattern.test(name) ||
+          recoveryStagingPattern.test(name) ||
+          recoveryQuarantinePattern.test(name) ||
+          recoveryRetentionQuarantinePattern.test(name),
+      )
       .sort()
       .reverse()
+    const pageBudget = Math.min(
+      RECOVERY_RETENTION_MAX_DIRECTORY_ENTRIES,
+      RECOVERY_RETENTION_MAX_AUTH_ATTEMPTS - authenticationAttempts,
+    )
+    const page = names
+      .filter((name) => previous.cursor === undefined || name.localeCompare(previous.cursor) < 0)
+      .slice(0, pageBudget)
+    let globalSeen = previous.globalSeen
+    const perNoteCounts = { ...previous.perNoteCounts }
+
+    for (const name of page) {
+      if (recoveryStagingPattern.test(name)) {
+        await cleanupAbandonedRecoveryStaging(root, name).catch(() => undefined)
+        continue
+      }
+      if (recoveryQuarantinePattern.test(name)) {
+        await cleanupAbandonedRecoveryQuarantine(root, name).catch(() => undefined)
+        continue
+      }
+      authenticationAttempts += 1
+      let entry: RecoveryMetadata
+      try {
+        entry = await readRecoveryMetadata(workspace, root, key, name)
+      } catch {
+        // Corrupt IDs advance the cursor but are never selected automatically.
+        continue
+      }
+      const pathHash = hash(entry.manifest.originalPath)
+      const noteSeen = perNoteCounts[pathHash] ?? 0
+      const shouldTrash =
+        recoveryRetentionQuarantinePattern.test(name) ||
+        globalSeen >= policy.globalLimit ||
+        noteSeen >= policy.perNoteLimit
+      if (!shouldTrash) {
+        globalSeen += 1
+        perNoteCounts[pathHash] = noteSeen + 1
+      }
+      if (!shouldTrash) continue
+      if (trashCalls >= RECOVERY_RETENTION_MAX_TRASH_CALLS) {
+        enqueueBacklog(name)
+        continue
+      }
+      const outcome = await trashAuthenticatedRecovery(root, entry, trash)
+      if (outcome.attempted) {
+        attemptedCount += 1
+        trashCalls += 1
+      }
+      if (outcome.failed) {
+        failureCount += 1
+        enqueueBacklog(outcome.retryName ?? name)
+      }
+    }
+    const completedSweep = page.length < pageBudget
+    const nextState: RecoveryRetentionStatePayload = completedSweep
+      ? {
+          version: 1,
+          globalSeen: 0,
+          perNoteCounts: {},
+          backlog: nextBacklog.slice(0, RECOVERY_RETENTION_MAX_BACKLOG),
+        }
+      : {
+          version: 1,
+          cursor: page.at(-1),
+          globalSeen,
+          perNoteCounts,
+          backlog: nextBacklog.slice(0, RECOVERY_RETENTION_MAX_BACKLOG),
+        }
+    try {
+      await writeRecoveryRetentionState(stateDirectory, key, nextState)
+    } catch {
+      failureCount += 1
+    }
   } catch {
-    return [retentionWarning(newestId)]
+    failureCount += 1
   }
-
-  const entries: RecoveryEntry[] = []
-  for (const id of ids) {
-    try {
-      entries.push(await readRecovery(workspace, id))
-    } catch {
-      // Corrupt or concurrently discarded entries are reported by listing and
-      // are never selected for automated retention.
-    }
-  }
-  entries.sort(
-    (left, right) =>
-      right.manifest.createdAt.localeCompare(left.manifest.createdAt) ||
-      right.manifest.id.localeCompare(left.manifest.id),
-  )
-
-  const selected = new Set<string>()
-  const perNoteCounts = new Map<string, number>()
-  for (const entry of entries) {
-    const count = perNoteCounts.get(entry.manifest.originalPath) ?? 0
-    perNoteCounts.set(entry.manifest.originalPath, count + 1)
-    if (count >= policy.perNoteLimit && entry.manifest.id !== newestId) {
-      selected.add(entry.manifest.id)
-    }
-  }
-  const perNoteSurvivors = entries.filter((entry) => !selected.has(entry.manifest.id))
-  for (const entry of perNoteSurvivors.slice(policy.globalLimit)) {
-    if (entry.manifest.id !== newestId) selected.add(entry.manifest.id)
-  }
-
-  const warnings: NoteOperationWarning[] = []
-  for (const entry of entries.slice().reverse()) {
-    if (!selected.has(entry.manifest.id)) continue
-    try {
-      await trash.trashItem(entry.directory)
-    } catch {
-      warnings.push(retentionWarning(entry.manifest.id))
-    }
-  }
-  return warnings
+  return failureCount === 0
+    ? []
+    : [retentionWarning(operation, attemptedCount, failureCount)].slice(
+        0,
+        RECOVERY_RETENTION_MAX_WARNINGS,
+      )
 }
 
 async function createRecovery(
   workspace: string,
   originalPath: string,
   checked: CheckedFile,
-  recoveryTrash: TrashAdapter,
-  recoveryPolicy: RecoveryRetentionPolicy | undefined,
   adapter: NoteFileAdapter = {},
-): Promise<RecoveryCreation> {
+): Promise<RecoverySummary> {
   const root = await recoveryRoot(workspace, true)
   const key = await recoveryKey(dirname(root), true, adapter)
   const createdAtMs = Date.now()
@@ -1465,14 +1863,11 @@ async function createRecovery(
     throw writeFailure(originalPath)
   }
   return {
-    summary: {
-      id,
-      originalPath,
-      createdAt: manifest.createdAt,
-      contentHash: manifest.contentHash,
-      revision: { mtimeMs: manifest.mtimeMs, contentHash: manifest.contentHash },
-    },
-    warnings: await pruneRecoveries(workspace, id, recoveryTrash, recoveryPolicy),
+    id,
+    originalPath,
+    createdAt: manifest.createdAt,
+    contentHash: manifest.contentHash,
+    revision: { mtimeMs: manifest.mtimeMs, contentHash: manifest.contentHash },
   }
 }
 
@@ -1509,6 +1904,7 @@ interface SafeFileContents {
 async function readContainedRegularFile(
   path: string,
   parent: string,
+  maximumBytes?: number,
 ): Promise<SafeFileContents | undefined> {
   let handle
   try {
@@ -1520,7 +1916,15 @@ async function readContainedRegularFile(
     handle = await open(path, flags)
     const opened = await handle.stat({ bigint: true })
     if (!opened.isFile() || identity(before) !== identity(opened)) return undefined
-    const bytes = await handle.readFile()
+    if (maximumBytes !== undefined && opened.size > BigInt(maximumBytes)) return undefined
+    let bytes: Buffer
+    if (maximumBytes === undefined) {
+      bytes = await handle.readFile()
+    } else {
+      const bounded = await readBoundedHandle(handle, maximumBytes)
+      if (bounded === undefined) return undefined
+      bytes = bounded
+    }
     const after = await lstat(path, { bigint: true })
     if (
       after.isSymbolicLink() ||
@@ -1792,7 +2196,7 @@ export async function saveNote(
   const parsed = parseManagedPath(workspace, input.path)
   const root = await managedRoot(workspace, parsed.visibility)
   const lock = await acquireTargetLock(workspace, parsed.displayPath, adapter)
-  return preserveOutcomeAcrossLockRelease(lock, "save", async () => {
+  const completed = await preserveOutcomeAcrossLockRelease(lock, "save", async () => {
     const current = await readCheckedFile(root, parsed.domain, parsed.filename)
     if (
       current.revision.mtimeMs !== input.expectedMtimeMs ||
@@ -1803,15 +2207,8 @@ export async function saveNote(
         revision: current.revision.contentHash,
       })
     }
-    const recovery = await createRecovery(
-      workspace,
-      parsed.displayPath,
-      current,
-      input.recoveryTrash,
-      input.recoveryPolicy,
-      adapter,
-    )
-    const authenticatedRecovery = await readRecovery(workspace, recovery.summary.id)
+    const recovery = await createRecovery(workspace, parsed.displayPath, current, adapter)
+    const authenticatedRecovery = await readRecovery(workspace, recovery.id)
     const directory = await checkedDomain(root, parsed.domain, false)
     const target = resolve(directory, parsed.filename)
     const bytes = Buffer.from(input.markdown, "utf8")
@@ -1831,11 +2228,16 @@ export async function saveNote(
         }
       },
     )
-    return resultWithWarnings(
-      await resultFromTarget(target, parsed.displayPath, bytes),
-      recovery.warnings,
-    )
+    return resultFromTarget(target, parsed.displayPath, bytes)
   })
+  if (completed.warnings?.some(({ code }) => code === "LOCK_RELEASE_FAILED")) return completed
+  const maintenanceWarnings = await maintainRecoveryRetention(
+    workspace,
+    input.recoveryTrash,
+    input.recoveryPolicy,
+    "save",
+  )
+  return resultWithWarnings(completed, [...(completed.warnings ?? []), ...maintenanceWarnings])
 }
 
 function isManifest(value: unknown): value is RecoveryManifest {
@@ -1858,56 +2260,81 @@ function isManifest(value: unknown): value is RecoveryManifest {
   )
 }
 
-async function readRecovery(workspace: string, id: string): Promise<RecoveryEntry> {
-  if (!recoveryIdPattern.test(id))
+async function readRecoveryFile(
+  directory: string,
+  path: string,
+  maximumBytes?: number,
+): Promise<Buffer> {
+  const flags = process.platform === "win32" ? "r" : constants.O_RDONLY | constants.O_NOFOLLOW
+  const before = await lstat(path, { bigint: true })
+  if (
+    before.isSymbolicLink() ||
+    !before.isFile() ||
+    (maximumBytes !== undefined && before.size > BigInt(maximumBytes))
+  )
+    throw appError("RECOVERY_INVALID", "Recovery data is invalid.")
+  const canonical = await realpath(path)
+  if (!isInside(directory, canonical))
+    throw appError("RECOVERY_INVALID", "Recovery data is invalid.")
+  const handle = await open(path, flags)
+  try {
+    const opened = await handle.stat({ bigint: true })
+    if (
+      !opened.isFile() ||
+      identity(before) !== identity(opened) ||
+      (maximumBytes !== undefined && opened.size > BigInt(maximumBytes))
+    )
+      throw appError("RECOVERY_INVALID", "Recovery data is invalid.")
+    const content =
+      maximumBytes === undefined
+        ? await handle.readFile()
+        : await readBoundedHandle(handle, maximumBytes)
+    if (content === undefined) throw appError("RECOVERY_INVALID", "Recovery data is invalid.")
+    const after = await lstat(path, { bigint: true })
+    const afterCanonical = await realpath(path)
+    if (
+      after.isSymbolicLink() ||
+      !after.isFile() ||
+      identity(before) !== identity(after) ||
+      identity(opened) !== identity(after) ||
+      !pathsEqual(canonical, afterCanonical) ||
+      !isInside(directory, afterCanonical)
+    ) {
+      throw appError("RECOVERY_INVALID", "Recovery data is invalid.")
+    }
+    return content
+  } finally {
+    await handle.close().catch(() => undefined)
+  }
+}
+
+async function readRecoveryMetadata(
+  workspace: string,
+  root: string,
+  key: Buffer,
+  directoryName: string,
+): Promise<RecoveryMetadata> {
+  const retentionMatch = recoveryRetentionQuarantinePattern.exec(directoryName)
+  const expectedId = recoveryIdPattern.test(directoryName) ? directoryName : retentionMatch?.[1]
+  if (expectedId === undefined || !recoveryIdPattern.test(expectedId))
     throw appError("RECOVERY_INVALID", "The recovery identifier is invalid.")
-  const root = await recoveryRoot(workspace, false)
-  const key = await recoveryKey(dirname(root), false)
-  const directory = resolve(root, id)
-  if (!isInside(root, directory) || safeRelative(root, directory) !== id)
+  const directory = resolve(root, directoryName)
+  if (!isInside(root, directory) || safeRelative(root, directory) !== directoryName)
     throw appError("RECOVERY_INVALID", "The recovery identifier is invalid.")
   let manifestBytes: Buffer
-  let bytes: Buffer
   let storedIntegrity: Buffer
-  async function readRecoveryFile(path: string): Promise<Buffer> {
-    const flags = process.platform === "win32" ? "r" : constants.O_RDONLY | constants.O_NOFOLLOW
-    const before = await lstat(path, { bigint: true })
-    if (before.isSymbolicLink() || !before.isFile())
-      throw appError("RECOVERY_INVALID", "Recovery data is invalid.")
-    const canonical = await realpath(path)
-    if (!isInside(directory, canonical))
-      throw appError("RECOVERY_INVALID", "Recovery data is invalid.")
-    const handle = await open(path, flags)
-    try {
-      const opened = await handle.stat({ bigint: true })
-      if (!opened.isFile() || identity(before) !== identity(opened))
-        throw appError("RECOVERY_INVALID", "Recovery data is invalid.")
-      const content = await handle.readFile()
-      const after = await lstat(path, { bigint: true })
-      const afterCanonical = await realpath(path)
-      if (
-        after.isSymbolicLink() ||
-        !after.isFile() ||
-        identity(before) !== identity(after) ||
-        identity(opened) !== identity(after) ||
-        !pathsEqual(canonical, afterCanonical) ||
-        !isInside(directory, afterCanonical)
-      ) {
-        throw appError("RECOVERY_INVALID", "Recovery data is invalid.")
-      }
-      return content
-    } finally {
-      await handle.close().catch(() => undefined)
-    }
-  }
+  let directoryIdentityAtRead: DirectoryIdentity
+  let directoryCanonical: string
   try {
-    const directoryDetails = await lstat(directory)
+    const directoryDetails = await lstat(directory, { bigint: true })
+    directoryCanonical = await realpath(directory)
     if (
       directoryDetails.isSymbolicLink() ||
       !directoryDetails.isDirectory() ||
-      !isInside(root, await realpath(directory))
+      !isInside(root, directoryCanonical)
     )
       throw appError("RECOVERY_INVALID", "Recovery data is invalid.")
+    directoryIdentityAtRead = directoryIdentity(directoryDetails)
   } catch (error) {
     if (isNoteError(error)) throw error
     if ((error as NodeJS.ErrnoException).code === "ENOENT")
@@ -1925,9 +2352,16 @@ async function readRecovery(workspace: string, id: string): Promise<RecoveryEntr
       )
         throw appError("RECOVERY_INVALID", "Recovery data is invalid.")
     }
-    manifestBytes = await readRecoveryFile(resolve(directory, "manifest.json"))
-    bytes = await readRecoveryFile(resolve(directory, "content.md"))
-    storedIntegrity = await readRecoveryFile(resolve(directory, "integrity.sha256"))
+    manifestBytes = await readRecoveryFile(
+      directory,
+      resolve(directory, "manifest.json"),
+      maximumRecoveryManifestBytes,
+    )
+    storedIntegrity = await readRecoveryFile(
+      directory,
+      resolve(directory, "integrity.sha256"),
+      maximumRecoveryIntegrityBytes,
+    )
   } catch (error) {
     if (isNoteError(error)) throw error
     throw appError("RECOVERY_INVALID", "Recovery data is invalid.")
@@ -1940,8 +2374,7 @@ async function readRecovery(workspace: string, id: string): Promise<RecoveryEntr
   }
   if (
     !isManifest(manifest) ||
-    manifest.id !== id ||
-    hash(bytes) !== manifest.contentHash ||
+    manifest.id !== expectedId ||
     !sameIntegrity(
       manifest.integrity,
       manifestIntegrity(key, {
@@ -1960,10 +2393,41 @@ async function readRecovery(workspace: string, id: string): Promise<RecoveryEntr
     throw appError("RECOVERY_INVALID", "Recovery data is invalid.")
   try {
     parseManagedPath(workspace, manifest.originalPath)
+    const after = await lstat(directory, { bigint: true })
+    if (
+      after.isSymbolicLink() ||
+      !after.isDirectory() ||
+      !sameDirectory(directoryIdentityAtRead, directoryIdentity(after)) ||
+      !pathsEqual(directoryCanonical, await realpath(directory))
+    ) {
+      throw new Error("recovery directory changed")
+    }
   } catch {
     throw appError("RECOVERY_INVALID", "Recovery data is invalid.")
   }
-  return { directory, manifest, bytes }
+  return {
+    directory,
+    directoryName,
+    directoryIdentity: directoryIdentityAtRead,
+    manifest,
+  }
+}
+
+async function readRecovery(workspace: string, id: string): Promise<RecoveryEntry> {
+  const root = await recoveryRoot(workspace, false)
+  const key = await recoveryKey(dirname(root), false)
+  const metadata = await readRecoveryMetadata(workspace, root, key, id)
+  let bytes: Buffer
+  try {
+    bytes = await readRecoveryFile(metadata.directory, resolve(metadata.directory, "content.md"))
+  } catch (error) {
+    if (isNoteError(error)) throw error
+    throw appError("RECOVERY_INVALID", "Recovery data is invalid.")
+  }
+  if (hash(bytes) !== metadata.manifest.contentHash) {
+    throw appError("RECOVERY_INVALID", "Recovery data is invalid.")
+  }
+  return { ...metadata, bytes }
 }
 
 async function cleanupAbandonedRecoveryStaging(root: string, name: string): Promise<void> {
@@ -2069,10 +2533,9 @@ export async function restoreRecovery(
   const parsed = parseManagedPath(workspace, entry.manifest.originalPath)
   const root = await managedRoot(workspace, parsed.visibility)
   const lock = await acquireTargetLock(workspace, parsed.displayPath, adapter)
-  return preserveOutcomeAcrossLockRelease(lock, "restore", async () => {
+  const completed = await preserveOutcomeAcrossLockRelease(lock, "restore", async () => {
     const target = resolve(await checkedDomain(root, parsed.domain, false), parsed.filename)
     let current: CheckedFile | undefined
-    let warnings: readonly NoteOperationWarning[] = []
     const currentState = await readCheckedFileState(root, parsed.domain, parsed.filename)
     if (currentState.kind === "present") current = currentState.file
     if (current !== undefined) {
@@ -2084,15 +2547,7 @@ export async function restoreRecovery(
           path: parsed.displayPath,
         })
       }
-      const undo = await createRecovery(
-        workspace,
-        parsed.displayPath,
-        current,
-        input.recoveryTrash,
-        input.recoveryPolicy,
-        adapter,
-      )
-      warnings = undo.warnings
+      await createRecovery(workspace, parsed.displayPath, current, adapter)
     }
     await writeTempAndReplace(
       target,
@@ -2117,11 +2572,16 @@ export async function restoreRecovery(
         }
       },
     )
-    return resultWithWarnings(
-      await resultFromTarget(target, parsed.displayPath, entry.bytes),
-      warnings,
-    )
+    return resultFromTarget(target, parsed.displayPath, entry.bytes)
   })
+  if (completed.warnings?.some(({ code }) => code === "LOCK_RELEASE_FAILED")) return completed
+  const maintenanceWarnings = await maintainRecoveryRetention(
+    workspace,
+    input.recoveryTrash,
+    input.recoveryPolicy,
+    "restore",
+  )
+  return resultWithWarnings(completed, [...(completed.warnings ?? []), ...maintenanceWarnings])
 }
 
 export async function discardRecovery(input: DiscardRecoveryInput): Promise<void> {
