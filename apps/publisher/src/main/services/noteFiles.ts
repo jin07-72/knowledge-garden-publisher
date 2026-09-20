@@ -89,15 +89,25 @@ export interface NoteFileAdapter {
   readonly beforeReplace?: (path: string) => Promise<void> | void
   readonly afterReplace?: (path: string) => Promise<void> | void
   readonly beforeKeyPublish?: () => Promise<void> | void
+  readonly afterKeyPublish?: () => Promise<void> | void
   readonly beforeLockMetadataPublish?: (lockDirectory: string) => Promise<void> | void
+  readonly afterLockMetadataPublish?: (lockDirectory: string) => Promise<void> | void
   readonly afterLockHeartbeat?: (lockDirectory: string) => Promise<void> | void
+  readonly beforeHeartbeatPublish?: (lockDirectory: string, attempt: number) => Promise<void> | void
   readonly beforeLockRelease?: (lockDirectory: string) => Promise<void> | void
+  readonly startHeartbeat?: (
+    lockDirectory: string,
+    heartbeat: () => Promise<void>,
+    intervalMs: number,
+  ) => () => void
   readonly now?: () => number
   readonly delay?: (milliseconds: number) => Promise<void>
   readonly isProcessAlive?: (pid: number) => boolean | undefined
   readonly lockLeaseMs?: number
   readonly lockWaitMs?: number
   readonly lockGraceMs?: number
+  readonly heartbeatRetryLimit?: number
+  readonly heartbeatRetryDelayMs?: number
 }
 
 interface ManagedRoot {
@@ -706,21 +716,41 @@ function validLease(inspection: LockInspection): inspection is LockInspection & 
   )
 }
 
-async function restoreQuarantine(quarantine: string, candidate: string): Promise<void> {
-  try {
-    await lstat(candidate)
-  } catch (error) {
-    if ((error as NodeJS.ErrnoException).code === "ENOENT") {
-      await nodeRename(quarantine, candidate).catch(() => undefined)
+async function restoreQuarantine(
+  quarantine: string,
+  candidate: string,
+  adapter: NoteFileAdapter,
+): Promise<boolean> {
+  const retryDelayMs = Math.max(1, adapter.heartbeatRetryDelayMs ?? 10)
+  const retryLimit = Math.max(
+    2,
+    Math.min(200, Math.ceil((adapter.lockWaitMs ?? defaultLockWaitMs) / retryDelayMs)),
+  )
+  for (let attempt = 0; attempt <= retryLimit; attempt += 1) {
+    try {
+      await lstat(candidate)
+      return false
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code !== "ENOENT") return false
+    }
+    try {
+      await nodeRename(quarantine, candidate)
+      return true
+    } catch (error) {
+      const code = (error as NodeJS.ErrnoException).code
+      if (code === "EEXIST" || code === "ENOTEMPTY" || code === "ENOENT") return false
+      if (attempt === retryLimit) return false
+      await leaseDelay(adapter, retryDelayMs)
     }
   }
+  return false
 }
 
 async function acquireLease(
   candidate: string,
   parent: string,
   adapter: NoteFileAdapter,
-  ownershipError: () => AppError,
+  ownershipError: (stage?: "release-rename" | "release-cleanup" | "release-mismatch") => AppError,
 ): Promise<TargetLock | undefined> {
   const leaseMs = Math.max(1, adapter.lockLeaseMs ?? defaultLockLeaseMs)
   const graceMs = Math.max(1, adapter.lockGraceMs ?? defaultLockGraceMs)
@@ -760,6 +790,7 @@ async function acquireLease(
       ) {
         throw new Error("lock ownership could not be published")
       }
+      await adapter.afterLockMetadataPublish?.(candidate)
       break
     } catch (error) {
       if ((error as NodeJS.ErrnoException).code !== "EEXIST") throw error
@@ -814,7 +845,7 @@ async function acquireLease(
         (moved.heartbeat.leaseExpiresAt > leaseNow(adapter) ||
           processLiveness(adapter, moved.owner.pid) !== false))
     ) {
-      await restoreQuarantine(quarantine, candidate)
+      await restoreQuarantine(quarantine, candidate, adapter)
       return undefined
     }
     reclaimedQuarantines.push(quarantine)
@@ -829,57 +860,105 @@ async function acquireLease(
   )
   let stopped = false
   let lostOwnership = false
+  const heartbeatRetryLimit = Math.max(0, Math.min(5, adapter.heartbeatRetryLimit ?? 2))
+  const heartbeatRetryDelayMs = Math.max(1, adapter.heartbeatRetryDelayMs ?? 10)
+  const ownershipRetryLimit = Math.max(
+    2,
+    Math.min(200, Math.ceil((adapter.lockWaitMs ?? defaultLockWaitMs) / heartbeatRetryDelayMs)),
+  )
 
-  async function stillOwned(): Promise<boolean> {
+  async function ownershipStatus(): Promise<"owned" | "lost" | "unknown"> {
     const current = await inspectLockDirectory(candidate, parent)
-    return (
-      current.kind === "present" &&
-      sameDirectory(identityAtAcquisition, current.identity) &&
-      current.owner?.token === token
-    )
+    if (current.kind === "unsafe") return "unknown"
+    // A concurrent stale-lock contender can briefly quarantine this directory
+    // between its identity check and rename. Missing is therefore ambiguous
+    // until the bounded ownership retry policy is exhausted.
+    if (current.kind === "missing") return "unknown"
+    if (current.kind !== "present") return "unknown"
+    return sameDirectory(identityAtAcquisition, current.identity) && current.owner?.token === token
+      ? "owned"
+      : "lost"
   }
 
   async function assertOwned(): Promise<void> {
     await heartbeatWork.catch(() => undefined)
-    if (lostOwnership || !(await stillOwned())) {
-      lostOwnership = true
-      throw ownershipError()
+    if (!lostOwnership) {
+      for (let attempt = 0; attempt <= ownershipRetryLimit; attempt += 1) {
+        const status = await ownershipStatus()
+        if (status === "owned") return
+        if (status === "lost") break
+        if (attempt < ownershipRetryLimit) {
+          await leaseDelay(adapter, heartbeatRetryDelayMs)
+        }
+      }
     }
+    lostOwnership = true
+    throw ownershipError()
   }
 
   let heartbeatWork = Promise.resolve()
-  const heartbeat = setInterval(
-    () => {
-      heartbeatWork = heartbeatWork.then(async () => {
-        if (stopped) return
-        if (!(await stillOwned())) {
+
+  async function runHeartbeat(): Promise<void> {
+    if (stopped) return
+    for (let attempt = 0; attempt <= heartbeatRetryLimit; attempt += 1) {
+      const before = await ownershipStatus()
+      if (before === "lost") {
+        lostOwnership = true
+        return
+      }
+      try {
+        if (before !== "owned") throw new Error("heartbeat ownership was ambiguous")
+        const heartbeatAt = leaseNow(adapter)
+        await adapter.beforeHeartbeatPublish?.(candidate, attempt)
+        await publishLeaseFile(candidate, leaseHeartbeatName, {
+          version: 1,
+          token,
+          heartbeatAt,
+          leaseExpiresAt: heartbeatAt + leaseMs,
+        })
+        await adapter.afterLockHeartbeat?.(candidate)
+        const after = await ownershipStatus()
+        if (after === "lost") {
           lostOwnership = true
           return
         }
-        const heartbeatAt = leaseNow(adapter)
-        try {
-          await publishLeaseFile(candidate, leaseHeartbeatName, {
-            version: 1,
-            token,
-            heartbeatAt,
-            leaseExpiresAt: heartbeatAt + leaseMs,
-          })
-          await adapter.afterLockHeartbeat?.(candidate)
-          if (!(await stillOwned())) lostOwnership = true
-        } catch {
+        if (after === "owned") return
+        throw new Error("heartbeat ownership was ambiguous")
+      } catch {
+        const afterFailure = await ownershipStatus()
+        if (afterFailure !== "owned") {
           lostOwnership = true
+          return
         }
-      })
-    },
-    Math.max(1, Math.floor(leaseMs / 3)),
-  )
-  heartbeat.unref()
+        if (attempt === heartbeatRetryLimit) {
+          lostOwnership = true
+          return
+        }
+        await leaseDelay(adapter, heartbeatRetryDelayMs * (attempt + 1))
+      }
+    }
+  }
+
+  function queueHeartbeat(): Promise<void> {
+    heartbeatWork = heartbeatWork.then(runHeartbeat)
+    return heartbeatWork
+  }
+
+  const heartbeatInterval = Math.max(1, Math.floor(leaseMs / 3))
+  let stopHeartbeat: () => void
+  if (adapter.startHeartbeat !== undefined) {
+    stopHeartbeat = adapter.startHeartbeat(candidate, queueHeartbeat, heartbeatInterval)
+  } else {
+    const heartbeat = setInterval(() => void queueHeartbeat(), heartbeatInterval)
+    heartbeat.unref()
+    stopHeartbeat = () => clearInterval(heartbeat)
+  }
 
   return {
     assertOwned,
     async release(): Promise<void> {
       stopped = true
-      clearInterval(heartbeat)
+      stopHeartbeat()
       await heartbeatWork.catch(() => undefined)
       try {
         await adapter.beforeLockRelease?.(candidate)
@@ -887,26 +966,47 @@ async function acquireLease(
         throw ownershipError()
       }
       const quarantine = `${candidate}.release-${token}-${randomUUID()}`
-      try {
-        await nodeRename(candidate, quarantine)
-      } catch (error) {
-        throw ownershipError()
+      let quarantined = false
+      for (let attempt = 0; attempt <= ownershipRetryLimit; attempt += 1) {
+        try {
+          await nodeRename(candidate, quarantine)
+          quarantined = true
+          break
+        } catch (error) {
+          const code = (error as NodeJS.ErrnoException).code
+          const transient =
+            code === "ENOENT" ||
+            code === "EPERM" ||
+            code === "EACCES" ||
+            code === "EBUSY" ||
+            code === "ENOTEMPTY"
+          const status = await ownershipStatus()
+          if (status === "lost" || !transient || attempt === ownershipRetryLimit) {
+            throw ownershipError("release-rename")
+          }
+          await leaseDelay(adapter, heartbeatRetryDelayMs)
+        }
       }
+      if (!quarantined) throw ownershipError("release-rename")
       const moved = await inspectLockDirectory(quarantine, parent)
       if (
         moved.kind === "present" &&
         sameDirectory(identityAtAcquisition, moved.identity) &&
         moved.owner?.token === token
       ) {
-        try {
-          await rm(quarantine, { force: true, recursive: true })
-        } catch {
-          throw ownershipError()
+        const cleanupRetries = Math.max(5, heartbeatRetryLimit)
+        for (let attempt = 0; attempt <= cleanupRetries; attempt += 1) {
+          try {
+            await rm(quarantine, { force: true, recursive: true })
+            return
+          } catch {
+            if (attempt === cleanupRetries) throw ownershipError("release-cleanup")
+            await leaseDelay(adapter, heartbeatRetryDelayMs * (attempt + 1))
+          }
         }
-        return
       }
-      await restoreQuarantine(quarantine, candidate)
-      throw ownershipError()
+      await restoreQuarantine(quarantine, candidate, adapter)
+      throw ownershipError("release-mismatch")
     },
   }
 }
@@ -934,9 +1034,16 @@ async function recoveryKey(
   const deadline = leaseNow(adapter) + Math.max(1, adapter.lockWaitMs ?? defaultLockWaitMs)
   let lock: TargetLock | undefined
   while (lock === undefined) {
+    const publishedBeforeLock = await existing()
+    if (publishedBeforeLock !== undefined) return publishedBeforeLock
     try {
-      lock = await acquireLease(initializationLock, keys, adapter, () =>
-        appError("RECOVERY_INVALID", "Recovery key initializer ownership was lost."),
+      lock = await acquireLease(initializationLock, keys, adapter, (stage) =>
+        appError(
+          "RECOVERY_INVALID",
+          stage === undefined
+            ? "Recovery key initializer ownership was lost."
+            : `Recovery key initializer ownership was lost at ${stage}.`,
+        ),
       )
     } catch {
       throw appError("RECOVERY_INVALID", "Recovery key could not be initialized.")
@@ -960,14 +1067,32 @@ async function recoveryKey(
     await handle.close()
     handle = undefined
     await adapter.beforeKeyPublish?.()
-    await lock.assertOwned()
+    try {
+      await lock.assertOwned()
+    } catch (error) {
+      if (isNoteError(error)) throw error
+      throw appError(
+        "RECOVERY_INVALID",
+        "Recovery key initializer ownership was lost before publication.",
+      )
+    }
     await nodeRename(temporary, path)
-  } catch {
+    await adapter.afterKeyPublish?.()
+  } catch (error) {
+    if (isNoteError(error)) throw error
     throw appError("RECOVERY_INVALID", "Recovery key could not be initialized.")
   } finally {
     await handle?.close().catch(() => undefined)
     await rm(temporary, { force: true }).catch(() => undefined)
-    await lock.release()
+    try {
+      await lock.release()
+    } catch (error) {
+      if (isNoteError(error)) throw error
+      throw appError(
+        "RECOVERY_INVALID",
+        "Recovery key initializer ownership was lost during release.",
+      )
+    }
   }
   try {
     return await readProtectedKey(path, keys)
@@ -985,8 +1110,14 @@ async function acquireTargetLock(
   const locks = await stateChild(dirname(recovery), "locks", true)
   const candidate = resolve(locks, `${hash(path)}.lock`)
   try {
-    const lock = await acquireLease(candidate, locks, adapter, () =>
-      appError("NOTE_FILE_LOCKED", "The note lock is no longer owned.", { path }),
+    const lock = await acquireLease(candidate, locks, adapter, (stage) =>
+      appError(
+        "NOTE_FILE_LOCKED",
+        stage === undefined
+          ? "The note lock is no longer owned."
+          : `The note lock failed at ${stage}.`,
+        { path },
+      ),
     )
     if (lock !== undefined) return lock
   } catch {

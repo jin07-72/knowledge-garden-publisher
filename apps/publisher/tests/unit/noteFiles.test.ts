@@ -509,16 +509,25 @@ describe("note files", () => {
     const displayPath = "content/technology/first-note.md"
     const lock = targetLockPath(root, displayPath)
     let heartbeatAdvanced = false
+    let now = 1_000
+    let tick: (() => Promise<void>) | undefined
 
     await saveNote(
       { workspace: root, path: displayPath, markdown: "saved", ...(await revision(path)) },
       {
         lockLeaseMs: 100,
+        now: () => now,
+        startHeartbeat: (directory, heartbeat) => {
+          if (directory === lock) tick = heartbeat
+          return () => undefined
+        },
         beforeReplace: async () => {
           const before = JSON.parse(await readFile(join(lock, "heartbeat.json"), "utf8")) as {
             heartbeatAt: number
           }
-          await new Promise<void>((resolve) => setTimeout(resolve, 90))
+          now += 50
+          expect(tick).toBeTypeOf("function")
+          await tick!()
           const after = JSON.parse(await readFile(join(lock, "heartbeat.json"), "utf8")) as {
             heartbeatAt: number
           }
@@ -530,15 +539,96 @@ describe("note files", () => {
     expect(heartbeatAdvanced).toBe(true)
   })
 
+  it("retries one transient heartbeat publication failure while ownership is unchanged", async () => {
+    const root = await createGarden()
+    const path = await createPublicNote(root)
+    const displayPath = "content/technology/first-note.md"
+    const lock = targetLockPath(root, displayPath)
+    let tick: (() => Promise<void>) | undefined
+    let attempts = 0
+    let retries = 0
+
+    await expect(
+      saveNote(
+        { workspace: root, path: displayPath, markdown: "saved", ...(await revision(path)) },
+        {
+          startHeartbeat: (directory, heartbeat) => {
+            if (directory === lock) tick = heartbeat
+            return () => undefined
+          },
+          beforeHeartbeatPublish: async (directory) => {
+            if (directory !== lock) return
+            attempts += 1
+            if (attempts === 1) throw new Error("transient heartbeat failure")
+          },
+          heartbeatRetryLimit: 1,
+          delay: async () => {
+            retries += 1
+          },
+          beforeReplace: async () => {
+            expect(tick).toBeTypeOf("function")
+            await tick!()
+          },
+        },
+      ),
+    ).resolves.toMatchObject({ contentHash: hash("saved") })
+
+    expect(attempts).toBe(2)
+    expect(retries).toBe(1)
+  })
+
+  it("does not retry a failed heartbeat while ownership is ambiguous", async () => {
+    const root = await createGarden()
+    const path = await createPublicNote(root)
+    const displayPath = "content/technology/first-note.md"
+    const lock = targetLockPath(root, displayPath)
+    let tick: (() => Promise<void>) | undefined
+    let retries = 0
+
+    await expect(
+      saveNote(
+        {
+          workspace: root,
+          path: displayPath,
+          markdown: "must not commit",
+          ...(await revision(path)),
+        },
+        {
+          lockWaitMs: 1,
+          startHeartbeat: (directory, heartbeat) => {
+            if (directory === lock) tick = heartbeat
+            return () => undefined
+          },
+          beforeHeartbeatPublish: async (directory) => {
+            if (directory !== lock) return
+            await rm(lock, { recursive: true, force: true })
+            throw new Error("heartbeat ownership became ambiguous")
+          },
+          delay: async () => {
+            retries += 1
+            await writeLockDirectory(lock)
+          },
+          beforeReplace: async () => {
+            expect(tick).toBeTypeOf("function")
+            await tick!()
+            if (retries === 0) await writeLockDirectory(lock)
+          },
+        },
+      ),
+    ).rejects.toMatchObject({ code: "NOTE_FILE_LOCKED" })
+
+    expect(retries).toBe(0)
+    expect(JSON.parse(await readFile(join(lock, "owner.json"), "utf8"))).toMatchObject({
+      token: "11111111-1111-4111-8111-111111111111",
+    })
+  })
+
   it("surfaces heartbeat ownership loss and blocks the target commit", async () => {
     const root = await createGarden()
     const path = await createPublicNote(root)
     const original = await readFile(path, "utf8")
     const lock = targetLockPath(root, "content/technology/first-note.md")
-    let lost!: () => void
-    const lostPromise = new Promise<void>((resolve) => {
-      lost = resolve
-    })
+    let tick: (() => Promise<void>) | undefined
     let replaced = false
 
     await expect(
@@ -551,14 +641,20 @@ describe("note files", () => {
         },
         {
           lockLeaseMs: 30,
+          startHeartbeat: (directory, heartbeat) => {
+            if (directory === lock) tick = heartbeat
+            return () => undefined
+          },
           afterLockHeartbeat: async (directory) => {
             if (directory !== lock || replaced) return
             replaced = true
             await rm(lock, { recursive: true, force: true })
             await writeLockDirectory(lock)
-            lost()
           },
-          beforeReplace: async () => lostPromise,
+          beforeReplace: async () => {
+            expect(tick).toBeTypeOf("function")
+            await tick!()
+          },
         },
       ),
     ).rejects.toMatchObject({ code: "NOTE_FILE_LOCKED" })
@@ -640,25 +736,53 @@ describe("note files", () => {
     const publishPromise = new Promise<void>((resolve) => {
       publish = resolve
     })
+    let resumeContender!: () => void
+    const resumeContenderPromise = new Promise<void>((resolve) => {
+      resumeContender = resolve
+    })
+    let contenderWaiting!: () => void
+    const contenderWaitingPromise = new Promise<void>((resolve) => {
+      contenderWaiting = resolve
+    })
+    let now = 10_000
+    let published!: () => void
+    const publishedPromise = new Promise<void>((resolve) => {
+      published = resolve
+    })
     const first = saveNote(
       { workspace: root, path: displayPath, markdown: "first", ...(await revision(path)) },
       {
         lockGraceMs: 200,
+        now: () => now,
         beforeLockMetadataPublish: async (directory) => {
           if (directory !== lock) return
           entered()
           await publishPromise
+        },
+        afterLockMetadataPublish: async (directory) => {
+          if (directory === lock) published()
         },
       },
     )
     await enteredPromise
     const contender = saveNote(
       { workspace: root, path: displayPath, markdown: "second", ...(await revision(path)) },
-      { lockGraceMs: 200 },
+      {
+        lockGraceMs: 200,
+        now: () => now,
+        delay: async (milliseconds) => {
+          now += milliseconds
+          contenderWaiting()
+          await resumeContenderPromise
+        },
+      },
     )
     void contender.catch(() => undefined)
-    await new Promise<void>((resolve) => setTimeout(resolve, 50))
+    await contenderWaitingPromise
+    expect(now).toBeLessThan(10_200)
     publish()
+    await publishedPromise
+    resumeContender()
 
     await expect(contender).rejects.toMatchObject({ code: "NOTE_FILE_LOCKED" })
     await expect(first).resolves.toMatchObject({ contentHash: hash("first") })
@@ -1178,10 +1302,14 @@ describe("note files", () => {
     const enteredPromise = new Promise<void>((resolve) => {
       entered = resolve
     })
+    let publish!: () => void
+    const publishPromise = new Promise<void>((resolve) => {
+      publish = resolve
+    })
     const adapter: NoteFileAdapter = {
       beforeKeyPublish: async () => {
         entered()
-        await new Promise<void>((resolve) => setTimeout(resolve, 50))
+        await publishPromise
       },
     }
     const initializing = saveNote(
@@ -1194,14 +1322,36 @@ describe("note files", () => {
       adapter,
     )
     await enteredPromise
-    const waiting = saveNote({
-      workspace: root,
-      path: "content/technology/second.md",
-      markdown: "two",
-      ...(await revision(second)),
+    let resumeWaiter!: () => void
+    const resumeWaiterPromise = new Promise<void>((resolve) => {
+      resumeWaiter = resolve
     })
-
-    await expect(Promise.all([initializing, waiting])).resolves.toHaveLength(2)
+    let waiterEntered!: () => void
+    const waiterEnteredPromise = new Promise<void>((resolve) => {
+      waiterEntered = resolve
+    })
+    let now = 20_000
+    const waiting = saveNote(
+      {
+        workspace: root,
+        path: "content/technology/second.md",
+        markdown: "two",
+        ...(await revision(second)),
+      },
+      {
+        now: () => now,
+        delay: async (milliseconds) => {
+          now += milliseconds
+          waiterEntered()
+          await resumeWaiterPromise
+        },
+      },
+    )
+    await waiterEnteredPromise
+    publish()
+    await expect(initializing).resolves.toMatchObject({ contentHash: hash("one") })
+    resumeWaiter()
+    await expect(waiting).resolves.toMatchObject({ contentHash: hash("two") })
   })
 
   it("does not publish a recovery key after initializer ownership is replaced", async () => {
@@ -1295,36 +1445,46 @@ describe("note files", () => {
       expiresAt: 3,
     })
     let publishers = 0
+    let publisherEntered!: () => void
+    const publisherEnteredPromise = new Promise<void>((resolve) => {
+      publisherEntered = resolve
+    })
+    let releasePublisher!: () => void
+    const releasePublisherPromise = new Promise<void>((resolve) => {
+      releasePublisher = resolve
+    })
     const adapter: NoteFileAdapter = {
       isProcessAlive: () => false,
       beforeKeyPublish: async () => {
         publishers += 1
-        await new Promise<void>((resolve) => setTimeout(resolve, 25))
+        publisherEntered()
+        await releasePublisherPromise
       },
     }
 
-    await expect(
-      Promise.all([
-        saveNote(
-          {
-            workspace: root,
-            path: "content/technology/first.md",
-            markdown: "one",
-            ...(await revision(first)),
-          },
-          adapter,
-        ),
-        saveNote(
-          {
-            workspace: root,
-            path: "content/technology/second.md",
-            markdown: "two",
-            ...(await revision(second)),
-          },
-          adapter,
-        ),
-      ]),
-    ).resolves.toHaveLength(2)
+    const saves = [
+      saveNote(
+        {
+          workspace: root,
+          path: "content/technology/first.md",
+          markdown: "one",
+          ...(await revision(first)),
+        },
+        adapter,
+      ),
+      saveNote(
+        {
+          workspace: root,
+          path: "content/technology/second.md",
+          markdown: "two",
+          ...(await revision(second)),
+        },
+        adapter,
+      ),
+    ]
+    await publisherEnteredPromise
+    releasePublisher()
+    await expect(Promise.all(saves)).resolves.toHaveLength(2)
     expect(publishers).toBe(1)
   })
 
@@ -1413,6 +1573,24 @@ describe("note files", () => {
     const publishPromise = new Promise<void>((resolve) => {
       publish = resolve
     })
+    let metadataPublished!: () => void
+    const metadataPublishedPromise = new Promise<void>((resolve) => {
+      metadataPublished = resolve
+    })
+    let keyPublished!: () => void
+    const keyPublishedPromise = new Promise<void>((resolve) => {
+      keyPublished = resolve
+    })
+    let waiterEntered!: () => void
+    const waiterEnteredPromise = new Promise<void>((resolve) => {
+      waiterEntered = resolve
+    })
+    let resumeWaiter!: () => void
+    const resumeWaiterPromise = new Promise<void>((resolve) => {
+      resumeWaiter = resolve
+    })
+    let now = 30_000
+    let delayCalls = 0
     let delayedOnce = false
     const initializer = saveNote(
       {
@@ -1423,12 +1601,17 @@ describe("note files", () => {
       },
       {
         lockGraceMs: 200,
+        now: () => now,
         beforeLockMetadataPublish: async (directory) => {
           if (directory !== initializationLock || delayedOnce) return
           delayedOnce = true
           entered()
           await publishPromise
         },
+        afterLockMetadataPublish: async (directory) => {
+          if (directory === initializationLock) metadataPublished()
+        },
+        afterKeyPublish: async () => keyPublished(),
       },
     )
     await enteredPromise
@@ -1439,10 +1622,26 @@ describe("note files", () => {
         markdown: "two",
         ...(await revision(second)),
       },
-      { lockGraceMs: 200 },
+      {
+        lockGraceMs: 200,
+        now: () => now,
+        delay: async (milliseconds) => {
+          now += milliseconds
+          delayCalls += 1
+          if (delayCalls === 1) {
+            waiterEntered()
+            await resumeWaiterPromise
+          } else {
+            await keyPublishedPromise
+          }
+        },
+      },
     )
-    await new Promise<void>((resolve) => setTimeout(resolve, 50))
+    await waiterEnteredPromise
+    expect(now).toBeLessThan(30_200)
     publish()
+    await metadataPublishedPromise
+    resumeWaiter()
 
     await expect(Promise.all([initializer, waiting])).resolves.toHaveLength(2)
   })
@@ -1460,37 +1659,47 @@ describe("note files", () => {
     await mkdir(initializationLock, { recursive: true, mode: 0o700 })
     await writeFile(join(initializationLock, "owner.json"), "truncated", { mode: 0o600 })
     let publishers = 0
+    let publisherEntered!: () => void
+    const publisherEnteredPromise = new Promise<void>((resolve) => {
+      publisherEntered = resolve
+    })
+    let releasePublisher!: () => void
+    const releasePublisherPromise = new Promise<void>((resolve) => {
+      releasePublisher = resolve
+    })
     const adapter: NoteFileAdapter = {
       lockGraceMs: 25,
       isProcessAlive: () => false,
       beforeKeyPublish: async () => {
         publishers += 1
-        await new Promise<void>((resolve) => setTimeout(resolve, 25))
+        publisherEntered()
+        await releasePublisherPromise
       },
     }
 
-    await expect(
-      Promise.all([
-        saveNote(
-          {
-            workspace: root,
-            path: "content/technology/first.md",
-            markdown: "one",
-            ...(await revision(first)),
-          },
-          adapter,
-        ),
-        saveNote(
-          {
-            workspace: root,
-            path: "content/technology/second.md",
-            markdown: "two",
-            ...(await revision(second)),
-          },
-          adapter,
-        ),
-      ]),
-    ).resolves.toHaveLength(2)
+    const saves = [
+      saveNote(
+        {
+          workspace: root,
+          path: "content/technology/first.md",
+          markdown: "one",
+          ...(await revision(first)),
+        },
+        adapter,
+      ),
+      saveNote(
+        {
+          workspace: root,
+          path: "content/technology/second.md",
+          markdown: "two",
+          ...(await revision(second)),
+        },
+        adapter,
+      ),
+    ]
+    await publisherEnteredPromise
+    releasePublisher()
+    await expect(Promise.all(saves)).resolves.toHaveLength(2)
     expect(publishers).toBe(1)
     await expect(lstat(initializationLock)).rejects.toMatchObject({ code: "ENOENT" })
   })
