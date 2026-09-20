@@ -3,6 +3,7 @@ import {
   lstat,
   mkdir,
   mkdtemp,
+  open,
   readFile,
   readdir,
   rename as fsRename,
@@ -14,19 +15,44 @@ import {
 } from "node:fs/promises"
 import { join } from "node:path"
 import { tmpdir } from "node:os"
-import { afterEach, describe, expect, it } from "vitest"
+import { afterEach, describe, expect, it, vi } from "vitest"
 import {
   createNote,
   discardRecovery,
   listRecoveries,
-  restoreRecovery,
-  saveNote,
+  restoreRecovery as restoreRecoveryService,
+  saveNote as saveNoteService,
   type NoteFileAdapter,
 } from "../../src/main/services/noteFiles"
+import type { TrashAdapter } from "../../src/shared/contracts"
 
 const temporaryDirectories: string[] = []
+const defaultRecoveryTrash: TrashAdapter = { trashItem: async () => undefined }
+
+function saveNote(
+  input: Omit<Parameters<typeof saveNoteService>[0], "recoveryTrash" | "recoveryPolicy"> & {
+    readonly recoveryTrash?: TrashAdapter
+    readonly recoveryPolicy?: { readonly perNoteLimit: number; readonly globalLimit: number }
+  },
+  adapter?: NoteFileAdapter,
+) {
+  const { recoveryTrash = defaultRecoveryTrash, ...rest } = input
+  return saveNoteService({ ...rest, recoveryTrash }, adapter)
+}
+
+function restoreRecovery(
+  input: Omit<Parameters<typeof restoreRecoveryService>[0], "recoveryTrash" | "recoveryPolicy"> & {
+    readonly recoveryTrash?: TrashAdapter
+    readonly recoveryPolicy?: { readonly perNoteLimit: number; readonly globalLimit: number }
+  },
+  adapter?: NoteFileAdapter,
+) {
+  const { recoveryTrash = defaultRecoveryTrash, ...rest } = input
+  return restoreRecoveryService({ ...rest, recoveryTrash }, adapter)
+}
 
 afterEach(async () => {
+  vi.restoreAllMocks()
   await Promise.all(
     temporaryDirectories.splice(0).map((path) => rm(path, { force: true, recursive: true })),
   )
@@ -175,6 +201,127 @@ describe("note files", () => {
       ].join("\n"),
     )
     expect(publicNote.contentHash).toHaveLength(64)
+  })
+
+  it.each(["writeFile", "sync", "close"] as const)(
+    "removes an exclusively-created destination when %s fails so a retry can succeed",
+    async (method) => {
+      const root = await createGarden()
+      const probe = join(root, "exclusive-write-probe")
+      const probeHandle = await open(probe, "wx", 0o600)
+      const prototype = Object.getPrototypeOf(probeHandle) as Record<string, unknown>
+      await probeHandle.close()
+      await rm(probe)
+      const failure = Object.assign(new Error(`injected ${method} failure`), { code: "EIO" })
+      let restoreSpy: () => void
+      if (method === "close") {
+        const fileHandlePrototype = prototype as unknown as {
+          writeFile(value: string | Uint8Array): Promise<void>
+        }
+        const originalWriteFile = fileHandlePrototype.writeFile
+        const spy = vi
+          .spyOn(fileHandlePrototype, "writeFile")
+          .mockImplementationOnce(async function (this: typeof probeHandle, value) {
+            await Reflect.apply(originalWriteFile, this, [value])
+            const originalClose = this.close
+            this.close = async () => {
+              this.close = originalClose
+              throw failure
+            }
+          })
+        restoreSpy = () => spy.mockRestore()
+      } else {
+        const spy = vi.spyOn(prototype as never, method as never) as unknown as {
+          mockRejectedValueOnce(value: unknown): void
+          mockRestore(): void
+        }
+        spy.mockRejectedValueOnce(failure)
+        restoreSpy = () => spy.mockRestore()
+      }
+      const input = {
+        workspace: root,
+        visibility: "public" as const,
+        domain: "technology" as const,
+        slug: `exclusive-${method.toLowerCase()}`,
+        title: "Exclusive cleanup",
+        date: "2026-09-20",
+        description: "Exercises failed exclusive creation.",
+        tags: ["test"],
+      }
+      const destination = join(root, "content", "technology", `${input.slug}.md`)
+
+      await expect(createNote(input)).rejects.toMatchObject({ code: "NOTE_FILE_WRITE_FAILED" })
+      await expect(lstat(destination)).rejects.toMatchObject({ code: "ENOENT" })
+
+      restoreSpy()
+      await expect(createNote(input)).resolves.toMatchObject({
+        path: `content/technology/${input.slug}.md`,
+      })
+    },
+  )
+
+  it("never removes a successor that replaces a failed exclusive destination", async () => {
+    const root = await createGarden()
+    const destination = join(root, "content", "technology", "exclusive-successor.md")
+    const displaced = `${destination}.displaced`
+    const probe = join(root, "exclusive-successor-probe")
+    const probeHandle = await open(probe, "wx", 0o600)
+    const prototype = Object.getPrototypeOf(probeHandle) as {
+      writeFile: (value: string | Uint8Array) => Promise<void>
+    }
+    await probeHandle.close()
+    await rm(probe)
+    vi.spyOn(prototype, "writeFile").mockImplementationOnce(async () => {
+      await fsRename(destination, displaced)
+      await writeFile(destination, "successor bytes")
+      throw Object.assign(new Error("injected write failure after replacement"), { code: "EIO" })
+    })
+
+    await expect(
+      createNote({
+        workspace: root,
+        visibility: "public",
+        domain: "technology",
+        slug: "exclusive-successor",
+        title: "Exclusive successor",
+        date: "2026-09-20",
+        description: "Preserves replacement identity.",
+        tags: ["test"],
+      }),
+    ).rejects.toMatchObject({ code: "NOTE_FILE_WRITE_FAILED" })
+    expect(await readFile(destination, "utf8")).toBe("successor bytes")
+  })
+
+  it("rejects a malformed expected content hash before workspace access or locking", async () => {
+    const root = await createGarden()
+    const missingWorkspace = join(root, "missing")
+
+    await expect(
+      saveNote({
+        workspace: missingWorkspace,
+        path: "content/technology/first-note.md",
+        markdown: "new",
+        expectedMtimeMs: 0,
+        expectedContentHash: "not-a-sha-256",
+      }),
+    ).rejects.toMatchObject({ code: "INVALID_INPUT" })
+    await expect(lstat(join(root, ".garden-publisher"))).rejects.toMatchObject({ code: "ENOENT" })
+  })
+
+  it("accepts an uppercase SHA-256 expected content hash", async () => {
+    const root = await createGarden()
+    const path = await createPublicNote(root)
+    const expected = await revision(path)
+
+    await expect(
+      saveNote({
+        workspace: root,
+        path: "content/technology/first-note.md",
+        markdown: "updated",
+        expectedMtimeMs: expected.expectedMtimeMs,
+        expectedContentHash: expected.expectedContentHash.toUpperCase(),
+      }),
+    ).resolves.toMatchObject({ contentHash: hash("updated") })
   })
 
   it("rejects invalid creation inputs and concurrent collisions without overwriting", async () => {
@@ -894,6 +1041,7 @@ describe("note files", () => {
         path: "content/technology/first-note.md",
         markdown: "new",
         expectedMtimeMs: 1,
+        expectedContentHash: hash("stale revision"),
       }),
     ).rejects.toMatchObject({ code: "EXTERNAL_EDIT" })
     expect(await readFile(path, "utf8")).toBe("external")
@@ -1144,7 +1292,8 @@ describe("note files", () => {
           ...(await revision(path)),
         },
         {
-          syncDirectory: async () => {
+          syncDirectory: async (target) => {
+            if (target !== path) return
             syncs += 1
             if (syncs === 1) throw new Error("injected directory sync failure")
           },
@@ -1172,6 +1321,7 @@ describe("note files", () => {
         },
         {
           syncDirectory: async (target) => {
+            if (target !== path) return
             syncs += 1
             if (syncs === 1) await writeFile(target, "changed during sync")
           },
@@ -1198,6 +1348,7 @@ describe("note files", () => {
         },
         {
           rename: async (from, to) => {
+            if (from.includes(".staging-")) return fsRename(from, to)
             renames += 1
             if (renames === 1) return fsRename(from, to)
             throw new Error("injected rollback failure")
@@ -1266,6 +1417,562 @@ describe("note files", () => {
     expect(await listRecoveries(root)).toHaveLength(2)
   })
 
+  it.each(["EACCES", "EIO"])(
+    "does not treat a target %s read failure as absence during restore",
+    async (code) => {
+      const root = await createGarden()
+      const path = await createPublicNote(root)
+      await saveNote({
+        workspace: root,
+        path: "content/technology/first-note.md",
+        markdown: "current target bytes",
+        ...(await revision(path)),
+      })
+      const [recovery] = await listRecoveries(root)
+      const probe = join(root, "restore-read-probe")
+      const probeHandle = await open(probe, "wx", 0o600)
+      const prototype = Object.getPrototypeOf(probeHandle) as { readFile: () => Promise<Buffer> }
+      await probeHandle.close()
+      await rm(probe)
+      const originalReadFile = prototype.readFile
+      let injected = false
+      let replacementAttempted = false
+      vi.spyOn(prototype, "readFile").mockImplementation(async function (this: typeof prototype) {
+        const bytes = await Reflect.apply(originalReadFile, this, [])
+        if (!injected && bytes.toString("utf8") === "current target bytes") {
+          injected = true
+          throw Object.assign(new Error(`injected ${code}`), { code })
+        }
+        return bytes
+      })
+
+      await expect(
+        restoreRecovery(
+          { workspace: root, id: recovery!.id },
+          {
+            beforeTempWrite: () => {
+              replacementAttempted = true
+            },
+          },
+        ),
+      ).rejects.toMatchObject({ code: "NOTE_FILE_ACCESS_FAILED" })
+      expect(injected).toBe(true)
+      expect(replacementAttempted).toBe(false)
+      expect(await readFile(path, "utf8")).toBe("current target bytes")
+    },
+  )
+
+  it("does not treat an unsafe linked restore target as absence", async ({ skip }) => {
+    const root = await createGarden()
+    const path = await createPublicNote(root)
+    await saveNote({
+      workspace: root,
+      path: "content/technology/first-note.md",
+      markdown: "current target bytes",
+      ...(await revision(path)),
+    })
+    const [recovery] = await listRecoveries(root)
+    const outside = join(root, "outside.md")
+    await writeFile(outside, "outside")
+    try {
+      await rm(path)
+      await symlink(outside, path, "file")
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code === "EPERM") return skip()
+      throw error
+    }
+    let replacementAttempted = false
+
+    await expect(
+      restoreRecovery(
+        { workspace: root, id: recovery!.id },
+        { beforeTempWrite: () => void (replacementAttempted = true) },
+      ),
+    ).rejects.toMatchObject({ code: "NOTE_FILE_UNSAFE_PATH" })
+    expect(replacementAttempted).toBe(false)
+    expect(await readFile(outside, "utf8")).toBe("outside")
+  })
+
+  it("restores after confirmed target absence without creating an undo snapshot", async () => {
+    const root = await createGarden()
+    const path = await createPublicNote(root)
+    await saveNote({
+      workspace: root,
+      path: "content/technology/first-note.md",
+      markdown: "current target bytes",
+      ...(await revision(path)),
+    })
+    const [recovery] = await listRecoveries(root)
+    await rm(path)
+
+    await restoreRecovery({ workspace: root, id: recovery!.id })
+
+    expect(await readFile(path, "utf8")).toContain("# Body")
+    expect(await listRecoveries(root)).toHaveLength(1)
+  })
+
+  it("returns a committed save with a lock cleanup warning when release fails", async () => {
+    const root = await createGarden()
+    const path = await createPublicNote(root)
+    const displayPath = "content/technology/first-note.md"
+    const lock = targetLockPath(root, displayPath)
+
+    const saved = await saveNote(
+      {
+        workspace: root,
+        path: displayPath,
+        markdown: "committed despite release failure",
+        ...(await revision(path)),
+      },
+      {
+        beforeLockRelease: (directory) => {
+          if (directory === lock) throw new Error("injected release failure")
+        },
+      },
+    )
+
+    expect(await readFile(path, "utf8")).toBe("committed despite release failure")
+    expect(saved.warnings).toEqual([
+      {
+        code: "LOCK_RELEASE_FAILED",
+        message: "The save completed, but its lock could not be cleaned up.",
+        details: { lockId: `${hash(displayPath)}.lock` },
+      },
+    ])
+  })
+
+  it("returns a committed restore with a lock cleanup warning when release fails", async () => {
+    const root = await createGarden()
+    const path = await createPublicNote(root)
+    const displayPath = "content/technology/first-note.md"
+    await saveNote({
+      workspace: root,
+      path: displayPath,
+      markdown: "current target bytes",
+      ...(await revision(path)),
+    })
+    const [recovery] = await listRecoveries(root)
+    const lock = targetLockPath(root, displayPath)
+
+    const restored = await restoreRecovery(
+      {
+        workspace: root,
+        id: recovery!.id,
+        expectedCurrentHash: hash("current target bytes"),
+      },
+      {
+        beforeLockRelease: (directory) => {
+          if (directory === lock) throw new Error("injected restore release failure")
+        },
+      },
+    )
+
+    expect(await readFile(path, "utf8")).toContain("# Body")
+    expect(restored.warnings).toEqual([
+      {
+        code: "LOCK_RELEASE_FAILED",
+        message: "The restore completed, but its lock could not be cleaned up.",
+        details: { lockId: `${hash(displayPath)}.lock` },
+      },
+    ])
+  })
+
+  it("preserves a primary save failure when lock release also fails", async () => {
+    const root = await createGarden()
+    const path = await createPublicNote(root)
+    const original = await readFile(path, "utf8")
+    const displayPath = "content/technology/first-note.md"
+    const lock = targetLockPath(root, displayPath)
+
+    await expect(
+      saveNote(
+        {
+          workspace: root,
+          path: displayPath,
+          markdown: "must not install",
+          ...(await revision(path)),
+        },
+        {
+          beforeTempWrite: () => {
+            throw new Error("injected primary failure")
+          },
+          beforeLockRelease: (directory) => {
+            if (directory === lock) throw new Error("injected release failure")
+          },
+        },
+      ),
+    ).rejects.toMatchObject({
+      code: "NOTE_FILE_WRITE_FAILED",
+      details: {
+        cleanupWarnings: [
+          expect.objectContaining({
+            code: "LOCK_RELEASE_FAILED",
+            details: { lockId: `${hash(displayPath)}.lock` },
+          }),
+        ],
+      },
+    })
+    expect(await readFile(path, "utf8")).toBe(original)
+  })
+
+  it.each(["snapshot", "manifest", "tag"] as const)(
+    "never exposes a partial final recovery when the %s file write is interrupted",
+    async (stage) => {
+      const root = await createGarden()
+      const path = await createPublicNote(root)
+      await saveNote({
+        workspace: root,
+        path: "content/technology/first-note.md",
+        markdown: "saved once",
+        ...(await revision(path)),
+      })
+      const recoveryRoot = join(root, ".garden-publisher", "recovery")
+      const existing = (await listRecoveries(root)).map(({ id }) => id)
+      const probe = join(root, "recovery-write-probe")
+      const probeHandle = await open(probe, "wx", 0o600)
+      const prototype = Object.getPrototypeOf(probeHandle) as {
+        writeFile: (value: string | Uint8Array) => Promise<void>
+      }
+      await probeHandle.close()
+      await rm(probe)
+      const originalWriteFile = prototype.writeFile
+      let interrupted = false
+      vi.spyOn(prototype, "writeFile").mockImplementation(async function (
+        this: typeof prototype,
+        value,
+      ) {
+        const text = Buffer.from(value).toString("utf8")
+        const matches =
+          stage === "snapshot"
+            ? text === "saved once"
+            : stage === "manifest"
+              ? text.includes('"originalPath":"content/technology/first-note.md"')
+              : /^[a-f0-9]{64}\n$/i.test(text)
+        if (matches && !interrupted) {
+          interrupted = true
+          const visible = (await readdir(recoveryRoot)).filter((name) => !name.startsWith("."))
+          expect(visible).toEqual(existing)
+          throw Object.assign(new Error(`interrupted ${stage}`), { code: "EIO" })
+        }
+        return Reflect.apply(originalWriteFile, this, [value])
+      })
+
+      await expect(
+        saveNote({
+          workspace: root,
+          path: "content/technology/first-note.md",
+          markdown: "should not install",
+          ...(await revision(path)),
+        }),
+      ).rejects.toMatchObject({ code: "NOTE_FILE_WRITE_FAILED" })
+      expect(interrupted).toBe(true)
+      expect((await listRecoveries(root)).map(({ id }) => id)).toEqual(existing)
+      expect((await readdir(recoveryRoot)).filter((name) => name.startsWith(".staging-"))).toEqual(
+        [],
+      )
+      expect(await readFile(path, "utf8")).toBe("saved once")
+    },
+  )
+
+  it("publishes a recovery only after its staging directory is complete and durable", async () => {
+    const root = await createGarden()
+    const path = await createPublicNote(root)
+    const synced: string[] = []
+    let recoveryRenameObserved = false
+
+    await saveNote(
+      {
+        workspace: root,
+        path: "content/technology/first-note.md",
+        markdown: "durable save",
+        ...(await revision(path)),
+      },
+      {
+        rename: async (from, to) => {
+          if (from.includes(".staging-")) {
+            recoveryRenameObserved = true
+            expect((await readdir(from)).sort()).toEqual([
+              "content.md",
+              "integrity.sha256",
+              "manifest.json",
+            ])
+          }
+          await fsRename(from, to)
+        },
+        syncDirectory: async (value) => {
+          synced.push(value)
+        },
+      },
+    )
+
+    expect(recoveryRenameObserved).toBe(true)
+    expect(synced.some((value) => value.includes(".garden-publisher\\keys"))).toBe(true)
+    expect(synced.some((value) => value.includes(".staging-"))).toBe(true)
+    expect(synced).toContain(join(root, ".garden-publisher", "recovery"))
+  })
+
+  it("keeps prior recoveries listable when publication fails before the directory rename", async () => {
+    const root = await createGarden()
+    const path = await createPublicNote(root)
+    await saveNote({
+      workspace: root,
+      path: "content/technology/first-note.md",
+      markdown: "saved once",
+      ...(await revision(path)),
+    })
+    const existing = (await listRecoveries(root)).map(({ id }) => id)
+
+    await expect(
+      saveNote(
+        {
+          workspace: root,
+          path: "content/technology/first-note.md",
+          markdown: "not installed",
+          ...(await revision(path)),
+        },
+        {
+          rename: async (from, to) => {
+            if (from.includes(".staging-")) throw new Error("interrupted before publish")
+            await fsRename(from, to)
+          },
+        },
+      ),
+    ).rejects.toMatchObject({ code: "NOTE_FILE_WRITE_FAILED" })
+    expect((await listRecoveries(root)).map(({ id }) => id)).toEqual(existing)
+    expect(await readFile(path, "utf8")).toBe("saved once")
+  })
+
+  it("recognizes a complete recovery when interruption happens after the directory rename", async () => {
+    const root = await createGarden()
+    const path = await createPublicNote(root)
+    let interrupted = false
+
+    await expect(
+      saveNote(
+        {
+          workspace: root,
+          path: "content/technology/first-note.md",
+          markdown: "installed after recovery publish",
+          ...(await revision(path)),
+        },
+        {
+          rename: async (from, to) => {
+            await fsRename(from, to)
+            if (from.includes(".staging-") && !interrupted) {
+              interrupted = true
+              throw new Error("interrupted after publish")
+            }
+          },
+        },
+      ),
+    ).resolves.toMatchObject({ contentHash: hash("installed after recovery publish") })
+    expect(interrupted).toBe(true)
+    expect(await listRecoveries(root)).toHaveLength(1)
+  })
+
+  it("lists valid recoveries with typed body-free issues and ignores staging namespaces", async () => {
+    const root = await createGarden()
+    const path = await createPublicNote(root)
+    await saveNote({
+      workspace: root,
+      path: "content/technology/first-note.md",
+      markdown: "saved",
+      ...(await revision(path)),
+    })
+    const recoveryRoot = join(root, ".garden-publisher", "recovery")
+    const corruptId = "1234567890abcdef"
+    await mkdir(join(recoveryRoot, corruptId), { mode: 0o700 })
+    const youngStaging = join(
+      recoveryRoot,
+      ".staging-1234567890abcdef-11111111-1111-4111-8111-111111111111",
+    )
+    await mkdir(youngStaging, { mode: 0o700 })
+    await mkdir(join(recoveryRoot, ".quarantine-11111111-1111-4111-8111-111111111111"), {
+      mode: 0o700,
+    })
+
+    const listed = await listRecoveries(root)
+
+    expect(listed.filter((item) => "originalPath" in item)).toHaveLength(1)
+    expect(listed.find((item) => item.id === corruptId)).toEqual({
+      id: corruptId,
+      code: "RECOVERY_INVALID",
+      message: "Recovery data is invalid.",
+    })
+    expect(JSON.stringify(listed)).not.toContain("# Body")
+    expect(JSON.stringify(listed)).not.toContain("saved")
+    expect(listed).toHaveLength(2)
+    await expect(lstat(youngStaging)).resolves.toMatchObject({ isDirectory: expect.any(Function) })
+  })
+
+  it("cleans only conservatively old, owned recovery staging directories", async () => {
+    const root = await createGarden()
+    const path = await createPublicNote(root)
+    await saveNote({
+      workspace: root,
+      path: "content/technology/first-note.md",
+      markdown: "initialize recovery storage",
+      ...(await revision(path)),
+    })
+    const staging = join(
+      root,
+      ".garden-publisher",
+      "recovery",
+      ".staging-1234567890abcdef-22222222-2222-4222-8222-222222222222",
+    )
+    await mkdir(staging, { mode: 0o700 })
+    const old = new Date(Date.now() - 25 * 60 * 60 * 1_000)
+    await utimes(staging, old, old)
+
+    await listRecoveries(root)
+
+    await expect(lstat(staging)).rejects.toMatchObject({ code: "ENOENT" })
+  })
+
+  it("prunes oldest per-note recoveries through Trash after the new recovery is durable", async () => {
+    const root = await createGarden()
+    const path = await createPublicNote(root)
+    const trashed: string[] = []
+    const trashRoot = join(root, "recoverable-trash")
+    await mkdir(trashRoot)
+    const recoveryTrash: TrashAdapter = {
+      trashItem: async (value) => {
+        trashed.push(value)
+        await fsRename(value, join(trashRoot, value.split(/[/\\]/).at(-1)!))
+      },
+    }
+    const recoveryPolicy = { perNoteLimit: 2, globalLimit: 10 }
+
+    await saveNote({
+      workspace: root,
+      path: "content/technology/first-note.md",
+      markdown: "version one",
+      ...(await revision(path)),
+      recoveryTrash,
+      recoveryPolicy,
+    })
+    const [oldest] = await listRecoveries(root)
+    await saveNote({
+      workspace: root,
+      path: "content/technology/first-note.md",
+      markdown: "version two",
+      ...(await revision(path)),
+      recoveryTrash,
+      recoveryPolicy,
+    })
+    await saveNote({
+      workspace: root,
+      path: "content/technology/first-note.md",
+      markdown: "version three",
+      ...(await revision(path)),
+      recoveryTrash,
+      recoveryPolicy,
+    })
+
+    expect(trashed).toEqual([join(root, ".garden-publisher", "recovery", oldest!.id)])
+    expect(await listRecoveries(root)).toHaveLength(2)
+    await expect(lstat(join(trashRoot, oldest!.id))).resolves.toMatchObject({
+      isDirectory: expect.any(Function),
+    })
+  })
+
+  it("enforces the global recovery cap across notes through the same Trash adapter", async () => {
+    const root = await createGarden()
+    const trashed: string[] = []
+    const trashRoot = join(root, "recoverable-trash")
+    await mkdir(trashRoot)
+    const recoveryTrash: TrashAdapter = {
+      trashItem: async (value) => {
+        trashed.push(value)
+        await fsRename(value, join(trashRoot, value.split(/[/\\]/).at(-1)!))
+      },
+    }
+    const recoveryPolicy = { perNoteLimit: 20, globalLimit: 3 }
+    const paths: string[] = []
+    for (const slug of ["global-one", "global-two", "global-three", "global-four"]) {
+      paths.push(await createPublicNote(root, slug))
+    }
+    let oldestId = ""
+    for (const [index, path] of paths.entries()) {
+      await saveNote({
+        workspace: root,
+        path: `content/technology/global-${["one", "two", "three", "four"][index]}.md`,
+        markdown: `version ${index}`,
+        ...(await revision(path)),
+        recoveryTrash,
+        recoveryPolicy,
+      })
+      if (index === 0) oldestId = (await listRecoveries(root))[0]!.id
+    }
+
+    expect(trashed).toEqual([join(root, ".garden-publisher", "recovery", oldestId)])
+    expect(await listRecoveries(root)).toHaveLength(3)
+  })
+
+  it("commits the save and returns a serializable warning when retention Trash fails", async () => {
+    const root = await createGarden()
+    const path = await createPublicNote(root)
+    const recoveryTrash: TrashAdapter = {
+      trashItem: async () => {
+        throw new Error("Trash unavailable")
+      },
+    }
+    const recoveryPolicy = { perNoteLimit: 1, globalLimit: 10 }
+    await saveNote({
+      workspace: root,
+      path: "content/technology/first-note.md",
+      markdown: "version one",
+      ...(await revision(path)),
+      recoveryTrash,
+      recoveryPolicy,
+    })
+
+    const saved = await saveNote({
+      workspace: root,
+      path: "content/technology/first-note.md",
+      markdown: "version two",
+      ...(await revision(path)),
+      recoveryTrash,
+      recoveryPolicy,
+    })
+
+    expect(await readFile(path, "utf8")).toBe("version two")
+    expect(saved.warnings).toEqual([
+      expect.objectContaining({
+        code: "RECOVERY_RETENTION_FAILED",
+        details: expect.objectContaining({ id: expect.any(String) }),
+      }),
+    ])
+    expect(() => JSON.stringify(saved)).not.toThrow()
+  })
+
+  it("bounds recovery authentication with a deterministic newest-ID-first limit", async () => {
+    const root = await createGarden()
+    const path = await createPublicNote(root)
+    await saveNote({
+      workspace: root,
+      path: "content/technology/first-note.md",
+      markdown: "initialize recovery key",
+      ...(await revision(path)),
+    })
+    const recoveryRoot = join(root, ".garden-publisher", "recovery")
+    const fakeIds: string[] = []
+    for (let index = 0; index < 1_200; index += 1) {
+      const id = `${9_000_000_000_000 + index}-00000000-0000-4000-8000-${String(index).padStart(12, "0")}`
+      fakeIds.push(id)
+      await mkdir(join(recoveryRoot, id), { mode: 0o700 })
+    }
+
+    const listed = await listRecoveries(root, { limit: 25 })
+    const next = await listRecoveries(root, { limit: 25, cursor: listed.at(-1)!.id })
+
+    expect(listed).toHaveLength(25)
+    expect(listed.map(({ id }) => id)).toEqual(fakeIds.sort().reverse().slice(0, 25))
+    expect(listed.every((item) => "code" in item && item.code === "RECOVERY_INVALID")).toBe(true)
+    expect(next.map(({ id }) => id)).toEqual(fakeIds.sort().reverse().slice(25, 50))
+    expect(next.some(({ id }) => listed.some((item) => item.id === id))).toBe(false)
+  }, 20_000)
+
   it("initializes recovery storage safely under concurrent saves and orders metadata deterministically", async () => {
     const root = await createGarden()
     const first = await createPublicNote(root, "first")
@@ -1284,12 +1991,14 @@ describe("note files", () => {
         ...(await revision(second)),
       }),
     ])
-    const recoveries = await listRecoveries(root)
+    const recoveries = (await listRecoveries(root)).filter(
+      (item): item is Extract<typeof item, { readonly createdAt: string }> => "createdAt" in item,
+    )
     expect(recoveries).toHaveLength(2)
     expect(
       [...recoveries].sort(
         (left, right) =>
-          right.createdAt.localeCompare(left.createdAt) || left.id.localeCompare(right.id),
+          right.createdAt.localeCompare(left.createdAt) || right.id.localeCompare(left.id),
       ),
     ).toEqual(recoveries)
   })
@@ -1790,7 +2499,12 @@ describe("note files", () => {
       },
     )
     await mkdir(join(root, ".garden-publisher", "recovery", "1234567890abcdef"))
-    await expect(listRecoveries(root)).rejects.toMatchObject({ code: "RECOVERY_INVALID" })
+    await expect(listRecoveries(root)).resolves.toEqual(
+      expect.arrayContaining([
+        expect.objectContaining({ id: recovery!.id, code: "RECOVERY_INVALID" }),
+        expect.objectContaining({ id: "1234567890abcdef", code: "RECOVERY_INVALID" }),
+      ]),
+    )
   })
 
   it("rejects a coherently retagged manifest without the workspace HMAC key", async () => {
@@ -1810,7 +2524,11 @@ describe("note files", () => {
     manifest.integrity = unkeyedManifestTag(manifest)
     await writeFile(manifestPath, JSON.stringify(manifest))
     await writeFile(join(entry, "integrity.sha256"), `${manifest.integrity as string}\n`)
-    await expect(listRecoveries(root)).rejects.toMatchObject({ code: "RECOVERY_INVALID" })
+    await expect(listRecoveries(root)).resolves.toContainEqual({
+      id: recovery!.id,
+      code: "RECOVERY_INVALID",
+      message: "Recovery data is invalid.",
+    })
   })
 
   it("rejects missing or corrupt workspace recovery HMAC keys", async () => {
@@ -1824,7 +2542,11 @@ describe("note files", () => {
     })
     const key = join(root, ".garden-publisher", "keys", "recovery-hmac.key")
     await rm(key)
-    await expect(listRecoveries(root)).rejects.toMatchObject({ code: "RECOVERY_INVALID" })
+    await expect(listRecoveries(root)).resolves.toContainEqual({
+      id: (await readdir(join(root, ".garden-publisher", "recovery")))[0],
+      code: "RECOVERY_INVALID",
+      message: "Recovery data is invalid.",
+    })
 
     const root2 = await createGarden()
     const second = await createPublicNote(root2)
@@ -1835,7 +2557,9 @@ describe("note files", () => {
       ...(await revision(second)),
     })
     await writeFile(join(root2, ".garden-publisher", "keys", "recovery-hmac.key"), "corrupt")
-    await expect(listRecoveries(root2)).rejects.toMatchObject({ code: "RECOVERY_INVALID" })
+    await expect(listRecoveries(root2)).resolves.toEqual([
+      expect.objectContaining({ code: "RECOVERY_INVALID" }),
+    ])
   })
 
   it("rejects tampered recovery snapshots and swapped recovery links", async ({ skip }) => {
@@ -1850,7 +2574,11 @@ describe("note files", () => {
     const [recovery] = await listRecoveries(root)
     const snapshot = join(root, ".garden-publisher", "recovery", recovery!.id, "content.md")
     await writeFile(snapshot, "snapshot tamper")
-    await expect(listRecoveries(root)).rejects.toMatchObject({ code: "RECOVERY_INVALID" })
+    await expect(listRecoveries(root)).resolves.toContainEqual({
+      id: recovery!.id,
+      code: "RECOVERY_INVALID",
+      message: "Recovery data is invalid.",
+    })
 
     const root2 = await createGarden()
     const second = await createPublicNote(root2)
@@ -1875,7 +2603,11 @@ describe("note files", () => {
       if ((error as NodeJS.ErrnoException).code === "EPERM") return skip()
       throw error
     }
-    await expect(listRecoveries(root2)).rejects.toMatchObject({ code: "RECOVERY_INVALID" })
+    await expect(listRecoveries(root2)).resolves.toContainEqual({
+      id: secondRecovery!.id,
+      code: "RECOVERY_INVALID",
+      message: "Recovery data is invalid.",
+    })
   })
 
   it("requires the recovery integrity digest stored separately from its manifest", async () => {
@@ -1889,7 +2621,11 @@ describe("note files", () => {
     })
     const [recovery] = await listRecoveries(root)
     await rm(join(root, ".garden-publisher", "recovery", recovery!.id, "integrity.sha256"))
-    await expect(listRecoveries(root)).rejects.toMatchObject({ code: "RECOVERY_INVALID" })
+    await expect(listRecoveries(root)).resolves.toContainEqual({
+      id: recovery!.id,
+      code: "RECOVERY_INVALID",
+      message: "Recovery data is invalid.",
+    })
   })
 
   it("maps recovery trash adapter failures to typed errors", async () => {

@@ -9,6 +9,7 @@ export type SerializableValue =
   | { readonly [key: string]: SerializableValue }
 
 export type AppErrorCode =
+  | "INVALID_INPUT"
   | "INVALID_WORKSPACE"
   | "CONTENT_MISSING"
   | "CONTENT_NOT_DIRECTORY"
@@ -63,7 +64,11 @@ type NoteFileError = Extract<
   AppError,
   {
     readonly code:
-      `NOTE_FILE_${string}` | "NOTE_ALREADY_EXISTS" | "EXTERNAL_EDIT" | `RECOVERY_${string}`
+      | `NOTE_FILE_${string}`
+      | "NOTE_ALREADY_EXISTS"
+      | "EXTERNAL_EDIT"
+      | "INVALID_INPUT"
+      | `RECOVERY_${string}`
   }
 >
 
