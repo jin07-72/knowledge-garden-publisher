@@ -50,19 +50,32 @@ function hash(source: string): string {
   return createHash("sha256").update(source).digest("hex")
 }
 
-function expiredLease(pid = 999_999, token = "00000000-0000-4000-8000-000000000000") {
-  return JSON.stringify({
-    version: 1,
-    token,
-    pid,
-    createdAt: 1,
-    heartbeatAt: 2,
-    leaseExpiresAt: 3,
-  })
-}
-
 function targetLockPath(root: string, path: string): string {
   return join(root, ".garden-publisher", "locks", `${hash(path)}.lock`)
+}
+
+async function writeLockDirectory(
+  path: string,
+  options: { token?: string; pid?: number; now?: number; expiresAt?: number } = {},
+): Promise<void> {
+  const now = options.now ?? Date.now()
+  const token = options.token ?? "11111111-1111-4111-8111-111111111111"
+  await mkdir(path, { recursive: false, mode: 0o700 })
+  await writeFile(
+    join(path, "owner.json"),
+    JSON.stringify({ version: 1, token, pid: options.pid ?? process.pid, createdAt: now }),
+    { mode: 0o600 },
+  )
+  await writeFile(
+    join(path, "heartbeat.json"),
+    JSON.stringify({
+      version: 1,
+      token,
+      heartbeatAt: now,
+      leaseExpiresAt: options.expiresAt ?? now + 10_000,
+    }),
+    { mode: 0o600 },
+  )
 }
 
 function unkeyedManifestTag(manifest: Record<string, unknown>): string {
@@ -348,7 +361,7 @@ describe("note files", () => {
     const path = await createPublicNote(root)
     const lock = targetLockPath(root, "content/technology/first-note.md")
     await mkdir(join(root, ".garden-publisher", "locks"), { recursive: true })
-    await writeFile(lock, expiredLease(), { mode: 0o600 })
+    await writeLockDirectory(lock, { pid: 999_999, now: 1, expiresAt: 3 })
 
     await expect(
       saveNote(
@@ -369,7 +382,7 @@ describe("note files", () => {
     const path = await createPublicNote(root)
     const lock = targetLockPath(root, "content/technology/first-note.md")
     await mkdir(join(root, ".garden-publisher", "locks"), { recursive: true })
-    await writeFile(lock, expiredLease(process.pid), { mode: 0o600 })
+    await writeLockDirectory(lock, { pid: process.pid, now: 1, expiresAt: 3 })
 
     await expect(
       saveNote(
@@ -382,41 +395,66 @@ describe("note files", () => {
         { isProcessAlive: () => true },
       ),
     ).rejects.toMatchObject({ code: "NOTE_FILE_LOCKED" })
-    expect(JSON.parse(await readFile(lock, "utf8"))).toMatchObject({ pid: process.pid })
+    expect(JSON.parse(await readFile(join(lock, "owner.json"), "utf8"))).toMatchObject({
+      pid: process.pid,
+    })
   })
 
-  it("does not release a target lease whose token was replaced", async () => {
+  it("does not delete a successor target lease during release", async () => {
     const root = await createGarden()
     const path = await createPublicNote(root)
     const lock = targetLockPath(root, "content/technology/first-note.md")
     const replacementToken = "11111111-1111-4111-8111-111111111111"
 
-    await saveNote(
-      {
-        workspace: root,
-        path: "content/technology/first-note.md",
-        markdown: "saved",
-        ...(await revision(path)),
-      },
-      {
-        beforeReplace: async () => {
-          const now = Date.now()
-          await writeFile(
-            lock,
-            JSON.stringify({
-              version: 1,
-              token: replacementToken,
-              pid: process.pid,
-              createdAt: now,
-              heartbeatAt: now,
-              leaseExpiresAt: now + 10_000,
-            }),
-          )
+    await expect(
+      saveNote(
+        {
+          workspace: root,
+          path: "content/technology/first-note.md",
+          markdown: "saved",
+          ...(await revision(path)),
         },
-      },
-    )
+        {
+          beforeLockRelease: async () => {
+            await rm(lock, { recursive: true, force: true })
+            await writeLockDirectory(lock, { token: replacementToken })
+          },
+        },
+      ),
+    ).rejects.toMatchObject({ code: "NOTE_FILE_LOCKED" })
 
-    expect(JSON.parse(await readFile(lock, "utf8"))).toMatchObject({ token: replacementToken })
+    expect(JSON.parse(await readFile(join(lock, "owner.json"), "utf8"))).toMatchObject({
+      token: replacementToken,
+    })
+  })
+
+  it("aborts before commit when a successor replaces the target lock directory", async () => {
+    const root = await createGarden()
+    const path = await createPublicNote(root)
+    const original = await readFile(path, "utf8")
+    const lock = targetLockPath(root, "content/technology/first-note.md")
+
+    await expect(
+      saveNote(
+        {
+          workspace: root,
+          path: "content/technology/first-note.md",
+          markdown: "must not commit",
+          ...(await revision(path)),
+        },
+        {
+          beforeReplace: async () => {
+            await rm(lock, { recursive: true, force: true })
+            await writeLockDirectory(lock)
+          },
+        },
+      ),
+    ).rejects.toMatchObject({ code: "NOTE_FILE_LOCKED" })
+
+    expect(await readFile(path, "utf8")).toBe(original)
+    expect(JSON.parse(await readFile(join(lock, "owner.json"), "utf8"))).toMatchObject({
+      token: "11111111-1111-4111-8111-111111111111",
+    })
   })
 
   it("lets exactly one stale-target reclaimer win and releases it for the next save", async () => {
@@ -425,7 +463,7 @@ describe("note files", () => {
     const displayPath = "content/technology/first-note.md"
     const lock = targetLockPath(root, displayPath)
     await mkdir(join(root, ".garden-publisher", "locks"), { recursive: true })
-    await writeFile(lock, expiredLease(), { mode: 0o600 })
+    await writeLockDirectory(lock, { pid: 999_999, now: 1, expiresAt: 3 })
     let entered!: () => void
     const enteredPromise = new Promise<void>((resolve) => {
       entered = resolve
@@ -477,15 +515,198 @@ describe("note files", () => {
       {
         lockLeaseMs: 100,
         beforeReplace: async () => {
-          const before = JSON.parse(await readFile(lock, "utf8")) as { heartbeatAt: number }
+          const before = JSON.parse(await readFile(join(lock, "heartbeat.json"), "utf8")) as {
+            heartbeatAt: number
+          }
           await new Promise<void>((resolve) => setTimeout(resolve, 90))
-          const after = JSON.parse(await readFile(lock, "utf8")) as { heartbeatAt: number }
+          const after = JSON.parse(await readFile(join(lock, "heartbeat.json"), "utf8")) as {
+            heartbeatAt: number
+          }
           heartbeatAdvanced = after.heartbeatAt > before.heartbeatAt
         },
       },
     )
 
     expect(heartbeatAdvanced).toBe(true)
+  })
+
+  it("surfaces heartbeat ownership loss and blocks the target commit", async () => {
+    const root = await createGarden()
+    const path = await createPublicNote(root)
+    const original = await readFile(path, "utf8")
+    const lock = targetLockPath(root, "content/technology/first-note.md")
+    let lost!: () => void
+    const lostPromise = new Promise<void>((resolve) => {
+      lost = resolve
+    })
+    let replaced = false
+
+    await expect(
+      saveNote(
+        {
+          workspace: root,
+          path: "content/technology/first-note.md",
+          markdown: "must not commit",
+          ...(await revision(path)),
+        },
+        {
+          lockLeaseMs: 30,
+          afterLockHeartbeat: async (directory) => {
+            if (directory !== lock || replaced) return
+            replaced = true
+            await rm(lock, { recursive: true, force: true })
+            await writeLockDirectory(lock)
+            lost()
+          },
+          beforeReplace: async () => lostPromise,
+        },
+      ),
+    ).rejects.toMatchObject({ code: "NOTE_FILE_LOCKED" })
+
+    expect(await readFile(path, "utf8")).toBe(original)
+    expect(JSON.parse(await readFile(join(lock, "owner.json"), "utf8"))).toMatchObject({
+      token: "11111111-1111-4111-8111-111111111111",
+    })
+  })
+
+  it("reclaims a truncated target lock only after the bounded grace period", async () => {
+    const root = await createGarden()
+    const path = await createPublicNote(root)
+    const lock = targetLockPath(root, "content/technology/first-note.md")
+    await mkdir(lock, { recursive: true, mode: 0o700 })
+    await writeFile(join(lock, "owner.json"), "{", { mode: 0o600 })
+    let now = 1_000
+    let delayed = 0
+
+    await expect(
+      saveNote(
+        {
+          workspace: root,
+          path: "content/technology/first-note.md",
+          markdown: "recovered",
+          ...(await revision(path)),
+        },
+        {
+          now: () => now,
+          delay: async (milliseconds) => {
+            delayed += milliseconds
+            now += milliseconds
+          },
+          lockGraceMs: 75,
+          isProcessAlive: () => false,
+        },
+      ),
+    ).resolves.toMatchObject({ contentHash: hash("recovered") })
+
+    expect(delayed).toBeGreaterThanOrEqual(75)
+  })
+
+  it("recovers a target lock directory left before owner publication", async () => {
+    const root = await createGarden()
+    const path = await createPublicNote(root)
+    const lock = targetLockPath(root, "content/technology/first-note.md")
+    await mkdir(lock, { recursive: true, mode: 0o700 })
+    let now = 2_000
+
+    await expect(
+      saveNote(
+        {
+          workspace: root,
+          path: "content/technology/first-note.md",
+          markdown: "recovered partial",
+          ...(await revision(path)),
+        },
+        {
+          now: () => now,
+          delay: async (milliseconds) => {
+            now += milliseconds
+          },
+          lockGraceMs: 40,
+        },
+      ),
+    ).resolves.toMatchObject({ contentHash: hash("recovered partial") })
+  })
+
+  it("does not steal a target lock whose owner metadata is published within grace", async () => {
+    const root = await createGarden()
+    const path = await createPublicNote(root)
+    const displayPath = "content/technology/first-note.md"
+    const lock = targetLockPath(root, displayPath)
+    let entered!: () => void
+    const enteredPromise = new Promise<void>((resolve) => {
+      entered = resolve
+    })
+    let publish!: () => void
+    const publishPromise = new Promise<void>((resolve) => {
+      publish = resolve
+    })
+    const first = saveNote(
+      { workspace: root, path: displayPath, markdown: "first", ...(await revision(path)) },
+      {
+        lockGraceMs: 200,
+        beforeLockMetadataPublish: async (directory) => {
+          if (directory !== lock) return
+          entered()
+          await publishPromise
+        },
+      },
+    )
+    await enteredPromise
+    const contender = saveNote(
+      { workspace: root, path: displayPath, markdown: "second", ...(await revision(path)) },
+      { lockGraceMs: 200 },
+    )
+    void contender.catch(() => undefined)
+    await new Promise<void>((resolve) => setTimeout(resolve, 50))
+    publish()
+
+    await expect(contender).rejects.toMatchObject({ code: "NOTE_FILE_LOCKED" })
+    await expect(first).resolves.toMatchObject({ contentHash: hash("first") })
+  })
+
+  it("allows at most one malformed-target-lock reclaimer and leaves no permanent block", async () => {
+    const root = await createGarden()
+    const path = await createPublicNote(root)
+    const displayPath = "content/technology/first-note.md"
+    const lock = targetLockPath(root, displayPath)
+    await mkdir(lock, { recursive: true, mode: 0o700 })
+    await writeFile(join(lock, "owner.json"), "truncated", { mode: 0o600 })
+    let entered!: () => void
+    const enteredPromise = new Promise<void>((resolve) => {
+      entered = resolve
+    })
+    let release!: () => void
+    const releasePromise = new Promise<void>((resolve) => {
+      release = resolve
+    })
+    let enteredOnce = false
+    const adapter: NoteFileAdapter = {
+      lockGraceMs: 25,
+      isProcessAlive: () => false,
+      beforeReplace: async () => {
+        if (!enteredOnce) {
+          enteredOnce = true
+          entered()
+          await releasePromise
+        }
+      },
+    }
+    const before = await revision(path)
+    const saves = [
+      saveNote({ workspace: root, path: displayPath, markdown: "one", ...before }, adapter),
+      saveNote({ workspace: root, path: displayPath, markdown: "two", ...before }, adapter),
+    ]
+    for (const save of saves) void save.catch(() => undefined)
+    await enteredPromise
+    release()
+    const settled = await Promise.allSettled(saves)
+    expect(settled.filter((result) => result.status === "fulfilled")).toHaveLength(1)
+    expect(settled.filter((result) => result.status === "rejected")).toHaveLength(1)
+    await expect(lstat(lock)).rejects.toMatchObject({ code: "ENOENT" })
+
+    await expect(
+      saveNote({ workspace: root, path: displayPath, markdown: "next", ...(await revision(path)) }),
+    ).resolves.toMatchObject({ contentHash: hash("next") })
   })
 
   it("keeps the live target present and restrictive temp mode before commit", async () => {
@@ -983,12 +1204,45 @@ describe("note files", () => {
     await expect(Promise.all([initializing, waiting])).resolves.toHaveLength(2)
   })
 
+  it("does not publish a recovery key after initializer ownership is replaced", async () => {
+    const root = await createGarden()
+    const path = await createPublicNote(root)
+    const keys = join(root, ".garden-publisher", "keys")
+    const initializationLock = join(keys, "recovery-hmac.key.initializing")
+
+    await expect(
+      saveNote(
+        {
+          workspace: root,
+          path: "content/technology/first-note.md",
+          markdown: "must not save",
+          ...(await revision(path)),
+        },
+        {
+          beforeKeyPublish: async () => {
+            await rm(initializationLock, { recursive: true, force: true })
+            await writeLockDirectory(initializationLock)
+          },
+        },
+      ),
+    ).rejects.toMatchObject({ code: "RECOVERY_INVALID" })
+
+    await expect(lstat(join(keys, "recovery-hmac.key"))).rejects.toMatchObject({ code: "ENOENT" })
+    expect(
+      JSON.parse(await readFile(join(initializationLock, "owner.json"), "utf8")),
+    ).toMatchObject({ token: "11111111-1111-4111-8111-111111111111" })
+  })
+
   it("reclaims a crashed recovery-key initializer lease", async () => {
     const root = await createGarden()
     const path = await createPublicNote(root)
     const keys = join(root, ".garden-publisher", "keys")
     await mkdir(keys, { recursive: true })
-    await writeFile(join(keys, "recovery-hmac.key.initializing"), expiredLease(), { mode: 0o600 })
+    await writeLockDirectory(join(keys, "recovery-hmac.key.initializing"), {
+      pid: 999_999,
+      now: 1,
+      expiresAt: 3,
+    })
 
     await expect(
       saveNote(
@@ -1009,7 +1263,7 @@ describe("note files", () => {
     const keys = join(root, ".garden-publisher", "keys")
     const initializationLock = join(keys, "recovery-hmac.key.initializing")
     await mkdir(keys, { recursive: true })
-    await writeFile(initializationLock, expiredLease(process.pid), { mode: 0o600 })
+    await writeLockDirectory(initializationLock, { pid: process.pid, now: 1, expiresAt: 3 })
 
     await expect(
       saveNote(
@@ -1022,7 +1276,9 @@ describe("note files", () => {
         { isProcessAlive: () => true, lockWaitMs: 100 },
       ),
     ).rejects.toMatchObject({ code: "RECOVERY_INVALID" })
-    expect(JSON.parse(await readFile(initializationLock, "utf8"))).toMatchObject({
+    expect(
+      JSON.parse(await readFile(join(initializationLock, "owner.json"), "utf8")),
+    ).toMatchObject({
       pid: process.pid,
     })
   })
@@ -1033,7 +1289,11 @@ describe("note files", () => {
     const second = await createPublicNote(root, "second")
     const keys = join(root, ".garden-publisher", "keys")
     await mkdir(keys, { recursive: true })
-    await writeFile(join(keys, "recovery-hmac.key.initializing"), expiredLease(), { mode: 0o600 })
+    await writeLockDirectory(join(keys, "recovery-hmac.key.initializing"), {
+      pid: 999_999,
+      now: 1,
+      expiresAt: 3,
+    })
     let publishers = 0
     const adapter: NoteFileAdapter = {
       isProcessAlive: () => false,
@@ -1066,6 +1326,173 @@ describe("note files", () => {
       ]),
     ).resolves.toHaveLength(2)
     expect(publishers).toBe(1)
+  })
+
+  it("reclaims a truncated key-initializer lock only after grace", async () => {
+    const root = await createGarden()
+    const path = await createPublicNote(root)
+    const initializationLock = join(
+      root,
+      ".garden-publisher",
+      "keys",
+      "recovery-hmac.key.initializing",
+    )
+    await mkdir(initializationLock, { recursive: true, mode: 0o700 })
+    await writeFile(join(initializationLock, "owner.json"), "{", { mode: 0o600 })
+    let now = 5_000
+    let delayed = 0
+
+    await expect(
+      saveNote(
+        {
+          workspace: root,
+          path: "content/technology/first-note.md",
+          markdown: "saved",
+          ...(await revision(path)),
+        },
+        {
+          now: () => now,
+          delay: async (milliseconds) => {
+            delayed += milliseconds
+            now += milliseconds
+          },
+          lockGraceMs: 60,
+          isProcessAlive: () => false,
+        },
+      ),
+    ).resolves.toMatchObject({ contentHash: hash("saved") })
+    expect(delayed).toBeGreaterThanOrEqual(60)
+  })
+
+  it("recovers a key initializer directory left before owner publication", async () => {
+    const root = await createGarden()
+    const path = await createPublicNote(root)
+    const initializationLock = join(
+      root,
+      ".garden-publisher",
+      "keys",
+      "recovery-hmac.key.initializing",
+    )
+    await mkdir(initializationLock, { recursive: true, mode: 0o700 })
+    let now = 8_000
+
+    await expect(
+      saveNote(
+        {
+          workspace: root,
+          path: "content/technology/first-note.md",
+          markdown: "saved after partial",
+          ...(await revision(path)),
+        },
+        {
+          now: () => now,
+          delay: async (milliseconds) => {
+            now += milliseconds
+          },
+          lockGraceMs: 40,
+        },
+      ),
+    ).resolves.toMatchObject({ contentHash: hash("saved after partial") })
+  })
+
+  it("does not steal delayed live key-initializer metadata published within grace", async () => {
+    const root = await createGarden()
+    const first = await createPublicNote(root, "first")
+    const second = await createPublicNote(root, "second")
+    const initializationLock = join(
+      root,
+      ".garden-publisher",
+      "keys",
+      "recovery-hmac.key.initializing",
+    )
+    let entered!: () => void
+    const enteredPromise = new Promise<void>((resolve) => {
+      entered = resolve
+    })
+    let publish!: () => void
+    const publishPromise = new Promise<void>((resolve) => {
+      publish = resolve
+    })
+    let delayedOnce = false
+    const initializer = saveNote(
+      {
+        workspace: root,
+        path: "content/technology/first.md",
+        markdown: "one",
+        ...(await revision(first)),
+      },
+      {
+        lockGraceMs: 200,
+        beforeLockMetadataPublish: async (directory) => {
+          if (directory !== initializationLock || delayedOnce) return
+          delayedOnce = true
+          entered()
+          await publishPromise
+        },
+      },
+    )
+    await enteredPromise
+    const waiting = saveNote(
+      {
+        workspace: root,
+        path: "content/technology/second.md",
+        markdown: "two",
+        ...(await revision(second)),
+      },
+      { lockGraceMs: 200 },
+    )
+    await new Promise<void>((resolve) => setTimeout(resolve, 50))
+    publish()
+
+    await expect(Promise.all([initializer, waiting])).resolves.toHaveLength(2)
+  })
+
+  it("allows only one malformed key-lock reclaimer to publish and leaves no block", async () => {
+    const root = await createGarden()
+    const first = await createPublicNote(root, "first")
+    const second = await createPublicNote(root, "second")
+    const initializationLock = join(
+      root,
+      ".garden-publisher",
+      "keys",
+      "recovery-hmac.key.initializing",
+    )
+    await mkdir(initializationLock, { recursive: true, mode: 0o700 })
+    await writeFile(join(initializationLock, "owner.json"), "truncated", { mode: 0o600 })
+    let publishers = 0
+    const adapter: NoteFileAdapter = {
+      lockGraceMs: 25,
+      isProcessAlive: () => false,
+      beforeKeyPublish: async () => {
+        publishers += 1
+        await new Promise<void>((resolve) => setTimeout(resolve, 25))
+      },
+    }
+
+    await expect(
+      Promise.all([
+        saveNote(
+          {
+            workspace: root,
+            path: "content/technology/first.md",
+            markdown: "one",
+            ...(await revision(first)),
+          },
+          adapter,
+        ),
+        saveNote(
+          {
+            workspace: root,
+            path: "content/technology/second.md",
+            markdown: "two",
+            ...(await revision(second)),
+          },
+          adapter,
+        ),
+      ]),
+    ).resolves.toHaveLength(2)
+    expect(publishers).toBe(1)
+    await expect(lstat(initializationLock)).rejects.toMatchObject({ code: "ENOENT" })
   })
 
   it("rejects corrupt recoveries and trashes only the exact contained recovery target", async () => {

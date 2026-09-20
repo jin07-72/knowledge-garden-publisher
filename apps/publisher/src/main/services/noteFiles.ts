@@ -89,11 +89,15 @@ export interface NoteFileAdapter {
   readonly beforeReplace?: (path: string) => Promise<void> | void
   readonly afterReplace?: (path: string) => Promise<void> | void
   readonly beforeKeyPublish?: () => Promise<void> | void
+  readonly beforeLockMetadataPublish?: (lockDirectory: string) => Promise<void> | void
+  readonly afterLockHeartbeat?: (lockDirectory: string) => Promise<void> | void
+  readonly beforeLockRelease?: (lockDirectory: string) => Promise<void> | void
   readonly now?: () => number
   readonly delay?: (milliseconds: number) => Promise<void>
   readonly isProcessAlive?: (pid: number) => boolean | undefined
   readonly lockLeaseMs?: number
   readonly lockWaitMs?: number
+  readonly lockGraceMs?: number
 }
 
 interface ManagedRoot {
@@ -129,16 +133,29 @@ interface RecoveryEntry {
 }
 
 interface TargetLock {
+  assertOwned(): Promise<void>
   release(): Promise<void>
 }
 
-interface LeaseMetadata {
+interface LeaseOwner {
   readonly version: 1
   readonly token: string
   readonly pid: number
   readonly createdAt: number
+}
+
+interface LeaseHeartbeat {
+  readonly version: 1
+  readonly token: string
   readonly heartbeatAt: number
   readonly leaseExpiresAt: number
+}
+
+interface DirectoryIdentity {
+  readonly dev: bigint
+  readonly ino: bigint
+  readonly birthtimeNs: bigint
+  readonly ctimeNs: bigint
 }
 
 function appError(
@@ -504,8 +521,11 @@ async function readProtectedKey(path: string, keysDirectory: string): Promise<Bu
   }
 }
 
-const defaultLockLeaseMs = 10_000
+const defaultLockLeaseMs = 60_000
 const defaultLockWaitMs = 2_000
+const defaultLockGraceMs = 250
+const leaseOwnerName = "owner.json"
+const leaseHeartbeatName = "heartbeat.json"
 
 function leaseNow(adapter: NoteFileAdapter): number {
   return (adapter.now ?? Date.now)()
@@ -537,58 +557,162 @@ function processLiveness(adapter: NoteFileAdapter, pid: number): boolean | undef
   }
 }
 
-function isLeaseMetadata(value: unknown): value is LeaseMetadata {
+function isLeaseOwner(value: unknown): value is LeaseOwner {
   if (typeof value !== "object" || value === null) return false
-  const lease = value as Partial<LeaseMetadata>
+  const owner = value as Partial<LeaseOwner>
   return (
-    lease.version === 1 &&
-    typeof lease.token === "string" &&
-    /^[a-f0-9-]{16,128}$/i.test(lease.token) &&
-    typeof lease.pid === "number" &&
-    Number.isSafeInteger(lease.pid) &&
-    lease.pid > 0 &&
-    typeof lease.createdAt === "number" &&
-    Number.isFinite(lease.createdAt) &&
-    typeof lease.heartbeatAt === "number" &&
-    Number.isFinite(lease.heartbeatAt) &&
-    typeof lease.leaseExpiresAt === "number" &&
-    Number.isFinite(lease.leaseExpiresAt) &&
-    lease.createdAt <= lease.heartbeatAt &&
-    lease.heartbeatAt < lease.leaseExpiresAt
+    owner.version === 1 &&
+    typeof owner.token === "string" &&
+    /^[a-f0-9-]{16,128}$/i.test(owner.token) &&
+    typeof owner.pid === "number" &&
+    Number.isSafeInteger(owner.pid) &&
+    owner.pid > 0 &&
+    typeof owner.createdAt === "number" &&
+    Number.isFinite(owner.createdAt)
   )
 }
 
-async function readLease(path: string, parent: string): Promise<LeaseMetadata | undefined> {
-  const checked = await readContainedRegularFile(path, parent)
-  if (checked === undefined || (process.platform !== "win32" && (checked.mode & 0o777) !== 0o600)) {
-    return undefined
+function isLeaseHeartbeat(value: unknown): value is LeaseHeartbeat {
+  if (typeof value !== "object" || value === null) return false
+  const heartbeat = value as Partial<LeaseHeartbeat>
+  return (
+    heartbeat.version === 1 &&
+    typeof heartbeat.token === "string" &&
+    /^[a-f0-9-]{16,128}$/i.test(heartbeat.token) &&
+    typeof heartbeat.heartbeatAt === "number" &&
+    Number.isFinite(heartbeat.heartbeatAt) &&
+    typeof heartbeat.leaseExpiresAt === "number" &&
+    Number.isFinite(heartbeat.leaseExpiresAt) &&
+    heartbeat.heartbeatAt < heartbeat.leaseExpiresAt
+  )
+}
+
+function directoryIdentity(details: BigIntStats): DirectoryIdentity {
+  return {
+    dev: details.dev,
+    ino: details.ino,
+    birthtimeNs: details.birthtimeNs,
+    ctimeNs: details.ctimeNs,
   }
+}
+
+function sameDirectory(left: DirectoryIdentity, right: DirectoryIdentity): boolean {
+  // Directory ctime changes when owner/heartbeat entries are atomically published.
+  // Device, inode, and birth time identify the immutable directory object.
+  return left.dev === right.dev && left.ino === right.ino && left.birthtimeNs === right.birthtimeNs
+}
+
+async function readLeaseFile<T>(
+  directory: string,
+  name: string,
+  validate: (value: unknown) => value is T,
+): Promise<{ readonly value?: T; readonly fingerprint: string }> {
+  const checked = await readContainedRegularFile(resolve(directory, name), directory)
+  if (checked === undefined || (process.platform !== "win32" && (checked.mode & 0o777) !== 0o600)) {
+    return { fingerprint: "missing-or-unsafe" }
+  }
+  const fingerprint = `${hash(checked.bytes)}:${checked.mode & 0o777}`
   try {
     const value: unknown = JSON.parse(checked.bytes.toString("utf8"))
-    return isLeaseMetadata(value) ? value : undefined
+    return validate(value) ? { value, fingerprint } : { fingerprint }
   } catch {
-    return undefined
+    return { fingerprint }
   }
 }
 
-async function writeLeaseExclusive(path: string, lease: LeaseMetadata): Promise<void> {
+interface LockInspection {
+  readonly kind: "present"
+  readonly identity: DirectoryIdentity
+  readonly ownerFingerprint: string
+  readonly heartbeatFingerprint: string
+  readonly owner?: LeaseOwner
+  readonly heartbeat?: LeaseHeartbeat
+}
+
+async function inspectLockDirectory(
+  path: string,
+  parent: string,
+): Promise<LockInspection | { readonly kind: "missing" | "unsafe" }> {
+  try {
+    const details = await lstat(path, { bigint: true })
+    if (details.isSymbolicLink() || !details.isDirectory()) return { kind: "unsafe" }
+    const canonical = await realpath(path)
+    if (!isInside(parent, canonical)) return { kind: "unsafe" }
+    const owner = await readLeaseFile(path, leaseOwnerName, isLeaseOwner)
+    const heartbeat = await readLeaseFile(path, leaseHeartbeatName, isLeaseHeartbeat)
+    const after = await lstat(path, { bigint: true })
+    if (
+      after.isSymbolicLink() ||
+      !after.isDirectory() ||
+      !sameDirectory(directoryIdentity(details), directoryIdentity(after)) ||
+      !pathsEqual(canonical, await realpath(path))
+    ) {
+      return { kind: "unsafe" }
+    }
+    return {
+      kind: "present",
+      identity: directoryIdentity(after),
+      owner: owner.value,
+      heartbeat: heartbeat.value,
+      ownerFingerprint: owner.fingerprint,
+      heartbeatFingerprint: heartbeat.fingerprint,
+    }
+  } catch (error) {
+    return (error as NodeJS.ErrnoException).code === "ENOENT"
+      ? { kind: "missing" }
+      : { kind: "unsafe" }
+  }
+}
+
+async function publishLeaseFile(
+  directory: string,
+  name: string,
+  value: LeaseOwner | LeaseHeartbeat,
+): Promise<void> {
+  const finalPath = resolve(directory, name)
+  const temporary = resolve(directory, `.${name}.tmp-${value.token}-${randomUUID()}`)
   let handle
   try {
-    handle = await open(path, "wx", 0o600)
-    await handle.writeFile(JSON.stringify(lease))
+    handle = await open(temporary, "wx", 0o600)
+    await handle.writeFile(JSON.stringify(value))
     await handle.sync()
+    await handle.close()
+    handle = undefined
+    const staged = await readContainedRegularFile(temporary, directory)
+    if (
+      staged === undefined ||
+      !staged.bytes.equals(Buffer.from(JSON.stringify(value))) ||
+      (process.platform !== "win32" && (staged.mode & 0o777) !== 0o600)
+    ) {
+      throw new Error("lease metadata could not be revalidated")
+    }
+    await nodeRename(temporary, finalPath)
+    await syncContainingDirectory(finalPath)
   } finally {
     await handle?.close().catch(() => undefined)
+    await rm(temporary, { force: true }).catch(() => undefined)
   }
 }
 
-async function replaceLease(path: string, lease: LeaseMetadata): Promise<void> {
-  const temporary = `${path}.heartbeat-${lease.token}-${randomUUID()}`
+function validLease(inspection: LockInspection): inspection is LockInspection & {
+  readonly owner: LeaseOwner
+  readonly heartbeat: LeaseHeartbeat
+} {
+  return (
+    inspection.owner !== undefined &&
+    inspection.heartbeat !== undefined &&
+    inspection.owner.token === inspection.heartbeat.token &&
+    inspection.owner.createdAt <= inspection.heartbeat.heartbeatAt
+  )
+}
+
+async function restoreQuarantine(quarantine: string, candidate: string): Promise<void> {
   try {
-    await writeLeaseExclusive(temporary, lease)
-    await nodeRename(temporary, path)
-  } finally {
-    await rm(temporary, { force: true }).catch(() => undefined)
+    await lstat(candidate)
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code === "ENOENT") {
+      await nodeRename(quarantine, candidate).catch(() => undefined)
+    }
   }
 }
 
@@ -596,68 +720,155 @@ async function acquireLease(
   candidate: string,
   parent: string,
   adapter: NoteFileAdapter,
+  ownershipError: () => AppError,
 ): Promise<TargetLock | undefined> {
-  const now = leaseNow(adapter)
   const leaseMs = Math.max(1, adapter.lockLeaseMs ?? defaultLockLeaseMs)
+  const graceMs = Math.max(1, adapter.lockGraceMs ?? defaultLockGraceMs)
   const token = randomUUID()
-  let owned: LeaseMetadata = {
+  const createdAt = leaseNow(adapter)
+  const owner: LeaseOwner = {
     version: 1,
     token,
     pid: process.pid,
-    createdAt: now,
-    heartbeatAt: now,
-    leaseExpiresAt: now + leaseMs,
+    createdAt,
   }
-  let quarantine: string | undefined
-  try {
-    await writeLeaseExclusive(candidate, owned)
-    if ((await readLease(candidate, parent))?.token !== token)
-      throw new Error("lock acquisition could not be revalidated")
-  } catch (error) {
-    if ((error as NodeJS.ErrnoException).code !== "EEXIST") throw error
-    const stale = await readLease(candidate, parent)
+  let acquiredIdentity: DirectoryIdentity | undefined
+  let partialSeenAt: number | undefined
+  const reclaimedQuarantines: string[] = []
+
+  while (acquiredIdentity === undefined) {
+    try {
+      await mkdir(candidate, { mode: 0o700 })
+      const acquired = await inspectLockDirectory(candidate, parent)
+      if (acquired.kind !== "present") throw new Error("lock directory is unsafe")
+      acquiredIdentity = acquired.identity
+      await adapter.beforeLockMetadataPublish?.(candidate)
+      const heartbeatAt = leaseNow(adapter)
+      await publishLeaseFile(candidate, leaseOwnerName, owner)
+      await publishLeaseFile(candidate, leaseHeartbeatName, {
+        version: 1,
+        token,
+        heartbeatAt,
+        leaseExpiresAt: heartbeatAt + leaseMs,
+      })
+      const published = await inspectLockDirectory(candidate, parent)
+      if (
+        published.kind !== "present" ||
+        !sameDirectory(acquiredIdentity, published.identity) ||
+        !validLease(published) ||
+        published.owner.token !== token
+      ) {
+        throw new Error("lock ownership could not be published")
+      }
+      break
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code !== "EEXIST") throw error
+    }
+
+    const observed = await inspectLockDirectory(candidate, parent)
+    if (observed.kind !== "present") {
+      if (observed.kind === "missing") continue
+      return undefined
+    }
+    const now = leaseNow(adapter)
+    const complete = validLease(observed)
     if (
-      stale === undefined ||
-      stale.leaseExpiresAt > now ||
-      processLiveness(adapter, stale.pid) !== false
+      complete &&
+      (observed.heartbeat.leaseExpiresAt > now ||
+        processLiveness(adapter, observed.owner.pid) !== false)
     ) {
       return undefined
     }
-    quarantine = `${candidate}.quarantine-${stale.token}-${randomUUID()}`
+    if (!complete) {
+      partialSeenAt ??= now
+      const elapsed = now - partialSeenAt
+      if (elapsed < graceMs) {
+        await leaseDelay(adapter, Math.min(25, Math.max(1, graceMs - elapsed)))
+        continue
+      }
+    }
+
+    const quarantine = `${candidate}.quarantine-${randomUUID()}`
+    const beforeQuarantine = await inspectLockDirectory(candidate, parent)
+    if (beforeQuarantine.kind === "missing") continue
+    if (
+      beforeQuarantine.kind !== "present" ||
+      !sameDirectory(observed.identity, beforeQuarantine.identity) ||
+      beforeQuarantine.ownerFingerprint !== observed.ownerFingerprint ||
+      beforeQuarantine.heartbeatFingerprint !== observed.heartbeatFingerprint
+    ) {
+      return undefined
+    }
     try {
       await nodeRename(candidate, quarantine)
     } catch {
+      continue
+    }
+    const moved = await inspectLockDirectory(quarantine, parent)
+    if (
+      moved.kind !== "present" ||
+      !sameDirectory(beforeQuarantine.identity, moved.identity) ||
+      moved.ownerFingerprint !== beforeQuarantine.ownerFingerprint ||
+      moved.heartbeatFingerprint !== beforeQuarantine.heartbeatFingerprint ||
+      (validLease(moved) &&
+        (moved.heartbeat.leaseExpiresAt > leaseNow(adapter) ||
+          processLiveness(adapter, moved.owner.pid) !== false))
+    ) {
+      await restoreQuarantine(quarantine, candidate)
       return undefined
     }
-    const moved = await readLease(quarantine, parent)
-    if (moved?.token !== stale.token) return undefined
-    try {
-      await writeLeaseExclusive(candidate, owned)
-      if ((await readLease(candidate, parent))?.token !== token)
-        throw new Error("lock acquisition could not be revalidated")
-    } catch {
-      return undefined
-    }
-    await rm(quarantine, { force: true }).catch(() => undefined)
-    quarantine = undefined
+    reclaimedQuarantines.push(quarantine)
+    partialSeenAt = undefined
   }
 
+  const identityAtAcquisition = acquiredIdentity
+  await Promise.all(
+    reclaimedQuarantines.map((quarantine) =>
+      rm(quarantine, { force: true, recursive: true }).catch(() => undefined),
+    ),
+  )
   let stopped = false
+  let lostOwnership = false
+
+  async function stillOwned(): Promise<boolean> {
+    const current = await inspectLockDirectory(candidate, parent)
+    return (
+      current.kind === "present" &&
+      sameDirectory(identityAtAcquisition, current.identity) &&
+      current.owner?.token === token
+    )
+  }
+
+  async function assertOwned(): Promise<void> {
+    await heartbeatWork.catch(() => undefined)
+    if (lostOwnership || !(await stillOwned())) {
+      lostOwnership = true
+      throw ownershipError()
+    }
+  }
+
   let heartbeatWork = Promise.resolve()
   const heartbeat = setInterval(
     () => {
       heartbeatWork = heartbeatWork.then(async () => {
         if (stopped) return
-        const current = await readLease(candidate, parent)
-        if (current?.token !== token) {
-          stopped = true
+        if (!(await stillOwned())) {
+          lostOwnership = true
           return
         }
         const heartbeatAt = leaseNow(adapter)
-        owned = { ...owned, heartbeatAt, leaseExpiresAt: heartbeatAt + leaseMs }
-        await replaceLease(candidate, owned).catch(() => {
-          stopped = true
-        })
+        try {
+          await publishLeaseFile(candidate, leaseHeartbeatName, {
+            version: 1,
+            token,
+            heartbeatAt,
+            leaseExpiresAt: heartbeatAt + leaseMs,
+          })
+          await adapter.afterLockHeartbeat?.(candidate)
+          if (!(await stillOwned())) lostOwnership = true
+        } catch {
+          lostOwnership = true
+        }
       })
     },
     Math.max(1, Math.floor(leaseMs / 3)),
@@ -665,16 +876,37 @@ async function acquireLease(
   heartbeat.unref()
 
   return {
+    assertOwned,
     async release(): Promise<void> {
       stopped = true
       clearInterval(heartbeat)
       await heartbeatWork.catch(() => undefined)
       try {
-        const current = await readLease(candidate, parent)
-        if (current?.token === token) await rm(candidate)
+        await adapter.beforeLockRelease?.(candidate)
       } catch {
-        // A failed cleanup leaves a conservative lease and never removes another owner.
+        throw ownershipError()
       }
+      const quarantine = `${candidate}.release-${token}-${randomUUID()}`
+      try {
+        await nodeRename(candidate, quarantine)
+      } catch (error) {
+        throw ownershipError()
+      }
+      const moved = await inspectLockDirectory(quarantine, parent)
+      if (
+        moved.kind === "present" &&
+        sameDirectory(identityAtAcquisition, moved.identity) &&
+        moved.owner?.token === token
+      ) {
+        try {
+          await rm(quarantine, { force: true, recursive: true })
+        } catch {
+          throw ownershipError()
+        }
+        return
+      }
+      await restoreQuarantine(quarantine, candidate)
+      throw ownershipError()
     },
   }
 }
@@ -703,7 +935,9 @@ async function recoveryKey(
   let lock: TargetLock | undefined
   while (lock === undefined) {
     try {
-      lock = await acquireLease(initializationLock, keys, adapter)
+      lock = await acquireLease(initializationLock, keys, adapter, () =>
+        appError("RECOVERY_INVALID", "Recovery key initializer ownership was lost."),
+      )
     } catch {
       throw appError("RECOVERY_INVALID", "Recovery key could not be initialized.")
     }
@@ -726,6 +960,7 @@ async function recoveryKey(
     await handle.close()
     handle = undefined
     await adapter.beforeKeyPublish?.()
+    await lock.assertOwned()
     await nodeRename(temporary, path)
   } catch {
     throw appError("RECOVERY_INVALID", "Recovery key could not be initialized.")
@@ -750,7 +985,9 @@ async function acquireTargetLock(
   const locks = await stateChild(dirname(recovery), "locks", true)
   const candidate = resolve(locks, `${hash(path)}.lock`)
   try {
-    const lock = await acquireLease(candidate, locks, adapter)
+    const lock = await acquireLease(candidate, locks, adapter, () =>
+      appError("NOTE_FILE_LOCKED", "The note lock is no longer owned.", { path }),
+    )
     if (lock !== undefined) return lock
   } catch {
     throw accessFailure(path)
@@ -899,6 +1136,7 @@ async function writeTempAndReplace(
   recoveryBytes: Buffer | undefined,
   mode: number | undefined,
   adapter: NoteFileAdapter,
+  assertLockOwned: () => Promise<void>,
   verifyBeforeCommit: () => Promise<void>,
 ): Promise<void> {
   const temp = `${target}.garden-publisher-tmp-${randomUUID()}`
@@ -928,6 +1166,7 @@ async function writeTempAndReplace(
         return false
       }
       try {
+        await assertLockOwned()
         await (adapter.rename ?? nodeRename)(rollbackTemp, target)
       } catch {
         const restored = await readContainedRegularFile(target, dirname(target))
@@ -935,6 +1174,7 @@ async function writeTempAndReplace(
       }
       if (mode !== undefined) await chmod(target, mode & 0o777)
       await (adapter.syncDirectory ?? syncContainingDirectory)(target)
+      await assertLockOwned()
       const restored = await readContainedRegularFile(target, dirname(target))
       return (
         restored !== undefined &&
@@ -960,6 +1200,7 @@ async function writeTempAndReplace(
     handle = undefined
     await adapter.beforeCommit?.(temp)
     await adapter.beforeReplace?.(displayPath)
+    await assertLockOwned()
     await verifyBeforeCommit()
     // Keep staged content owner-only until it has been completely written,
     // flushed, closed, and revalidated immediately before the final swap.
@@ -974,6 +1215,7 @@ async function writeTempAndReplace(
     ) {
       throw new Error("staged content changed")
     }
+    await assertLockOwned()
     try {
       await (adapter.rename ?? nodeRename)(temp, target)
     } catch (renameError) {
@@ -986,6 +1228,7 @@ async function writeTempAndReplace(
     try {
       if (mode !== undefined) await chmod(target, mode & 0o777)
       await adapter.afterReplace?.(displayPath)
+      await assertLockOwned()
       const installed = await readContainedRegularFile(target, dirname(target))
       if (
         installed === undefined ||
@@ -996,6 +1239,7 @@ async function writeTempAndReplace(
         throw new Error("replacement identity changed")
       }
       await (adapter.syncDirectory ?? syncContainingDirectory)(target)
+      await assertLockOwned()
       const durable = await readContainedRegularFile(target, dirname(target))
       if (
         durable === undefined ||
@@ -1102,6 +1346,7 @@ export async function saveNote(
       authenticatedRecovery.bytes,
       current.mode,
       adapter,
+      () => lock.assertOwned(),
       async () => {
         if (!(await verifyUnchanged(root, parsed.domain, parsed.filename, current))) {
           throw appError("EXTERNAL_EDIT", "The note changed outside the editor.", {
@@ -1309,6 +1554,7 @@ export async function restoreRecovery(
       current?.bytes,
       current?.mode,
       adapter,
+      () => lock.assertOwned(),
       async () => {
         if (current === undefined) {
           try {
