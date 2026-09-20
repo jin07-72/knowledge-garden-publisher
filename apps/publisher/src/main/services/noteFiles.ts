@@ -82,10 +82,18 @@ export interface RecoverySummary {
 /** Deterministic failure seam for atomic-write tests. Production uses node:fs. */
 export interface NoteFileAdapter {
   readonly rename?: (from: string, to: string) => Promise<void>
+  readonly syncDirectory?: (path: string) => Promise<void>
   readonly beforeTempWrite?: (path: string) => Promise<void> | void
   readonly beforeTempSync?: (path: string) => Promise<void> | void
   readonly beforeCommit?: (temporaryPath: string) => Promise<void> | void
   readonly beforeReplace?: (path: string) => Promise<void> | void
+  readonly afterReplace?: (path: string) => Promise<void> | void
+  readonly beforeKeyPublish?: () => Promise<void> | void
+  readonly now?: () => number
+  readonly delay?: (milliseconds: number) => Promise<void>
+  readonly isProcessAlive?: (pid: number) => boolean | undefined
+  readonly lockLeaseMs?: number
+  readonly lockWaitMs?: number
 }
 
 interface ManagedRoot {
@@ -122,6 +130,15 @@ interface RecoveryEntry {
 
 interface TargetLock {
   release(): Promise<void>
+}
+
+interface LeaseMetadata {
+  readonly version: 1
+  readonly token: string
+  readonly pid: number
+  readonly createdAt: number
+  readonly heartbeatAt: number
+  readonly leaseExpiresAt: number
 }
 
 function appError(
@@ -169,6 +186,13 @@ function accessFailure(path: string): AppError {
 
 function writeFailure(path: string): AppError {
   return appError("NOTE_FILE_WRITE_FAILED", "Could not atomically save the garden note.", { path })
+}
+
+function uncertainCommit(): AppError {
+  return appError(
+    "NOTE_FILE_COMMIT_UNCERTAIN",
+    "The note commit could not be safely confirmed or rolled back.",
+  )
 }
 
 function isNoteError(error: unknown): error is AppError {
@@ -480,7 +504,186 @@ async function readProtectedKey(path: string, keysDirectory: string): Promise<Bu
   }
 }
 
-async function recoveryKey(state: string, create: boolean): Promise<Buffer> {
+const defaultLockLeaseMs = 10_000
+const defaultLockWaitMs = 2_000
+
+function leaseNow(adapter: NoteFileAdapter): number {
+  return (adapter.now ?? Date.now)()
+}
+
+function leaseDelay(adapter: NoteFileAdapter, milliseconds: number): Promise<void> {
+  return (
+    adapter.delay?.(milliseconds) ??
+    new Promise<void>((resolve) => setTimeout(resolve, milliseconds))
+  )
+}
+
+function processLiveness(adapter: NoteFileAdapter, pid: number): boolean | undefined {
+  if (adapter.isProcessAlive !== undefined) {
+    try {
+      return adapter.isProcessAlive(pid)
+    } catch {
+      return undefined
+    }
+  }
+  if (!Number.isSafeInteger(pid) || pid <= 0) return false
+  try {
+    process.kill(pid, 0)
+    return true
+  } catch (error) {
+    const code = (error as NodeJS.ErrnoException).code
+    if (code === "ESRCH") return false
+    return undefined
+  }
+}
+
+function isLeaseMetadata(value: unknown): value is LeaseMetadata {
+  if (typeof value !== "object" || value === null) return false
+  const lease = value as Partial<LeaseMetadata>
+  return (
+    lease.version === 1 &&
+    typeof lease.token === "string" &&
+    /^[a-f0-9-]{16,128}$/i.test(lease.token) &&
+    typeof lease.pid === "number" &&
+    Number.isSafeInteger(lease.pid) &&
+    lease.pid > 0 &&
+    typeof lease.createdAt === "number" &&
+    Number.isFinite(lease.createdAt) &&
+    typeof lease.heartbeatAt === "number" &&
+    Number.isFinite(lease.heartbeatAt) &&
+    typeof lease.leaseExpiresAt === "number" &&
+    Number.isFinite(lease.leaseExpiresAt) &&
+    lease.createdAt <= lease.heartbeatAt &&
+    lease.heartbeatAt < lease.leaseExpiresAt
+  )
+}
+
+async function readLease(path: string, parent: string): Promise<LeaseMetadata | undefined> {
+  const checked = await readContainedRegularFile(path, parent)
+  if (checked === undefined || (process.platform !== "win32" && (checked.mode & 0o777) !== 0o600)) {
+    return undefined
+  }
+  try {
+    const value: unknown = JSON.parse(checked.bytes.toString("utf8"))
+    return isLeaseMetadata(value) ? value : undefined
+  } catch {
+    return undefined
+  }
+}
+
+async function writeLeaseExclusive(path: string, lease: LeaseMetadata): Promise<void> {
+  let handle
+  try {
+    handle = await open(path, "wx", 0o600)
+    await handle.writeFile(JSON.stringify(lease))
+    await handle.sync()
+  } finally {
+    await handle?.close().catch(() => undefined)
+  }
+}
+
+async function replaceLease(path: string, lease: LeaseMetadata): Promise<void> {
+  const temporary = `${path}.heartbeat-${lease.token}-${randomUUID()}`
+  try {
+    await writeLeaseExclusive(temporary, lease)
+    await nodeRename(temporary, path)
+  } finally {
+    await rm(temporary, { force: true }).catch(() => undefined)
+  }
+}
+
+async function acquireLease(
+  candidate: string,
+  parent: string,
+  adapter: NoteFileAdapter,
+): Promise<TargetLock | undefined> {
+  const now = leaseNow(adapter)
+  const leaseMs = Math.max(1, adapter.lockLeaseMs ?? defaultLockLeaseMs)
+  const token = randomUUID()
+  let owned: LeaseMetadata = {
+    version: 1,
+    token,
+    pid: process.pid,
+    createdAt: now,
+    heartbeatAt: now,
+    leaseExpiresAt: now + leaseMs,
+  }
+  let quarantine: string | undefined
+  try {
+    await writeLeaseExclusive(candidate, owned)
+    if ((await readLease(candidate, parent))?.token !== token)
+      throw new Error("lock acquisition could not be revalidated")
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code !== "EEXIST") throw error
+    const stale = await readLease(candidate, parent)
+    if (
+      stale === undefined ||
+      stale.leaseExpiresAt > now ||
+      processLiveness(adapter, stale.pid) !== false
+    ) {
+      return undefined
+    }
+    quarantine = `${candidate}.quarantine-${stale.token}-${randomUUID()}`
+    try {
+      await nodeRename(candidate, quarantine)
+    } catch {
+      return undefined
+    }
+    const moved = await readLease(quarantine, parent)
+    if (moved?.token !== stale.token) return undefined
+    try {
+      await writeLeaseExclusive(candidate, owned)
+      if ((await readLease(candidate, parent))?.token !== token)
+        throw new Error("lock acquisition could not be revalidated")
+    } catch {
+      return undefined
+    }
+    await rm(quarantine, { force: true }).catch(() => undefined)
+    quarantine = undefined
+  }
+
+  let stopped = false
+  let heartbeatWork = Promise.resolve()
+  const heartbeat = setInterval(
+    () => {
+      heartbeatWork = heartbeatWork.then(async () => {
+        if (stopped) return
+        const current = await readLease(candidate, parent)
+        if (current?.token !== token) {
+          stopped = true
+          return
+        }
+        const heartbeatAt = leaseNow(adapter)
+        owned = { ...owned, heartbeatAt, leaseExpiresAt: heartbeatAt + leaseMs }
+        await replaceLease(candidate, owned).catch(() => {
+          stopped = true
+        })
+      })
+    },
+    Math.max(1, Math.floor(leaseMs / 3)),
+  )
+  heartbeat.unref()
+
+  return {
+    async release(): Promise<void> {
+      stopped = true
+      clearInterval(heartbeat)
+      await heartbeatWork.catch(() => undefined)
+      try {
+        const current = await readLease(candidate, parent)
+        if (current?.token === token) await rm(candidate)
+      } catch {
+        // A failed cleanup leaves a conservative lease and never removes another owner.
+      }
+    },
+  }
+}
+
+async function recoveryKey(
+  state: string,
+  create: boolean,
+  adapter: NoteFileAdapter = {},
+): Promise<Buffer> {
   const keys = await stateChild(state, recoveryKeyDirectory, create)
   const path = resolve(keys, recoveryKeyName)
   async function existing(): Promise<Buffer | undefined> {
@@ -494,36 +697,42 @@ async function recoveryKey(state: string, create: boolean): Promise<Buffer> {
   const present = await existing()
   if (present !== undefined) return present
   if (!create) throw appError("RECOVERY_INVALID", "Recovery key is invalid.")
+
   const initializationLock = `${path}.initializing`
-  try {
-    const lock = await open(initializationLock, "wx", 0o600)
-    await lock.close()
-  } catch (error) {
-    if ((error as NodeJS.ErrnoException).code !== "EEXIST") {
+  const deadline = leaseNow(adapter) + Math.max(1, adapter.lockWaitMs ?? defaultLockWaitMs)
+  let lock: TargetLock | undefined
+  while (lock === undefined) {
+    try {
+      lock = await acquireLease(initializationLock, keys, adapter)
+    } catch {
       throw appError("RECOVERY_INVALID", "Recovery key could not be initialized.")
     }
-    for (let attempt = 0; attempt < 128; attempt += 1) {
-      const published = await existing()
-      if (published !== undefined) return published
-      await new Promise<void>((resolve) => setImmediate(resolve))
-    }
-    throw appError("RECOVERY_INVALID", "Recovery key could not be initialized.")
+    if (lock !== undefined) break
+    const published = await existing()
+    if (published !== undefined) return published
+    if (leaseNow(adapter) >= deadline)
+      throw appError("RECOVERY_INVALID", "Recovery key could not be initialized.")
+    await leaseDelay(adapter, 25)
   }
+
   const temporary = `${path}.tmp-${randomUUID()}`
   let handle
   try {
+    const concurrentlyPublished = await existing()
+    if (concurrentlyPublished !== undefined) return concurrentlyPublished
     handle = await open(temporary, "wx", 0o600)
     await handle.writeFile(randomBytes(32))
     await handle.sync()
     await handle.close()
     handle = undefined
+    await adapter.beforeKeyPublish?.()
     await nodeRename(temporary, path)
-  } catch (error) {
+  } catch {
     throw appError("RECOVERY_INVALID", "Recovery key could not be initialized.")
   } finally {
     await handle?.close().catch(() => undefined)
     await rm(temporary, { force: true }).catch(() => undefined)
-    await rm(initializationLock, { force: true }).catch(() => undefined)
+    await lock.release()
   }
   try {
     return await readProtectedKey(path, keys)
@@ -532,36 +741,21 @@ async function recoveryKey(state: string, create: boolean): Promise<Buffer> {
   }
 }
 
-async function acquireTargetLock(workspace: string, path: string): Promise<TargetLock> {
+async function acquireTargetLock(
+  workspace: string,
+  path: string,
+  adapter: NoteFileAdapter,
+): Promise<TargetLock> {
   const recovery = await recoveryRoot(workspace, true)
   const locks = await stateChild(dirname(recovery), "locks", true)
   const candidate = resolve(locks, `${hash(path)}.lock`)
-  let handle
-  let lockIdentity: string
   try {
-    handle = await open(candidate, "wx", 0o600)
-    lockIdentity = identity(await handle.stat({ bigint: true }))
-  } catch (error) {
-    await handle?.close().catch(() => undefined)
-    if ((error as NodeJS.ErrnoException).code === "EEXIST") {
-      throw appError("NOTE_FILE_LOCKED", "The note is being saved by another process.", { path })
-    }
+    const lock = await acquireLease(candidate, locks, adapter)
+    if (lock !== undefined) return lock
+  } catch {
     throw accessFailure(path)
   }
-  return {
-    async release(): Promise<void> {
-      await handle.close().catch(() => undefined)
-      try {
-        const current = await lstat(candidate, { bigint: true })
-        // Never remove a path that no longer has the identity we exclusively created.
-        if (!current.isSymbolicLink() && identity(current) === lockIdentity) {
-          await rm(candidate)
-        }
-      } catch {
-        // A failed cleanup can leave a conservative lock, but never deletes a live replacement.
-      }
-    },
-  }
+  throw appError("NOTE_FILE_LOCKED", "The note is being saved by another process.", { path })
 }
 
 function manifestPayload(manifest: Omit<RecoveryManifest, "integrity">): string {
@@ -592,9 +786,10 @@ async function createRecovery(
   workspace: string,
   originalPath: string,
   checked: CheckedFile,
+  adapter: NoteFileAdapter = {},
 ): Promise<RecoverySummary> {
   const root = await recoveryRoot(workspace, true)
-  const key = await recoveryKey(dirname(root), true)
+  const key = await recoveryKey(dirname(root), true, adapter)
   const id = `${Date.now()}-${randomUUID()}`
   const directory = resolve(root, id)
   const manifestData: Omit<RecoveryManifest, "integrity"> = {
@@ -658,42 +853,99 @@ async function syncContainingDirectory(target: string): Promise<void> {
   }
 }
 
+interface SafeFileContents {
+  readonly bytes: Buffer
+  readonly identity: string
+  readonly mode: number
+}
+
+async function readContainedRegularFile(
+  path: string,
+  parent: string,
+): Promise<SafeFileContents | undefined> {
+  let handle
+  try {
+    const before = await lstat(path, { bigint: true })
+    if (before.isSymbolicLink() || !before.isFile()) return undefined
+    const canonical = await realpath(path)
+    if (!isInside(parent, canonical)) return undefined
+    const flags = process.platform === "win32" ? "r" : constants.O_RDONLY | constants.O_NOFOLLOW
+    handle = await open(path, flags)
+    const opened = await handle.stat({ bigint: true })
+    if (!opened.isFile() || identity(before) !== identity(opened)) return undefined
+    const bytes = await handle.readFile()
+    const after = await lstat(path, { bigint: true })
+    if (
+      after.isSymbolicLink() ||
+      !after.isFile() ||
+      identity(before) !== identity(after) ||
+      identity(opened) !== identity(after) ||
+      !pathsEqual(canonical, await realpath(path))
+    ) {
+      return undefined
+    }
+    return { bytes, identity: identity(opened), mode: Number(opened.mode) }
+  } catch {
+    return undefined
+  } finally {
+    await handle?.close().catch(() => undefined)
+  }
+}
+
 async function writeTempAndReplace(
   target: string,
   displayPath: string,
   bytes: Buffer,
+  recoveryBytes: Buffer | undefined,
   mode: number | undefined,
   adapter: NoteFileAdapter,
   verifyBeforeCommit: () => Promise<void>,
 ): Promise<void> {
   const temp = `${target}.garden-publisher-tmp-${randomUUID()}`
   let handle
+  let stagedIdentity: string | undefined
 
-  async function bytesAt(path: string): Promise<Buffer | undefined> {
-    let handle
+  async function rollback(): Promise<boolean> {
+    if (recoveryBytes === undefined) return false
+    const rollbackTemp = `${target}.garden-publisher-rollback-${randomUUID()}`
+    let rollbackHandle
     try {
-      const before = await lstat(path, { bigint: true })
-      if (before.isSymbolicLink() || !before.isFile()) return undefined
-      const canonical = await realpath(path)
-      if (!isInside(dirname(path), canonical)) return undefined
-      const flags = process.platform === "win32" ? "r" : constants.O_RDONLY | constants.O_NOFOLLOW
-      handle = await open(path, flags)
-      const opened = await handle.stat({ bigint: true })
-      if (!opened.isFile() || identity(before) !== identity(opened)) return undefined
-      const source = await handle.readFile()
-      const after = await lstat(path, { bigint: true })
+      rollbackHandle = await open(rollbackTemp, "wx", 0o600)
+      await rollbackHandle.writeFile(recoveryBytes)
+      await rollbackHandle.sync()
+      const writtenIdentity = identity(await rollbackHandle.stat({ bigint: true }))
+      await rollbackHandle.close()
+      rollbackHandle = undefined
+      const staged = await readContainedRegularFile(rollbackTemp, dirname(rollbackTemp))
       if (
-        after.isSymbolicLink() ||
-        identity(before) !== identity(after) ||
-        !pathsEqual(canonical, await realpath(path))
+        staged === undefined ||
+        staged.identity !== writtenIdentity ||
+        staged.bytes.length !== recoveryBytes.length ||
+        hash(staged.bytes) !== hash(recoveryBytes) ||
+        !staged.bytes.equals(recoveryBytes) ||
+        (process.platform !== "win32" && (staged.mode & 0o777) !== 0o600)
       ) {
-        return undefined
+        return false
       }
-      return source
+      try {
+        await (adapter.rename ?? nodeRename)(rollbackTemp, target)
+      } catch {
+        const restored = await readContainedRegularFile(target, dirname(target))
+        if (!restored?.bytes.equals(recoveryBytes)) return false
+      }
+      if (mode !== undefined) await chmod(target, mode & 0o777)
+      await (adapter.syncDirectory ?? syncContainingDirectory)(target)
+      const restored = await readContainedRegularFile(target, dirname(target))
+      return (
+        restored !== undefined &&
+        restored.bytes.length === recoveryBytes.length &&
+        hash(restored.bytes) === hash(recoveryBytes) &&
+        restored.bytes.equals(recoveryBytes)
+      )
     } catch {
-      return undefined
+      return false
     } finally {
-      await handle?.close().catch(() => undefined)
+      await rollbackHandle?.close().catch(() => undefined)
     }
   }
 
@@ -703,6 +955,7 @@ async function writeTempAndReplace(
     await handle.writeFile(bytes)
     await adapter.beforeTempSync?.(temp)
     await handle.sync()
+    stagedIdentity = identity(await handle.stat({ bigint: true }))
     await handle.close()
     handle = undefined
     await adapter.beforeCommit?.(temp)
@@ -710,18 +963,52 @@ async function writeTempAndReplace(
     await verifyBeforeCommit()
     // Keep staged content owner-only until it has been completely written,
     // flushed, closed, and revalidated immediately before the final swap.
-    if (mode !== undefined) await chmod(temp, mode & 0o777)
+    const staged = await readContainedRegularFile(temp, dirname(temp))
+    if (
+      staged === undefined ||
+      staged.identity !== stagedIdentity ||
+      staged.bytes.length !== bytes.length ||
+      hash(staged.bytes) !== hash(bytes) ||
+      !staged.bytes.equals(bytes) ||
+      (process.platform !== "win32" && (staged.mode & 0o777) !== 0o600)
+    ) {
+      throw new Error("staged content changed")
+    }
     try {
       await (adapter.rename ?? nodeRename)(temp, target)
     } catch (renameError) {
       // A replace can complete before an adapter reports failure. Inspect the
       // live target: reporting failure after installing the requested bytes
       // would mislead a concurrent editor and discard a completed operation.
-      if (!(await bytesAt(target))?.equals(bytes)) throw renameError
+      if (!(await readContainedRegularFile(target, dirname(target)))?.bytes.equals(bytes))
+        throw renameError
     }
-    const installed = await bytesAt(target)
-    if (!installed?.equals(bytes)) throw new Error("replacement identity changed")
-    await syncContainingDirectory(target)
+    try {
+      if (mode !== undefined) await chmod(target, mode & 0o777)
+      await adapter.afterReplace?.(displayPath)
+      const installed = await readContainedRegularFile(target, dirname(target))
+      if (
+        installed === undefined ||
+        installed.bytes.length !== bytes.length ||
+        hash(installed.bytes) !== hash(bytes) ||
+        !installed.bytes.equals(bytes)
+      ) {
+        throw new Error("replacement identity changed")
+      }
+      await (adapter.syncDirectory ?? syncContainingDirectory)(target)
+      const durable = await readContainedRegularFile(target, dirname(target))
+      if (
+        durable === undefined ||
+        durable.bytes.length !== bytes.length ||
+        hash(durable.bytes) !== hash(bytes) ||
+        !durable.bytes.equals(bytes)
+      ) {
+        throw new Error("replacement changed during directory sync")
+      }
+    } catch {
+      if (!(await rollback())) throw uncertainCommit()
+      throw writeFailure(displayPath)
+    }
   } catch (error) {
     if (isNoteError(error)) throw error
     throw writeFailure(displayPath)
@@ -788,7 +1075,7 @@ export async function saveNote(
   const workspace = await canonicalWorkspace(input.workspace)
   const parsed = parseManagedPath(workspace, input.path)
   const root = await managedRoot(workspace, parsed.visibility)
-  const lock = await acquireTargetLock(workspace, parsed.displayPath)
+  const lock = await acquireTargetLock(workspace, parsed.displayPath, adapter)
   try {
     const current = await readCheckedFile(root, parsed.domain, parsed.filename)
     if (
@@ -803,7 +1090,8 @@ export async function saveNote(
     if (!input.expectedContentHash || !/^[a-f0-9]{64}$/i.test(input.expectedContentHash)) {
       throw invalidPath(parsed.displayPath)
     }
-    await createRecovery(workspace, parsed.displayPath, current)
+    const recovery = await createRecovery(workspace, parsed.displayPath, current, adapter)
+    const authenticatedRecovery = await readRecovery(workspace, recovery.id)
     const directory = await checkedDomain(root, parsed.domain, false)
     const target = resolve(directory, parsed.filename)
     const bytes = Buffer.from(input.markdown, "utf8")
@@ -811,6 +1099,7 @@ export async function saveNote(
       target,
       parsed.displayPath,
       bytes,
+      authenticatedRecovery.bytes,
       current.mode,
       adapter,
       async () => {
@@ -993,7 +1282,7 @@ export async function restoreRecovery(
   const entry = await readRecovery(workspace, input.id)
   const parsed = parseManagedPath(workspace, entry.manifest.originalPath)
   const root = await managedRoot(workspace, parsed.visibility)
-  const lock = await acquireTargetLock(workspace, parsed.displayPath)
+  const lock = await acquireTargetLock(workspace, parsed.displayPath, adapter)
   try {
     const target = resolve(await checkedDomain(root, parsed.domain, false), parsed.filename)
     let current: CheckedFile | undefined
@@ -1011,12 +1300,13 @@ export async function restoreRecovery(
           path: parsed.displayPath,
         })
       }
-      await createRecovery(workspace, parsed.displayPath, current)
+      await createRecovery(workspace, parsed.displayPath, current, adapter)
     }
     await writeTempAndReplace(
       target,
       parsed.displayPath,
       entry.bytes,
+      current?.bytes,
       current?.mode,
       adapter,
       async () => {
