@@ -190,6 +190,13 @@ interface JournalManifest extends JournalPayload {
   integrity: string
 }
 
+interface QuarantinedRecreation {
+  path: string
+  quarantine: string
+  identity: string
+  kind: "file" | "directory"
+}
+
 function transactionError(
   code: Extract<AppError["code"], `TRANSACTION_${string}`>,
   message: string,
@@ -623,24 +630,102 @@ function referenceLabel(value: string): string {
   return value.trim().replace(/\s+/g, " ").toLowerCase()
 }
 
-function localReferenceOccurrences(source: string, failurePath = "."): LocalReferenceOccurrence[] {
-  const mask = markdownMask(source)
+function unescapeMarkdownDestination(value: string): string {
+  return value.replace(/\\(.)/g, "$1")
+}
+
+function inlineMarkdownOccurrences(
+  source: string,
+  mask: string,
+  failurePath: string,
+): LocalReferenceOccurrence[] {
   const occurrences: LocalReferenceOccurrence[] = []
-  const ordinary = /!?\[[^\]\n]*\]\(([^)\s]+)(?:\s+[^)]*)?\)/g
-  for (const match of mask.matchAll(ordinary)) {
-    const index = match.index
-    if (escapedAt(source, index)) continue
-    const maskedTarget = match[1]
-    const targetOffset = match[0].indexOf(maskedTarget)
-    let start = index + targetOffset
-    let end = start + maskedTarget.length
-    if (source[start] === "<" && source[end - 1] === ">") {
-      start += 1
-      end -= 1
+  const opener = /!?\[[^\]\r\n]*\]\(/g
+  for (const match of mask.matchAll(opener)) {
+    if (escapedAt(source, match.index)) continue
+    let cursor = match.index + match[0].length
+    while (mask[cursor] === " " || mask[cursor] === "\t") cursor += 1
+    let start = cursor
+    let end = cursor
+    if (mask[cursor] === "<") {
+      start = ++cursor
+      while (cursor < mask.length && mask[cursor] !== "\n" && mask[cursor] !== "\r") {
+        if (mask[cursor] === "\\" && cursor + 1 < mask.length) {
+          cursor += 2
+          continue
+        }
+        if (mask[cursor] === ">") break
+        if (mask[cursor] === "<") throw blocked("UNSUPPORTED_ATTACHMENT_REFERENCE", failurePath)
+        cursor += 1
+      }
+      if (mask[cursor] !== ">") throw blocked("UNSUPPORTED_ATTACHMENT_REFERENCE", failurePath)
+      end = cursor
+      cursor += 1
+    } else {
+      let depth = 0
+      while (cursor < mask.length && mask[cursor] !== "\n" && mask[cursor] !== "\r") {
+        const character = mask[cursor]
+        if (character === "\\" && cursor + 1 < mask.length) {
+          cursor += 2
+          continue
+        }
+        if (character === "(") {
+          depth += 1
+          cursor += 1
+          continue
+        }
+        if (character === ")") {
+          if (depth === 0) break
+          depth -= 1
+          cursor += 1
+          continue
+        }
+        if ((character === " " || character === "\t") && depth === 0) break
+        cursor += 1
+      }
+      end = cursor
+      if (depth !== 0) {
+        throw blocked("UNSUPPORTED_ATTACHMENT_REFERENCE", failurePath)
+      }
+    }
+    const hadSeparator = mask[cursor] === " " || mask[cursor] === "\t"
+    while (mask[cursor] === " " || mask[cursor] === "\t") cursor += 1
+    if (mask[cursor] !== ")") {
+      if (!hadSeparator || !['"', "'", "("].includes(mask[cursor] ?? "")) {
+        throw blocked("UNSUPPORTED_ATTACHMENT_REFERENCE", failurePath)
+      }
+      const opening = mask[cursor]
+      const closing = opening === "(" ? ")" : opening
+      cursor += 1
+      let closed = false
+      while (cursor < mask.length && mask[cursor] !== "\n" && mask[cursor] !== "\r") {
+        if (mask[cursor] === "\\" && cursor + 1 < mask.length) {
+          cursor += 2
+          continue
+        }
+        if (mask[cursor] === closing) {
+          closed = true
+          cursor += 1
+          break
+        }
+        cursor += 1
+      }
+      if (!closed) throw blocked("UNSUPPORTED_ATTACHMENT_REFERENCE", failurePath)
+      while (mask[cursor] === " " || mask[cursor] === "\t") cursor += 1
+      if (mask[cursor] !== ")") throw blocked("UNSUPPORTED_ATTACHMENT_REFERENCE", failurePath)
     }
     const target = source.slice(start, end)
-    if (!externalReference(target)) occurrences.push({ start, end, target, syntax: "markdown" })
+    if (target.length === 0) continue
+    if (!externalReference(unescapeMarkdownDestination(target))) {
+      occurrences.push({ start, end, target, syntax: "markdown" })
+    }
   }
+  return occurrences
+}
+
+function localReferenceOccurrences(source: string, failurePath = "."): LocalReferenceOccurrence[] {
+  const mask = markdownMask(source)
+  const occurrences = inlineMarkdownOccurrences(source, mask, failurePath)
   const embeds = /!\[\[([^\]\n]+)\]\]/g
   for (const match of mask.matchAll(embeds)) {
     const index = match.index
@@ -719,7 +804,7 @@ function attachmentCandidate(
 ): string | undefined {
   let decoded: string
   try {
-    decoded = decodeURIComponent(occurrence.target.split(/[?#]/, 1)[0])
+    decoded = decodeURIComponent(unescapeMarkdownDestination(occurrence.target).split(/[?#]/, 1)[0])
   } catch {
     throw blocked("AMBIGUOUS_ATTACHMENT", note.path)
   }
@@ -1725,8 +1810,10 @@ async function replacePlannedFile(
   bytes: Buffer,
   mode: number,
   expected: TransactionRevision,
+  expectedIdentity: string,
   journalDirectory: string,
   adapter: NoteTransactionAdapter,
+  quarantinedOriginals: Set<string>,
   onPublished: (identity?: string) => void,
 ): Promise<void> {
   const target = absolutePath(workspace, path)
@@ -1734,12 +1821,28 @@ async function replacePlannedFile(
   const quarantined = resolve(originals, `${sha256(path)}.bin`)
   await mkdir(originals, { mode: 0o700 })
   await syncDirectory(journalDirectory)
-  await adapter.beforeLinkQuarantine?.(path)
+  quarantinedOriginals.add(path)
+  try {
+    await adapter.beforeLinkQuarantine?.(path)
+  } catch (error) {
+    quarantinedOriginals.delete(path)
+    throw error
+  }
   try {
     await rename(target, quarantined)
     await syncDirectory(dirname(target))
     await syncDirectory(originals)
-  } catch {
+  } catch (error) {
+    const retained = await safeAbsoluteFile(quarantined, journalDirectory)
+    if (retained !== undefined && retained.identity === expectedIdentity) throw error
+    if ((await pathState(workspace, path)) === "absent") {
+      throw transactionError(
+        "TRANSACTION_UNCERTAIN",
+        "A Wiki-link source quarantine could not be confirmed.",
+        { path },
+      )
+    }
+    quarantinedOriginals.delete(path)
     throw transactionError("TRANSACTION_STALE", "A Wiki-link source changed during execution.", {
       path,
     })
@@ -1751,6 +1854,7 @@ async function replacePlannedFile(
       await rm(quarantined)
       await syncDirectory(dirname(target))
       await syncDirectory(originals)
+      quarantinedOriginals.delete(path)
     } catch {
       throw transactionError(
         "TRANSACTION_UNCERTAIN",
@@ -1767,6 +1871,7 @@ async function replacePlannedFile(
     await publishExclusive(workspace, path, bytes, mode, adapter, onPublished)
     await rm(quarantined)
     await syncDirectory(originals)
+    quarantinedOriginals.delete(path)
   } catch (error) {
     if ((await pathState(workspace, path)) === "absent") {
       try {
@@ -1774,6 +1879,7 @@ async function replacePlannedFile(
         await rm(quarantined)
         await syncDirectory(dirname(target))
         await syncDirectory(originals)
+        quarantinedOriginals.delete(path)
       } catch {
         throw transactionError(
           "TRANSACTION_UNCERTAIN",
@@ -2021,6 +2127,112 @@ async function removeSources(
   }
 }
 
+async function quarantineRecreatedSources(
+  workspace: string,
+  plan: NoteTransactionPlan,
+  journalDirectory: string,
+  recreations: Map<string, QuarantinedRecreation>,
+): Promise<boolean> {
+  const attachmentMoves = plan.moves.filter(({ kind }) => kind === "attachment")
+  const sourceRoot = attachmentMoves[0]?.source.split("/").slice(0, 3).join("/")
+  const candidates = [
+    { path: plan.source, kind: "file" as const, name: "note" },
+    ...(sourceRoot ? [{ path: sourceRoot, kind: "directory" as const, name: "attachments" }] : []),
+  ]
+  const root = resolve(journalDirectory, "external-recreations")
+  let found = false
+  for (const candidate of candidates) {
+    const absolute = absolutePath(workspace, candidate.path)
+    let before
+    try {
+      before = await lstat(absolute, { bigint: true })
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code === "ENOENT") continue
+      throw transactionError(
+        "TRANSACTION_UNCERTAIN",
+        "A source path could not be revalidated after quarantine.",
+        { path: candidate.path },
+      )
+    }
+    if (
+      before.isSymbolicLink() ||
+      (candidate.kind === "file" ? !before.isFile() : !before.isDirectory())
+    ) {
+      throw transactionError(
+        "TRANSACTION_UNCERTAIN",
+        "A recreated source path has an unsafe type.",
+        { path: candidate.path },
+      )
+    }
+    try {
+      await mkdir(root, { mode: 0o700 })
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code !== "EEXIST") throw error
+      await ensureSafeDirectory(root, journalDirectory)
+    }
+    const quarantine = resolve(root, candidate.name)
+    const identity = candidate.kind === "file" ? fileIdentity(before) : directoryIdentity(before)
+    const recreation: QuarantinedRecreation = {
+      path: candidate.path,
+      quarantine,
+      identity,
+      kind: candidate.kind,
+    }
+    recreations.set(candidate.path, recreation)
+    try {
+      await rename(absolute, quarantine)
+    } catch (error) {
+      const moved = await lstat(quarantine, { bigint: true }).catch(() => undefined)
+      const movedIdentity =
+        moved === undefined
+          ? undefined
+          : candidate.kind === "file" && moved.isFile()
+            ? fileIdentity(moved)
+            : candidate.kind === "directory" && moved.isDirectory()
+              ? directoryIdentity(moved)
+              : undefined
+      if (movedIdentity === identity) {
+        found = true
+        await syncDirectory(dirname(absolute))
+        await syncDirectory(root)
+        continue
+      }
+      if (
+        (error as NodeJS.ErrnoException).code === "ENOENT" &&
+        (await pathState(workspace, candidate.path)) === "absent"
+      ) {
+        recreations.delete(candidate.path)
+        continue
+      }
+      throw transactionError(
+        "TRANSACTION_UNCERTAIN",
+        "A recreated source path could not be quarantined safely.",
+        { path: candidate.path },
+      )
+    }
+    found = true
+    await syncDirectory(dirname(absolute))
+    await syncDirectory(root)
+    const moved = await lstat(quarantine, { bigint: true }).catch(() => undefined)
+    const movedIdentity =
+      moved === undefined
+        ? undefined
+        : candidate.kind === "file" && moved.isFile()
+          ? fileIdentity(moved)
+          : candidate.kind === "directory" && moved.isDirectory()
+            ? directoryIdentity(moved)
+            : undefined
+    if (movedIdentity !== identity) {
+      throw transactionError(
+        "TRANSACTION_UNCERTAIN",
+        "A recreated source quarantine could not be verified.",
+        { path: candidate.path },
+      )
+    }
+  }
+  return found
+}
+
 async function safeAbsoluteFile(path: string, parent: string): Promise<SafeFile | undefined> {
   let handle
   try {
@@ -2108,8 +2320,11 @@ async function rollback(
   publishedRoots: ReadonlySet<string>,
   removedSources: ReadonlySet<string>,
   installedIdentities: ReadonlyMap<string, string>,
+  quarantinedOriginals: Set<string>,
+  externalRecreations: ReadonlyMap<string, QuarantinedRecreation>,
 ): Promise<boolean> {
   try {
+    let rollbackCertain = true
     await adapter.beforeRollback?.()
     const attachmentMoves = plan.moves.filter(({ kind }) => kind === "attachment")
     const sourceRoot = attachmentMoves[0]?.source.split("/").slice(0, 3).join("/")
@@ -2126,19 +2341,21 @@ async function rollback(
         !(await treeMatchesSourceRevisions(removedAssets, sourceRoot, attachmentMoves))
       )
         return false
-      if ((await pathState(workspace, sourceRoot)) !== "absent") return false
-      await rename(removedAssets, absolutePath(workspace, sourceRoot))
-      await syncDirectory(dirname(absolutePath(workspace, sourceRoot)))
-      await syncDirectory(removed)
-      if (
-        canonicalJson(await treeSnapshot(absolutePath(workspace, sourceRoot))) !==
-        canonicalJson(expected)
-      )
-        return false
+      if (!externalRecreations.has(sourceRoot)) {
+        if ((await pathState(workspace, sourceRoot)) !== "absent") return false
+        await rename(removedAssets, absolutePath(workspace, sourceRoot))
+        await syncDirectory(dirname(absolutePath(workspace, sourceRoot)))
+        await syncDirectory(removed)
+        if (
+          canonicalJson(await treeSnapshot(absolutePath(workspace, sourceRoot))) !==
+          canonicalJson(expected)
+        )
+          return false
+      }
     }
     const sourceBackup = journal.backupFiles.get(plan.source)
     if (!sourceBackup) return false
-    if (removedSources.has(plan.source)) {
+    if (removedSources.has(plan.source) && !externalRecreations.has(plan.source)) {
       const removedNote = resolve(removed, "note.md")
       const quarantined = await safeAbsoluteFile(removedNote, journal.directory)
       if (
@@ -2204,7 +2421,33 @@ async function rollback(
       const backup = journal.backupFiles.get(path)
       if (!backup) return false
       const appliedHash = appliedHashes.get(path)
-      if (appliedHash === undefined) continue
+      const forwardOriginal = resolve(journal.directory, "forward-originals", `${sha256(path)}.bin`)
+      if (appliedHash === undefined) {
+        if (!quarantinedOriginals.has(path)) continue
+        const retained = await safeAbsoluteFile(forwardOriginal, journal.directory)
+        if (
+          retained === undefined ||
+          retained.identity !== backup.identity ||
+          retained.revision.contentHash !== backup.revision.contentHash
+        )
+          return false
+        if ((await pathState(workspace, path)) !== "absent") {
+          rollbackCertain = false
+          continue
+        }
+        try {
+          await link(forwardOriginal, absolutePath(workspace, path))
+          const restored = await safeFile(workspace, path)
+          if (restored.identity !== retained.identity) return false
+          await rm(forwardOriginal)
+          await syncDirectory(dirname(absolutePath(workspace, path)))
+          await syncDirectory(dirname(forwardOriginal))
+          quarantinedOriginals.delete(path)
+        } catch {
+          return false
+        }
+        continue
+      }
       const quarantinedPath = resolve(linkQuarantine, `${sha256(path)}.bin`)
       try {
         await rename(absolutePath(workspace, path), quarantinedPath)
@@ -2225,7 +2468,6 @@ async function rollback(
       await publishExclusive(workspace, path, backup.bytes, backup.mode, {}, () => undefined)
       await rm(quarantinedPath)
       await syncDirectory(linkQuarantine)
-      const forwardOriginal = resolve(journal.directory, "forward-originals", `${sha256(path)}.bin`)
       const retained = await safeAbsoluteFile(forwardOriginal, journal.directory)
       if (retained !== undefined) {
         if (retained.revision.contentHash !== backup.revision.contentHash) return false
@@ -2255,16 +2497,52 @@ async function rollback(
       await rm(quarantinedTarget)
       await syncDirectory(quarantine)
     }
+    for (const recreation of externalRecreations.values()) {
+      if ((await pathState(workspace, recreation.path)) !== "absent") return false
+      if (recreation.kind === "file") {
+        const retained = await safeAbsoluteFile(recreation.quarantine, journal.directory)
+        if (retained === undefined || retained.identity !== recreation.identity) return false
+        try {
+          await link(recreation.quarantine, absolutePath(workspace, recreation.path))
+        } catch {
+          return false
+        }
+        const restored = await safeFile(workspace, recreation.path)
+        if (restored.identity !== recreation.identity) return false
+        await rm(recreation.quarantine)
+      } else {
+        if ((await currentDirectoryIdentity(recreation.quarantine)) !== recreation.identity) {
+          return false
+        }
+        try {
+          await rename(recreation.quarantine, absolutePath(workspace, recreation.path))
+        } catch {
+          return false
+        }
+        if (
+          (await currentDirectoryIdentity(absolutePath(workspace, recreation.path))) !==
+          recreation.identity
+        ) {
+          return false
+        }
+      }
+      await syncDirectory(dirname(absolutePath(workspace, recreation.path)))
+      await syncDirectory(dirname(recreation.quarantine))
+    }
     for (const [path, backup] of journal.backupFiles) {
       const attachmentSource = sourceRoot !== undefined && path.startsWith(`${sourceRoot}/`)
       const unappliedLink =
         path !== plan.source &&
         plan.linkEdits.some((edit) => edit.path === path) &&
         !appliedHashes.has(path)
+      const externallyRecreated =
+        externalRecreations.has(path) ||
+        (attachmentSource && sourceRoot !== undefined && externalRecreations.has(sourceRoot))
       if (
         (path === plan.source && !removedSources.has(plan.source)) ||
         (attachmentSource && !removedSources.has(sourceRoot!)) ||
-        unappliedLink
+        unappliedLink ||
+        externallyRecreated
       )
         continue
       const current = await safeFile(workspace, path)
@@ -2282,6 +2560,7 @@ async function rollback(
       (await pathState(workspace, targetRoot)) !== "absent"
     )
       return false
+    if (!rollbackCertain) return false
     await updateJournal(journal, "rolled-back", key)
     return true
   } catch {
@@ -2445,6 +2724,8 @@ async function execute(
   const publishedRoots = new Set<string>()
   const removedSources = new Set<string>()
   const installedIdentities = new Map<string, string>()
+  const quarantinedOriginals = new Set<string>()
+  const externalRecreations = new Map<string, QuarantinedRecreation>()
   try {
     await locks.assertOwned()
     await revalidatePlan(workspace, plan)
@@ -2503,14 +2784,17 @@ async function execute(
       }
       const updated = Buffer.from(applyWikiEdits(current.bytes.toString("utf8"), edits), "utf8")
       await locks.assertOwned()
+      await updateJournal(journal, "link-quarantine-intent", key)
       await replacePlannedFile(
         workspace,
         path,
         updated,
         current.mode,
         edits[0].revision,
+        current.identity,
         journal.directory,
         adapter,
+        quarantinedOriginals,
         (identity) => {
           appliedHashes.set(path, sha256(updated))
           if (identity !== undefined) installedIdentities.set(path, identity)
@@ -2543,6 +2827,15 @@ async function execute(
     await locks.assertOwned()
     await updateJournal(journal, "source-removed", key)
     await adapter.afterPhase?.("source-removed")
+
+    await locks.assertOwned()
+    await updateJournal(journal, "source-recreation-check-intent", key)
+    if (await quarantineRecreatedSources(workspace, plan, journal.directory, externalRecreations)) {
+      throw transactionError(
+        "TRANSACTION_STALE",
+        "A source path was recreated before the transaction completed.",
+      )
+    }
 
     await updateJournal(journal, "complete", key)
     const changedPaths = planPaths(plan).sort((left, right) => left.localeCompare(right))
@@ -2578,6 +2871,8 @@ async function execute(
         publishedRoots,
         removedSources,
         installedIdentities,
+        quarantinedOriginals,
+        externalRecreations,
       )
       if (!restored) {
         await updateJournal(journal, "rollback-uncertain", key).catch(() => undefined)

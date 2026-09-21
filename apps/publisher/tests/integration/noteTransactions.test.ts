@@ -325,6 +325,54 @@ describe("note visibility transactions", () => {
     })
   })
 
+  it("blocks CommonMark angle destinations outside the owned tree", async () => {
+    const workspace = await garden({ git: true })
+    await put(
+      workspace,
+      "content/life/angles.md",
+      [
+        "---",
+        "title: Angles",
+        "---",
+        "",
+        '![image](<../shared/chart one.png> "Chart title")',
+        "[download](<../shared/manual one.pdf> 'Manual title')",
+        "",
+      ].join("\n"),
+    )
+
+    await expect(
+      planVisibilityChange({
+        workspace,
+        path: "content/life/angles.md",
+        visibility: "private",
+      }),
+    ).rejects.toMatchObject({
+      code: "TRANSACTION_PLAN_BLOCKED",
+      details: { issue: "AMBIGUOUS_ATTACHMENT" },
+    })
+  })
+
+  it("fails closed for a malformed local angle destination", async () => {
+    const workspace = await garden({ git: true })
+    await put(
+      workspace,
+      "content/life/malformed.md",
+      "---\ntitle: Malformed\n---\n\n![image](<../_assets/malformed/chart one.png)\n",
+    )
+
+    await expect(
+      planVisibilityChange({
+        workspace,
+        path: "content/life/malformed.md",
+        visibility: "private",
+      }),
+    ).rejects.toMatchObject({
+      code: "TRANSACTION_PLAN_BLOCKED",
+      details: { issue: "UNSUPPORTED_ATTACHMENT_REFERENCE" },
+    })
+  })
+
   it("fails closed for an unresolved local image reference", async () => {
     const workspace = await garden({ git: true })
     await put(
@@ -654,6 +702,40 @@ describe("note rename transactions", () => {
     expect(renamed).toContain("https://example.invalid/_assets/topic/chart.png")
   })
 
+  it("parses and rewrites CommonMark angle destinations with spaces and titles", async () => {
+    const workspace = await garden()
+    await put(
+      workspace,
+      "content/life/topic.md",
+      [
+        "---",
+        "title: Topic",
+        "angle: '![front](<../_assets/topic/front one.png>)'",
+        "---",
+        "",
+        '![Chart](<../_assets/topic/chart one.png> "Chart title")',
+        "[Manual](<../_assets/topic/manual one.pdf> 'Manual title')",
+        "[Escaped](<../_assets/topic/escaped\\ file.svg> (Escaped title))",
+        "",
+        "    ![code](<../_assets/topic/code one.png>)",
+        "",
+      ].join("\n"),
+    )
+    await put(workspace, "content/_assets/topic/chart one.png", "chart")
+    await put(workspace, "content/_assets/topic/manual one.pdf", "manual")
+    await put(workspace, "content/_assets/topic/escaped file.svg", "escaped")
+
+    const plan = await planRename({ workspace, path: "content/life/topic.md", slug: "renamed" })
+    await executeRename(plan, { workspace })
+
+    const renamed = await readFile(join(workspace, "content/life/renamed.md"), "utf8")
+    expect(renamed).toContain('![Chart](<../_assets/renamed/chart one.png> "Chart title")')
+    expect(renamed).toContain("[Manual](<../_assets/renamed/manual one.pdf> 'Manual title')")
+    expect(renamed).toContain("[Escaped](<../_assets/renamed/escaped\\ file.svg> (Escaped title))")
+    expect(renamed).toContain("angle: '![front](<../_assets/topic/front one.png>)'")
+    expect(renamed).toContain("    ![code](<../_assets/topic/code one.png>)")
+  })
+
   it("updates owned reference definitions while leaving reference uses and code unchanged", async () => {
     const workspace = await garden()
     await put(
@@ -879,6 +961,110 @@ describe("note rename transactions", () => {
 })
 
 describe("transaction recovery", () => {
+  it("restores a link source when failure occurs after atomic quarantine", async () => {
+    const workspace = await garden()
+    const original = "Incoming [[life/topic]]\n"
+    await put(workspace, "content/life/topic.md", "---\ntitle: Topic\n---\n")
+    await put(workspace, "content/reading/ref.md", original)
+    const plan = await planRename({ workspace, path: "content/life/topic.md", slug: "renamed" })
+
+    await expect(
+      executeRename(plan, {
+        workspace,
+        adapter: {
+          afterLinkQuarantine() {
+            throw new Error("injected post-quarantine failure")
+          },
+        },
+      }),
+    ).rejects.toMatchObject({ code: "TRANSACTION_FAILED" })
+
+    expect(await readFile(join(workspace, "content/reading/ref.md"), "utf8")).toBe(original)
+    expect(await exists(join(workspace, "content/life/renamed.md"))).toBe(false)
+    expect(await inspectPendingTransactions({ workspace })).toEqual([])
+  })
+
+  it("preserves an external link replacement and retains an uncertain journal", async () => {
+    const workspace = await garden()
+    const external = "EXTERNAL [[life/topic]]\n"
+    await put(workspace, "content/life/topic.md", "---\ntitle: Topic\n---\n")
+    await put(workspace, "content/reading/ref.md", "Incoming [[life/topic]]\n")
+    const plan = await planRename({ workspace, path: "content/life/topic.md", slug: "renamed" })
+
+    await expect(
+      executeRename(plan, {
+        workspace,
+        adapter: {
+          async afterLinkQuarantine(path) {
+            await writeFile(join(workspace, path), external)
+            throw new Error("external replacement after quarantine")
+          },
+        },
+      }),
+    ).rejects.toMatchObject({ code: "TRANSACTION_UNCERTAIN" })
+
+    expect(await readFile(join(workspace, "content/reading/ref.md"), "utf8")).toBe(external)
+    expect(await exists(join(workspace, "content/life/renamed.md"))).toBe(false)
+    await expect(inspectPendingTransactions({ workspace })).resolves.toEqual([
+      expect.objectContaining({ id: plan.id, phase: "rollback-uncertain" }),
+    ])
+  })
+
+  it("preserves a source note recreated after quarantine and rejects success", async () => {
+    const workspace = await garden()
+    const external = "---\ntitle: RECREATED_NOTE\n---\n"
+    await put(workspace, "private/life/topic.md", "---\ntitle: Original\n---\n")
+    const plan = await planVisibilityChange({
+      workspace,
+      path: "private/life/topic.md",
+      visibility: "public",
+    })
+
+    await expect(
+      executeVisibilityChange(plan, {
+        workspace,
+        adapter: {
+          async afterSourceQuarantine(path) {
+            if (path === plan.source) await writeFile(join(workspace, path), external)
+          },
+        },
+      }),
+    ).rejects.toMatchObject({ code: "TRANSACTION_STALE" })
+
+    expect(await readFile(join(workspace, plan.source), "utf8")).toBe(external)
+    expect(await exists(join(workspace, plan.target))).toBe(false)
+  })
+
+  it("preserves an attachment tree recreated after quarantine and rejects success", async () => {
+    const workspace = await garden()
+    await put(workspace, "private/life/topic.md", "---\ntitle: Original\n---\n")
+    await put(workspace, "private/_assets/topic/original.bin", "original")
+    const plan = await planVisibilityChange({
+      workspace,
+      path: "private/life/topic.md",
+      visibility: "public",
+    })
+
+    await expect(
+      executeVisibilityChange(plan, {
+        workspace,
+        adapter: {
+          async afterSourceQuarantine(path) {
+            if (path === "private/_assets/topic") {
+              await put(workspace, "private/_assets/topic/external.bin", "external")
+            }
+          },
+        },
+      }),
+    ).rejects.toMatchObject({ code: "TRANSACTION_STALE" })
+
+    expect(await readFile(join(workspace, "private/_assets/topic/external.bin"), "utf8")).toBe(
+      "external",
+    )
+    expect(await exists(join(workspace, "content/_assets/topic"))).toBe(false)
+    expect(await exists(join(workspace, plan.target))).toBe(false)
+  })
+
   it("preserves a source save made at the quarantine boundary", async () => {
     const workspace = await garden()
     const original = "---\ntitle: Original\n---\n"
