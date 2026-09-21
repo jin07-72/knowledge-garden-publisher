@@ -50,6 +50,14 @@ export type AppErrorCode =
   | "RECOVERY_INVALID"
   | "RECOVERY_CONFLICT"
   | "RECOVERY_DISCARD_FAILED"
+  | "TRANSACTION_PLAN_BLOCKED"
+  | "TRANSACTION_PLAN_INVALID"
+  | "TRANSACTION_STALE"
+  | "TRANSACTION_COLLISION"
+  | "TRANSACTION_LOCKED"
+  | "TRANSACTION_PENDING"
+  | "TRANSACTION_FAILED"
+  | "TRANSACTION_UNCERTAIN"
 
 export type AppError = {
   readonly [Code in AppErrorCode]: {
@@ -69,6 +77,7 @@ type NoteFileError = Extract<
       | "EXTERNAL_EDIT"
       | "INVALID_INPUT"
       | `RECOVERY_${string}`
+      | `TRANSACTION_${string}`
   }
 >
 

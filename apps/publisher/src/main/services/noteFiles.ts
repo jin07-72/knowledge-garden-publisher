@@ -17,6 +17,27 @@ import { dirname, isAbsolute, posix, relative, resolve } from "node:path"
 import { stringify } from "yaml"
 import type { AppError, SerializableValue, TrashAdapter, Visibility } from "../../shared/contracts"
 
+// Transactions are kept in a focused internal module because this service also
+// owns the lower-level 2,500-line atomic save/recovery implementation.
+export {
+  executeRename,
+  executeVisibilityChange,
+  inspectPendingTransactions,
+  planRename,
+  planVisibilityChange,
+  type NoteTransactionAdapter,
+  type NoteTransactionPlan,
+  type PendingTransaction,
+  type RenameInput,
+  type RenamePlan,
+  type TransactionContext,
+  type TransactionMove,
+  type TransactionResult,
+  type VisibilityChangeInput,
+  type VisibilityChangePlan,
+  type WikiLinkEdit,
+} from "./noteTransactions"
+
 const domains = new Set(["technology", "reading", "language", "life"])
 const slugPattern = /^[a-z0-9]+(?:-[a-z0-9]+)*$/
 const recoveryIdPattern = /^[a-z0-9-]{16,128}$/i
