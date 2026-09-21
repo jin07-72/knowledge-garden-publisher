@@ -1,5 +1,16 @@
 import { execFile } from "node:child_process"
-import { lstat, mkdir, mkdtemp, readFile, rm, symlink, writeFile } from "node:fs/promises"
+import { createHash } from "node:crypto"
+import {
+  lstat,
+  mkdir,
+  mkdtemp,
+  readFile,
+  rename,
+  rm,
+  symlink,
+  utimes,
+  writeFile,
+} from "node:fs/promises"
 import { tmpdir } from "node:os"
 import { dirname, join } from "node:path"
 import { promisify } from "node:util"
@@ -15,6 +26,10 @@ import {
 
 const run = promisify(execFile)
 const roots: string[] = []
+
+function hash(value: string): string {
+  return createHash("sha256").update(value).digest("hex")
+}
 
 async function exists(path: string): Promise<boolean> {
   return lstat(path).then(
@@ -179,6 +194,7 @@ describe("note visibility transactions", () => {
       code: "TRANSACTION_PLAN_BLOCKED",
       details: { issue: "GIT_HISTORY_CHECK_FAILED" },
     })
+    expect(await exists(join(workspace, ".garden-publisher"))).toBe(false)
   })
 
   it("fails closed for note and attachment collisions", async () => {
@@ -276,6 +292,56 @@ describe("note visibility transactions", () => {
     ).rejects.toMatchObject({
       code: "TRANSACTION_PLAN_BLOCKED",
       details: { issue: "SHARED_ATTACHMENT" },
+    })
+  })
+
+  it("blocks reference-style local attachments outside the owned tree", async () => {
+    const workspace = await garden({ git: true })
+    await put(
+      workspace,
+      "content/life/references.md",
+      [
+        "---",
+        "title: References",
+        "---",
+        "",
+        "![image][shared]",
+        "[download][shared]",
+        "",
+        '[shared]: ../shared/manual%20copy.pdf "Manual"',
+        "",
+      ].join("\n"),
+    )
+
+    await expect(
+      planVisibilityChange({
+        workspace,
+        path: "content/life/references.md",
+        visibility: "private",
+      }),
+    ).rejects.toMatchObject({
+      code: "TRANSACTION_PLAN_BLOCKED",
+      details: { issue: "AMBIGUOUS_ATTACHMENT" },
+    })
+  })
+
+  it("fails closed for an unresolved local image reference", async () => {
+    const workspace = await garden({ git: true })
+    await put(
+      workspace,
+      "content/life/unresolved.md",
+      "---\ntitle: Unresolved\n---\n\n![chart][missing-definition]\n",
+    )
+
+    await expect(
+      planVisibilityChange({
+        workspace,
+        path: "content/life/unresolved.md",
+        visibility: "private",
+      }),
+    ).rejects.toMatchObject({
+      code: "TRANSACTION_PLAN_BLOCKED",
+      details: { issue: "UNSUPPORTED_ATTACHMENT_REFERENCE" },
     })
   })
 
@@ -588,6 +654,47 @@ describe("note rename transactions", () => {
     expect(renamed).toContain("https://example.invalid/_assets/topic/chart.png")
   })
 
+  it("updates owned reference definitions while leaving reference uses and code unchanged", async () => {
+    const workspace = await garden()
+    await put(
+      workspace,
+      "content/life/topic.md",
+      [
+        "---",
+        "title: Topic",
+        "reference: '[chart]: ../_assets/topic/frontmatter.png'",
+        "---",
+        "",
+        "![Chart][chart]",
+        "[Download][]",
+        "![shortcut]",
+        "",
+        '[chart]: <../_assets/topic/chart%20one.png> "Chart"',
+        "[download]: ../_assets/topic/download.pdf",
+        "[shortcut]: ../_assets/topic/shortcut.svg",
+        "",
+        "    [code]: ../_assets/topic/code.png",
+        "",
+      ].join("\n"),
+    )
+    await put(workspace, "content/_assets/topic/chart one.png", "chart")
+    await put(workspace, "content/_assets/topic/download.pdf", "download")
+    await put(workspace, "content/_assets/topic/shortcut.svg", "shortcut")
+
+    const plan = await planRename({ workspace, path: "content/life/topic.md", slug: "renamed" })
+    await executeRename(plan, { workspace })
+
+    const renamed = await readFile(join(workspace, "content/life/renamed.md"), "utf8")
+    expect(renamed).toContain("![Chart][chart]")
+    expect(renamed).toContain("[Download][]")
+    expect(renamed).toContain("![shortcut]")
+    expect(renamed).toContain('[chart]: <../_assets/renamed/chart%20one.png> "Chart"')
+    expect(renamed).toContain("[download]: ../_assets/renamed/download.pdf")
+    expect(renamed).toContain("[shortcut]: ../_assets/renamed/shortcut.svg")
+    expect(renamed).toContain("reference: '[chart]: ../_assets/topic/frontmatter.png'")
+    expect(renamed).toContain("    [code]: ../_assets/topic/code.png")
+  })
+
   it("moves domains, updates qualified identities, and preserves bytes outside approved edits", async () => {
     const workspace = await garden()
     await put(workspace, "private/life/topic.md", "---\r\ntitle: Topic\r\n---\r\n\r\nBody\r\n")
@@ -737,9 +844,296 @@ describe("note rename transactions", () => {
     const renamed = await readFile(join(workspace, "content/life/renamed.md"), "utf8")
     expect(renamed).toContain('aliases:\n  - "legacy: topic"\n  - topic\n')
   })
+
+  it("uses the YAML AST to preserve a commented flow alias collection", async () => {
+    const workspace = await garden()
+    await put(
+      workspace,
+      "content/life/topic.md",
+      "---\ntitle: Topic\naliases: [legacy] # preserve this comment\n---\n\nbody\n",
+    )
+
+    const plan = await planRename({ workspace, path: "content/life/topic.md", slug: "renamed" })
+    await executeRename(plan, { workspace })
+
+    const renamed = await readFile(join(workspace, "content/life/renamed.md"), "utf8")
+    expect(renamed).toContain("aliases: [ legacy, topic ] # preserve this comment")
+    expect(renamed.match(/^aliases:/gm)).toHaveLength(1)
+  })
+
+  it("blocks aliases with non-string YAML structures", async () => {
+    const workspace = await garden()
+    await put(
+      workspace,
+      "content/life/topic.md",
+      "---\ntitle: Topic\naliases: { legacy: true }\n---\n\nbody\n",
+    )
+
+    await expect(
+      planRename({ workspace, path: "content/life/topic.md", slug: "renamed" }),
+    ).rejects.toMatchObject({
+      code: "TRANSACTION_PLAN_BLOCKED",
+      details: { issue: "ALIASES_UNSUPPORTED" },
+    })
+  })
 })
 
 describe("transaction recovery", () => {
+  it("preserves a source save made at the quarantine boundary", async () => {
+    const workspace = await garden()
+    const original = "---\ntitle: Original\n---\n"
+    const external = "---\ntitle: BOUNDARY_SAVE\n---\n"
+    await put(workspace, "private/life/topic.md", original)
+    const plan = await planVisibilityChange({
+      workspace,
+      path: "private/life/topic.md",
+      visibility: "public",
+    })
+
+    await expect(
+      executeVisibilityChange(plan, {
+        workspace,
+        adapter: {
+          async beforeSourceQuarantine(path) {
+            if (path === plan.source) await writeFile(join(workspace, path), external)
+          },
+        },
+      }),
+    ).rejects.toMatchObject({ code: "TRANSACTION_STALE" })
+
+    expect(await readFile(join(workspace, plan.source), "utf8")).toBe(external)
+    expect(await exists(join(workspace, plan.target))).toBe(false)
+  })
+
+  it("rolls back a source quarantined before the atomic primitive reports failure", async () => {
+    const workspace = await garden()
+    const original = "---\ntitle: Original\n---\n"
+    await put(workspace, "private/life/topic.md", original)
+    const plan = await planVisibilityChange({
+      workspace,
+      path: "private/life/topic.md",
+      visibility: "public",
+    })
+
+    await expect(
+      executeVisibilityChange(plan, {
+        workspace,
+        adapter: {
+          afterSourceQuarantine(path) {
+            if (path === plan.source) throw new Error("injected post-rename failure")
+          },
+        },
+      }),
+    ).rejects.toMatchObject({ code: "TRANSACTION_FAILED" })
+
+    expect(await readFile(join(workspace, plan.source), "utf8")).toBe(original)
+    expect(await exists(join(workspace, plan.target))).toBe(false)
+    expect(await inspectPendingTransactions({ workspace })).toEqual([])
+  })
+
+  it("preserves a note saved after attachment publication and rolls back targets as stale", async () => {
+    const workspace = await garden()
+    const original = "---\ntitle: Original\n---\n"
+    const external = "---\ntitle: EXTERNAL_SAVE\n---\n"
+    await put(workspace, "private/life/topic.md", original)
+    const plan = await planVisibilityChange({
+      workspace,
+      path: "private/life/topic.md",
+      visibility: "public",
+    })
+
+    await expect(
+      executeVisibilityChange(plan, {
+        workspace,
+        adapter: {
+          async afterPhase(phase) {
+            if (phase === "attachments-published") {
+              await writeFile(join(workspace, "private/life/topic.md"), external)
+            }
+          },
+        },
+      }),
+    ).rejects.toMatchObject({ code: "TRANSACTION_STALE" })
+
+    expect(await readFile(join(workspace, "private/life/topic.md"), "utf8")).toBe(external)
+    expect(await exists(join(workspace, "content/life/topic.md"))).toBe(false)
+    expect(await inspectPendingTransactions({ workspace })).toEqual([])
+    const transactionRoot = join(workspace, ".garden-publisher", "transactions", plan.id)
+    expect(
+      await readFile(join(transactionRoot, "backups", `0000-${hash(plan.source)}.bin`), "utf8"),
+    ).not.toContain("EXTERNAL_SAVE")
+  })
+
+  it("preserves an attachment changed immediately before source removal", async () => {
+    const workspace = await garden()
+    await put(workspace, "private/life/topic.md", "---\ntitle: Topic\n---\n")
+    await put(workspace, "private/_assets/topic/data.bin", "original")
+    const plan = await planVisibilityChange({
+      workspace,
+      path: "private/life/topic.md",
+      visibility: "public",
+    })
+
+    await expect(
+      executeVisibilityChange(plan, {
+        workspace,
+        adapter: {
+          async afterPhase(phase) {
+            if (phase === "attachments-published") {
+              await writeFile(join(workspace, "private/_assets/topic/data.bin"), "external")
+            }
+          },
+        },
+      }),
+    ).rejects.toMatchObject({ code: "TRANSACTION_STALE" })
+
+    expect(await readFile(join(workspace, "private/_assets/topic/data.bin"), "utf8")).toBe(
+      "external",
+    )
+    expect(await exists(join(workspace, "content/_assets/topic"))).toBe(false)
+    expect(await readFile(join(workspace, "private/life/topic.md"), "utf8")).toContain(
+      "title: Topic",
+    )
+  })
+
+  it("never exposes a partially staged attachment tree as the final target", async () => {
+    const workspace = await garden()
+    await put(workspace, "private/life/topic.md", "---\ntitle: Topic\n---\n")
+    await put(workspace, "private/_assets/topic/a.bin", "a")
+    await put(workspace, "private/_assets/topic/b.bin", "b")
+    const plan = await planVisibilityChange({
+      workspace,
+      path: "private/life/topic.md",
+      visibility: "public",
+    })
+
+    await expect(
+      executeVisibilityChange(plan, {
+        workspace,
+        adapter: {
+          afterAttachmentStageFile(path: string) {
+            if (path.endsWith("/a.bin")) throw new Error("injected partial staging failure")
+          },
+        } as NoteTransactionAdapter & {
+          afterAttachmentStageFile(path: string): void
+        },
+      }),
+    ).rejects.toMatchObject({ code: "TRANSACTION_FAILED" })
+
+    expect(await exists(join(workspace, "content/_assets/topic"))).toBe(false)
+    expect(await readFile(join(workspace, "private/_assets/topic/a.bin"), "utf8")).toBe("a")
+    expect(await readFile(join(workspace, "private/_assets/topic/b.bin"), "utf8")).toBe("b")
+  })
+
+  it("recognizes a completed atomic attachment-root publish when the primitive reports failure", async () => {
+    const workspace = await garden()
+    await put(workspace, "private/life/topic.md", "---\ntitle: Topic\n---\n")
+    await put(workspace, "private/_assets/topic/a.bin", "a")
+    const plan = await planVisibilityChange({
+      workspace,
+      path: "private/life/topic.md",
+      visibility: "public",
+    })
+
+    await expect(
+      executeVisibilityChange(plan, {
+        workspace,
+        adapter: {
+          afterAttachmentRootPublish() {
+            throw new Error("rename completed before failure")
+          },
+        } as NoteTransactionAdapter & { afterAttachmentRootPublish(): void },
+      }),
+    ).rejects.toMatchObject({ code: "TRANSACTION_FAILED" })
+
+    expect(await exists(join(workspace, "content/_assets/topic"))).toBe(false)
+    expect(await readFile(join(workspace, "private/_assets/topic/a.bin"), "utf8")).toBe("a")
+  })
+
+  it("atomically quarantines an externally replaced attachment target tree", async () => {
+    const workspace = await garden()
+    await put(workspace, "private/life/topic.md", "---\ntitle: Topic\n---\n")
+    await put(workspace, "private/_assets/topic/a.bin", "a")
+    const plan = await planVisibilityChange({
+      workspace,
+      path: "private/life/topic.md",
+      visibility: "public",
+    })
+
+    await expect(
+      executeVisibilityChange(plan, {
+        workspace,
+        adapter: {
+          async afterPhase(phase) {
+            if (phase !== "attachments-published") return
+            await writeFile(join(workspace, "content/_assets/topic/a.bin"), "external")
+            throw new Error("external attachment replacement")
+          },
+        },
+      }),
+    ).rejects.toMatchObject({ code: "TRANSACTION_UNCERTAIN" })
+
+    expect(await exists(join(workspace, "content/_assets/topic"))).toBe(false)
+    expect(
+      await readFile(
+        join(
+          workspace,
+          ".garden-publisher",
+          "transactions",
+          plan.id,
+          "rollback-quarantine",
+          "attachments-target",
+          "a.bin",
+        ),
+        "utf8",
+      ),
+    ).toBe("external")
+  })
+
+  it("marks the journal uncertain when the first publication was installed then replaced", async () => {
+    const workspace = await garden()
+    await put(workspace, "private/life/topic.md", "---\ntitle: Topic\n---\n")
+    const plan = await planVisibilityChange({
+      workspace,
+      path: "private/life/topic.md",
+      visibility: "public",
+    })
+    const external = "EXTERNAL_AFTER_FIRST_PUBLICATION"
+
+    await expect(
+      executeVisibilityChange(plan, {
+        workspace,
+        adapter: {
+          async afterExclusivePublish(path: string) {
+            if (path !== plan.target) return
+            await writeFile(join(workspace, ...path.split("/")), external)
+            throw new Error("installed then failed")
+          },
+        } as NoteTransactionAdapter & {
+          afterExclusivePublish(path: string): Promise<void>
+        },
+      }),
+    ).rejects.toMatchObject({ code: "TRANSACTION_UNCERTAIN" })
+
+    expect(await exists(join(workspace, "content/life/topic.md"))).toBe(false)
+    expect(
+      await readFile(
+        join(
+          workspace,
+          ".garden-publisher",
+          "transactions",
+          plan.id,
+          "rollback-quarantine",
+          "note-target",
+        ),
+        "utf8",
+      ),
+    ).toBe(external)
+    await expect(inspectPendingTransactions({ workspace })).resolves.toEqual([
+      expect.objectContaining({ id: plan.id, phase: "rollback-uncertain" }),
+    ])
+  })
+
   it("rolls back byte-for-byte after every mutable phase and leaves no target", async () => {
     for (const phase of [
       "journal-created",
@@ -806,6 +1200,81 @@ describe("transaction recovery", () => {
 
     await expect(first).resolves.toMatchObject({ id: plan.id })
     expect(await exists(join(workspace, "content/life/topic.md"))).toBe(true)
+  })
+
+  it("cleans up an orphan lock when owner metadata publication fails", async () => {
+    const workspace = await garden()
+    await put(workspace, "private/life/topic.md", "---\ntitle: Topic\n---\n")
+    const plan = await planVisibilityChange({
+      workspace,
+      path: "private/life/topic.md",
+      visibility: "public",
+    })
+
+    await expect(
+      executeVisibilityChange(plan, {
+        workspace,
+        adapter: {
+          beforeLockOwnerPublish() {
+            throw new Error("injected owner publication failure")
+          },
+        } as NoteTransactionAdapter & { beforeLockOwnerPublish(): void },
+      }),
+    ).rejects.toMatchObject({ code: "TRANSACTION_LOCKED" })
+
+    await expect(executeVisibilityChange(plan, { workspace })).resolves.toMatchObject({
+      id: plan.id,
+    })
+  })
+
+  it("conservatively recovers an old ownerless lock directory", async () => {
+    const workspace = await garden()
+    await put(workspace, "private/life/topic.md", "---\ntitle: Topic\n---\n")
+    const plan = await planVisibilityChange({
+      workspace,
+      path: "private/life/topic.md",
+      visibility: "public",
+    })
+    const lock = join(
+      workspace,
+      ".garden-publisher",
+      "transaction-locks",
+      `${hash(plan.source)}.lock`,
+    )
+    await mkdir(lock)
+    const old = new Date(Date.now() - 10 * 60 * 1000)
+    await utimes(lock, old, old)
+
+    await expect(executeVisibilityChange(plan, { workspace })).resolves.toMatchObject({
+      id: plan.id,
+    })
+  })
+
+  it("never removes a successor lock that replaces the owned lease before release", async () => {
+    const workspace = await garden()
+    await put(workspace, "private/life/topic.md", "---\ntitle: Topic\n---\n")
+    const plan = await planVisibilityChange({
+      workspace,
+      path: "private/life/topic.md",
+      visibility: "public",
+    })
+    let successor: string | undefined
+
+    await executeVisibilityChange(plan, {
+      workspace,
+      adapter: {
+        async beforeLockRelease(lockPath: string) {
+          if (successor !== undefined) return
+          await rename(lockPath, `${lockPath}.predecessor`)
+          await mkdir(lockPath)
+          await writeFile(join(lockPath, "successor"), "must survive")
+          successor = lockPath
+        },
+      } as NoteTransactionAdapter & { beforeLockRelease(path: string): Promise<void> },
+    })
+
+    expect(successor).toBeDefined()
+    expect(await readFile(join(successor!, "successor"), "utf8")).toBe("must survive")
   })
 
   it("retains an authenticated pending journal and returns uncertainty when rollback fails", async () => {
@@ -887,7 +1356,23 @@ describe("transaction recovery", () => {
     expect(await exists(join(workspace, "content/life/topic.md"))).toBe(false)
   })
 
-  it("does not delete an external replacement discovered during rollback", async () => {
+  it("returns a typed body-free error for inspect setup failures", async () => {
+    const workspace = await garden()
+    await writeFile(join(workspace, ".garden-publisher"), "PRIVATE_SETUP_SENTINEL")
+
+    let failure: unknown
+    try {
+      await inspectPendingTransactions({ workspace })
+    } catch (error) {
+      failure = error
+    }
+
+    expect(failure).toMatchObject({ code: expect.stringMatching(/^TRANSACTION_/) })
+    expect(JSON.stringify(failure)).not.toContain("PRIVATE_SETUP_SENTINEL")
+    expect(JSON.stringify(failure)).not.toContain(workspace)
+  })
+
+  it("quarantines an external target replacement without deleting or overwriting it", async () => {
     const workspace = await garden()
     await put(workspace, "private/life/topic.md", "---\ntitle: Topic\n---\n")
     const plan = await planVisibilityChange({
@@ -909,7 +1394,105 @@ describe("transaction recovery", () => {
         },
       }),
     ).rejects.toMatchObject({ code: "TRANSACTION_UNCERTAIN" })
-    expect(await readFile(join(workspace, "content/life/topic.md"), "utf8")).toBe(external)
+    expect(await exists(join(workspace, "content/life/topic.md"))).toBe(false)
+    expect(
+      await readFile(
+        join(
+          workspace,
+          ".garden-publisher",
+          "transactions",
+          plan.id,
+          "rollback-quarantine",
+          "note-target",
+        ),
+        "utf8",
+      ),
+    ).toBe(external)
+  })
+
+  it("does not claim an identical-byte external note replacement during rollback", async () => {
+    const workspace = await garden()
+    await put(workspace, "private/life/topic.md", "---\ntitle: Topic\n---\n")
+    const plan = await planVisibilityChange({
+      workspace,
+      path: "private/life/topic.md",
+      visibility: "public",
+    })
+
+    await expect(
+      executeVisibilityChange(plan, {
+        workspace,
+        adapter: {
+          async afterPhase(phase) {
+            if (phase !== "note-published") return
+            const target = join(workspace, plan.target)
+            const bytes = await readFile(target)
+            const external = `${target}.external`
+            await writeFile(external, bytes)
+            await rename(external, target)
+            throw new Error("fail after identical external replacement")
+          },
+        },
+      }),
+    ).rejects.toMatchObject({ code: "TRANSACTION_UNCERTAIN" })
+
+    expect(await exists(join(workspace, plan.target))).toBe(false)
+    expect(
+      await readFile(
+        join(
+          workspace,
+          ".garden-publisher",
+          "transactions",
+          plan.id,
+          "rollback-quarantine",
+          "note-target",
+        ),
+        "utf8",
+      ),
+    ).toContain("title: Topic")
+  })
+
+  it("does not claim an identical external attachment tree during rollback", async () => {
+    const workspace = await garden()
+    await put(workspace, "private/life/topic.md", "---\ntitle: Topic\n---\n")
+    await put(workspace, "private/_assets/topic/data.bin", "same bytes")
+    const plan = await planVisibilityChange({
+      workspace,
+      path: "private/life/topic.md",
+      visibility: "public",
+    })
+
+    await expect(
+      executeVisibilityChange(plan, {
+        workspace,
+        adapter: {
+          async afterPhase(phase) {
+            if (phase !== "attachments-published") return
+            const target = join(workspace, "content/_assets/topic/data.bin")
+            const external = `${target}.external`
+            await writeFile(external, "same bytes")
+            await rename(external, target)
+            throw new Error("fail after identical external tree replacement")
+          },
+        },
+      }),
+    ).rejects.toMatchObject({ code: "TRANSACTION_UNCERTAIN" })
+
+    expect(await exists(join(workspace, "content/_assets/topic"))).toBe(false)
+    expect(
+      await readFile(
+        join(
+          workspace,
+          ".garden-publisher",
+          "transactions",
+          plan.id,
+          "rollback-quarantine",
+          "attachments-target",
+          "data.bin",
+        ),
+        "utf8",
+      ),
+    ).toBe("same bytes")
   })
 
   it("does not apply a link edit to a file changed after the note was published", async () => {
@@ -930,7 +1513,31 @@ describe("transaction recovery", () => {
           },
         },
       }),
-    ).rejects.toMatchObject({ code: "TRANSACTION_UNCERTAIN" })
+    ).rejects.toMatchObject({ code: "TRANSACTION_STALE" })
     expect(await readFile(join(workspace, "content/reading/ref.md"), "utf8")).toBe(external)
+    expect(await exists(join(workspace, "content/life/renamed.md"))).toBe(false)
+  })
+
+  it("preserves a link source changed at the atomic quarantine boundary", async () => {
+    const workspace = await garden()
+    await put(workspace, "content/life/topic.md", "---\ntitle: Topic\n---\n")
+    await put(workspace, "content/reading/ref.md", "[[life/topic]]\n")
+    const plan = await planRename({ workspace, path: "content/life/topic.md", slug: "renamed" })
+    const external = "boundary replacement [[life/topic]]\n"
+
+    await expect(
+      executeRename(plan, {
+        workspace,
+        adapter: {
+          async beforeLinkQuarantine(path) {
+            if (path === "content/reading/ref.md") {
+              await writeFile(join(workspace, path), external)
+            }
+          },
+        },
+      }),
+    ).rejects.toMatchObject({ code: "TRANSACTION_STALE" })
+    expect(await readFile(join(workspace, "content/reading/ref.md"), "utf8")).toBe(external)
+    expect(await exists(join(workspace, "content/life/renamed.md"))).toBe(false)
   })
 })

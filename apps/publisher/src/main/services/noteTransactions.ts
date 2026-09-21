@@ -15,7 +15,7 @@ import {
   writeFile,
 } from "node:fs/promises"
 import { dirname, extname, isAbsolute, posix, relative, resolve } from "node:path"
-import { parseDocument } from "yaml"
+import { isScalar, isSeq, parseDocument } from "yaml"
 import type { AppError, Visibility } from "../../shared/contracts"
 import { systemCommandRunner, type CommandRunner } from "../lib/commandRunner"
 
@@ -116,6 +116,15 @@ export interface NoteTransactionAdapter {
   afterPhase?: (phase: TransactionPhase) => Promise<void> | void
   beforePublish?: (path: string) => Promise<void> | void
   beforeAttachmentRootPublish?: (path: string) => Promise<void> | void
+  afterAttachmentStageFile?: (path: string) => Promise<void> | void
+  afterAttachmentRootPublish?: (path: string) => Promise<void> | void
+  afterExclusivePublish?: (path: string) => Promise<void> | void
+  beforeLockOwnerPublish?: (path: string) => Promise<void> | void
+  beforeLockRelease?: (path: string) => Promise<void> | void
+  beforeLinkQuarantine?: (path: string) => Promise<void> | void
+  afterLinkQuarantine?: (path: string) => Promise<void> | void
+  beforeSourceQuarantine?: (path: string) => Promise<void> | void
+  afterSourceQuarantine?: (path: string) => Promise<void> | void
   beforeRollback?: () => Promise<void> | void
 }
 
@@ -149,6 +158,7 @@ interface SafeFile {
   bytes: Buffer
   revision: TransactionRevision
   mode: number
+  identity: string
 }
 
 interface ParsedNotePath {
@@ -350,6 +360,7 @@ async function safeFile(workspace: string, path: string): Promise<SafeFile> {
       bytes,
       revision: { mtimeMs: ordinary.mtimeMs, contentHash: sha256(bytes) },
       mode: Number(opened.mode),
+      identity: fileIdentity(opened),
     }
   } catch (error) {
     if ((error as NodeJS.ErrnoException).code === "ENOENT") {
@@ -425,15 +436,78 @@ async function durableWrite(path: string, bytes: Uint8Array | string, mode = 0o6
   }
 }
 
-async function trustKey(workspace: string, create: boolean): Promise<Buffer> {
-  if (create) await ensureStateDirectories(workspace)
-  const path = resolve(workspace, ...keyRelativePath.split("/"))
+function fileIdentity(details: {
+  dev: bigint
+  ino: bigint
+  size: bigint
+  mtimeNs: bigint
+}): string {
+  return `${details.dev}:${details.ino}:${details.size}:${details.mtimeNs}`
+}
+
+async function readBoundedHandle(
+  handle: Awaited<ReturnType<typeof open>>,
+  maximumBytes: number,
+): Promise<Buffer | undefined> {
+  const bounded = Buffer.alloc(maximumBytes + 1)
+  let offset = 0
+  while (offset < bounded.length) {
+    const { bytesRead } = await handle.read(bounded, offset, bounded.length - offset, offset)
+    if (bytesRead === 0) break
+    offset += bytesRead
+  }
+  return offset > maximumBytes ? undefined : bounded.subarray(0, offset)
+}
+
+async function readProtectedKey(path: string, parent: string): Promise<Buffer> {
+  let handle
   try {
-    const details = await lstat(path)
-    if (details.isSymbolicLink() || !details.isFile()) throw new Error("unsafe key")
-    const key = await readFile(path)
-    if (key.length !== 32) throw new Error("invalid key")
+    const before = await lstat(path, { bigint: true })
+    if (
+      before.isSymbolicLink() ||
+      !before.isFile() ||
+      before.size !== 32n ||
+      (process.platform !== "win32" && (Number(before.mode) & 0o777) !== 0o600)
+    ) {
+      throw new Error("unsafe key")
+    }
+    const canonical = await realpath(path)
+    if (!inside(parent, canonical)) throw new Error("unsafe key")
+    const flags = process.platform === "win32" ? "r" : constants.O_RDONLY | constants.O_NOFOLLOW
+    handle = await open(path, flags)
+    const opened = await handle.stat({ bigint: true })
+    if (!opened.isFile() || fileIdentity(before) !== fileIdentity(opened)) {
+      throw new Error("changed key")
+    }
+    const key = await readBoundedHandle(handle, 32)
+    if (key === undefined || key.length !== 32) throw new Error("invalid key")
+    const after = await lstat(path, { bigint: true })
+    if (
+      after.isSymbolicLink() ||
+      fileIdentity(opened) !== fileIdentity(after) ||
+      canonical !== (await realpath(path))
+    ) {
+      throw new Error("changed key")
+    }
     return key
+  } finally {
+    await handle?.close().catch(() => undefined)
+  }
+}
+
+async function trustKey(workspace: string, create: boolean): Promise<Buffer> {
+  const state = resolve(workspace, stateName)
+  const keys = resolve(state, "keys")
+  const path = resolve(workspace, ...keyRelativePath.split("/"))
+  if (create) {
+    try {
+      await ensureStateDirectories(workspace)
+    } catch {
+      throw blocked("PLANNING_FAILED", ".")
+    }
+  }
+  try {
+    return await readProtectedKey(path, keys)
   } catch (error) {
     if ((error as NodeJS.ErrnoException).code !== "ENOENT" || !create) {
       throw transactionError(
@@ -455,10 +529,11 @@ async function trustKey(workspace: string, create: boolean): Promise<Buffer> {
   } finally {
     await rm(temporary, { force: true }).catch(() => undefined)
   }
-  const key = await readFile(path)
-  if (key.length !== 32)
+  try {
+    return await readProtectedKey(path, keys)
+  } catch {
     throw transactionError("TRANSACTION_PLAN_INVALID", "The transaction trust key is unavailable.")
-  return key
+  }
 }
 
 function unsignedPlan<T extends NoteTransactionPlan>(plan: T): Omit<T, "integrity"> {
@@ -492,6 +567,12 @@ async function attachmentFiles(
   const moves: TransactionMove[] = []
   async function visit(directory: string, relativeDirectory: string): Promise<void> {
     const entries = await readdir(directory, { withFileTypes: true })
+    if (entries.length === 0) {
+      throw blocked(
+        "UNSAFE_ATTACHMENT_ENTRY",
+        relativeDirectory ? `${sourceRoot}/${relativeDirectory}` : sourceRoot,
+      )
+    }
     entries.sort((left, right) => left.name.localeCompare(right.name))
     for (const entry of entries) {
       const child = resolve(directory, entry.name)
@@ -529,7 +610,7 @@ interface LocalReferenceOccurrence {
   start: number
   end: number
   target: string
-  syntax: "markdown" | "wiki-embed"
+  syntax: "markdown" | "wiki-embed" | "reference-definition"
 }
 
 function escapedAt(source: string, index: number): boolean {
@@ -538,7 +619,11 @@ function escapedAt(source: string, index: number): boolean {
   return slashes % 2 === 1
 }
 
-function localReferenceOccurrences(source: string): LocalReferenceOccurrence[] {
+function referenceLabel(value: string): string {
+  return value.trim().replace(/\s+/g, " ").toLowerCase()
+}
+
+function localReferenceOccurrences(source: string, failurePath = "."): LocalReferenceOccurrence[] {
   const mask = markdownMask(source)
   const occurrences: LocalReferenceOccurrence[] = []
   const ordinary = /!?\[[^\]\n]*\]\(([^)\s]+)(?:\s+[^)]*)?\)/g
@@ -566,6 +651,63 @@ function localReferenceOccurrences(source: string): LocalReferenceOccurrence[] {
     const targetOffset = rawInner.indexOf(target)
     const start = index + 3 + targetOffset
     occurrences.push({ start, end: start + target.length, target, syntax: "wiki-embed" })
+  }
+  const definitions = new Map<string, LocalReferenceOccurrence>()
+  const definition =
+    /^ {0,3}\[([^\]\r\n]+)\]:[\t ]*(?:<([^>\r\n]+)>|([^\s\r\n]+))(?:[\t ]+(?:"[^"\r\n]*"|'[^'\r\n]*'|\([^\)\r\n]*\)))?[\t ]*$/gm
+  for (const match of mask.matchAll(definition)) {
+    const label = referenceLabel(match[1])
+    if (label.startsWith("^")) continue
+    const maskedTarget = match[2] ?? match[3]
+    if (!label || !maskedTarget || definitions.has(label)) {
+      throw blocked("UNSUPPORTED_ATTACHMENT_REFERENCE", failurePath)
+    }
+    const targetOffset = match[0].indexOf(maskedTarget)
+    const start = match.index + targetOffset
+    const target = source.slice(start, start + maskedTarget.length)
+    definitions.set(label, {
+      start,
+      end: start + maskedTarget.length,
+      target,
+      syntax: "reference-definition",
+    })
+  }
+  const referencedLabels = new Set<string>()
+  const explicit = /(!?)\[([^\]\r\n]+)\]\[([^\]\r\n]*)\]/g
+  for (const match of mask.matchAll(explicit)) {
+    if (escapedAt(source, match.index)) continue
+    const label = referenceLabel(match[3] || match[2])
+    if (label.startsWith("^")) continue
+    if (!label || !definitions.has(label)) {
+      throw blocked("UNSUPPORTED_ATTACHMENT_REFERENCE", failurePath)
+    }
+    referencedLabels.add(label)
+  }
+  const shortcutImage = /!\[(?!\[)([^\]\r\n]+)\](?![\[(])/g
+  for (const match of mask.matchAll(shortcutImage)) {
+    if (escapedAt(source, match.index)) continue
+    const label = referenceLabel(match[1])
+    if (label.startsWith("^")) continue
+    if (!label || !definitions.has(label)) {
+      throw blocked("UNSUPPORTED_ATTACHMENT_REFERENCE", failurePath)
+    }
+    referencedLabels.add(label)
+  }
+  const shortcutLink = /\[([^\]\r\n]+)\](?![\[(])/g
+  for (const match of mask.matchAll(shortcutLink)) {
+    if (
+      escapedAt(source, match.index) ||
+      source[match.index - 1] === "[" ||
+      source[match.index + match[0].length] === ":"
+    )
+      continue
+    const label = referenceLabel(match[1])
+    if (label.startsWith("^")) continue
+    if (definitions.has(label)) referencedLabels.add(label)
+  }
+  for (const label of referencedLabels) {
+    const occurrence = definitions.get(label)!
+    if (!externalReference(occurrence.target)) occurrences.push(occurrence)
   }
   return occurrences.sort((left, right) => left.start - right.start)
 }
@@ -601,14 +743,17 @@ async function assertOwnedReferences(
   markdown: string,
 ): Promise<void> {
   const owned = resolve(workspace, note.root, "_assets", note.slug)
-  for (const occurrence of localReferenceOccurrences(markdown)) {
+  for (const occurrence of localReferenceOccurrences(markdown, note.path)) {
     const candidate = attachmentCandidate(workspace, note, occurrence)
     if (candidate === undefined) continue
     if (!inside(owned, candidate)) throw blocked("AMBIGUOUS_ATTACHMENT", note.path)
   }
   for (const scanned of await scanMarkdown(workspace)) {
     if (scanned.path === note.path) continue
-    for (const occurrence of localReferenceOccurrences(scanned.file.bytes.toString("utf8"))) {
+    for (const occurrence of localReferenceOccurrences(
+      scanned.file.bytes.toString("utf8"),
+      scanned.path,
+    )) {
       const candidate = attachmentCandidate(workspace, scanned.note, occurrence)
       if (candidate !== undefined && inside(owned, candidate)) {
         throw blocked("SHARED_ATTACHMENT", scanned.path)
@@ -649,7 +794,6 @@ async function buildBase(
   sourceFile: SafeFile
   moves: TransactionMove[]
   collisionChecks: TransactionCollisionCheck[]
-  key: Buffer
 }> {
   const { root: workspace, identity: workspaceIdentity } = await canonicalWorkspace(workspaceInput)
   const sourceFile = await safeFile(workspace, sourcePath)
@@ -681,14 +825,12 @@ async function buildBase(
       ? [attachmentTargetRoot, ...attachmentMoves.map(({ target }) => target)]
       : []),
   ].map((path) => ({ path, expected: "absent" as const }))
-  const key = await trustKey(workspace, true)
   return {
     workspace,
     workspaceIdentity,
     sourceFile,
     moves: [noteMove, ...attachmentMoves],
     collisionChecks,
-    key,
   }
 }
 
@@ -732,6 +874,7 @@ async function buildVisibilityChangePlan(
         },
       ]
     : []
+  const key = await trustKey(base.workspace, true)
   return signPlan(
     {
       version: 1,
@@ -749,7 +892,7 @@ async function buildVisibilityChangePlan(
       historyWarning,
       warnings,
     },
-    base.key,
+    key,
   ) as VisibilityChangePlan
 }
 
@@ -902,41 +1045,27 @@ function addAlias(markdown: string, alias: string): string {
   const full = frontmatter[0]
   const body = frontmatter[1]
   const document = parseDocument(body)
-  const values = (document.toJS() as Record<string, unknown>).aliases
-  const aliases =
-    values === undefined ? [] : typeof values === "string" ? [values] : (values as string[])
-  if (aliases.includes(alias)) return markdown
-  const escapedAlias = alias
-  let updated: string
-  const flow = /^aliases:[\t ]*\[([^\r\n]*)\][\t ]*$/m.exec(body)
-  if (flow) {
-    const insertion = flow[1].trim() === "" ? escapedAlias : `${flow[1]}, ${escapedAlias}`
-    updated =
-      body.slice(0, flow.index) +
-      flow[0].replace(flow[1], insertion) +
-      body.slice(flow.index + flow[0].length)
-  } else {
-    const block = /^aliases:[\t ]*\r?\n((?:[\t ]+-[^\r\n]*(?:\r?\n|$))*)/m.exec(body)
-    if (block) {
-      const insertAt = block.index + block[0].length
-      const separator = block[0].endsWith("\n") ? "" : lineEnding
-      updated =
-        body.slice(0, insertAt) +
-        `${separator}  - ${escapedAlias}${lineEnding}` +
-        body.slice(insertAt)
-    } else {
-      const scalar = /^aliases:[\t ]*([^\r\n]+)[\t ]*$/m.exec(body)
-      if (scalar) {
-        const previous = scalar[1].trim()
-        updated =
-          body.slice(0, scalar.index) +
-          `aliases:${lineEnding}  - ${previous}${lineEnding}  - ${escapedAlias}` +
-          body.slice(scalar.index + scalar[0].length)
-      } else {
-        updated = `${body}aliases:${lineEnding}  - ${escapedAlias}${lineEnding}`
-      }
+  const node = document.get("aliases", true)
+  if (node === undefined) {
+    document.set("aliases", [alias])
+  } else if (isSeq(node)) {
+    const aliases = node.items.map((item) => (isScalar(item) ? item.value : undefined))
+    if (aliases.includes(alias)) return markdown
+    node.add(alias)
+  } else if (isScalar(node) && typeof node.value === "string") {
+    if (node.value === alias) return markdown
+    const comment = node.comment
+    document.set("aliases", [node.value, alias])
+    const replacement = document.get("aliases", true)
+    if (replacement && typeof replacement === "object") {
+      const commented = replacement as { comment?: string }
+      commented.comment = comment ?? undefined
     }
+  } else {
+    throw blocked("ALIASES_UNSUPPORTED", "frontmatter")
   }
+  let updated = document.toString()
+  if (lineEnding === "\r\n") updated = updated.replaceAll("\n", "\r\n")
   const bodyStart = full.indexOf(body)
   return markdown.slice(0, bodyStart) + updated + markdown.slice(bodyStart + body.length)
 }
@@ -952,7 +1081,7 @@ function rewriteOwnedAttachmentReferences(
   const segment = `/_assets/${source.slug}/`
   const replacementSegment = `/_assets/${newSlug}/`
   const replacements: Array<{ start: number; end: number; replacement: string }> = []
-  for (const occurrence of localReferenceOccurrences(markdown)) {
+  for (const occurrence of localReferenceOccurrences(markdown, source.path)) {
     const candidate = attachmentCandidate(workspace, source, occurrence)
     if (candidate === undefined || !inside(owned, candidate)) continue
     const normalized = occurrence.target.replaceAll("\\", "/")
@@ -1063,6 +1192,7 @@ async function buildRenamePlan(input: RenameInput): Promise<RenamePlan> {
       left.path.localeCompare(right.path) || left.oldTarget.localeCompare(right.oldTarget),
   )
   const alias = newSlug !== source.slug ? source.slug : oldQualified
+  const key = await trustKey(base.workspace, true)
   return signPlan(
     {
       version: 1,
@@ -1084,7 +1214,7 @@ async function buildRenamePlan(input: RenameInput): Promise<RenamePlan> {
       linkEdits,
       warnings: [],
     },
-    base.key,
+    key,
   ) as RenamePlan
 }
 
@@ -1175,44 +1305,206 @@ async function verifyPlan(
   return { plan, workspace, key }
 }
 
+interface OwnedTransactionLock {
+  path: string
+  identity: string
+  token: string
+  ownerPublished: boolean
+}
+
+interface TransactionLockSet {
+  assertOwned(): Promise<void>
+  release(): Promise<void>
+}
+
+const abandonedTransactionLockAgeMs = 5 * 60 * 1000
+
+function directoryIdentity(details: { dev: bigint; ino: bigint; birthtimeNs: bigint }): string {
+  return `${details.dev}:${details.ino}:${details.birthtimeNs}`
+}
+
+async function currentDirectoryIdentity(path: string): Promise<string | undefined> {
+  try {
+    const details = await lstat(path, { bigint: true })
+    if (details.isSymbolicLink() || !details.isDirectory()) return undefined
+    return directoryIdentity(details)
+  } catch {
+    return undefined
+  }
+}
+
+async function ownerToken(lock: OwnedTransactionLock): Promise<string | undefined> {
+  let handle
+  const path = resolve(lock.path, "owner.json")
+  try {
+    if ((await currentDirectoryIdentity(lock.path)) !== lock.identity) return undefined
+    const before = await lstat(path, { bigint: true })
+    if (before.isSymbolicLink() || !before.isFile() || before.size > 4096n) return undefined
+    const flags = process.platform === "win32" ? "r" : constants.O_RDONLY | constants.O_NOFOLLOW
+    handle = await open(path, flags)
+    const opened = await handle.stat({ bigint: true })
+    if (!opened.isFile() || fileIdentity(before) !== fileIdentity(opened)) return undefined
+    const bytes = await handle.readFile()
+    const after = await lstat(path, { bigint: true })
+    if (fileIdentity(opened) !== fileIdentity(after)) return undefined
+    if ((await currentDirectoryIdentity(lock.path)) !== lock.identity) return undefined
+    const value = JSON.parse(bytes.toString("utf8")) as { token?: unknown }
+    return typeof value.token === "string" ? value.token : undefined
+  } catch {
+    return undefined
+  } finally {
+    await handle?.close().catch(() => undefined)
+  }
+}
+
+async function releaseOwnedLock(
+  lock: OwnedTransactionLock,
+  adapter: NoteTransactionAdapter,
+): Promise<void> {
+  await adapter.beforeLockRelease?.(lock.path)
+  if ((await currentDirectoryIdentity(lock.path)) !== lock.identity) {
+    throw transactionError("TRANSACTION_LOCKED", "Transaction lock ownership was lost.")
+  }
+  if (lock.ownerPublished && (await ownerToken(lock)) !== lock.token) {
+    throw transactionError("TRANSACTION_LOCKED", "Transaction lock ownership was lost.")
+  }
+  const quarantine = `${lock.path}.release-${randomUUID()}`
+  await rename(lock.path, quarantine)
+  if ((await currentDirectoryIdentity(quarantine)) !== lock.identity) {
+    throw transactionError("TRANSACTION_LOCKED", "Transaction lock ownership was lost.")
+  }
+  await rm(quarantine, { recursive: true, force: true })
+  await syncDirectory(dirname(lock.path))
+}
+
+async function recoverAbandonedLock(path: string): Promise<boolean> {
+  let details
+  try {
+    details = await lstat(path, { bigint: true })
+    if (details.isSymbolicLink() || !details.isDirectory()) return false
+    if (Date.now() - Number(details.mtimeMs) < abandonedTransactionLockAgeMs) return false
+    try {
+      await lstat(resolve(path, "owner.json"))
+      return false
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code !== "ENOENT") return false
+    }
+  } catch {
+    return false
+  }
+  const identity = directoryIdentity(details)
+  const quarantine = `${path}.stale-${randomUUID()}`
+  try {
+    await rename(path, quarantine)
+    if ((await currentDirectoryIdentity(quarantine)) !== identity) {
+      try {
+        await rename(quarantine, path)
+      } catch {
+        // Preserve the unverified successor under its quarantine name.
+      }
+      return false
+    }
+    await rm(quarantine, { recursive: true })
+    await syncDirectory(dirname(path))
+    return true
+  } catch {
+    return false
+  }
+}
+
 async function acquireLocks(
   workspace: string,
   paths: readonly string[],
-): Promise<() => Promise<void>> {
-  await ensureStateDirectories(workspace)
+  adapter: NoteTransactionAdapter,
+): Promise<TransactionLockSet> {
+  try {
+    await ensureStateDirectories(workspace)
+  } catch {
+    throw transactionError("TRANSACTION_LOCKED", "Transaction locks could not be initialized.")
+  }
   const root = resolve(workspace, stateName, "transaction-locks")
   const unique = [...new Set(paths)].sort((left, right) => left.localeCompare(right))
-  const acquired: string[] = []
+  const acquired: OwnedTransactionLock[] = []
   try {
     for (const path of unique) {
       const lock = resolve(root, `${sha256(path)}.lock`)
-      try {
-        await mkdir(lock, { mode: 0o700 })
-      } catch (error) {
-        if ((error as NodeJS.ErrnoException).code === "EEXIST") {
-          throw transactionError(
-            "TRANSACTION_LOCKED",
-            "A conflicting note transaction is already running.",
-            {
-              path,
-            },
-          )
+      let created = false
+      for (let attempt = 0; attempt < 2 && !created; attempt += 1) {
+        try {
+          await mkdir(lock, { mode: 0o700 })
+          created = true
+        } catch (error) {
+          if (
+            (error as NodeJS.ErrnoException).code === "EEXIST" &&
+            attempt === 0 &&
+            (await recoverAbandonedLock(lock))
+          ) {
+            continue
+          }
+          if ((error as NodeJS.ErrnoException).code === "EEXIST") {
+            throw transactionError(
+              "TRANSACTION_LOCKED",
+              "A conflicting note transaction is already running.",
+              {
+                path,
+              },
+            )
+          }
+          throw error
         }
-        throw error
       }
-      await durableWrite(
-        resolve(lock, "owner.json"),
-        `${JSON.stringify({ version: 1, pid: process.pid, createdAt: new Date().toISOString() })}\n`,
-      )
-      acquired.push(lock)
+      if (!created) throw transactionError("TRANSACTION_LOCKED", "Transaction lock unavailable.")
+      const identity = await currentDirectoryIdentity(lock)
+      if (identity === undefined) throw new Error("lock identity unavailable")
+      const owned: OwnedTransactionLock = {
+        path: lock,
+        identity,
+        token: randomBytes(32).toString("hex"),
+        ownerPublished: false,
+      }
+      acquired.push(owned)
+      const temporary = resolve(lock, `.owner-${randomUUID()}.json`)
+      try {
+        await durableWrite(
+          temporary,
+          `${JSON.stringify({
+            version: 1,
+            token: owned.token,
+            pid: process.pid,
+            createdAt: new Date().toISOString(),
+          })}\n`,
+        )
+        await adapter.beforeLockOwnerPublish?.(lock)
+        await rename(temporary, resolve(lock, "owner.json"))
+        await syncDirectory(lock)
+        owned.ownerPublished = true
+        if ((await ownerToken(owned)) !== owned.token) throw new Error("lock owner changed")
+        await syncDirectory(root)
+      } finally {
+        await rm(temporary, { force: true }).catch(() => undefined)
+      }
     }
   } catch (error) {
-    await Promise.all(acquired.reverse().map((path) => rm(path, { recursive: true, force: true })))
+    for (const lock of acquired.reverse()) {
+      await releaseOwnedLock(lock, {}).catch(() => undefined)
+    }
     if ((error as { code?: string }).code?.startsWith("TRANSACTION_")) throw error
     throw transactionError("TRANSACTION_LOCKED", "Transaction locks could not be acquired.")
   }
-  return async () => {
-    for (const path of acquired.reverse()) await rm(path, { recursive: true, force: true })
+  return {
+    async assertOwned() {
+      for (const lock of acquired) {
+        if (
+          (await currentDirectoryIdentity(lock.path)) !== lock.identity ||
+          (await ownerToken(lock)) !== lock.token
+        ) {
+          throw transactionError("TRANSACTION_LOCKED", "Transaction lock ownership was lost.")
+        }
+      }
+    },
+    async release() {
+      for (const lock of acquired.reverse()) await releaseOwnedLock(lock, adapter)
+    },
   }
 }
 
@@ -1363,6 +1655,8 @@ async function publishExclusive(
   path: string,
   bytes: Buffer,
   mode: number,
+  adapter: NoteTransactionAdapter,
+  onPublished: (identity?: string) => void,
 ): Promise<void> {
   const target = absolutePath(workspace, path)
   const parent = dirname(target)
@@ -1383,6 +1677,16 @@ async function publishExclusive(
       // atomically and, unlike rename(), never replaces a late external target.
       await link(temporary, target)
       published = true
+      onPublished()
+      const installedIdentity = await lstat(target, { bigint: true })
+      if (installedIdentity.isSymbolicLink() || !installedIdentity.isFile()) {
+        throw transactionError(
+          "TRANSACTION_UNCERTAIN",
+          "An exclusive transaction publication could not be confirmed.",
+          { path },
+        )
+      }
+      onPublished(fileIdentity(installedIdentity))
     } catch (error) {
       if ((error as NodeJS.ErrnoException).code === "EEXIST") {
         throw transactionError(
@@ -1393,6 +1697,7 @@ async function publishExclusive(
       }
       throw error
     }
+    await adapter.afterExclusivePublish?.(path)
     await chmod(target, mode & 0o777)
     const installed = await safeFile(workspace, path)
     if (!installed.bytes.equals(bytes)) throw new Error("published bytes changed")
@@ -1407,16 +1712,6 @@ async function publishExclusive(
           { path },
         )
       }
-      try {
-        await rm(target, { force: true })
-        await syncDirectory(parent)
-      } catch {
-        throw transactionError(
-          "TRANSACTION_UNCERTAIN",
-          "An exclusive transaction publication could not be rolled back.",
-          { path },
-        )
-      }
     }
     throw error
   } finally {
@@ -1424,23 +1719,70 @@ async function publishExclusive(
   }
 }
 
-async function replaceAtomic(
+async function replacePlannedFile(
   workspace: string,
   path: string,
   bytes: Buffer,
   mode: number,
+  expected: TransactionRevision,
+  journalDirectory: string,
+  adapter: NoteTransactionAdapter,
+  onPublished: (identity?: string) => void,
 ): Promise<void> {
   const target = absolutePath(workspace, path)
-  const temporary = `${target}.garden-publisher-${randomUUID()}`
+  const originals = resolve(journalDirectory, "forward-originals")
+  const quarantined = resolve(originals, `${sha256(path)}.bin`)
+  await mkdir(originals, { mode: 0o700 })
+  await syncDirectory(journalDirectory)
+  await adapter.beforeLinkQuarantine?.(path)
   try {
-    await durableWrite(temporary, bytes)
-    await rename(temporary, target)
-    await chmod(target, mode & 0o777)
-    const installed = await safeFile(workspace, path)
-    if (!installed.bytes.equals(bytes)) throw new Error("replacement changed")
+    await rename(target, quarantined)
     await syncDirectory(dirname(target))
-  } finally {
-    await rm(temporary, { force: true }).catch(() => undefined)
+    await syncDirectory(originals)
+  } catch {
+    throw transactionError("TRANSACTION_STALE", "A Wiki-link source changed during execution.", {
+      path,
+    })
+  }
+  const original = await safeAbsoluteFile(quarantined, journalDirectory)
+  if (original === undefined || !revisionMatches(original.revision, expected)) {
+    try {
+      await link(quarantined, target)
+      await rm(quarantined)
+      await syncDirectory(dirname(target))
+      await syncDirectory(originals)
+    } catch {
+      throw transactionError(
+        "TRANSACTION_UNCERTAIN",
+        "A changed Wiki-link source could not be restored safely.",
+        { path },
+      )
+    }
+    throw transactionError("TRANSACTION_STALE", "A Wiki-link source changed during execution.", {
+      path,
+    })
+  }
+  await adapter.afterLinkQuarantine?.(path)
+  try {
+    await publishExclusive(workspace, path, bytes, mode, adapter, onPublished)
+    await rm(quarantined)
+    await syncDirectory(originals)
+  } catch (error) {
+    if ((await pathState(workspace, path)) === "absent") {
+      try {
+        await link(quarantined, target)
+        await rm(quarantined)
+        await syncDirectory(dirname(target))
+        await syncDirectory(originals)
+      } catch {
+        throw transactionError(
+          "TRANSACTION_UNCERTAIN",
+          "A Wiki-link replacement could not be restored safely.",
+          { path },
+        )
+      }
+    }
+    throw error
   }
 }
 
@@ -1451,12 +1793,35 @@ function editsByPath(plan: NoteTransactionPlan): Map<string, WikiLinkEdit[]> {
   return grouped
 }
 
+function expectedAttachmentTree(
+  moves: readonly TransactionMove[],
+  root: string,
+  side: "source" | "target",
+): Array<{ path: string; hash: string }> {
+  const directories = new Set<string>()
+  const files = moves.map((move) => {
+    const relativePath = move[side].slice(root.length + 1)
+    const parts = relativePath.split("/")
+    parts.pop()
+    let directory = ""
+    for (const part of parts) {
+      directory = directory ? `${directory}/${part}` : part
+      directories.add(`${directory}/`)
+    }
+    return { path: relativePath, hash: move.revision.contentHash }
+  })
+  return [...[...directories].map((path) => ({ path, hash: "directory" })), ...files].sort(
+    (left, right) => left.path.localeCompare(right.path),
+  )
+}
+
 async function publishAttachments(
   workspace: string,
   plan: NoteTransactionPlan,
   adapter: NoteTransactionAdapter,
   appliedHashes: Map<string, string>,
   publishedRoots: Set<string>,
+  installedIdentities: Map<string, string>,
 ): Promise<void> {
   const moves = plan.moves.filter(({ kind }) => kind === "attachment")
   if (moves.length === 0) return
@@ -1467,11 +1832,21 @@ async function publishAttachments(
   const staging = resolve(parent, `.garden-publisher-${plan.id}-${randomUUID()}`)
   try {
     await mkdir(staging, { mode: 0o700 })
+    const stagingIdentity = await currentDirectoryIdentity(staging)
+    if (stagingIdentity === undefined) throw new Error("attachment staging identity unavailable")
+    const stagedIdentities = new Map<string, string>()
+    const directories = new Set<string>([staging])
     for (const move of moves) {
       const relativeTarget = move.target.slice(targetRoot.length + 1)
       const target = resolve(staging, ...relativeTarget.split("/"))
       if (!inside(staging, target)) throw new Error("invalid attachment target")
       await mkdir(dirname(target), { recursive: true, mode: 0o700 })
+      let directory = dirname(target)
+      while (inside(staging, directory)) {
+        directories.add(directory)
+        if (directory === staging) break
+        directory = dirname(directory)
+      }
       const source = await safeFile(workspace, move.source)
       if (!revisionMatches(source.revision, move.revision)) {
         throw transactionError("TRANSACTION_STALE", "An attachment changed during execution.", {
@@ -1480,56 +1855,88 @@ async function publishAttachments(
       }
       await durableWrite(target, source.bytes)
       await chmod(target, move.mode & 0o777)
+      const staged = await safeAbsoluteFile(target, staging)
+      if (staged === undefined || staged.revision.contentHash !== move.revision.contentHash) {
+        throw new Error("staged attachment verification failed")
+      }
+      stagedIdentities.set(move.target, staged.identity)
+      await adapter.afterAttachmentStageFile?.(move.target)
+    }
+    const expected = expectedAttachmentTree(moves, targetRoot, "target")
+    if (canonicalJson(await treeSnapshot(staging)) !== canonicalJson(expected)) {
+      throw new Error("staged attachment tree changed")
+    }
+    for (const directory of [...directories].sort((left, right) => right.length - left.length)) {
+      await syncDirectory(directory)
     }
     await adapter.beforePublish?.(targetRoot)
     await adapter.beforeAttachmentRootPublish?.(targetRoot)
-    try {
-      await mkdir(absoluteTargetRoot, { mode: 0o700 })
-      publishedRoots.add(targetRoot)
-      await syncDirectory(parent)
-    } catch (error) {
-      if ((error as NodeJS.ErrnoException).code !== "EEXIST") throw error
+    if ((await pathState(workspace, targetRoot)) !== "absent") {
       throw transactionError(
         "TRANSACTION_COLLISION",
         "An attachment target was created during execution.",
         { path: targetRoot },
       )
     }
-    const createdDirectories = new Set<string>([absoluteTargetRoot])
-    for (const move of moves) {
-      const relativeTarget = move.target.slice(targetRoot.length + 1)
-      const parts = relativeTarget.split("/")
-      let directory = absoluteTargetRoot
-      for (const part of parts.slice(0, -1)) {
-        const child = resolve(directory, part)
-        if (!inside(absoluteTargetRoot, child)) throw new Error("invalid attachment target")
-        if (!createdDirectories.has(child)) {
-          try {
-            await mkdir(child, { mode: 0o700 })
-          } catch (error) {
-            if ((error as NodeJS.ErrnoException).code === "EEXIST") {
-              throw transactionError(
-                "TRANSACTION_COLLISION",
-                "An attachment target was created during execution.",
-                { path: move.target },
-              )
-            }
-            throw error
-          }
-          await syncDirectory(directory)
-          createdDirectories.add(child)
+    try {
+      await rename(staging, absoluteTargetRoot)
+      if ((await currentDirectoryIdentity(absoluteTargetRoot)) !== stagingIdentity) {
+        throw transactionError(
+          "TRANSACTION_UNCERTAIN",
+          "The published attachment tree identity could not be verified.",
+          { path: targetRoot },
+        )
+      }
+      publishedRoots.add(targetRoot)
+      installedIdentities.set(targetRoot, stagingIdentity)
+      for (const move of moves) {
+        appliedHashes.set(move.target, move.revision.contentHash)
+        installedIdentities.set(move.target, stagedIdentities.get(move.target)!)
+      }
+      await adapter.afterAttachmentRootPublish?.(targetRoot)
+    } catch (error) {
+      if (
+        (await currentDirectoryIdentity(absoluteTargetRoot)) === stagingIdentity &&
+        canonicalJson(await treeSnapshot(absoluteTargetRoot)) === canonicalJson(expected)
+      ) {
+        publishedRoots.add(targetRoot)
+        installedIdentities.set(targetRoot, stagingIdentity)
+        for (const move of moves) {
+          appliedHashes.set(move.target, move.revision.contentHash)
+          installedIdentities.set(move.target, stagedIdentities.get(move.target)!)
         }
-        directory = child
+      } else if (["EEXIST", "ENOTEMPTY"].includes((error as NodeJS.ErrnoException).code ?? "")) {
+        throw transactionError(
+          "TRANSACTION_COLLISION",
+          "An attachment target was created during execution.",
+          { path: targetRoot },
+        )
       }
-      const staged = await readFile(resolve(staging, ...relativeTarget.split("/")))
-      if (sha256(staged) !== move.revision.contentHash) {
-        throw new Error("staged attachment verification failed")
-      }
-      await publishExclusive(workspace, move.target, staged, move.mode)
-      appliedHashes.set(move.target, move.revision.contentHash)
+      throw error
+    }
+    await syncDirectory(parent)
+    if (
+      (await currentDirectoryIdentity(absoluteTargetRoot)) !== stagingIdentity ||
+      canonicalJson(await treeSnapshot(absoluteTargetRoot)) !== canonicalJson(expected)
+    ) {
+      throw transactionError(
+        "TRANSACTION_UNCERTAIN",
+        "The published attachment tree could not be verified.",
+        { path: targetRoot },
+      )
+    }
+    for (const move of moves) {
       const installed = await safeFile(workspace, move.target)
-      if (installed.revision.contentHash !== move.revision.contentHash)
-        throw new Error("attachment verification failed")
+      if (
+        installed.identity !== stagedIdentities.get(move.target) ||
+        installed.revision.contentHash !== move.revision.contentHash
+      ) {
+        throw transactionError(
+          "TRANSACTION_UNCERTAIN",
+          "A published attachment file could not be verified.",
+          { path: move.target },
+        )
+      }
     }
   } finally {
     await rm(staging, { recursive: true, force: true }).catch(() => undefined)
@@ -1540,35 +1947,113 @@ async function removeSources(
   workspace: string,
   plan: NoteTransactionPlan,
   journalDirectory: string,
+  removedSources: Set<string>,
+  adapter: NoteTransactionAdapter,
 ): Promise<void> {
   const removed = resolve(journalDirectory, "removed")
   await mkdir(removed, { mode: 0o700 })
   const sourceNote = absolutePath(workspace, plan.source)
-  await rename(sourceNote, resolve(removed, "note.md"))
+  const removedNote = resolve(removed, "note.md")
+  await adapter.beforeSourceQuarantine?.(plan.source)
+  await rename(sourceNote, removedNote)
+  removedSources.add(plan.source)
   await syncDirectory(dirname(sourceNote))
+  await syncDirectory(removed)
+  await adapter.afterSourceQuarantine?.(plan.source)
+  const quarantinedNote = await safeAbsoluteFile(removedNote, journalDirectory)
+  if (
+    quarantinedNote === undefined ||
+    !revisionMatches(quarantinedNote.revision, plan.sourceRevision)
+  ) {
+    try {
+      await link(removedNote, sourceNote)
+      await rm(removedNote)
+      await syncDirectory(dirname(sourceNote))
+      await syncDirectory(removed)
+      removedSources.delete(plan.source)
+    } catch {
+      throw transactionError(
+        "TRANSACTION_UNCERTAIN",
+        "A changed source note could not be restored after quarantine.",
+        { path: plan.source },
+      )
+    }
+    throw transactionError("TRANSACTION_STALE", "The source note changed before removal.", {
+      path: plan.source,
+    })
+  }
   const attachments = plan.moves.filter(({ kind }) => kind === "attachment")
   if (attachments.length > 0) {
     const sourceRoot = attachments[0].source.split("/").slice(0, 3).join("/")
-    await rename(absolutePath(workspace, sourceRoot), resolve(removed, "attachments"))
-    await syncDirectory(dirname(absolutePath(workspace, sourceRoot)))
+    const absoluteSourceRoot = absolutePath(workspace, sourceRoot)
+    const removedAttachments = resolve(removed, "attachments")
+    await adapter.beforeSourceQuarantine?.(sourceRoot)
+    await rename(absoluteSourceRoot, removedAttachments)
+    removedSources.add(sourceRoot)
+    await syncDirectory(dirname(absoluteSourceRoot))
+    await syncDirectory(removed)
+    await adapter.afterSourceQuarantine?.(sourceRoot)
+    const expected = expectedAttachmentTree(attachments, sourceRoot, "source")
+    if (
+      canonicalJson(await treeSnapshot(removedAttachments)) !== canonicalJson(expected) ||
+      !(await treeMatchesSourceRevisions(removedAttachments, sourceRoot, attachments))
+    ) {
+      try {
+        if ((await pathState(workspace, sourceRoot)) !== "absent")
+          throw new Error("source replaced")
+        await rename(removedAttachments, absoluteSourceRoot)
+        await syncDirectory(dirname(absoluteSourceRoot))
+        await syncDirectory(removed)
+        removedSources.delete(sourceRoot)
+      } catch {
+        throw transactionError(
+          "TRANSACTION_UNCERTAIN",
+          "A changed attachment tree could not be restored after quarantine.",
+          { path: sourceRoot },
+        )
+      }
+      throw transactionError(
+        "TRANSACTION_STALE",
+        "The source attachment tree changed before removal.",
+        { path: sourceRoot },
+      )
+    }
   }
-  await syncDirectory(removed)
 }
 
-async function treeMatchesAppliedMoves(
-  workspace: string,
-  rootPath: string,
-  moves: readonly TransactionMove[],
-  appliedHashes: ReadonlyMap<string, string>,
-): Promise<boolean> {
-  const expected = moves
-    .filter((move) => appliedHashes.has(move.target))
-    .map((move) => ({
-      path: move.target.slice(rootPath.length + 1),
-      hash: appliedHashes.get(move.target)!,
-    }))
-    .sort((left, right) => left.path.localeCompare(right.path))
-  const absoluteRoot = absolutePath(workspace, rootPath)
+async function safeAbsoluteFile(path: string, parent: string): Promise<SafeFile | undefined> {
+  let handle
+  try {
+    const before = await lstat(path, { bigint: true })
+    if (before.isSymbolicLink() || !before.isFile()) return undefined
+    const canonical = await realpath(path)
+    if (!inside(parent, canonical)) return undefined
+    const flags = process.platform === "win32" ? "r" : constants.O_RDONLY | constants.O_NOFOLLOW
+    handle = await open(path, flags)
+    const opened = await handle.stat({ bigint: true })
+    if (!opened.isFile() || fileIdentity(before) !== fileIdentity(opened)) return undefined
+    const bytes = await handle.readFile()
+    const after = await lstat(path, { bigint: true })
+    if (fileIdentity(opened) !== fileIdentity(after) || canonical !== (await realpath(path))) {
+      return undefined
+    }
+    const ordinary = await handle.stat()
+    return {
+      bytes,
+      revision: { mtimeMs: ordinary.mtimeMs, contentHash: sha256(bytes) },
+      mode: Number(opened.mode),
+      identity: fileIdentity(opened),
+    }
+  } catch {
+    return undefined
+  } finally {
+    await handle?.close().catch(() => undefined)
+  }
+}
+
+async function treeSnapshot(
+  absoluteRoot: string,
+): Promise<Array<{ path: string; hash: string }> | undefined> {
   const actual: Array<{ path: string; hash: string }> = []
   async function visit(directory: string, prefix: string): Promise<boolean> {
     const entries = await readdir(directory, { withFileTypes: true })
@@ -1577,6 +2062,7 @@ async function treeMatchesAppliedMoves(
       const relativePath = prefix ? `${prefix}/${entry.name}` : entry.name
       if (entry.isSymbolicLink()) return false
       if (entry.isDirectory()) {
+        actual.push({ path: `${relativePath}/`, hash: "directory" })
         if (!(await visit(path, relativePath))) return false
       } else if (entry.isFile()) {
         const bytes = await readFile(path)
@@ -1586,12 +2072,30 @@ async function treeMatchesAppliedMoves(
     return true
   }
   try {
-    if (!(await visit(absoluteRoot, ""))) return false
+    const root = await lstat(absoluteRoot)
+    if (root.isSymbolicLink() || !root.isDirectory()) return undefined
+    if (!(await visit(absoluteRoot, ""))) return undefined
   } catch {
-    return false
+    return undefined
   }
   actual.sort((left, right) => left.path.localeCompare(right.path))
-  return canonicalJson(actual) === canonicalJson(expected)
+  return actual
+}
+
+async function treeMatchesSourceRevisions(
+  absoluteRoot: string,
+  sourceRoot: string,
+  moves: readonly TransactionMove[],
+): Promise<boolean> {
+  for (const move of moves) {
+    const relativePath = move.source.slice(sourceRoot.length + 1)
+    const file = await safeAbsoluteFile(
+      resolve(absoluteRoot, ...relativePath.split("/")),
+      absoluteRoot,
+    )
+    if (file === undefined || !revisionMatches(file.revision, move.revision)) return false
+  }
+  return true
 }
 
 async function rollback(
@@ -1602,6 +2106,8 @@ async function rollback(
   adapter: NoteTransactionAdapter,
   appliedHashes: ReadonlyMap<string, string>,
   publishedRoots: ReadonlySet<string>,
+  removedSources: ReadonlySet<string>,
+  installedIdentities: ReadonlyMap<string, string>,
 ): Promise<boolean> {
   try {
     await adapter.beforeRollback?.()
@@ -1609,60 +2115,158 @@ async function rollback(
     const sourceRoot = attachmentMoves[0]?.source.split("/").slice(0, 3).join("/")
     const targetRoot = attachmentMoves[0]?.target.split("/").slice(0, 3).join("/")
     const removed = resolve(journal.directory, "removed")
-    if (sourceRoot && (await pathState(workspace, sourceRoot)) === "absent") {
+    const quarantine = resolve(journal.directory, "rollback-quarantine")
+    await mkdir(quarantine, { mode: 0o700 })
+    await syncDirectory(journal.directory)
+    if (sourceRoot && removedSources.has(sourceRoot)) {
       const removedAssets = resolve(removed, "attachments")
-      try {
-        await rename(removedAssets, absolutePath(workspace, sourceRoot))
-      } catch {
-        for (const move of attachmentMoves) {
-          const backup = journal.backupFiles.get(move.source)
-          if (!backup) return false
-          await mkdir(dirname(absolutePath(workspace, move.source)), {
-            recursive: true,
-            mode: 0o700,
-          })
-          await publishExclusive(workspace, move.source, backup.bytes, backup.mode)
-        }
-      }
+      const expected = expectedAttachmentTree(attachmentMoves, sourceRoot, "source")
+      if (
+        canonicalJson(await treeSnapshot(removedAssets)) !== canonicalJson(expected) ||
+        !(await treeMatchesSourceRevisions(removedAssets, sourceRoot, attachmentMoves))
+      )
+        return false
+      if ((await pathState(workspace, sourceRoot)) !== "absent") return false
+      await rename(removedAssets, absolutePath(workspace, sourceRoot))
+      await syncDirectory(dirname(absolutePath(workspace, sourceRoot)))
+      await syncDirectory(removed)
+      if (
+        canonicalJson(await treeSnapshot(absolutePath(workspace, sourceRoot))) !==
+        canonicalJson(expected)
+      )
+        return false
     }
     const sourceBackup = journal.backupFiles.get(plan.source)
     if (!sourceBackup) return false
-    if ((await pathState(workspace, plan.source)) === "absent") {
-      await publishExclusive(workspace, plan.source, sourceBackup.bytes, sourceBackup.mode)
-    } else {
-      const current = await safeFile(workspace, plan.source)
-      if (!current.bytes.equals(sourceBackup.bytes)) return false
-    }
-    if (
-      targetRoot &&
-      publishedRoots.has(targetRoot) &&
-      (await pathState(workspace, targetRoot)) === "present"
-    ) {
-      if (!(await treeMatchesAppliedMoves(workspace, targetRoot, attachmentMoves, appliedHashes)))
+    if (removedSources.has(plan.source)) {
+      const removedNote = resolve(removed, "note.md")
+      const quarantined = await safeAbsoluteFile(removedNote, journal.directory)
+      if (
+        quarantined === undefined ||
+        !revisionMatches(quarantined.revision, plan.sourceRevision)
+      ) {
         return false
-      await rm(absolutePath(workspace, targetRoot), { recursive: true, force: true })
-      await syncDirectory(dirname(absolutePath(workspace, targetRoot)))
+      }
+      try {
+        await link(removedNote, absolutePath(workspace, plan.source))
+      } catch {
+        return false
+      }
+      await chmod(absolutePath(workspace, plan.source), sourceBackup.mode & 0o777)
+      await syncDirectory(dirname(absolutePath(workspace, plan.source)))
+      const restored = await safeFile(workspace, plan.source)
+      if (!revisionMatches(restored.revision, plan.sourceRevision)) return false
+      await rm(removedNote)
+      await syncDirectory(removed)
     }
+    if (targetRoot && publishedRoots.has(targetRoot)) {
+      const installedIdentity = installedIdentities.get(targetRoot)
+      if (installedIdentity === undefined) return false
+      const quarantinedRoot = resolve(quarantine, "attachments-target")
+      try {
+        await rename(absolutePath(workspace, targetRoot), quarantinedRoot)
+      } catch {
+        return false
+      }
+      await syncDirectory(dirname(absolutePath(workspace, targetRoot)))
+      await syncDirectory(quarantine)
+      const expected = expectedAttachmentTree(attachmentMoves, targetRoot, "target").map((entry) =>
+        entry.hash === "directory"
+          ? entry
+          : { path: entry.path, hash: appliedHashes.get(`${targetRoot}/${entry.path}`) },
+      )
+      if (
+        (await currentDirectoryIdentity(quarantinedRoot)) !== installedIdentity ||
+        expected.some(({ hash }) => hash === undefined) ||
+        canonicalJson(await treeSnapshot(quarantinedRoot)) !== canonicalJson(expected)
+      )
+        return false
+      for (const move of attachmentMoves) {
+        const relativePath = move.target.slice(targetRoot.length + 1)
+        const quarantinedFile = await safeAbsoluteFile(
+          resolve(quarantinedRoot, ...relativePath.split("/")),
+          quarantinedRoot,
+        )
+        if (
+          quarantinedFile === undefined ||
+          quarantinedFile.identity !== installedIdentities.get(move.target) ||
+          quarantinedFile.revision.contentHash !== appliedHashes.get(move.target)
+        )
+          return false
+      }
+      await rm(quarantinedRoot, { recursive: true })
+      await syncDirectory(quarantine)
+    }
+    const linkQuarantine = resolve(quarantine, "links")
+    await mkdir(linkQuarantine, { mode: 0o700 })
     for (const path of new Set(plan.linkEdits.map(({ path }) => path))) {
       if (path === plan.source) continue
       const backup = journal.backupFiles.get(path)
       if (!backup) return false
-      const current = await safeFile(workspace, path)
       const appliedHash = appliedHashes.get(path)
-      if (appliedHash === undefined) {
-        if (!current.bytes.equals(backup.bytes)) return false
-      } else {
-        if (current.revision.contentHash !== appliedHash) return false
-        await replaceAtomic(workspace, path, backup.bytes, backup.mode)
+      if (appliedHash === undefined) continue
+      const quarantinedPath = resolve(linkQuarantine, `${sha256(path)}.bin`)
+      try {
+        await rename(absolutePath(workspace, path), quarantinedPath)
+      } catch {
+        return false
+      }
+      await syncDirectory(dirname(absolutePath(workspace, path)))
+      await syncDirectory(linkQuarantine)
+      const current = await safeAbsoluteFile(quarantinedPath, journal.directory)
+      const installedIdentity = installedIdentities.get(path)
+      if (
+        installedIdentity === undefined ||
+        current === undefined ||
+        current.identity !== installedIdentity ||
+        current.revision.contentHash !== appliedHash
+      )
+        return false
+      await publishExclusive(workspace, path, backup.bytes, backup.mode, {}, () => undefined)
+      await rm(quarantinedPath)
+      await syncDirectory(linkQuarantine)
+      const forwardOriginal = resolve(journal.directory, "forward-originals", `${sha256(path)}.bin`)
+      const retained = await safeAbsoluteFile(forwardOriginal, journal.directory)
+      if (retained !== undefined) {
+        if (retained.revision.contentHash !== backup.revision.contentHash) return false
+        await rm(forwardOriginal)
+        await syncDirectory(dirname(forwardOriginal))
       }
     }
-    if ((await pathState(workspace, plan.target)) === "present") {
-      const target = await safeFile(workspace, plan.target)
-      if (target.revision.contentHash !== appliedHashes.get(plan.target)) return false
-      await rm(absolutePath(workspace, plan.target), { force: true })
+    const targetHash = appliedHashes.get(plan.target)
+    if (targetHash !== undefined) {
+      const quarantinedTarget = resolve(quarantine, "note-target")
+      try {
+        await rename(absolutePath(workspace, plan.target), quarantinedTarget)
+      } catch {
+        return false
+      }
       await syncDirectory(dirname(absolutePath(workspace, plan.target)))
+      await syncDirectory(quarantine)
+      const target = await safeAbsoluteFile(quarantinedTarget, journal.directory)
+      const installedIdentity = installedIdentities.get(plan.target)
+      if (
+        installedIdentity === undefined ||
+        target === undefined ||
+        target.identity !== installedIdentity ||
+        target.revision.contentHash !== targetHash
+      )
+        return false
+      await rm(quarantinedTarget)
+      await syncDirectory(quarantine)
     }
     for (const [path, backup] of journal.backupFiles) {
+      const attachmentSource = sourceRoot !== undefined && path.startsWith(`${sourceRoot}/`)
+      const unappliedLink =
+        path !== plan.source &&
+        plan.linkEdits.some((edit) => edit.path === path) &&
+        !appliedHashes.has(path)
+      if (
+        (path === plan.source && !removedSources.has(plan.source)) ||
+        (attachmentSource && !removedSources.has(sourceRoot!)) ||
+        unappliedLink
+      )
+        continue
       const current = await safeFile(workspace, path)
       if (
         current.revision.contentHash !== backup.revision.contentHash ||
@@ -1670,7 +2274,8 @@ async function rollback(
       )
         return false
     }
-    if ((await pathState(workspace, plan.target)) !== "absent") return false
+    if (targetHash !== undefined && (await pathState(workspace, plan.target)) !== "absent")
+      return false
     if (
       targetRoot &&
       publishedRoots.has(targetRoot) &&
@@ -1688,6 +2293,7 @@ function planPaths(plan: NoteTransactionPlan): string[] {
   return [
     ...new Set([
       ...plan.moves.flatMap(({ source, target }) => [source, target]),
+      ...plan.collisionChecks.map(({ path }) => path),
       ...plan.linkEdits.map(({ path }) => path),
     ]),
   ]
@@ -1730,19 +2336,25 @@ async function readJournalManifest(
   }
 }
 
-export async function inspectPendingTransactions(
+async function inspectPendingTransactionsInternal(
   input: { workspace: string } | string,
 ): Promise<PendingTransaction[]> {
   const { root: workspace } = await canonicalWorkspace(
     typeof input === "string" ? input : input.workspace,
   )
-  let key: Buffer
+  const state = resolve(workspace, stateName)
+  const root = resolve(state, transactionDirectoryName)
   try {
-    key = await trustKey(workspace, false)
-  } catch {
-    return []
+    await ensureSafeDirectory(state, workspace)
+    await ensureSafeDirectory(root, state)
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code === "ENOENT") return []
+    throw transactionError(
+      "TRANSACTION_PLAN_INVALID",
+      "Transaction history could not be inspected safely.",
+    )
   }
-  const root = resolve(workspace, stateName, transactionDirectoryName)
+  const key = await trustKey(workspace, false)
   let entries
   try {
     entries = await readdir(root, { withFileTypes: true })
@@ -1776,6 +2388,27 @@ export async function inspectPendingTransactions(
   return pending
 }
 
+export async function inspectPendingTransactions(
+  input: { workspace: string } | string,
+): Promise<PendingTransaction[]> {
+  try {
+    return await inspectPendingTransactionsInternal(input)
+  } catch (error) {
+    if (
+      typeof error === "object" &&
+      error !== null &&
+      typeof (error as { code?: unknown }).code === "string" &&
+      (error as { code: string }).code.startsWith("TRANSACTION_")
+    ) {
+      throw error
+    }
+    throw transactionError(
+      "TRANSACTION_PLAN_INVALID",
+      "Transaction history could not be inspected safely.",
+    )
+  }
+}
+
 async function assertNoPendingConflict(
   workspace: string,
   plan: NoteTransactionPlan,
@@ -1802,15 +2435,18 @@ async function execute(
 ): Promise<TransactionResult> {
   const verified = await verifyPlan(rawPlan, expectedKind, context.workspace)
   const { plan, workspace, key } = verified
+  const adapter = context.adapter ?? {}
   await assertNoPendingConflict(workspace, plan)
-  const releaseLocks = await acquireLocks(workspace, planPaths(plan))
+  const locks = await acquireLocks(workspace, planPaths(plan), adapter)
   let journal:
     { directory: string; manifest: JournalPayload; backupFiles: Map<string, SafeFile> } | undefined
   let mutationStarted = false
   const appliedHashes = new Map<string, string>()
   const publishedRoots = new Set<string>()
-  const adapter = context.adapter ?? {}
+  const removedSources = new Set<string>()
+  const installedIdentities = new Map<string, string>()
   try {
+    await locks.assertOwned()
     await revalidatePlan(workspace, plan)
     journal = await createJournal(workspace, plan, key)
     await adapter.afterPhase?.("journal-created")
@@ -1834,10 +2470,22 @@ async function execute(
       )
       targetBytes = Buffer.from(addAlias(attachments, plan.alias), "utf8")
     }
+    await locks.assertOwned()
+    await updateJournal(journal, "note-publish-intent", key)
     await adapter.beforePublish?.(plan.target)
-    await publishExclusive(workspace, plan.target, targetBytes, source.mode)
-    appliedHashes.set(plan.target, sha256(targetBytes))
-    mutationStarted = true
+    await publishExclusive(
+      workspace,
+      plan.target,
+      targetBytes,
+      source.mode,
+      adapter,
+      (identity) => {
+        appliedHashes.set(plan.target, sha256(targetBytes))
+        if (identity !== undefined) installedIdentities.set(plan.target, identity)
+        mutationStarted = true
+      },
+    )
+    await locks.assertOwned()
     await updateJournal(journal, "note-published", key)
     await adapter.afterPhase?.("note-published")
 
@@ -1854,17 +2502,45 @@ async function execute(
         )
       }
       const updated = Buffer.from(applyWikiEdits(current.bytes.toString("utf8"), edits), "utf8")
-      await replaceAtomic(workspace, path, updated, current.mode)
-      appliedHashes.set(path, sha256(updated))
+      await locks.assertOwned()
+      await replacePlannedFile(
+        workspace,
+        path,
+        updated,
+        current.mode,
+        edits[0].revision,
+        journal.directory,
+        adapter,
+        (identity) => {
+          appliedHashes.set(path, sha256(updated))
+          if (identity !== undefined) installedIdentities.set(path, identity)
+        },
+      )
     }
+    await locks.assertOwned()
     await updateJournal(journal, "links-published", key)
     await adapter.afterPhase?.("links-published")
 
-    await publishAttachments(workspace, plan, adapter, appliedHashes, publishedRoots)
+    await locks.assertOwned()
+    await updateJournal(journal, "attachments-publish-intent", key)
+    await publishAttachments(
+      workspace,
+      plan,
+      adapter,
+      appliedHashes,
+      publishedRoots,
+      installedIdentities,
+    )
+    if (publishedRoots.size > 0) mutationStarted = true
+    await locks.assertOwned()
     await updateJournal(journal, "attachments-published", key)
     await adapter.afterPhase?.("attachments-published")
 
-    await removeSources(workspace, plan, journal.directory)
+    await locks.assertOwned()
+    await updateJournal(journal, "source-remove-intent", key)
+    await removeSources(workspace, plan, journal.directory, removedSources, adapter)
+    if (removedSources.size > 0) mutationStarted = true
+    await locks.assertOwned()
     await updateJournal(journal, "source-removed", key)
     await adapter.afterPhase?.("source-removed")
 
@@ -1900,6 +2576,8 @@ async function execute(
         adapter,
         appliedHashes,
         publishedRoots,
+        removedSources,
+        installedIdentities,
       )
       if (!restored) {
         await updateJournal(journal, "rollback-uncertain", key).catch(() => undefined)
@@ -1909,6 +2587,7 @@ async function execute(
           { transactionId: plan.id },
         )
       }
+      if ((error as { code?: string }).code === "TRANSACTION_STALE") throw error
       throw transactionError("TRANSACTION_FAILED", "The transaction failed and was rolled back.", {
         transactionId: plan.id,
       })
@@ -1922,7 +2601,7 @@ async function execute(
       },
     )
   } finally {
-    await releaseLocks().catch(() => undefined)
+    await locks.release().catch(() => undefined)
   }
 }
 
