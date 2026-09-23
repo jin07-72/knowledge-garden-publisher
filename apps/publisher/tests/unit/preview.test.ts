@@ -64,7 +64,7 @@ class ManualClock {
 class FakeProcess extends EventEmitter implements PreviewProcess {
   readonly stdout = new PassThrough()
   readonly stderr = new PassThrough()
-  pid = 4242
+  pid: number | undefined = 4242
   alive = true
   readonly signals: Array<NodeJS.Signals | number | undefined> = []
 
@@ -101,7 +101,7 @@ function dependencies(overrides: Partial<PreviewDependencies> = {}): TestDepende
     runtimePath: () => "C:\\Program Files\\Knowledge Garden\\resources\\node\\node.exe",
     spawn: () => {
       const child = new FakeProcess()
-      child.pid += children.length
+      child.pid = 4242 + children.length
       children.push(child)
       return child
     },
@@ -564,6 +564,87 @@ describe("PreviewManager", () => {
     failedChild.close(1)
     expect(failedChild.listenerCount("close")).toBe(0)
     expect(failedChild.listenerCount("error")).toBe(0)
+
+    await expect(manager.start({ workspace: "C:\\Garden" })).resolves.toMatchObject({
+      state: "ready",
+      generation: 2,
+    })
+    expect(deps.children).toHaveLength(2)
+  })
+
+  it("retains a live child after a startup error until a confirmed close", async () => {
+    const terminate = vi.fn<PreviewDependencies["terminate"]>(async () => false)
+    const deps = dependencies({
+      terminate,
+      probe: async () => deps.children.length >= 2,
+    })
+    const manager = new PreviewManager(deps)
+    const observed: PreviewStatus[] = []
+    manager.subscribe((status) => observed.push(status))
+    const first = manager.start({ workspace: "C:\\Garden" })
+
+    await until(() => expect(deps.children).toHaveLength(1), "startup-error first spawn")
+    const failedChild = deps.children[0]
+    failedChild.emit("error", new Error("spawn reported a live child error"))
+
+    await expect(first).resolves.toMatchObject({
+      state: "error",
+      generation: 1,
+      error: { code: "PREVIEW_STOP_FAILED" },
+    })
+    expect(observed).toEqual(
+      expect.arrayContaining([
+        expect.objectContaining({
+          error: expect.objectContaining({ code: "PREVIEW_START_FAILED" }),
+        }),
+      ]),
+    )
+    expect(terminate).toHaveBeenCalledTimes(1)
+    expect(failedChild.alive).toBe(true)
+    expect(failedChild.listenerCount("error")).toBe(1)
+    expect(failedChild.listenerCount("close")).toBe(1)
+
+    await expect(manager.start({ workspace: "C:\\Garden" })).resolves.toMatchObject({
+      state: "error",
+      generation: 1,
+      error: { code: "PREVIEW_STOP_FAILED" },
+    })
+    expect(deps.children).toHaveLength(1)
+
+    failedChild.close(1)
+    expect(failedChild.listenerCount("error")).toBe(0)
+    expect(failedChild.listenerCount("close")).toBe(0)
+
+    await expect(manager.start({ workspace: "C:\\Garden" })).resolves.toMatchObject({
+      state: "ready",
+      generation: 2,
+    })
+    expect(deps.children).toHaveLength(2)
+  })
+
+  it("clears a startup-error child when its missing pid confirms no process was created", async () => {
+    const terminate = vi.fn<PreviewDependencies["terminate"]>(async () => false)
+    const deps = dependencies({
+      terminate,
+      probe: async () => deps.children.length >= 2,
+    })
+    const manager = new PreviewManager(deps)
+    const first = manager.start({ workspace: "C:\\Garden" })
+
+    await until(() => expect(deps.children).toHaveLength(1), "no-child startup-error spawn")
+    const absentChild = deps.children[0]
+    absentChild.pid = undefined
+    absentChild.alive = false
+    absentChild.emit("error", new Error("spawn ENOENT"))
+
+    await expect(first).resolves.toMatchObject({
+      state: "error",
+      generation: 1,
+      error: { code: "PREVIEW_START_FAILED" },
+    })
+    expect(terminate).not.toHaveBeenCalled()
+    expect(absentChild.listenerCount("error")).toBe(0)
+    expect(absentChild.listenerCount("close")).toBe(0)
 
     await expect(manager.start({ workspace: "C:\\Garden" })).resolves.toMatchObject({
       state: "ready",

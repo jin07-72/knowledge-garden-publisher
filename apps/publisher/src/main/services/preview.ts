@@ -73,6 +73,7 @@ type Listener = (status: PreviewStatus) => void
 type AttemptEvent =
   | { readonly kind: "port-race" }
   | { readonly kind: "build-error" }
+  | { readonly kind: "process-error"; readonly noChild: boolean }
   | { readonly kind: "exit"; readonly code: number | null; readonly signal: string | null }
 type WaitOutcome =
   | AttemptEvent
@@ -590,6 +591,30 @@ export class PreviewManager {
             ),
           })
         }
+        if (outcome.kind === "process-error") {
+          const failure = this.transition({
+            state: "error",
+            generation,
+            port,
+            error: appError(
+              "PREVIEW_START_FAILED",
+              "Local preview reported a process error.",
+              this.logDetails(),
+            ),
+          })
+          if (outcome.noChild) {
+            this.detachAttempt(attempt)
+            attempt.inStartup = false
+            session.attempt = undefined
+            this.clearSession(session)
+            return failure
+          }
+
+          const terminated = await this.terminateAttempt(session, attempt)
+          if (!terminated) return this.stopFailure(session, attempt.port)
+          this.clearSession(session)
+          return failure
+        }
 
         this.detachAttempt(attempt)
         session.attempt = undefined
@@ -691,9 +716,13 @@ export class PreviewManager {
         this.consumeChunk(session, attempt, String(chunk), "stdout"),
       onStderr: (chunk: unknown): void =>
         this.consumeChunk(session, attempt, String(chunk), "stderr"),
-      onError: (): void => this.processEnded(session, attempt, null, null, false),
+      onError: (): void =>
+        this.processEvent(session, attempt, {
+          kind: "process-error",
+          noChild: child.pid === undefined,
+        }),
       onClose: (code: number | null, signal?: string | null): void => {
-        this.processEnded(session, attempt, code, signal ?? null, true)
+        this.processEvent(session, attempt, { kind: "exit", code, signal: signal ?? null })
       },
     } satisfies ProcessAttempt
 
@@ -706,17 +735,16 @@ export class PreviewManager {
     return attempt
   }
 
-  private processEnded(
+  private processEvent(
     session: PreviewSession,
     attempt: ProcessAttempt,
-    code: number | null,
-    signal: string | null,
-    confirmedClose: boolean,
+    event: Extract<AttemptEvent, { readonly kind: "process-error" | "exit" }>,
   ): void {
     if (this.session !== session || session.attempt !== attempt) return
+    const confirmedClose = event.kind === "exit"
     if (confirmedClose) attempt.closeObserved = true
     this.flushRemainders(session, attempt)
-    this.settleAttempt(attempt, { kind: "exit", code, signal })
+    this.settleAttempt(attempt, event)
     if (attempt.stopping || (attempt.inStartup && attempt.startupWaitActive)) return
     if (!confirmedClose) {
       if (
