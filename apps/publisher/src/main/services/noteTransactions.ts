@@ -1,4 +1,4 @@
-import { createHash, createHmac, randomBytes, randomUUID, timingSafeEqual } from "node:crypto"
+import { createHash, createHmac, randomUUID, timingSafeEqual } from "node:crypto"
 import { constants } from "node:fs"
 import {
   chmod,
@@ -16,15 +16,25 @@ import {
 } from "node:fs/promises"
 import { dirname, extname, isAbsolute, posix, relative, resolve } from "node:path"
 import { isScalar, isSeq, parseDocument } from "yaml"
-import type { AppError, Visibility } from "../../shared/contracts"
+import type { AppError, TrashAdapter, Visibility } from "../../shared/contracts"
 import { systemCommandRunner, type CommandRunner } from "../lib/commandRunner"
+import {
+  acquireInternalNotePathLease,
+  internalRecoveryKey,
+  type InternalNotePathLease,
+  type NoteFileAdapter,
+} from "./noteFiles"
 
 const validDomains = new Set<NoteDomain>(["technology", "reading", "language", "life"])
 const slugPattern = /^[a-z0-9]+(?:-[a-z0-9]+)*$/
 const hashPattern = /^[a-f0-9]{64}$/
 const stateName = ".garden-publisher"
 const transactionDirectoryName = "transactions"
-const keyRelativePath = `${stateName}/keys/recovery-hmac.key`
+export const DEFAULT_TRANSACTION_PER_NOTE_RETENTION = 20
+export const DEFAULT_TRANSACTION_GLOBAL_RETENTION = 200
+export const MAX_TRANSACTION_RETENTION_SCAN = 256
+export const MAX_TRANSACTION_RETENTION_TRASH_CALLS = 16
+const maximumJournalManifestBytes = 256 * 1024
 
 export type NoteDomain = "technology" | "reading" | "language" | "life"
 
@@ -112,6 +122,22 @@ export type TransactionPhase =
   | "attachments-published"
   | "source-removed"
 
+type NoteTransactionLeaseAdapter = Pick<
+  NoteFileAdapter,
+  | "afterLockMetadataPublish"
+  | "afterLockHeartbeat"
+  | "beforeHeartbeatPublish"
+  | "startHeartbeat"
+  | "now"
+  | "delay"
+  | "isProcessAlive"
+  | "lockLeaseMs"
+  | "lockWaitMs"
+  | "lockGraceMs"
+  | "heartbeatRetryLimit"
+  | "heartbeatRetryDelayMs"
+>
+
 export interface NoteTransactionAdapter {
   afterPhase?: (phase: TransactionPhase) => Promise<void> | void
   beforePublish?: (path: string) => Promise<void> | void
@@ -126,15 +152,19 @@ export interface NoteTransactionAdapter {
   beforeSourceQuarantine?: (path: string) => Promise<void> | void
   afterSourceQuarantine?: (path: string) => Promise<void> | void
   beforeRollback?: () => Promise<void> | void
+  /** Narrow deterministic seam for exercising the shared note-path lease lifecycle. */
+  leaseAdapter?: NoteTransactionLeaseAdapter
 }
 
 export interface TransactionContext {
   workspace: string
   adapter?: NoteTransactionAdapter
+  /** Moves pruned authenticated terminal journals to the platform Trash. */
+  transactionTrash?: TrashAdapter
 }
 
 export interface TransactionWarning {
-  code: "PUBLIC_HISTORY_REMAINS"
+  code: "PUBLIC_HISTORY_REMAINS" | "LOCK_RELEASE_FAILED" | "TRANSACTION_RETENTION_FAILED"
   message: string
 }
 
@@ -152,6 +182,7 @@ export interface PendingTransaction {
   createdAt: string
   phase: string
   paths: string[]
+  issue?: "TRANSACTION_INVALID"
 }
 
 interface SafeFile {
@@ -182,12 +213,34 @@ interface JournalPayload {
   kind: "visibility" | "rename"
   createdAt: string
   phase: string
+  source: string
   paths: string[]
   backups: JournalBackup[]
 }
 
 interface JournalManifest extends JournalPayload {
   integrity: string
+}
+
+type LegacyJournalPayload = Omit<JournalPayload, "source">
+
+interface LegacyJournalManifest extends LegacyJournalPayload {
+  integrity: string
+}
+
+interface TerminalMarker {
+  version: 1
+  id: string
+  kind: "visibility" | "rename"
+  createdAt: string
+  phase: "complete" | "rolled-back"
+  source: string
+  integrity: string
+}
+
+interface AuthenticatedTerminalEvidence {
+  readonly marker: TerminalMarker
+  readonly directoryIdentity: string
 }
 
 interface QuarantinedRecreation {
@@ -404,7 +457,7 @@ async function ensureStateDirectories(workspace: string): Promise<void> {
     if ((error as NodeJS.ErrnoException).code !== "EEXIST") throw error
   }
   await ensureSafeDirectory(state, workspace)
-  for (const child of ["keys", transactionDirectoryName, "transaction-locks"]) {
+  for (const child of [transactionDirectoryName]) {
     const path = resolve(state, child)
     try {
       await mkdir(path, { mode: 0o700 })
@@ -456,89 +509,21 @@ async function readBoundedHandle(
   handle: Awaited<ReturnType<typeof open>>,
   maximumBytes: number,
 ): Promise<Buffer | undefined> {
-  const bounded = Buffer.alloc(maximumBytes + 1)
+  const bytes = Buffer.alloc(maximumBytes + 1)
   let offset = 0
-  while (offset < bounded.length) {
-    const { bytesRead } = await handle.read(bounded, offset, bounded.length - offset, offset)
-    if (bytesRead === 0) break
-    offset += bytesRead
+  while (offset < bytes.length) {
+    const read = await handle.read(bytes, offset, bytes.length - offset, offset)
+    if (read.bytesRead === 0) break
+    offset += read.bytesRead
   }
-  return offset > maximumBytes ? undefined : bounded.subarray(0, offset)
-}
-
-async function readProtectedKey(path: string, parent: string): Promise<Buffer> {
-  let handle
-  try {
-    const before = await lstat(path, { bigint: true })
-    if (
-      before.isSymbolicLink() ||
-      !before.isFile() ||
-      before.size !== 32n ||
-      (process.platform !== "win32" && (Number(before.mode) & 0o777) !== 0o600)
-    ) {
-      throw new Error("unsafe key")
-    }
-    const canonical = await realpath(path)
-    if (!inside(parent, canonical)) throw new Error("unsafe key")
-    const flags = process.platform === "win32" ? "r" : constants.O_RDONLY | constants.O_NOFOLLOW
-    handle = await open(path, flags)
-    const opened = await handle.stat({ bigint: true })
-    if (!opened.isFile() || fileIdentity(before) !== fileIdentity(opened)) {
-      throw new Error("changed key")
-    }
-    const key = await readBoundedHandle(handle, 32)
-    if (key === undefined || key.length !== 32) throw new Error("invalid key")
-    const after = await lstat(path, { bigint: true })
-    if (
-      after.isSymbolicLink() ||
-      fileIdentity(opened) !== fileIdentity(after) ||
-      canonical !== (await realpath(path))
-    ) {
-      throw new Error("changed key")
-    }
-    return key
-  } finally {
-    await handle?.close().catch(() => undefined)
-  }
+  return offset > maximumBytes ? undefined : bytes.subarray(0, offset)
 }
 
 async function trustKey(workspace: string, create: boolean): Promise<Buffer> {
-  const state = resolve(workspace, stateName)
-  const keys = resolve(state, "keys")
-  const path = resolve(workspace, ...keyRelativePath.split("/"))
-  if (create) {
-    try {
-      await ensureStateDirectories(workspace)
-    } catch {
-      throw blocked("PLANNING_FAILED", ".")
-    }
-  }
   try {
-    return await readProtectedKey(path, keys)
-  } catch (error) {
-    if ((error as NodeJS.ErrnoException).code !== "ENOENT" || !create) {
-      throw transactionError(
-        "TRANSACTION_PLAN_INVALID",
-        "The transaction trust key is unavailable.",
-      )
-    }
-  }
-  const temporary = `${path}.tmp-${randomUUID()}`
-  try {
-    const key = randomBytes(32)
-    await durableWrite(temporary, key)
-    try {
-      await link(temporary, path)
-    } catch (error) {
-      if ((error as NodeJS.ErrnoException).code !== "EEXIST") throw error
-    }
-    await syncDirectory(dirname(path))
-  } finally {
-    await rm(temporary, { force: true }).catch(() => undefined)
-  }
-  try {
-    return await readProtectedKey(path, keys)
+    return await internalRecoveryKey(workspace, create)
   } catch {
+    if (create) throw blocked("PLANNING_FAILED", ".")
     throw transactionError("TRANSACTION_PLAN_INVALID", "The transaction trust key is unavailable.")
   }
 }
@@ -826,6 +811,7 @@ async function assertOwnedReferences(
   workspace: string,
   note: ParsedNotePath,
   markdown: string,
+  scannedMarkdown?: readonly ScannedMarkdown[],
 ): Promise<void> {
   const owned = resolve(workspace, note.root, "_assets", note.slug)
   for (const occurrence of localReferenceOccurrences(markdown, note.path)) {
@@ -833,7 +819,7 @@ async function assertOwnedReferences(
     if (candidate === undefined) continue
     if (!inside(owned, candidate)) throw blocked("AMBIGUOUS_ATTACHMENT", note.path)
   }
-  for (const scanned of await scanMarkdown(workspace)) {
+  for (const scanned of scannedMarkdown ?? (await scanMarkdown(workspace))) {
     if (scanned.path === note.path) continue
     for (const occurrence of localReferenceOccurrences(
       scanned.file.bytes.toString("utf8"),
@@ -1037,7 +1023,9 @@ function maskRange(mask: string[], start: number, end: number): void {
 }
 
 function markdownMask(source: string): string {
-  const mask = [...source]
+  // RegExp indices and String.slice use UTF-16 code units. split("") keeps the
+  // mask in that same coordinate system even when astral characters are present.
+  const mask = source.split("")
   const bom = source.startsWith("\uFEFF") ? 1 : 0
   if (source.slice(bom).startsWith("---")) {
     const frontmatter = /^(?:\uFEFF)?---[\t ]*\r?\n[\s\S]*?^---[\t ]*(?:\r?\n|$)/m.exec(source)
@@ -1240,8 +1228,8 @@ async function buildRenamePlan(input: RenameInput): Promise<RenamePlan> {
   )
   const sourceMarkdown = base.sourceFile.bytes.toString("utf8")
   assertAliasSupported(sourceMarkdown)
-  await assertOwnedReferences(base.workspace, source, sourceMarkdown)
   const notes = await scanMarkdown(base.workspace)
+  await assertOwnedReferences(base.workspace, source, sourceMarkdown, notes)
   const sameSlug = notes.filter(({ note }) => note.slug === source.slug)
   const oldQualified = `${source.domain}/${source.slug}`
   const newQualified = `${newDomain}/${newSlug}`
@@ -1390,19 +1378,18 @@ async function verifyPlan(
   return { plan, workspace, key }
 }
 
-interface OwnedTransactionLock {
-  path: string
-  identity: string
-  token: string
-  ownerPublished: boolean
-}
-
 interface TransactionLockSet {
   assertOwned(): Promise<void>
-  release(): Promise<void>
+  release(): Promise<string[]>
 }
 
-const abandonedTransactionLockAgeMs = 5 * 60 * 1000
+function lockReleaseWarning(message: string): {
+  readonly code: "LOCK_RELEASE_FAILED"
+  readonly message: string
+  readonly [key: string]: string
+} {
+  return { code: "LOCK_RELEASE_FAILED", message }
+}
 
 function directoryIdentity(details: { dev: bigint; ino: bigint; birthtimeNs: bigint }): string {
   return `${details.dev}:${details.ino}:${details.birthtimeNs}`
@@ -1418,82 +1405,11 @@ async function currentDirectoryIdentity(path: string): Promise<string | undefine
   }
 }
 
-async function ownerToken(lock: OwnedTransactionLock): Promise<string | undefined> {
-  let handle
-  const path = resolve(lock.path, "owner.json")
-  try {
-    if ((await currentDirectoryIdentity(lock.path)) !== lock.identity) return undefined
-    const before = await lstat(path, { bigint: true })
-    if (before.isSymbolicLink() || !before.isFile() || before.size > 4096n) return undefined
-    const flags = process.platform === "win32" ? "r" : constants.O_RDONLY | constants.O_NOFOLLOW
-    handle = await open(path, flags)
-    const opened = await handle.stat({ bigint: true })
-    if (!opened.isFile() || fileIdentity(before) !== fileIdentity(opened)) return undefined
-    const bytes = await handle.readFile()
-    const after = await lstat(path, { bigint: true })
-    if (fileIdentity(opened) !== fileIdentity(after)) return undefined
-    if ((await currentDirectoryIdentity(lock.path)) !== lock.identity) return undefined
-    const value = JSON.parse(bytes.toString("utf8")) as { token?: unknown }
-    return typeof value.token === "string" ? value.token : undefined
-  } catch {
-    return undefined
-  } finally {
-    await handle?.close().catch(() => undefined)
-  }
-}
-
-async function releaseOwnedLock(
-  lock: OwnedTransactionLock,
-  adapter: NoteTransactionAdapter,
-): Promise<void> {
-  await adapter.beforeLockRelease?.(lock.path)
-  if ((await currentDirectoryIdentity(lock.path)) !== lock.identity) {
-    throw transactionError("TRANSACTION_LOCKED", "Transaction lock ownership was lost.")
-  }
-  if (lock.ownerPublished && (await ownerToken(lock)) !== lock.token) {
-    throw transactionError("TRANSACTION_LOCKED", "Transaction lock ownership was lost.")
-  }
-  const quarantine = `${lock.path}.release-${randomUUID()}`
-  await rename(lock.path, quarantine)
-  if ((await currentDirectoryIdentity(quarantine)) !== lock.identity) {
-    throw transactionError("TRANSACTION_LOCKED", "Transaction lock ownership was lost.")
-  }
-  await rm(quarantine, { recursive: true, force: true })
-  await syncDirectory(dirname(lock.path))
-}
-
-async function recoverAbandonedLock(path: string): Promise<boolean> {
-  let details
-  try {
-    details = await lstat(path, { bigint: true })
-    if (details.isSymbolicLink() || !details.isDirectory()) return false
-    if (Date.now() - Number(details.mtimeMs) < abandonedTransactionLockAgeMs) return false
-    try {
-      await lstat(resolve(path, "owner.json"))
-      return false
-    } catch (error) {
-      if ((error as NodeJS.ErrnoException).code !== "ENOENT") return false
-    }
-  } catch {
-    return false
-  }
-  const identity = directoryIdentity(details)
-  const quarantine = `${path}.stale-${randomUUID()}`
-  try {
-    await rename(path, quarantine)
-    if ((await currentDirectoryIdentity(quarantine)) !== identity) {
-      try {
-        await rename(quarantine, path)
-      } catch {
-        // Preserve the unverified successor under its quarantine name.
-      }
-      return false
-    }
-    await rm(quarantine, { recursive: true })
-    await syncDirectory(dirname(path))
-    return true
-  } catch {
-    return false
+function sharedLeaseAdapter(adapter: NoteTransactionAdapter): NoteFileAdapter {
+  return {
+    ...adapter.leaseAdapter,
+    beforeLockMetadataPublish: adapter.beforeLockOwnerPublish,
+    beforeLockRelease: adapter.beforeLockRelease,
   }
 }
 
@@ -1502,93 +1418,52 @@ async function acquireLocks(
   paths: readonly string[],
   adapter: NoteTransactionAdapter,
 ): Promise<TransactionLockSet> {
-  try {
-    await ensureStateDirectories(workspace)
-  } catch {
-    throw transactionError("TRANSACTION_LOCKED", "Transaction locks could not be initialized.")
-  }
-  const root = resolve(workspace, stateName, "transaction-locks")
   const unique = [...new Set(paths)].sort((left, right) => left.localeCompare(right))
-  const acquired: OwnedTransactionLock[] = []
+  const acquired: InternalNotePathLease[] = []
   try {
     for (const path of unique) {
-      const lock = resolve(root, `${sha256(path)}.lock`)
-      let created = false
-      for (let attempt = 0; attempt < 2 && !created; attempt += 1) {
-        try {
-          await mkdir(lock, { mode: 0o700 })
-          created = true
-        } catch (error) {
-          if (
-            (error as NodeJS.ErrnoException).code === "EEXIST" &&
-            attempt === 0 &&
-            (await recoverAbandonedLock(lock))
-          ) {
-            continue
-          }
-          if ((error as NodeJS.ErrnoException).code === "EEXIST") {
-            throw transactionError(
-              "TRANSACTION_LOCKED",
-              "A conflicting note transaction is already running.",
-              {
-                path,
-              },
-            )
-          }
-          throw error
-        }
-      }
-      if (!created) throw transactionError("TRANSACTION_LOCKED", "Transaction lock unavailable.")
-      const identity = await currentDirectoryIdentity(lock)
-      if (identity === undefined) throw new Error("lock identity unavailable")
-      const owned: OwnedTransactionLock = {
-        path: lock,
-        identity,
-        token: randomBytes(32).toString("hex"),
-        ownerPublished: false,
-      }
-      acquired.push(owned)
-      const temporary = resolve(lock, `.owner-${randomUUID()}.json`)
-      try {
-        await durableWrite(
-          temporary,
-          `${JSON.stringify({
-            version: 1,
-            token: owned.token,
-            pid: process.pid,
-            createdAt: new Date().toISOString(),
-          })}\n`,
-        )
-        await adapter.beforeLockOwnerPublish?.(lock)
-        await rename(temporary, resolve(lock, "owner.json"))
-        await syncDirectory(lock)
-        owned.ownerPublished = true
-        if ((await ownerToken(owned)) !== owned.token) throw new Error("lock owner changed")
-        await syncDirectory(root)
-      } finally {
-        await rm(temporary, { force: true }).catch(() => undefined)
-      }
+      acquired.push(
+        await acquireInternalNotePathLease(workspace, path, sharedLeaseAdapter(adapter)),
+      )
     }
   } catch (error) {
-    for (const lock of acquired.reverse()) {
-      await releaseOwnedLock(lock, {}).catch(() => undefined)
+    const cleanup = await Promise.allSettled(acquired.reverse().map((lock) => lock.release()))
+    const primary = (error as { code?: string }).code?.startsWith("TRANSACTION_")
+      ? (error as AppError)
+      : transactionError("TRANSACTION_LOCKED", "A conflicting note operation is running.")
+    if (cleanup.some(({ status }) => status === "rejected")) {
+      throw {
+        ...primary,
+        details: {
+          ...primary.details,
+          cleanupWarnings: [
+            lockReleaseWarning("One or more acquired path locks could not be released safely."),
+          ],
+        },
+      } satisfies AppError
     }
-    if ((error as { code?: string }).code?.startsWith("TRANSACTION_")) throw error
-    throw transactionError("TRANSACTION_LOCKED", "Transaction locks could not be acquired.")
+    throw primary
   }
   return {
     async assertOwned() {
       for (const lock of acquired) {
-        if (
-          (await currentDirectoryIdentity(lock.path)) !== lock.identity ||
-          (await ownerToken(lock)) !== lock.token
-        ) {
+        try {
+          await lock.assertOwned()
+        } catch {
           throw transactionError("TRANSACTION_LOCKED", "Transaction lock ownership was lost.")
         }
       }
     },
     async release() {
-      for (const lock of acquired.reverse()) await releaseOwnedLock(lock, adapter)
+      const warnings: string[] = []
+      for (const lock of acquired.reverse()) {
+        try {
+          await lock.release()
+        } catch {
+          warnings.push(lock.lockId)
+        }
+      }
+      return warnings
     },
   }
 }
@@ -1636,7 +1511,7 @@ async function revalidatePlan(workspace: string, plan: NoteTransactionPlan): Pro
   }
 }
 
-function journalIntegrity(key: Buffer, payload: JournalPayload): string {
+function journalIntegrity(key: Buffer, payload: JournalPayload | LegacyJournalPayload): string {
   return hmac(key, payload)
 }
 
@@ -1695,6 +1570,7 @@ async function createJournal(
       kind: plan.kind,
       createdAt: plan.createdAt,
       phase: "prepared",
+      source: plan.source,
       paths: [
         ...new Set([
           ...plan.moves.flatMap(({ source, target }) => [source, target]),
@@ -1733,6 +1609,27 @@ async function updateJournal(
 ): Promise<void> {
   journal.manifest = { ...journal.manifest, phase }
   await writeJournalManifest(journal.directory, journal.manifest, key)
+  if (phase === "complete" || phase === "rolled-back") {
+    const terminalPhase: TerminalMarker["phase"] = phase
+    const payload = {
+      version: 1 as const,
+      id: journal.manifest.id,
+      kind: journal.manifest.kind,
+      createdAt: journal.manifest.createdAt,
+      phase: terminalPhase,
+      source: journal.manifest.source,
+    }
+    const marker: TerminalMarker = { ...payload, integrity: hmac(key, payload) }
+    const target = resolve(journal.directory, "terminal.json")
+    const temporary = `${target}.tmp-${randomUUID()}`
+    try {
+      await durableWrite(temporary, `${JSON.stringify(marker)}\n`)
+      await rename(temporary, target)
+      await syncDirectory(journal.directory)
+    } finally {
+      await rm(temporary, { force: true }).catch(() => undefined)
+    }
+  }
 }
 
 async function publishExclusive(
@@ -2233,7 +2130,11 @@ async function quarantineRecreatedSources(
   return found
 }
 
-async function safeAbsoluteFile(path: string, parent: string): Promise<SafeFile | undefined> {
+async function safeAbsoluteFile(
+  path: string,
+  parent: string,
+  maximumBytes?: number,
+): Promise<SafeFile | undefined> {
   let handle
   try {
     const before = await lstat(path, { bigint: true })
@@ -2244,7 +2145,11 @@ async function safeAbsoluteFile(path: string, parent: string): Promise<SafeFile 
     handle = await open(path, flags)
     const opened = await handle.stat({ bigint: true })
     if (!opened.isFile() || fileIdentity(before) !== fileIdentity(opened)) return undefined
-    const bytes = await handle.readFile()
+    const bytes =
+      maximumBytes === undefined
+        ? await handle.readFile()
+        : await readBoundedHandle(handle, maximumBytes)
+    if (bytes === undefined) return undefined
     const after = await lstat(path, { bigint: true })
     if (fileIdentity(opened) !== fileIdentity(after) || canonical !== (await realpath(path))) {
       return undefined
@@ -2569,8 +2474,14 @@ async function rollback(
 }
 
 function planPaths(plan: NoteTransactionPlan): string[] {
+  const attachmentMoves = plan.moves.filter(({ kind }) => kind === "attachment")
+  const attachmentRoots = attachmentMoves.flatMap((move) => [
+    move.source.split("/").slice(0, 3).join("/"),
+    move.target.split("/").slice(0, 3).join("/"),
+  ])
   return [
     ...new Set([
+      ...attachmentRoots,
       ...plan.moves.flatMap(({ source, target }) => [source, target]),
       ...plan.collisionChecks.map(({ path }) => path),
       ...plan.linkEdits.map(({ path }) => path),
@@ -2578,15 +2489,29 @@ function planPaths(plan: NoteTransactionPlan): string[] {
   ]
 }
 
+function lockPaths(plan: NoteTransactionPlan): string[] {
+  const source = parseNotePath(plan.source)
+  const target = parseNotePath(plan.target)
+  return [
+    ...new Set([
+      ...planPaths(plan),
+      `${source.root}/_assets/${source.slug}`,
+      `${target.root}/_assets/${target.slug}`,
+    ]),
+  ]
+}
+
 async function readJournalManifest(
   directory: string,
   key: Buffer,
-): Promise<JournalManifest | undefined> {
+): Promise<JournalManifest | LegacyJournalManifest | undefined> {
   try {
     const details = await lstat(directory)
     if (details.isSymbolicLink() || !details.isDirectory()) return undefined
     const manifestPath = resolve(directory, "manifest.json")
-    const manifest = JSON.parse(await readFile(manifestPath, "utf8")) as Partial<JournalManifest>
+    const checked = await safeAbsoluteFile(manifestPath, directory, maximumJournalManifestBytes)
+    if (checked === undefined) return undefined
+    const manifest = JSON.parse(checked.bytes.toString("utf8")) as Partial<JournalManifest>
     if (
       manifest.version !== 1 ||
       typeof manifest.id !== "string" ||
@@ -2599,7 +2524,7 @@ async function readJournalManifest(
       typeof manifest.integrity !== "string"
     )
       return undefined
-    const payload: JournalPayload = {
+    const common: LegacyJournalPayload = {
       version: 1,
       id: manifest.id,
       kind: manifest.kind,
@@ -2608,8 +2533,66 @@ async function readJournalManifest(
       paths: manifest.paths as string[],
       backups: manifest.backups as JournalBackup[],
     }
-    if (!sameMac(manifest.integrity, journalIntegrity(key, payload))) return undefined
-    return { ...payload, integrity: manifest.integrity }
+    if (typeof manifest.source === "string") {
+      const payload: JournalPayload = { ...common, source: manifest.source }
+      if (!sameMac(manifest.integrity, journalIntegrity(key, payload))) return undefined
+      return { ...payload, integrity: manifest.integrity }
+    }
+    if (!sameMac(manifest.integrity, journalIntegrity(key, common))) return undefined
+    return { ...common, integrity: manifest.integrity }
+  } catch {
+    return undefined
+  }
+}
+
+async function readTerminalMarker(
+  directory: string,
+  key: Buffer,
+): Promise<AuthenticatedTerminalEvidence | undefined> {
+  try {
+    const before = await lstat(directory, { bigint: true })
+    if (before.isSymbolicLink() || !before.isDirectory()) return undefined
+    const canonical = await realpath(directory)
+    const identity = directoryIdentity(before)
+    const checked = await safeAbsoluteFile(
+      resolve(directory, "terminal.json"),
+      directory,
+      maximumJournalManifestBytes,
+    )
+    if (checked === undefined) return undefined
+    const marker = JSON.parse(checked.bytes.toString("utf8")) as Partial<TerminalMarker>
+    if (
+      marker.version !== 1 ||
+      typeof marker.id !== "string" ||
+      (marker.kind !== "visibility" && marker.kind !== "rename") ||
+      typeof marker.createdAt !== "string" ||
+      (marker.phase !== "complete" && marker.phase !== "rolled-back") ||
+      typeof marker.source !== "string" ||
+      typeof marker.integrity !== "string"
+    )
+      return undefined
+    const payload = {
+      version: 1 as const,
+      id: marker.id,
+      kind: marker.kind,
+      createdAt: marker.createdAt,
+      phase: marker.phase,
+      source: marker.source,
+    }
+    if (!sameMac(marker.integrity, hmac(key, payload))) return undefined
+    const after = await lstat(directory, { bigint: true })
+    if (
+      after.isSymbolicLink() ||
+      !after.isDirectory() ||
+      directoryIdentity(after) !== identity ||
+      canonical !== (await realpath(directory))
+    ) {
+      return undefined
+    }
+    return {
+      marker: { ...payload, integrity: marker.integrity },
+      directoryIdentity: identity,
+    }
   } catch {
     return undefined
   }
@@ -2644,12 +2627,35 @@ async function inspectPendingTransactionsInternal(
       "Transaction history could not be inspected.",
     )
   }
+  const transactionEntries = entries
+    .filter(
+      (entry) =>
+        entry.isDirectory() && !entry.isSymbolicLink() && !entry.name.startsWith(".staging-"),
+    )
+    .sort((left, right) => left.name.localeCompare(right.name))
+  if (transactionEntries.length > MAX_TRANSACTION_RETENTION_SCAN) {
+    throw transactionError(
+      "TRANSACTION_PENDING",
+      "Retained transaction evidence exceeds the bounded inspection limit.",
+    )
+  }
   const pending: PendingTransaction[] = []
-  for (const entry of entries.sort((left, right) => left.name.localeCompare(right.name))) {
-    if (!entry.isDirectory() || entry.isSymbolicLink() || entry.name.startsWith(".staging-"))
-      continue
-    const manifest = await readJournalManifest(resolve(root, entry.name), key)
+  for (const entry of transactionEntries) {
+    const directory = resolve(root, entry.name)
+    const manifest = await readJournalManifest(directory, key)
     if (!manifest) {
+      const terminal = await readTerminalMarker(directory, key)
+      if (terminal !== undefined && terminal.marker.id === entry.name) {
+        pending.push({
+          id: terminal.marker.id,
+          kind: terminal.marker.kind,
+          createdAt: terminal.marker.createdAt,
+          phase: "terminal-invalid",
+          paths: [],
+          issue: "TRANSACTION_INVALID",
+        })
+        continue
+      }
       throw transactionError(
         "TRANSACTION_PENDING",
         "Retained transaction evidence failed authentication and must be inspected.",
@@ -2707,6 +2713,111 @@ async function assertNoPendingConflict(
   }
 }
 
+interface RetainedTerminalTransaction extends AuthenticatedTerminalEvidence {
+  readonly directory: string
+  readonly directoryName: string
+}
+
+async function restoreTerminalQuarantine(
+  source: string,
+  quarantine: string,
+  expectedIdentity: string,
+): Promise<void> {
+  if ((await currentDirectoryIdentity(quarantine)) !== expectedIdentity) return
+  if ((await currentDirectoryIdentity(source)) !== undefined) return
+  await rename(quarantine, source).catch(() => undefined)
+}
+
+async function trashAuthenticatedTerminal(
+  root: string,
+  entry: RetainedTerminalTransaction,
+  trash: TrashAdapter,
+): Promise<boolean> {
+  const source = resolve(root, entry.directoryName)
+  if (
+    relative(root, source) !== entry.directoryName ||
+    entry.marker.id !== entry.directoryName ||
+    !/^[a-f0-9-]{36}$/i.test(entry.directoryName) ||
+    (await currentDirectoryIdentity(source)) !== entry.directoryIdentity
+  ) {
+    return false
+  }
+  const quarantine = resolve(root, `.retention-${entry.marker.id}-${randomUUID()}`)
+  try {
+    await rename(source, quarantine)
+  } catch {
+    return false
+  }
+  const movedIdentity = await currentDirectoryIdentity(quarantine)
+  const canonical = await realpath(quarantine).catch(() => "")
+  if (movedIdentity !== entry.directoryIdentity || !inside(root, canonical)) {
+    await restoreTerminalQuarantine(source, quarantine, entry.directoryIdentity)
+    return false
+  }
+  try {
+    await trash.trashItem(quarantine)
+    if ((await currentDirectoryIdentity(quarantine)) !== undefined) {
+      await restoreTerminalQuarantine(source, quarantine, entry.directoryIdentity)
+      return false
+    }
+    return true
+  } catch {
+    await restoreTerminalQuarantine(source, quarantine, entry.directoryIdentity)
+    return false
+  }
+}
+
+async function maintainTransactionRetention(
+  workspace: string,
+  key: Buffer,
+  trash: TrashAdapter | undefined,
+): Promise<TransactionWarning[]> {
+  if (trash === undefined) return []
+  const root = resolve(workspace, stateName, transactionDirectoryName)
+  const entries = (await readdir(root, { withFileTypes: true }))
+    .filter(
+      (entry) => entry.isDirectory() && !entry.isSymbolicLink() && !entry.name.startsWith("."),
+    )
+    .slice(0, MAX_TRANSACTION_RETENTION_SCAN)
+  const terminal: RetainedTerminalTransaction[] = []
+  for (const entry of entries) {
+    const directory = resolve(root, entry.name)
+    const evidence = await readTerminalMarker(directory, key)
+    if (evidence !== undefined && evidence.marker.id === entry.name) {
+      terminal.push({ ...evidence, directory, directoryName: entry.name })
+    }
+  }
+  terminal.sort((left, right) => right.marker.createdAt.localeCompare(left.marker.createdAt))
+  const retainedBySource = new Map<string, number>()
+  const prune: RetainedTerminalTransaction[] = []
+  let retainedGlobal = 0
+  for (const entry of terminal) {
+    const sourceKey = entry.marker.source.split("/").slice(1).join("/")
+    const retainedForSource = retainedBySource.get(sourceKey) ?? 0
+    if (
+      retainedGlobal >= DEFAULT_TRANSACTION_GLOBAL_RETENTION ||
+      retainedForSource >= DEFAULT_TRANSACTION_PER_NOTE_RETENTION
+    ) {
+      prune.push(entry)
+      continue
+    }
+    retainedGlobal += 1
+    retainedBySource.set(sourceKey, retainedForSource + 1)
+  }
+  let failed = false
+  for (const entry of prune.slice(0, MAX_TRANSACTION_RETENTION_TRASH_CALLS)) {
+    if (!(await trashAuthenticatedTerminal(root, entry, trash))) failed = true
+  }
+  return failed
+    ? [
+        {
+          code: "TRANSACTION_RETENTION_FAILED",
+          message: "Some retained transaction data could not be moved to Trash.",
+        },
+      ]
+    : []
+}
+
 async function execute(
   rawPlan: unknown,
   expectedKind: NoteTransactionPlan["kind"],
@@ -2716,7 +2827,7 @@ async function execute(
   const { plan, workspace, key } = verified
   const adapter = context.adapter ?? {}
   await assertNoPendingConflict(workspace, plan)
-  const locks = await acquireLocks(workspace, planPaths(plan), adapter)
+  const locks = await acquireLocks(workspace, lockPaths(plan), adapter)
   let journal:
     { directory: string; manifest: JournalPayload; backupFiles: Map<string, SafeFile> } | undefined
   let mutationStarted = false
@@ -2726,6 +2837,27 @@ async function execute(
   const installedIdentities = new Map<string, string>()
   const quarantinedOriginals = new Set<string>()
   const externalRecreations = new Map<string, QuarantinedRecreation>()
+  async function failAfterRelease(error: unknown): Promise<never> {
+    const cleanupWarnings = await locks.release()
+    if (
+      cleanupWarnings.length > 0 &&
+      typeof error === "object" &&
+      error !== null &&
+      typeof (error as { code?: unknown }).code === "string"
+    ) {
+      const app = error as AppError
+      throw {
+        ...app,
+        details: {
+          ...app.details,
+          cleanupWarnings: [
+            lockReleaseWarning("One or more path locks could not be released safely."),
+          ],
+        },
+      } satisfies AppError
+    }
+    throw error
+  }
   try {
     await locks.assertOwned()
     await revalidatePlan(workspace, plan)
@@ -2839,6 +2971,20 @@ async function execute(
 
     await updateJournal(journal, "complete", key)
     const changedPaths = planPaths(plan).sort((left, right) => left.localeCompare(right))
+    const cleanupWarnings = await locks.release()
+    const retentionWarnings = await maintainTransactionRetention(
+      workspace,
+      key,
+      context.transactionTrash,
+    ).catch(
+      () =>
+        [
+          {
+            code: "TRANSACTION_RETENTION_FAILED" as const,
+            message: "Retained transaction maintenance could not be completed.",
+          },
+        ] as TransactionWarning[],
+    )
     return {
       id: plan.id,
       changedPaths,
@@ -2846,18 +2992,28 @@ async function execute(
         ? { pendingPublicDeletion: plan.source }
         : {}),
       historyWarning: plan.kind === "visibility" ? plan.historyWarning : false,
-      warnings: [...plan.warnings],
+      warnings: [
+        ...plan.warnings,
+        ...(cleanupWarnings.length > 0
+          ? [lockReleaseWarning("The transaction completed, but one or more path locks remain.")]
+          : []),
+        ...retentionWarnings,
+      ],
     }
   } catch (error) {
     if (!mutationStarted && journal) {
       await updateJournal(journal, "rolled-back", key).catch(() => undefined)
-      if ((error as { code?: string }).code?.startsWith("TRANSACTION_")) throw error
-      throw transactionError(
-        "TRANSACTION_FAILED",
-        "The transaction failed before modifying note data.",
-        {
-          transactionId: plan.id,
-        },
+      if ((error as { code?: string }).code?.startsWith("TRANSACTION_")) {
+        return failAfterRelease(error)
+      }
+      return failAfterRelease(
+        transactionError(
+          "TRANSACTION_FAILED",
+          "The transaction failed before modifying note data.",
+          {
+            transactionId: plan.id,
+          },
+        ),
       )
     }
     if (mutationStarted && journal) {
@@ -2876,27 +3032,31 @@ async function execute(
       )
       if (!restored) {
         await updateJournal(journal, "rollback-uncertain", key).catch(() => undefined)
-        throw transactionError(
-          "TRANSACTION_UNCERTAIN",
-          "The transaction could not be safely confirmed or rolled back.",
-          { transactionId: plan.id },
+        return failAfterRelease(
+          transactionError(
+            "TRANSACTION_UNCERTAIN",
+            "The transaction could not be safely confirmed or rolled back.",
+            { transactionId: plan.id },
+          ),
         )
       }
-      if ((error as { code?: string }).code === "TRANSACTION_STALE") throw error
-      throw transactionError("TRANSACTION_FAILED", "The transaction failed and was rolled back.", {
-        transactionId: plan.id,
-      })
+      if ((error as { code?: string }).code === "TRANSACTION_STALE") {
+        return failAfterRelease(error)
+      }
+      return failAfterRelease(
+        transactionError("TRANSACTION_FAILED", "The transaction failed and was rolled back.", {
+          transactionId: plan.id,
+        }),
+      )
     }
-    if ((error as { code?: string }).code?.startsWith("TRANSACTION_")) throw error
-    throw transactionError(
-      "TRANSACTION_FAILED",
-      "The transaction failed before modifying note data.",
-      {
+    if ((error as { code?: string }).code?.startsWith("TRANSACTION_")) {
+      return failAfterRelease(error)
+    }
+    return failAfterRelease(
+      transactionError("TRANSACTION_FAILED", "The transaction failed before modifying note data.", {
         transactionId: plan.id,
-      },
+      }),
     )
-  } finally {
-    await locks.release().catch(() => undefined)
   }
 }
 

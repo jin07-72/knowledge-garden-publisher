@@ -20,9 +20,13 @@ import type { AppError, SerializableValue, TrashAdapter, Visibility } from "../.
 // Transactions are kept in a focused internal module because this service also
 // owns the lower-level 2,500-line atomic save/recovery implementation.
 export {
+  DEFAULT_TRANSACTION_GLOBAL_RETENTION,
+  DEFAULT_TRANSACTION_PER_NOTE_RETENTION,
   executeRename,
   executeVisibilityChange,
   inspectPendingTransactions,
+  MAX_TRANSACTION_RETENTION_SCAN,
+  MAX_TRANSACTION_RETENTION_TRASH_CALLS,
   planRename,
   planVisibilityChange,
   type NoteTransactionAdapter,
@@ -1361,6 +1365,32 @@ async function acquireTargetLock(
     throw accessFailure(path)
   }
   throw appError("NOTE_FILE_LOCKED", "The note is being saved by another process.", { path })
+}
+
+/** Narrow internal bridge shared with multi-path note transactions. */
+export interface InternalNotePathLease {
+  readonly lockId: string
+  assertOwned(): Promise<void>
+  release(): Promise<void>
+}
+
+/** Uses the exact save/restore lease namespace and lifecycle for a canonical relative note path. */
+export async function acquireInternalNotePathLease(
+  workspace: string,
+  path: string,
+  adapter: NoteFileAdapter = {},
+): Promise<InternalNotePathLease> {
+  return acquireTargetLock(workspace, path, adapter)
+}
+
+/** Uses the exact recovery key initialization lease and protected read implementation. */
+export async function internalRecoveryKey(
+  workspace: string,
+  create: boolean,
+  adapter: NoteFileAdapter = {},
+): Promise<Buffer> {
+  const recovery = await recoveryRoot(workspace, create)
+  return recoveryKey(dirname(recovery), create, adapter)
 }
 
 function manifestPayload(manifest: Omit<RecoveryManifest, "integrity">): string {

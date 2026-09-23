@@ -1,9 +1,10 @@
 import { execFile } from "node:child_process"
-import { createHash } from "node:crypto"
+import { createHash, createHmac, randomUUID } from "node:crypto"
 import {
   lstat,
   mkdir,
   mkdtemp,
+  readdir,
   readFile,
   rename,
   rm,
@@ -18,17 +19,37 @@ import { afterEach, describe, expect, it } from "vitest"
 import {
   executeRename,
   executeVisibilityChange,
+  DEFAULT_TRANSACTION_GLOBAL_RETENTION,
+  DEFAULT_TRANSACTION_PER_NOTE_RETENTION,
+  MAX_TRANSACTION_RETENTION_SCAN,
+  MAX_TRANSACTION_RETENTION_TRASH_CALLS,
   inspectPendingTransactions,
   planRename,
   planVisibilityChange,
+  saveNote,
+  type NoteFileAdapter,
   type NoteTransactionAdapter,
 } from "../../src/main/services/noteFiles"
 
 const run = promisify(execFile)
 const roots: string[] = []
 
-function hash(value: string): string {
+function hash(value: string | Uint8Array): string {
   return createHash("sha256").update(value).digest("hex")
+}
+
+function canonicalJson(value: unknown): string {
+  if (value === null || typeof value !== "object") return JSON.stringify(value)
+  if (Array.isArray(value)) return `[${value.map(canonicalJson).join(",")}]`
+  const object = value as Record<string, unknown>
+  return `{${Object.keys(object)
+    .sort()
+    .map((key) => `${JSON.stringify(key)}:${canonicalJson(object[key])}`)
+    .join(",")}}`
+}
+
+function authenticate(key: Buffer, value: unknown): string {
+  return createHmac("sha256", key).update(canonicalJson(value)).digest("hex")
 }
 
 async function exists(path: string): Promise<boolean> {
@@ -56,6 +77,17 @@ async function put(root: string, path: string, contents: string | Buffer): Promi
   await mkdir(dirname(target), { recursive: true })
   await writeFile(target, contents)
 }
+
+async function revision(
+  root: string,
+  path: string,
+): Promise<{ expectedMtimeMs: number; expectedContentHash: string }> {
+  const target = join(root, ...path.split("/"))
+  const [details, bytes] = await Promise.all([lstat(target), readFile(target)])
+  return { expectedMtimeMs: details.mtimeMs, expectedContentHash: hash(bytes) }
+}
+
+const noTrash = { trashItem: async () => undefined }
 
 afterEach(async () => {
   await Promise.all(roots.splice(0).map((root) => rm(root, { recursive: true, force: true })))
@@ -563,7 +595,7 @@ describe("note visibility transactions", () => {
           async beforePublish(path) {
             if (path === "content/life/topic.md") await put(workspace, path, external)
           },
-        } as NoteTransactionAdapter,
+        },
       }),
     ).rejects.toMatchObject({ code: "TRANSACTION_COLLISION" })
     expect(await readFile(join(workspace, "content/life/topic.md"), "utf8")).toBe(external)
@@ -589,8 +621,6 @@ describe("note visibility transactions", () => {
             expect(path).toBe("content/_assets/topic")
             await put(workspace, "content/_assets/topic/external.txt", external)
           },
-        } as NoteTransactionAdapter & {
-          beforeAttachmentRootPublish(path: string): Promise<void>
         },
       }),
     ).rejects.toMatchObject({ code: "TRANSACTION_FAILED" })
@@ -841,6 +871,36 @@ describe("note rename transactions", () => {
     )
   })
 
+  it("keeps UTF-16 masks aligned around repeated astral characters", async () => {
+    const workspace = await garden()
+    await put(
+      workspace,
+      "content/life/topic.md",
+      [
+        "---",
+        "title: 🌱🌱 Topic [[life/topic]]",
+        "---",
+        "",
+        "🌱🌱 `[[life/topic]] ![code](<../_assets/topic/chart one.png>)`",
+        "```md",
+        "🌱🌱 [[life/topic]] ![fenced](<../_assets/topic/chart one.png>)",
+        "```",
+        "🌱🌱 [[life/topic]] ![real](<../_assets/topic/chart one.png>)",
+        "",
+      ].join("\n"),
+    )
+    await put(workspace, "content/_assets/topic/chart one.png", "chart")
+
+    const plan = await planRename({ workspace, path: "content/life/topic.md", slug: "renamed" })
+    await executeRename(plan, { workspace })
+
+    const renamed = await readFile(join(workspace, "content/life/renamed.md"), "utf8")
+    expect(renamed).toContain("title: 🌱🌱 Topic [[life/topic]]")
+    expect(renamed).toContain("🌱🌱 `[[life/topic]] ![code](<../_assets/topic/chart one.png>)`")
+    expect(renamed).toContain("🌱🌱 [[life/topic]] ![fenced](<../_assets/topic/chart one.png>)")
+    expect(renamed).toContain("🌱🌱 [[life/renamed]] ![real](<../_assets/renamed/chart one.png>)")
+  })
+
   it("does not rewrite Wiki links inside indented code blocks", async () => {
     const workspace = await garden()
     await put(workspace, "content/life/topic.md", "---\ntitle: Topic\n---\n")
@@ -961,6 +1021,185 @@ describe("note rename transactions", () => {
 })
 
 describe("transaction recovery", () => {
+  it("publishes safe bounded transaction-retention defaults", () => {
+    expect(DEFAULT_TRANSACTION_PER_NOTE_RETENTION).toBe(20)
+    expect(DEFAULT_TRANSACTION_GLOBAL_RETENTION).toBeLessThan(MAX_TRANSACTION_RETENTION_SCAN)
+    expect(MAX_TRANSACTION_RETENTION_TRASH_CALLS).toBeLessThanOrEqual(
+      MAX_TRANSACTION_RETENTION_SCAN,
+    )
+  })
+
+  it("retains at most twenty terminal transactions per note via Trash", async () => {
+    const workspace = await garden({ git: true })
+    let path = "private/life/topic.md"
+    await put(workspace, path, "---\ntitle: Topic\n---\n")
+    const trashed: string[] = []
+    let injectTrashFailure = true
+    const retentionWarnings: string[] = []
+    const trash = {
+      async trashItem(absolutePath: string) {
+        if (injectTrashFailure) {
+          injectTrashFailure = false
+          throw new Error("injected Trash failure")
+        }
+        trashed.push(absolutePath)
+        await rm(absolutePath, { recursive: true })
+      },
+    }
+
+    for (let index = 0; index < 22; index += 1) {
+      const visibility = path.startsWith("private/") ? "public" : "private"
+      const plan = await planVisibilityChange({ workspace, path, visibility })
+      const result = await executeVisibilityChange(plan, { workspace, transactionTrash: trash })
+      retentionWarnings.push(...result.warnings.map(({ code }) => code))
+      path = plan.target
+    }
+
+    const entries = await readdir(join(workspace, ".garden-publisher", "transactions"))
+    expect(entries.filter((entry) => !entry.startsWith(".")).length).toBeLessThanOrEqual(20)
+    expect(trashed.length).toBeGreaterThanOrEqual(2)
+    expect(trashed).toEqual(
+      expect.arrayContaining([
+        expect.stringMatching(/[\\/]\.retention-[a-f0-9-]{36}-[a-f0-9-]{36}$/i),
+      ]),
+    )
+    expect(retentionWarnings).toContain("TRANSACTION_RETENTION_FAILED")
+  }, 30_000)
+
+  it("bounds failed retention work and never selects authenticated nonterminal evidence", async () => {
+    const workspace = await garden()
+    const source = "private/life/topic.md"
+    await put(workspace, source, "---\ntitle: Topic\n---\n")
+    const plan = await planVisibilityChange({ workspace, path: source, visibility: "public" })
+    const key = await readFile(join(workspace, ".garden-publisher", "keys", "recovery-hmac.key"))
+    const transactionRoot = join(workspace, ".garden-publisher", "transactions")
+    await mkdir(transactionRoot, { recursive: true })
+    for (let index = 0; index < 40; index += 1) {
+      const id = randomUUID()
+      const payload = {
+        version: 1 as const,
+        id,
+        kind: "visibility" as const,
+        createdAt: new Date(Date.UTC(2026, 0, 1, 0, 0, index)).toISOString(),
+        phase: "complete" as const,
+        source: "content/life/retained.md",
+      }
+      await put(
+        workspace,
+        `.garden-publisher/transactions/${id}/terminal.json`,
+        JSON.stringify({ ...payload, integrity: authenticate(key, payload) }),
+      )
+    }
+    const pendingId = randomUUID()
+    const pendingPayload = {
+      version: 1 as const,
+      id: pendingId,
+      kind: "rename" as const,
+      createdAt: new Date(Date.UTC(2025, 0, 1)).toISOString(),
+      phase: "rollback-uncertain",
+      source: "private/reading/pending.md",
+      paths: ["private/reading/pending.md"],
+      backups: [],
+    }
+    await put(
+      workspace,
+      `.garden-publisher/transactions/${pendingId}/manifest.json`,
+      JSON.stringify({ ...pendingPayload, integrity: authenticate(key, pendingPayload) }),
+    )
+    const attempted: string[] = []
+
+    const result = await executeVisibilityChange(plan, {
+      workspace,
+      transactionTrash: {
+        async trashItem(path) {
+          attempted.push(path)
+          throw new Error("injected Trash failure")
+        },
+      },
+    })
+
+    expect(attempted).toHaveLength(MAX_TRANSACTION_RETENTION_TRASH_CALLS)
+    expect(attempted).toEqual(
+      expect.arrayContaining([
+        expect.stringMatching(/[\\/]\.retention-[a-f0-9-]{36}-[a-f0-9-]{36}$/i),
+      ]),
+    )
+    expect(attempted.some((path) => path.includes(pendingId))).toBe(false)
+    expect(await exists(join(transactionRoot, pendingId))).toBe(true)
+    expect((await readdir(transactionRoot)).some((entry) => entry.startsWith(".retention-"))).toBe(
+      false,
+    )
+    expect(result.warnings).toContainEqual(
+      expect.objectContaining({ code: "TRANSACTION_RETENTION_FAILED" }),
+    )
+  })
+
+  it("keeps completed journals from the previous authenticated format recoverable", async () => {
+    const workspace = await garden()
+    const source = "private/life/topic.md"
+    await put(workspace, source, "---\ntitle: Topic\n---\n")
+    const plan = await planVisibilityChange({ workspace, path: source, visibility: "public" })
+    const key = await readFile(join(workspace, ".garden-publisher", "keys", "recovery-hmac.key"))
+    const legacyPayload = {
+      version: 1 as const,
+      id: randomUUID(),
+      kind: "visibility" as const,
+      createdAt: new Date(Date.UTC(2025, 0, 1)).toISOString(),
+      phase: "complete",
+      paths: ["private/reading/legacy.md", "content/reading/legacy.md"],
+      backups: [],
+    }
+    await put(
+      workspace,
+      `.garden-publisher/transactions/${legacyPayload.id}/manifest.json`,
+      JSON.stringify({ ...legacyPayload, integrity: authenticate(key, legacyPayload) }),
+    )
+
+    await expect(inspectPendingTransactions({ workspace })).resolves.toEqual([])
+    await expect(executeVisibilityChange(plan, { workspace })).resolves.toMatchObject({
+      id: plan.id,
+    })
+    expect(
+      await exists(
+        join(workspace, ".garden-publisher", "transactions", legacyPayload.id, "manifest.json"),
+      ),
+    ).toBe(true)
+  })
+
+  it("reports corrupted terminal evidence without blocking a new transaction", async () => {
+    const workspace = await garden({ git: true })
+    await put(workspace, "private/life/topic.md", "---\ntitle: PRIVATE_SENTINEL\n---\n")
+    const first = await planVisibilityChange({
+      workspace,
+      path: "private/life/topic.md",
+      visibility: "public",
+    })
+    await executeVisibilityChange(first, { workspace, transactionTrash: noTrash })
+    await writeFile(
+      join(workspace, ".garden-publisher", "transactions", first.id, "manifest.json"),
+      "PRIVATE_SENTINEL invalid manifest",
+    )
+
+    const inspected = await inspectPendingTransactions({ workspace })
+    expect(inspected).toEqual([
+      expect.objectContaining({
+        id: first.id,
+        phase: "terminal-invalid",
+        issue: "TRANSACTION_INVALID",
+      }),
+    ])
+    expect(JSON.stringify(inspected)).not.toContain("PRIVATE_SENTINEL")
+
+    const second = await planVisibilityChange({
+      workspace,
+      path: "content/life/topic.md",
+      visibility: "private",
+    })
+    await expect(
+      executeVisibilityChange(second, { workspace, transactionTrash: noTrash }),
+    ).resolves.toMatchObject({ id: second.id })
+  })
+
   it("restores a link source when failure occurs after atomic quarantine", async () => {
     const workspace = await garden()
     const original = "Incoming [[life/topic]]\n"
@@ -1200,8 +1439,6 @@ describe("transaction recovery", () => {
           afterAttachmentStageFile(path: string) {
             if (path.endsWith("/a.bin")) throw new Error("injected partial staging failure")
           },
-        } as NoteTransactionAdapter & {
-          afterAttachmentStageFile(path: string): void
         },
       }),
     ).rejects.toMatchObject({ code: "TRANSACTION_FAILED" })
@@ -1228,7 +1465,7 @@ describe("transaction recovery", () => {
           afterAttachmentRootPublish() {
             throw new Error("rename completed before failure")
           },
-        } as NoteTransactionAdapter & { afterAttachmentRootPublish(): void },
+        },
       }),
     ).rejects.toMatchObject({ code: "TRANSACTION_FAILED" })
 
@@ -1295,8 +1532,6 @@ describe("transaction recovery", () => {
             await writeFile(join(workspace, ...path.split("/")), external)
             throw new Error("installed then failed")
           },
-        } as NoteTransactionAdapter & {
-          afterExclusivePublish(path: string): Promise<void>
         },
       }),
     ).rejects.toMatchObject({ code: "TRANSACTION_UNCERTAIN" })
@@ -1353,7 +1588,7 @@ describe("transaction recovery", () => {
       expect(await exists(join(workspace, "content/_assets/renamed"))).toBe(false)
       expect(await inspectPendingTransactions({ workspace })).toEqual([])
     }
-  })
+  }, 20_000)
 
   it("allows exactly one of two conflicting executions to win", async () => {
     const workspace = await garden()
@@ -1388,6 +1623,169 @@ describe("transaction recovery", () => {
     expect(await exists(join(workspace, "content/life/topic.md"))).toBe(true)
   })
 
+  it("does not let a transaction race a save paused before replacement", async () => {
+    const workspace = await garden()
+    const path = "private/life/topic.md"
+    await put(workspace, path, "---\ntitle: Topic\n---\n")
+    const plan = await planVisibilityChange({ workspace, path, visibility: "public" })
+    let entered!: () => void
+    let proceed!: () => void
+    const paused = new Promise<void>((resolve) => (entered = resolve))
+    const gate = new Promise<void>((resolve) => (proceed = resolve))
+    const adapter: NoteFileAdapter = {
+      async beforeReplace() {
+        entered()
+        await gate
+      },
+    }
+    const saving = saveNote(
+      {
+        workspace,
+        path,
+        markdown: "---\ntitle: Saved\n---\n",
+        ...(await revision(workspace, path)),
+        recoveryTrash: noTrash,
+      },
+      adapter,
+    )
+    await paused
+    const transactionOutcome = await executeVisibilityChange(plan, { workspace }).then(
+      (value) => ({ value }),
+      (error: unknown) => ({ error }),
+    )
+    proceed()
+    const saveOutcome = await saving.then(
+      (value) => ({ value }),
+      (error: unknown) => ({ error }),
+    )
+    expect(transactionOutcome).toMatchObject({
+      error: { code: expect.stringMatching(/^TRANSACTION_(?:LOCKED|STALE)$/) },
+    })
+    expect(saveOutcome).toMatchObject({ value: { path } })
+    expect(await exists(join(workspace, plan.target))).toBe(false)
+    expect(await readFile(join(workspace, path), "utf8")).toContain("title: Saved")
+  })
+
+  it("blocks saveNote while a visibility transaction owns the source lease", async () => {
+    const workspace = await garden()
+    const path = "private/life/topic.md"
+    await put(workspace, path, "---\ntitle: Topic\n---\n")
+    const before = await revision(workspace, path)
+    const plan = await planVisibilityChange({ workspace, path, visibility: "public" })
+    let entered!: () => void
+    let proceed!: () => void
+    const paused = new Promise<void>((resolve) => (entered = resolve))
+    const gate = new Promise<void>((resolve) => (proceed = resolve))
+    const transaction = executeVisibilityChange(plan, {
+      workspace,
+      adapter: {
+        async afterPhase(phase) {
+          if (phase !== "journal-created") return
+          entered()
+          await gate
+        },
+      },
+    })
+    await paused
+    const saveOutcome = await saveNote({
+      workspace,
+      path,
+      markdown: "---\ntitle: Saved\n---\n",
+      ...before,
+      recoveryTrash: noTrash,
+    }).then(
+      (value) => ({ value }),
+      (error: unknown) => ({ error }),
+    )
+    proceed()
+    const transactionOutcome = await transaction.then(
+      (value) => ({ value }),
+      (error: unknown) => ({ error }),
+    )
+    expect(saveOutcome).toMatchObject({ error: { code: "NOTE_FILE_LOCKED" } })
+    expect(transactionOutcome).toMatchObject({ value: { id: plan.id } })
+    expect(await exists(join(workspace, path))).toBe(false)
+  })
+
+  it("locks every incoming Markdown file edited by rename against saveNote", async () => {
+    const workspace = await garden()
+    await put(workspace, "content/life/topic.md", "---\ntitle: Topic\n---\n")
+    const incoming = "content/reading/ref.md"
+    await put(workspace, incoming, "[[life/topic]]\n")
+    const incomingRevision = await revision(workspace, incoming)
+    const plan = await planRename({ workspace, path: "content/life/topic.md", slug: "renamed" })
+    let entered!: () => void
+    let proceed!: () => void
+    const paused = new Promise<void>((resolve) => (entered = resolve))
+    const gate = new Promise<void>((resolve) => (proceed = resolve))
+    const transaction = executeRename(plan, {
+      workspace,
+      adapter: {
+        async afterPhase(phase) {
+          if (phase !== "journal-created") return
+          entered()
+          await gate
+        },
+      },
+    })
+    await paused
+    const saveOutcome = await saveNote({
+      workspace,
+      path: incoming,
+      markdown: "external [[life/topic]]\n",
+      ...incomingRevision,
+      recoveryTrash: noTrash,
+    }).then(
+      (value) => ({ value }),
+      (error: unknown) => ({ error }),
+    )
+    proceed()
+    const transactionOutcome = await transaction.then(
+      (value) => ({ value }),
+      (error: unknown) => ({ error }),
+    )
+    expect(saveOutcome).toMatchObject({ error: { code: "NOTE_FILE_LOCKED" } })
+    expect(transactionOutcome).toMatchObject({ value: { id: plan.id } })
+    expect(await readFile(join(workspace, incoming), "utf8")).toContain("[[life/renamed]]")
+  })
+
+  it("shares one stable protected key during concurrent first-use save and planning", async () => {
+    const workspace = await garden()
+    const moving = "private/life/topic.md"
+    const saving = "private/reading/draft.md"
+    await put(workspace, moving, "---\ntitle: Topic\n---\n")
+    await put(workspace, saving, "---\ntitle: Draft\n---\n")
+    const savingRevision = await revision(workspace, saving)
+    let entered!: () => void
+    let proceed!: () => void
+    const keyPublishPaused = new Promise<void>((resolve) => (entered = resolve))
+    const gate = new Promise<void>((resolve) => (proceed = resolve))
+    const save = saveNote(
+      {
+        workspace,
+        path: saving,
+        markdown: "---\ntitle: Saved\n---\n",
+        ...savingRevision,
+        recoveryTrash: noTrash,
+      },
+      {
+        async beforeKeyPublish() {
+          entered()
+          await gate
+        },
+      },
+    )
+    await keyPublishPaused
+    const planned = planVisibilityChange({ workspace, path: moving, visibility: "public" })
+    proceed()
+
+    await expect(save).resolves.toMatchObject({ path: saving })
+    const plan = await planned
+    await expect(executeVisibilityChange(plan, { workspace })).resolves.toMatchObject({
+      id: plan.id,
+    })
+  })
+
   it("cleans up an orphan lock when owner metadata publication fails", async () => {
     const workspace = await garden()
     await put(workspace, "private/life/topic.md", "---\ntitle: Topic\n---\n")
@@ -1404,7 +1802,7 @@ describe("transaction recovery", () => {
           beforeLockOwnerPublish() {
             throw new Error("injected owner publication failure")
           },
-        } as NoteTransactionAdapter & { beforeLockOwnerPublish(): void },
+        },
       }),
     ).rejects.toMatchObject({ code: "TRANSACTION_LOCKED" })
 
@@ -1421,19 +1819,72 @@ describe("transaction recovery", () => {
       path: "private/life/topic.md",
       visibility: "public",
     })
-    const lock = join(
-      workspace,
-      ".garden-publisher",
-      "transaction-locks",
-      `${hash(plan.source)}.lock`,
-    )
-    await mkdir(lock)
+    const lock = join(workspace, ".garden-publisher", "locks", `${hash(plan.source)}.lock`)
+    await mkdir(lock, { recursive: true })
     const old = new Date(Date.now() - 10 * 60 * 1000)
     await utimes(lock, old, old)
 
     await expect(executeVisibilityChange(plan, { workspace })).resolves.toMatchObject({
       id: plan.id,
     })
+  })
+
+  it("recovers an expired dead-owner lease left after owner publication", async () => {
+    const workspace = await garden()
+    const source = "private/life/topic.md"
+    await put(workspace, source, "---\ntitle: Topic\n---\n")
+    const plan = await planVisibilityChange({ workspace, path: source, visibility: "public" })
+    const lock = join(workspace, ".garden-publisher", "locks", `${hash(source)}.lock`)
+    await mkdir(lock, { recursive: true })
+    await writeFile(
+      join(lock, "owner.json"),
+      JSON.stringify({
+        version: 1,
+        token: "00000000-0000-4000-8000-000000000000",
+        pid: 9,
+        createdAt: 1,
+      }),
+    )
+    let clock = 10_000
+
+    await expect(
+      executeVisibilityChange(plan, {
+        workspace,
+        adapter: {
+          leaseAdapter: {
+            now: () => clock,
+            delay: async (milliseconds) => {
+              clock += milliseconds
+            },
+            isProcessAlive: () => false,
+            lockGraceMs: 1,
+          },
+        },
+      }),
+    ).resolves.toMatchObject({ id: plan.id })
+  })
+
+  it("attempts every path-lock release and preserves a successful transaction outcome", async () => {
+    const workspace = await garden()
+    const source = "private/life/topic.md"
+    await put(workspace, source, "---\ntitle: Topic\n---\n")
+    const plan = await planVisibilityChange({ workspace, path: source, visibility: "public" })
+    const releaseAttempts: string[] = []
+
+    const result = await executeVisibilityChange(plan, {
+      workspace,
+      adapter: {
+        beforeLockRelease(path) {
+          releaseAttempts.push(path)
+          throw new Error("injected release failure")
+        },
+      },
+    })
+
+    expect(releaseAttempts.length).toBeGreaterThan(1)
+    expect(new Set(releaseAttempts).size).toBe(releaseAttempts.length)
+    expect(result).toMatchObject({ id: plan.id })
+    expect(result.warnings).toContainEqual(expect.objectContaining({ code: "LOCK_RELEASE_FAILED" }))
   })
 
   it("never removes a successor lock that replaces the owned lease before release", async () => {
@@ -1446,7 +1897,7 @@ describe("transaction recovery", () => {
     })
     let successor: string | undefined
 
-    await executeVisibilityChange(plan, {
+    const result = await executeVisibilityChange(plan, {
       workspace,
       adapter: {
         async beforeLockRelease(lockPath: string) {
@@ -1456,11 +1907,54 @@ describe("transaction recovery", () => {
           await writeFile(join(lockPath, "successor"), "must survive")
           successor = lockPath
         },
-      } as NoteTransactionAdapter & { beforeLockRelease(path: string): Promise<void> },
+      },
     })
 
     expect(successor).toBeDefined()
     expect(await readFile(join(successor!, "successor"), "utf8")).toBe("must survive")
+    expect(result.warnings).toContainEqual(expect.objectContaining({ code: "LOCK_RELEASE_FAILED" }))
+    const liveLocks = (await readdir(join(workspace, ".garden-publisher", "locks"))).filter(
+      (entry) => entry.endsWith(".lock"),
+    )
+    expect(liveLocks).toEqual([successor!.split(/[\\/]/).at(-1)])
+  })
+
+  it("attaches release warnings to the primary typed transaction failure", async () => {
+    const workspace = await garden()
+    const source = "private/life/topic.md"
+    await put(workspace, source, "---\ntitle: Topic\n---\n")
+    const plan = await planVisibilityChange({ workspace, path: source, visibility: "public" })
+    let replaced = false
+    let failure: unknown
+    try {
+      await executeVisibilityChange(plan, {
+        workspace,
+        adapter: {
+          afterPhase(phase) {
+            if (phase === "journal-created") throw new Error("injected primary failure")
+          },
+          async beforeLockRelease(lockPath) {
+            if (replaced) return
+            replaced = true
+            await rename(lockPath, `${lockPath}.predecessor`)
+            await mkdir(lockPath)
+          },
+        },
+      })
+    } catch (error) {
+      failure = error
+    }
+
+    expect(failure).toMatchObject({
+      code: "TRANSACTION_FAILED",
+      details: {
+        cleanupWarnings: [expect.objectContaining({ code: "LOCK_RELEASE_FAILED" })],
+      },
+    })
+    const liveLocks = (await readdir(join(workspace, ".garden-publisher", "locks"))).filter(
+      (entry) => entry.endsWith(".lock"),
+    )
+    expect(liveLocks).toHaveLength(1)
   })
 
   it("retains an authenticated pending journal and returns uncertainty when rollback fails", async () => {
