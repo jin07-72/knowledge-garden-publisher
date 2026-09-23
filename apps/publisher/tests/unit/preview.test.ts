@@ -484,9 +484,59 @@ describe("PreviewManager", () => {
 
     const tail = (manager.getStatus().error?.details?.logTail ?? []) as readonly string[]
     expect(tail).toEqual(expect.arrayContaining([expect.stringContaining("[truncated]")]))
-    expect(tail).toEqual(expect.arrayContaining([expect.stringContaining("[file]")]))
+    expect(tail.some((entry) => /\[(?:file|path)\]/.test(entry))).toBe(true)
     expect(tail.every((entry) => Buffer.byteLength(entry, "utf8") <= 512)).toBe(true)
     expect(JSON.stringify(manager.getStatus())).not.toContain("ultra-private-sentinel")
+  })
+
+  it("detects a rebuild failure at the start of a huge unterminated line", async () => {
+    const deps = dependencies({ probe: async () => true })
+    const manager = new PreviewManager(deps)
+    await manager.start({ workspace: "C:\\Garden" })
+
+    deps.children[0].stderr.write(`Rebuild failed: ${"x".repeat(20_000)} tail-private-sentinel.txt`)
+
+    expect(manager.getStatus()).toMatchObject({
+      state: "error",
+      error: { code: "PREVIEW_BUILD_FAILED" },
+    })
+    expect(JSON.stringify(manager.getStatus())).not.toContain("tail-private-sentinel")
+  })
+
+  it("detects EADDRINUSE at the start of a huge unterminated startup line", async () => {
+    const deps = dependencies({ probe: async () => deps.children.length >= 2 })
+    const manager = new PreviewManager(deps)
+    const starting = manager.start({ workspace: "C:\\Garden" })
+
+    await until(() => expect(deps.children).toHaveLength(1), "unterminated port-race spawn")
+    deps.children[0].stderr.write(`EADDRINUSE ${"x".repeat(20_000)}`)
+
+    await until(() => expect(deps.children).toHaveLength(2), "unterminated port-race retry")
+    await expect(starting).resolves.toMatchObject({ state: "ready", generation: 1 })
+  })
+
+  it("redacts arbitrary file extensions and suspicious relative paths without swallowing prose", async () => {
+    const deps = dependencies({ probe: async () => true })
+    const manager = new PreviewManager(deps)
+    await manager.start({ workspace: "C:\\Garden" })
+    const child = deps.children[0]
+
+    child.stderr.write("Rebuild failed: confidential-report.txt because prose-alpha remains\n")
+    child.stderr.write(
+      "Rebuild failed: C:\\private assets\\diagram.svg because prose-beta remains\n",
+    )
+    child.stderr.write(
+      "Rebuild failed: assets/private map/render.png because prose-gamma remains\n",
+    )
+    child.stderr.write(
+      "Rebuild failed: native-private.node module-private.wasm bundle-private.map payload-private.secretkind\n",
+    )
+
+    const serialized = JSON.stringify(manager.getStatus())
+    expect(serialized).not.toMatch(
+      /confidential-report|private assets|diagram\.svg|private map|render\.png|native-private|module-private|bundle-private|payload-private/i,
+    )
+    expect(serialized).toMatch(/prose-alpha remains.*prose-beta remains.*prose-gamma remains/i)
   })
 
   it("retries complete address-in-use lines and incomplete final lines only up to the bound", async () => {
@@ -1086,6 +1136,24 @@ describe("createProcessTreeTerminator", () => {
 
     await expect(terminate(new FakeProcess())).resolves.toBe(false)
     expect(runTaskkill).toHaveBeenCalledTimes(1)
+  })
+
+  it("recovers when graceful taskkill fails but forced tree cleanup succeeds", async () => {
+    const alive = [true, true, false]
+    let calls = 0
+    const runTaskkill = vi.fn<TreeTerminationDependencies["runTaskkill"]>(async () => {
+      calls += 1
+      if (calls === 1) throw new Error("graceful taskkill returned nonzero")
+    })
+    const terminate = createProcessTreeTerminator(
+      treeDependencies({ isAlive: () => alive.shift() ?? false, runTaskkill }),
+    )
+
+    await expect(terminate(new FakeProcess())).resolves.toBe(true)
+    expect(runTaskkill).toHaveBeenNthCalledWith(2, "taskkill.exe", ["/PID", "4242", "/T", "/F"], {
+      shell: false,
+      windowsHide: true,
+    })
   })
 
   it("treats an uncertain liveness check as termination failure", async () => {

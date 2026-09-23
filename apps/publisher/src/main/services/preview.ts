@@ -99,6 +99,10 @@ interface ProcessAttempt {
   readonly onClose: (code: number | null, signal?: string | null) => void
   stdoutRemainder: string
   stderrRemainder: string
+  stdoutParsePrefix: string
+  stderrParsePrefix: string
+  stdoutLineHandled: boolean
+  stderrLineHandled: boolean
   settled: boolean
   inStartup: boolean
   startupWaitActive: boolean
@@ -121,17 +125,20 @@ const LOOPBACK_HOST = "127.0.0.1" as const
 const ANSI = /\u001B\[[0-?]*[ -/]*[@-~]/g
 const URL = /https?:\/\/[^\s]+/gi
 const WINDOWS_FILE_PATH =
-  /(?:[A-Za-z]:[\\/]|\\\\)[^\r\n]*?\.(?:md|markdown|ts|tsx|js|jsx|mjs|cjs|json|jsonc|yaml|yml|toml|ini|css|scss|html|vue|svelte)\b/gi
+  /(?:[A-Za-z]:[\\/]|\\\\)[^\r\n]*?(?:\.[A-Za-z0-9][A-Za-z0-9_-]*)+(?=$|[\s"',);:\]}])/gi
 const WINDOWS_PATH_TOKEN = /(?:[A-Za-z]:[\\/]|\\\\)[^\s"'`()<>]+/g
-const POSIX_FILE_PATH =
-  /\/[^\r\n]*?\.(?:md|markdown|ts|tsx|js|jsx|mjs|cjs|json|jsonc|yaml|yml|toml|ini|css|scss|html|vue|svelte)\b/gi
+const POSIX_FILE_PATH = /\/[^\r\n]*?(?:\.[A-Za-z0-9][A-Za-z0-9_-]*)+(?=$|[\s"',);:\]}])/gi
 const POSIX_PATH_TOKEN = /\/[^\s"'`()<>]+/g
+const RELATIVE_FILE_PATH =
+  /(^|[\s"'`(])(?:(?:\.{1,2}[\\/])|(?:[^\\/\s"'`()<>:]+[\\/]))[^\r\n]*?(?:\.[A-Za-z0-9][A-Za-z0-9_-]*)+(?=$|[\s"',);:\]}])/gi
+const RELATIVE_PATH_TOKEN = /(^|[\s"'`(])(?:\.{1,2}[\\/]|[^\\/\s"'`()<>:]+[\\/])[^\\/\s"'`()<>:]+/g
 const RELATIVE_FILE =
-  /(^|[\s"'`(])(?:(?:\.{1,2}[\\/])?(?:[^\\/\s"'`()<>:]+[\\/])*)?[^\\/\s"'`()<>:]+\.(?:md|markdown|ts|tsx|js|jsx|mjs|cjs|json|jsonc|yaml|yml|toml|ini|css|scss|html|vue|svelte)\b/gi
+  /(^|[\s"'`(])[^\\/\s"'`()<>:]+(?:\.[A-Za-z0-9][A-Za-z0-9_-]*)+(?=$|[\s"',);:\]}])/gi
 const MAX_LOG_LINES = 80
 const MAX_LOG_BYTES = 8_192
 const MAX_LOG_ENTRY_BYTES = 512
 const MAX_PARTIAL_BYTES = 512
+const MAX_PARSE_PREFIX_BYTES = 512
 const TRUNCATION_MARKER = "[truncated] "
 
 function deferred<T>(): Deferred<T> {
@@ -171,11 +178,22 @@ function boundedUtf8Tail(value: string, maximumBytes: number): string {
   return `${TRUNCATION_MARKER}${tail}`
 }
 
+function boundedUtf8Head(value: string, maximumBytes: number): string {
+  const bytes = Buffer.from(value, "utf8")
+  if (bytes.byteLength <= maximumBytes) return value
+  return bytes
+    .subarray(0, maximumBytes)
+    .toString("utf8")
+    .replace(/\uFFFD+$/, "")
+}
+
 function scrub(line: string): string {
   const redacted = normalized(line)
     .replace(URL, "[url]")
     .replace(WINDOWS_FILE_PATH, "[path]")
     .replace(WINDOWS_PATH_TOKEN, "[path]")
+    .replace(RELATIVE_FILE_PATH, (_match, prefix: string) => `${prefix}[path]`)
+    .replace(RELATIVE_PATH_TOKEN, (_match, prefix: string) => `${prefix}[path]`)
     .replace(RELATIVE_FILE, (_match, prefix: string) => `${prefix}[file]`)
     .replace(POSIX_FILE_PATH, "[path]")
     .replace(POSIX_PATH_TOKEN, "[path]")
@@ -222,30 +240,31 @@ export function createProcessTreeTerminator(
       const initiallyAlive = safeAlive(dependencies, pid)
       if (initiallyAlive === undefined) return false
       if (!initiallyAlive) return false
-      let taskkillFailed = false
+      let gracefulTreeConfirmed = true
       try {
         await dependencies.runTaskkill("taskkill.exe", ["/PID", String(pid), "/T"], {
           shell: false,
           windowsHide: true,
         })
       } catch {
-        taskkillFailed = true
+        gracefulTreeConfirmed = false
       }
       await dependencies.wait(dependencies.gracefulWaitMs)
       const aliveAfterGrace = safeAlive(dependencies, pid)
       if (aliveAfterGrace === undefined) return false
-      if (!aliveAfterGrace) return !taskkillFailed
+      if (!aliveAfterGrace) return gracefulTreeConfirmed
+      let forcedTreeConfirmed = true
       try {
         await dependencies.runTaskkill("taskkill.exe", ["/PID", String(pid), "/T", "/F"], {
           shell: false,
           windowsHide: true,
         })
       } catch {
-        taskkillFailed = true
+        forcedTreeConfirmed = false
       }
       await dependencies.wait(dependencies.forceWaitMs)
       const aliveAfterForce = safeAlive(dependencies, pid)
-      return !taskkillFailed && aliveAfterForce === false
+      return forcedTreeConfirmed && aliveAfterForce === false
     }
 
     const group = -pid
@@ -743,6 +762,10 @@ export class PreviewManager {
       events,
       stdoutRemainder: "",
       stderrRemainder: "",
+      stdoutParsePrefix: "",
+      stderrParsePrefix: "",
+      stdoutLineHandled: false,
+      stderrLineHandled: false,
       settled: false,
       inStartup: true,
       startupWaitActive: true,
@@ -830,36 +853,89 @@ export class PreviewManager {
     source: "stdout" | "stderr",
   ): void {
     if (this.session !== session || session.attempt !== attempt || attempt.stopping) return
-    const buffered =
-      (source === "stdout" ? attempt.stdoutRemainder : attempt.stderrRemainder) + chunk
-    const lines = buffered.split(/\r\n|\n|\r/)
-    const remainder = boundedUtf8Tail(lines.pop() ?? "", MAX_PARTIAL_BYTES)
-    if (source === "stdout") attempt.stdoutRemainder = remainder
-    else attempt.stderrRemainder = remainder
-    for (const line of lines) {
-      if (line !== "") this.consumeLine(session, attempt, line)
+    let display = source === "stdout" ? attempt.stdoutRemainder : attempt.stderrRemainder
+    let parsePrefix = source === "stdout" ? attempt.stdoutParsePrefix : attempt.stderrParsePrefix
+    let handled = source === "stdout" ? attempt.stdoutLineHandled : attempt.stderrLineHandled
+    const parts = chunk.split(/\r\n|\n|\r/)
+    for (const [index, part] of parts.entries()) {
+      display = boundedUtf8Tail(display + part, MAX_PARTIAL_BYTES)
+      parsePrefix = boundedUtf8Head(parsePrefix + part, MAX_PARSE_PREFIX_BYTES)
+      if (index < parts.length - 1) {
+        if (!handled && (display !== "" || parsePrefix !== "")) {
+          this.consumeLine(session, attempt, display, parsePrefix)
+        }
+        display = ""
+        parsePrefix = ""
+        handled = false
+      } else if (!handled && parsePrefix !== "") {
+        handled = this.consumeLine(session, attempt, display, parsePrefix, true)
+      }
+    }
+    if (source === "stdout") {
+      attempt.stdoutRemainder = display
+      attempt.stdoutParsePrefix = parsePrefix
+      attempt.stdoutLineHandled = handled
+    } else {
+      attempt.stderrRemainder = display
+      attempt.stderrParsePrefix = parsePrefix
+      attempt.stderrLineHandled = handled
     }
   }
 
   private flushRemainders(session: PreviewSession, attempt: ProcessAttempt): void {
-    for (const line of [attempt.stdoutRemainder, attempt.stderrRemainder]) {
-      if (line !== "") this.consumeLine(session, attempt, line)
+    const pending = [
+      [attempt.stdoutRemainder, attempt.stdoutParsePrefix, attempt.stdoutLineHandled],
+      [attempt.stderrRemainder, attempt.stderrParsePrefix, attempt.stderrLineHandled],
+    ] as const
+    for (const [display, parsePrefix, handled] of pending) {
+      if (!handled && (display !== "" || parsePrefix !== "")) {
+        this.consumeLine(session, attempt, display, parsePrefix)
+      }
     }
     attempt.stdoutRemainder = ""
     attempt.stderrRemainder = ""
+    attempt.stdoutParsePrefix = ""
+    attempt.stderrParsePrefix = ""
+    attempt.stdoutLineHandled = false
+    attempt.stderrLineHandled = false
   }
 
-  private consumeLine(session: PreviewSession, attempt: ProcessAttempt, raw: string): void {
-    if (this.session !== session || session.attempt !== attempt || attempt.stopping) return
-    this.appendTail(raw)
-    const line = normalized(raw).toLowerCase()
-    if (/eaddrinuse|address already in use|port .*already in use/i.test(line)) {
-      this.settleAttempt(attempt, { kind: "port-race" })
-      return
-    }
-
+  private consumeLine(
+    session: PreviewSession,
+    attempt: ProcessAttempt,
+    displayRaw: string,
+    parseRaw = displayRaw,
+    partial = false,
+  ): boolean {
+    if (this.session !== session || session.attempt !== attempt || attempt.stopping) return false
+    const line = normalized(parseRaw).toLowerCase()
+    const portRace = /eaddrinuse|address already in use|port .*already in use/i.test(line)
     const initialBuildFailure = line.includes("failed to build quartz")
     const rebuildFailure = line.includes("rebuild failed:")
+    const rebuildStarted =
+      line.includes("detected change, rebuilding") || line.includes("detected a source code change")
+    const canStartRebuild =
+      rebuildStarted &&
+      session.lastSuccessfulUrl !== undefined &&
+      (this.status.state === "ready" || this.status.state === "error")
+    const rebuildCompleted = this.status.state === "building" && line.includes("done rebuilding")
+    if (
+      partial &&
+      !portRace &&
+      !initialBuildFailure &&
+      !rebuildFailure &&
+      !canStartRebuild &&
+      !rebuildCompleted
+    ) {
+      return false
+    }
+
+    this.appendTail(displayRaw)
+    if (portRace) {
+      this.settleAttempt(attempt, { kind: "port-race" })
+      return true
+    }
+
     if (initialBuildFailure || rebuildFailure) {
       attempt.buildFailed = true
       this.transition({
@@ -874,16 +950,10 @@ export class PreviewManager {
         ),
       })
       if (attempt.inStartup) this.settleAttempt(attempt, { kind: "build-error" })
-      return
+      return true
     }
 
-    const rebuildStarted =
-      line.includes("detected change, rebuilding") || line.includes("detected a source code change")
-    if (
-      rebuildStarted &&
-      session.lastSuccessfulUrl !== undefined &&
-      (this.status.state === "ready" || this.status.state === "error")
-    ) {
+    if (canStartRebuild) {
       attempt.buildFailed = false
       this.transition({
         state: "building",
@@ -891,10 +961,10 @@ export class PreviewManager {
         port: attempt.port,
         lastSuccessfulUrl: session.lastSuccessfulUrl,
       })
-      return
+      return true
     }
 
-    if (this.status.state === "building" && line.includes("done rebuilding")) {
+    if (rebuildCompleted) {
       attempt.buildFailed = false
       this.transition({
         state: "ready",
@@ -903,7 +973,9 @@ export class PreviewManager {
         url: session.lastSuccessfulUrl,
         lastSuccessfulUrl: session.lastSuccessfulUrl,
       })
+      return true
     }
+    return false
   }
 
   private settleAttempt(attempt: ProcessAttempt, event: AttemptEvent): void {
