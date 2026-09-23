@@ -60,6 +60,14 @@ export type AppErrorCode =
   | "TRANSACTION_PENDING"
   | "TRANSACTION_FAILED"
   | "TRANSACTION_UNCERTAIN"
+  | "RUNTIME_MISSING"
+  | "QUARTZ_MISSING"
+  | "WORKSPACE_INVALID"
+  | "PORT_UNAVAILABLE"
+  | "PREVIEW_TIMEOUT"
+  | "PREVIEW_BUILD_FAILED"
+  | "PREVIEW_START_FAILED"
+  | "PREVIEW_STOP_FAILED"
 
 export type AppError = {
   readonly [Code in AppErrorCode]: {
@@ -83,7 +91,22 @@ type NoteFileError = Extract<
   }
 >
 
-export type WorkspaceIssue = Exclude<AppError, NoteIndexError | NoteFileError> & {
+type PreviewError = Extract<
+  AppError,
+  {
+    readonly code:
+      | "RUNTIME_MISSING"
+      | "QUARTZ_MISSING"
+      | "WORKSPACE_INVALID"
+      | "PORT_UNAVAILABLE"
+      | "PREVIEW_TIMEOUT"
+      | "PREVIEW_BUILD_FAILED"
+      | "PREVIEW_START_FAILED"
+      | "PREVIEW_STOP_FAILED"
+  }
+>
+
+export type WorkspaceIssue = Exclude<AppError, NoteIndexError | NoteFileError | PreviewError> & {
   readonly path?: string
 }
 
@@ -148,6 +171,17 @@ export interface DeploymentRun {
 
 export interface TrashAdapter {
   trashItem(absolutePath: string): Promise<void>
+}
+
+export type PreviewPhase = "stopped" | "starting" | "ready" | "building" | "error" | "stopping"
+
+export interface PreviewStatus {
+  readonly state: PreviewPhase
+  readonly generation: number
+  readonly port?: number
+  readonly url?: string
+  readonly lastSuccessfulUrl?: string
+  readonly error?: AppError
 }
 
 export const DEFAULT_GARDEN_PATH = String.raw`C:\Users\11546\Desktop\web`
