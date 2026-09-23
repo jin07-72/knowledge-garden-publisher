@@ -114,6 +114,7 @@ function dependencies(overrides: Partial<PreviewDependencies> = {}): TestDepende
       return nextPort++
     },
     probe: async () => false,
+    probeWs: async () => true,
     terminate: async (child) => {
       ;(child as FakeProcess).close()
       return true
@@ -308,6 +309,29 @@ describe("PreviewManager", () => {
     })
   })
 
+  it("does not become ready until both HTTP and the attempt WebSocket port respond", async () => {
+    let webSocketReady = false
+    const probeWs = vi.fn(async () => webSocketReady)
+    const deps = dependencies({ probe: async () => true, probeWs })
+    const manager = new PreviewManager(deps)
+    const starting = manager.start({ workspace: "C:\\Garden" })
+    let settled = false
+    void starting.then(() => {
+      settled = true
+    })
+
+    await until(
+      () => expect(probeWs).toHaveBeenCalledWith(43121, expect.any(AbortSignal)),
+      "ws probe",
+    )
+    expect(settled).toBe(false)
+    expect(manager.getStatus()).toMatchObject({ state: "starting", port: 43120 })
+
+    webSocketReady = true
+    await deps.clock.advance(10)
+    await expect(starting).resolves.toMatchObject({ state: "ready", generation: 1 })
+  })
+
   it("parses ANSI and chunk-split rebuild logs and recovers after a build error", async () => {
     const deps = dependencies({ probe: async () => true })
     const manager = new PreviewManager(deps)
@@ -344,6 +368,25 @@ describe("PreviewManager", () => {
     })
   })
 
+  it("reports a recovered rebuild process exit instead of preserving stale success", async () => {
+    const deps = dependencies({ probe: async () => true })
+    const manager = new PreviewManager(deps)
+    await manager.start({ workspace: "C:\\Garden" })
+    const child = deps.children[0]
+
+    child.stderr.write("Rebuild failed: private-plugin.ts\n")
+    child.stdout.write("Detected change, rebuilding...\n")
+    child.stdout.write("Done rebuilding in 2ms\n")
+    expect(manager.getStatus()).toMatchObject({ state: "ready" })
+
+    child.close(1)
+    expect(manager.getStatus()).toMatchObject({
+      state: "error",
+      generation: 1,
+      error: { code: "PREVIEW_EXITED" },
+    })
+  })
+
   it("reports an initial Quartz build failure without leaking its source path", async () => {
     const deps = dependencies()
     const manager = new PreviewManager(deps)
@@ -368,7 +411,7 @@ describe("PreviewManager", () => {
     expect(manager.getStatus()).toMatchObject({
       state: "error",
       lastSuccessfulUrl: "http://127.0.0.1:43120/",
-      error: { code: "PREVIEW_START_FAILED" },
+      error: { code: "PREVIEW_EXITED" },
     })
   })
 
@@ -396,6 +439,54 @@ describe("PreviewManager", () => {
     deps.children[0].stderr.write("Rebuild failed: \\\\server\\Jane Doe\\garden\\secret.md\n")
 
     expect(JSON.stringify(manager.getStatus())).not.toMatch(/Jane|Doe|garden|secret\.md|server/i)
+  })
+
+  it("preserves ordinary explanation text after redacting an absolute source path", async () => {
+    const deps = dependencies({ probe: async () => true })
+    const manager = new PreviewManager(deps)
+    await manager.start({ workspace: "C:\\Garden" })
+
+    deps.children[0].stderr.write(
+      "Rebuild failed: C:\\private sentinel\\secret.ts because the syntax token is missing\n",
+    )
+
+    const tail = (manager.getStatus().error?.details?.logTail ?? []) as readonly string[]
+    expect(tail).toEqual(
+      expect.arrayContaining([expect.stringContaining("because the syntax token is missing")]),
+    )
+    expect(JSON.stringify(tail)).not.toMatch(/private sentinel|secret\.ts/i)
+  })
+
+  it("redacts relative source and note filenames from serialized log tails", async () => {
+    const deps = dependencies({ probe: async () => true })
+    const manager = new PreviewManager(deps)
+    await manager.start({ workspace: "C:\\Garden" })
+
+    deps.children[0].stderr.write(
+      "Rebuild failed: confidential-acquisition-plan.md notes/private-sentinel/config-secret.ts\n",
+    )
+
+    const serialized = JSON.stringify(manager.getStatus())
+    expect(serialized).not.toMatch(/confidential-acquisition-plan|private-sentinel|config-secret/i)
+    expect(serialized).toContain("[file]")
+    expect(serialized).toContain("Rebuild failed:")
+  })
+
+  it("bounds a UTF-8 partial log line incrementally while retaining its redacted tail", async () => {
+    const deps = dependencies({ probe: async () => true })
+    const manager = new PreviewManager(deps)
+    await manager.start({ workspace: "C:\\Garden" })
+    const child = deps.children[0]
+
+    child.stderr.write("🙂".repeat(10_000))
+    child.stderr.write(" vault/ultra-private-sentinel.ts")
+    child.close(1)
+
+    const tail = (manager.getStatus().error?.details?.logTail ?? []) as readonly string[]
+    expect(tail).toEqual(expect.arrayContaining([expect.stringContaining("[truncated]")]))
+    expect(tail).toEqual(expect.arrayContaining([expect.stringContaining("[file]")]))
+    expect(tail.every((entry) => Buffer.byteLength(entry, "utf8") <= 512)).toBe(true)
+    expect(JSON.stringify(manager.getStatus())).not.toContain("ultra-private-sentinel")
   })
 
   it("retries complete address-in-use lines and incomplete final lines only up to the bound", async () => {
@@ -775,6 +866,33 @@ describe("PreviewManager", () => {
     expect(observed).toHaveBeenCalledTimes(calls)
   })
 
+  it.each(["C:\\Garden", "C:\\Other"])(
+    "lets a second stop cancel a %s restart queued behind the shared physical stop",
+    async (restartWorkspace) => {
+      const termination = new Deferred<boolean>()
+      const terminate = vi.fn<PreviewDependencies["terminate"]>(async (child) => {
+        await termination.promise
+        ;(child as FakeProcess).close()
+        return true
+      })
+      const deps = dependencies({ probe: async () => true, terminate })
+      const manager = new PreviewManager(deps)
+      await manager.start({ workspace: "C:\\Garden" })
+
+      const firstStop = manager.stop()
+      const queuedRestart = manager.start({ workspace: restartWorkspace })
+      const finalStop = manager.stop()
+      expect(finalStop).toBe(firstStop)
+
+      termination.resolve(true)
+      await expect(firstStop).resolves.toEqual({ state: "stopped", generation: 1 })
+      await expect(finalStop).resolves.toEqual({ state: "stopped", generation: 1 })
+      await expect(queuedRestart).resolves.toEqual({ state: "stopped", generation: 1 })
+      expect(deps.children).toHaveLength(1)
+      expect(manager.getStatus()).toEqual({ state: "stopped", generation: 1 })
+    },
+  )
+
   it("shares concurrent dispose and remains retryable with subscribers after cleanup failure", async () => {
     const firstTermination = new Deferred<boolean>()
     const outcomes: Array<boolean | Promise<boolean>> = [firstTermination.promise, true]
@@ -846,6 +964,40 @@ describe("PreviewManager", () => {
     expect(terminate).toHaveBeenCalledTimes(2)
   })
 
+  it("retains ownership when failed Windows tree cleanup only observes the root exit", async () => {
+    const alive = [true, false]
+    const terminate = createProcessTreeTerminator({
+      platform: "win32",
+      isAlive: () => alive.shift() ?? false,
+      signalGroup: () => undefined,
+      runTaskkill: async () => {
+        throw new Error("taskkill failed")
+      },
+      wait: async () => undefined,
+      gracefulWaitMs: 50,
+      forceWaitMs: 50,
+    })
+    const deps = dependencies({ probe: async () => true, terminate })
+    const manager = new PreviewManager(deps)
+    await manager.start({ workspace: "C:\\Garden" })
+    const child = deps.children[0]
+
+    await expect(manager.stop()).resolves.toMatchObject({
+      state: "error",
+      error: { code: "PREVIEW_STOP_FAILED" },
+    })
+    expect(child.listenerCount("close")).toBe(1)
+
+    await expect(manager.stop()).resolves.toMatchObject({
+      state: "error",
+      error: { code: "PREVIEW_STOP_FAILED" },
+    })
+    expect(child.listenerCount("close")).toBe(1)
+
+    child.close(1)
+    await expect(manager.stop()).resolves.toEqual({ state: "stopped", generation: 1 })
+  })
+
   it("does not treat a child error as confirmed exit during failed termination", async () => {
     const firstTermination = new Deferred<boolean>()
     const outcomes: Array<boolean | Promise<boolean>> = [firstTermination.promise, true]
@@ -913,14 +1065,27 @@ describe("createProcessTreeTerminator", () => {
     })
   })
 
-  it("does not invoke taskkill when the Windows process is already gone", async () => {
+  it("fails closed when the Windows root is already gone without tree confirmation", async () => {
     const runTaskkill = vi.fn<TreeTerminationDependencies["runTaskkill"]>()
     const terminate = createProcessTreeTerminator(
       treeDependencies({ isAlive: () => false, runTaskkill }),
     )
 
-    await expect(terminate(new FakeProcess())).resolves.toBe(true)
+    await expect(terminate(new FakeProcess())).resolves.toBe(false)
     expect(runTaskkill).not.toHaveBeenCalled()
+  })
+
+  it("fails closed when taskkill fails even if the root dies and descendants are unobservable", async () => {
+    const alive = [true, false]
+    const runTaskkill = vi.fn<TreeTerminationDependencies["runTaskkill"]>(async () => {
+      throw new Error("taskkill returned nonzero")
+    })
+    const terminate = createProcessTreeTerminator(
+      treeDependencies({ isAlive: () => alive.shift() ?? false, runTaskkill }),
+    )
+
+    await expect(terminate(new FakeProcess())).resolves.toBe(false)
+    expect(runTaskkill).toHaveBeenCalledTimes(1)
   })
 
   it("treats an uncertain liveness check as termination failure", async () => {

@@ -39,6 +39,7 @@ export interface PreviewDependencies {
   ) => PreviewProcess
   readonly allocatePort: (request: PortRequest) => Promise<number>
   readonly probe: (url: string, signal: AbortSignal) => Promise<boolean>
+  readonly probeWs: (port: number, signal: AbortSignal) => Promise<boolean>
   readonly terminate: (child: PreviewProcess) => Promise<boolean>
   readonly platform?: NodeJS.Platform
   readonly now?: () => number
@@ -119,10 +120,19 @@ interface PreviewSession {
 const LOOPBACK_HOST = "127.0.0.1" as const
 const ANSI = /\u001B\[[0-?]*[ -/]*[@-~]/g
 const URL = /https?:\/\/[^\s]+/gi
-const WINDOWS_PATH = /(?:[A-Za-z]:[\\/]|\\\\)[^\r\n]*/g
-const POSIX_PATH = /\/[^\r\n]*/g
+const WINDOWS_FILE_PATH =
+  /(?:[A-Za-z]:[\\/]|\\\\)[^\r\n]*?\.(?:md|markdown|ts|tsx|js|jsx|mjs|cjs|json|jsonc|yaml|yml|toml|ini|css|scss|html|vue|svelte)\b/gi
+const WINDOWS_PATH_TOKEN = /(?:[A-Za-z]:[\\/]|\\\\)[^\s"'`()<>]+/g
+const POSIX_FILE_PATH =
+  /\/[^\r\n]*?\.(?:md|markdown|ts|tsx|js|jsx|mjs|cjs|json|jsonc|yaml|yml|toml|ini|css|scss|html|vue|svelte)\b/gi
+const POSIX_PATH_TOKEN = /\/[^\s"'`()<>]+/g
+const RELATIVE_FILE =
+  /(^|[\s"'`(])(?:(?:\.{1,2}[\\/])?(?:[^\\/\s"'`()<>:]+[\\/])*)?[^\\/\s"'`()<>:]+\.(?:md|markdown|ts|tsx|js|jsx|mjs|cjs|json|jsonc|yaml|yml|toml|ini|css|scss|html|vue|svelte)\b/gi
 const MAX_LOG_LINES = 80
 const MAX_LOG_BYTES = 8_192
+const MAX_LOG_ENTRY_BYTES = 512
+const MAX_PARTIAL_BYTES = 512
+const TRUNCATION_MARKER = "[truncated] "
 
 function deferred<T>(): Deferred<T> {
   let resolve!: (value: T) => void
@@ -150,12 +160,26 @@ function normalized(line: string): string {
   return line.replace(ANSI, "")
 }
 
+function boundedUtf8Tail(value: string, maximumBytes: number): string {
+  const bytes = Buffer.from(value, "utf8")
+  if (bytes.byteLength <= maximumBytes) return value
+  const markerBytes = Buffer.byteLength(TRUNCATION_MARKER, "utf8")
+  const tail = bytes
+    .subarray(bytes.byteLength - Math.max(0, maximumBytes - markerBytes))
+    .toString("utf8")
+    .replace(/^\uFFFD+/, "")
+  return `${TRUNCATION_MARKER}${tail}`
+}
+
 function scrub(line: string): string {
-  return normalized(line)
+  const redacted = normalized(line)
     .replace(URL, "[url]")
-    .replace(WINDOWS_PATH, "[path]")
-    .replace(POSIX_PATH, "[path]")
-    .slice(0, 512)
+    .replace(WINDOWS_FILE_PATH, "[path]")
+    .replace(WINDOWS_PATH_TOKEN, "[path]")
+    .replace(RELATIVE_FILE, (_match, prefix: string) => `${prefix}[file]`)
+    .replace(POSIX_FILE_PATH, "[path]")
+    .replace(POSIX_PATH_TOKEN, "[path]")
+  return boundedUtf8Tail(redacted, MAX_LOG_ENTRY_BYTES)
 }
 
 function validPort(port: number): boolean {
@@ -197,30 +221,31 @@ export function createProcessTreeTerminator(
     if (dependencies.platform === "win32") {
       const initiallyAlive = safeAlive(dependencies, pid)
       if (initiallyAlive === undefined) return false
-      if (!initiallyAlive) return true
+      if (!initiallyAlive) return false
+      let taskkillFailed = false
       try {
         await dependencies.runTaskkill("taskkill.exe", ["/PID", String(pid), "/T"], {
           shell: false,
           windowsHide: true,
         })
       } catch {
-        // Liveness checks decide whether escalation is required.
+        taskkillFailed = true
       }
       await dependencies.wait(dependencies.gracefulWaitMs)
       const aliveAfterGrace = safeAlive(dependencies, pid)
       if (aliveAfterGrace === undefined) return false
-      if (!aliveAfterGrace) return true
+      if (!aliveAfterGrace) return !taskkillFailed
       try {
         await dependencies.runTaskkill("taskkill.exe", ["/PID", String(pid), "/T", "/F"], {
           shell: false,
           windowsHide: true,
         })
       } catch {
-        // A failed command is reported by the final liveness check.
+        taskkillFailed = true
       }
       await dependencies.wait(dependencies.forceWaitMs)
       const aliveAfterForce = safeAlive(dependencies, pid)
-      return aliveAfterForce === false
+      return !taskkillFailed && aliveAfterForce === false
     }
 
     const group = -pid
@@ -310,9 +335,9 @@ export class PreviewManager {
   }
 
   stop(): Promise<PreviewStatus> {
-    if (this.stopFlight !== undefined) return this.stopFlight
     this.lifecycleEpoch += 1
     this.session?.controller.abort()
+    if (this.stopFlight !== undefined) return this.stopFlight
     if (this.session === undefined && this.status.state === "stopped")
       return Promise.resolve(this.status)
 
@@ -365,7 +390,11 @@ export class PreviewManager {
     ordinal: number,
     epoch: number,
   ): Promise<PreviewStatus> {
-    if (request.signal?.aborted || epoch !== this.lifecycleEpoch) return this.status
+    if (request.signal?.aborted) return this.status
+    if (epoch !== this.lifecycleEpoch) {
+      await this.operationTail
+      return this.status
+    }
 
     let workspace: string
     try {
@@ -378,7 +407,11 @@ export class PreviewManager {
         "Select an existing workspace directory.",
       )
     }
-    if (request.signal?.aborted || epoch !== this.lifecycleEpoch) return this.status
+    if (request.signal?.aborted) return this.status
+    if (epoch !== this.lifecycleEpoch) {
+      await this.operationTail
+      return this.status
+    }
 
     const canonicalKey = this.key(this.pathApi().normalize(workspace))
     const canonical = this.canonicalFlights.get(canonicalKey)
@@ -656,9 +689,13 @@ export class PreviewManager {
         const pollController = new AbortController()
         const cancelPoll = (): void => pollController.abort()
         signal.addEventListener("abort", cancelPoll, { once: true })
-        const probe = this.dependencies
-          .probe(publicUrl(attempt.port), pollController.signal)
-          .then<ReadinessRound>((ready) => (ready ? { kind: "ready" } : { kind: "not-ready" }))
+        const probe = Promise.all([
+          this.dependencies.probe(publicUrl(attempt.port), pollController.signal),
+          this.dependencies.probeWs(attempt.wsPort, pollController.signal),
+        ])
+          .then<ReadinessRound>((readiness) =>
+            readiness.every(Boolean) ? { kind: "ready" } : { kind: "not-ready" },
+          )
           .catch<ReadinessRound>(() => ({ kind: "not-ready" }))
         const poll = delay(
           Math.max(1, this.dependencies.readinessPollMs ?? 150),
@@ -782,11 +819,7 @@ export class PreviewManager {
       generation: session.generation,
       port: attempt.port,
       lastSuccessfulUrl: session.lastSuccessfulUrl,
-      error: appError(
-        "PREVIEW_START_FAILED",
-        "Local preview stopped unexpectedly.",
-        this.logDetails(),
-      ),
+      error: appError("PREVIEW_EXITED", "Local preview stopped unexpectedly.", this.logDetails()),
     })
   }
 
@@ -800,7 +833,7 @@ export class PreviewManager {
     const buffered =
       (source === "stdout" ? attempt.stdoutRemainder : attempt.stderrRemainder) + chunk
     const lines = buffered.split(/\r\n|\n|\r/)
-    const remainder = lines.pop() ?? ""
+    const remainder = boundedUtf8Tail(lines.pop() ?? "", MAX_PARTIAL_BYTES)
     if (source === "stdout") attempt.stdoutRemainder = remainder
     else attempt.stderrRemainder = remainder
     for (const line of lines) {
@@ -851,6 +884,7 @@ export class PreviewManager {
       session.lastSuccessfulUrl !== undefined &&
       (this.status.state === "ready" || this.status.state === "error")
     ) {
+      attempt.buildFailed = false
       this.transition({
         state: "building",
         generation: session.generation,
@@ -861,6 +895,7 @@ export class PreviewManager {
     }
 
     if (this.status.state === "building" && line.includes("done rebuilding")) {
+      attempt.buildFailed = false
       this.transition({
         state: "ready",
         generation: session.generation,

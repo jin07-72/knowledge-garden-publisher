@@ -67,6 +67,7 @@ export type AppErrorCode =
   | "PREVIEW_TIMEOUT"
   | "PREVIEW_BUILD_FAILED"
   | "PREVIEW_START_FAILED"
+  | "PREVIEW_EXITED"
   | "PREVIEW_STOP_FAILED"
 
 export type AppError = {
@@ -102,6 +103,7 @@ type PreviewError = Extract<
       | "PREVIEW_TIMEOUT"
       | "PREVIEW_BUILD_FAILED"
       | "PREVIEW_START_FAILED"
+      | "PREVIEW_EXITED"
       | "PREVIEW_STOP_FAILED"
   }
 >
