@@ -441,7 +441,7 @@ describe("PreviewManager", () => {
     expect(JSON.stringify(manager.getStatus())).not.toMatch(/Jane|Doe|garden|secret\.md|server/i)
   })
 
-  it("preserves ordinary explanation text after redacting an absolute source path", async () => {
+  it("reduces an absolute-path failure to a safe diagnostic summary", async () => {
     const deps = dependencies({ probe: async () => true })
     const manager = new PreviewManager(deps)
     await manager.start({ workspace: "C:\\Garden" })
@@ -451,10 +451,8 @@ describe("PreviewManager", () => {
     )
 
     const tail = (manager.getStatus().error?.details?.logTail ?? []) as readonly string[]
-    expect(tail).toEqual(
-      expect.arrayContaining([expect.stringContaining("because the syntax token is missing")]),
-    )
-    expect(JSON.stringify(tail)).not.toMatch(/private sentinel|secret\.ts/i)
+    expect(tail).toEqual(["Quartz rebuild failed."])
+    expect(JSON.stringify(tail)).not.toMatch(/private sentinel|secret\.ts|syntax token/i)
   })
 
   it("redacts relative source and note filenames from serialized log tails", async () => {
@@ -468,8 +466,8 @@ describe("PreviewManager", () => {
 
     const serialized = JSON.stringify(manager.getStatus())
     expect(serialized).not.toMatch(/confidential-acquisition-plan|private-sentinel|config-secret/i)
-    expect(serialized).toContain("[file]")
-    expect(serialized).toContain("Rebuild failed:")
+    expect(serialized).toContain("Quartz rebuild failed.")
+    expect(serialized).not.toMatch(/\[(?:file|path)\]/)
   })
 
   it("bounds a UTF-8 partial log line incrementally while retaining its redacted tail", async () => {
@@ -484,7 +482,9 @@ describe("PreviewManager", () => {
 
     const tail = (manager.getStatus().error?.details?.logTail ?? []) as readonly string[]
     expect(tail).toEqual(expect.arrayContaining([expect.stringContaining("[truncated]")]))
-    expect(tail.some((entry) => /\[(?:file|path)\]/.test(entry))).toBe(true)
+    expect(tail).toEqual(
+      expect.arrayContaining([expect.stringContaining("Quartz preview diagnostic.")]),
+    )
     expect(tail.every((entry) => Buffer.byteLength(entry, "utf8") <= 512)).toBe(true)
     expect(JSON.stringify(manager.getStatus())).not.toContain("ultra-private-sentinel")
   })
@@ -515,7 +515,7 @@ describe("PreviewManager", () => {
     await expect(starting).resolves.toMatchObject({ state: "ready", generation: 1 })
   })
 
-  it("redacts arbitrary file extensions and suspicious relative paths without swallowing prose", async () => {
+  it("summarizes arbitrary extensions and suspicious relative paths without exposing prose", async () => {
     const deps = dependencies({ probe: async () => true })
     const manager = new PreviewManager(deps)
     await manager.start({ workspace: "C:\\Garden" })
@@ -536,7 +536,34 @@ describe("PreviewManager", () => {
     expect(serialized).not.toMatch(
       /confidential-report|private assets|diagram\.svg|private map|render\.png|native-private|module-private|bundle-private|payload-private/i,
     )
-    expect(serialized).toMatch(/prose-alpha remains.*prose-beta remains.*prose-gamma remains/i)
+    expect(serialized).not.toMatch(/prose-alpha|prose-beta|prose-gamma/i)
+    expect(
+      ((manager.getStatus().error?.details?.logTail ?? []) as readonly string[]).every(
+        (entry) => entry === "Quartz rebuild failed.",
+      ),
+    ).toBe(true)
+  })
+
+  it("serializes only allowlisted diagnostics for ambiguous free-text build failures", async () => {
+    const deps = dependencies({ probe: async () => true })
+    const manager = new PreviewManager(deps)
+    await manager.start({ workspace: "C:\\Garden" })
+    const child = deps.children[0]
+
+    child.stderr.write("input/output 1/2 Node 22.16.0\n")
+    child.stderr.write("Rebuild failed: confidential plan.txt\n")
+    child.stderr.write("Rebuild failed: private assets/render.weird-ext\n")
+    child.stderr.write("Rebuild failed: .secret-env extensionless-private\n")
+    child.stderr.write("Rebuild failed:path:private-root/colon-private.bin\n")
+
+    const tail = (manager.getStatus().error?.details?.logTail ?? []) as readonly string[]
+    expect(tail.length).toBeGreaterThan(0)
+    expect(
+      tail.every((entry) => /^(?:Quartz preview diagnostic|Quartz rebuild failed)\.?$/.test(entry)),
+    ).toBe(true)
+    expect(JSON.stringify(tail)).not.toMatch(
+      /confidential|private assets|render\.weird-ext|secret-env|extensionless-private|private-root|colon-private|\[path\]|\[file\]/i,
+    )
   })
 
   it("retries complete address-in-use lines and incomplete final lines only up to the bound", async () => {

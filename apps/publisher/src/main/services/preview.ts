@@ -123,20 +123,8 @@ interface PreviewSession {
 
 const LOOPBACK_HOST = "127.0.0.1" as const
 const ANSI = /\u001B\[[0-?]*[ -/]*[@-~]/g
-const URL = /https?:\/\/[^\s]+/gi
-const WINDOWS_FILE_PATH =
-  /(?:[A-Za-z]:[\\/]|\\\\)[^\r\n]*?(?:\.[A-Za-z0-9][A-Za-z0-9_-]*)+(?=$|[\s"',);:\]}])/gi
-const WINDOWS_PATH_TOKEN = /(?:[A-Za-z]:[\\/]|\\\\)[^\s"'`()<>]+/g
-const POSIX_FILE_PATH = /\/[^\r\n]*?(?:\.[A-Za-z0-9][A-Za-z0-9_-]*)+(?=$|[\s"',);:\]}])/gi
-const POSIX_PATH_TOKEN = /\/[^\s"'`()<>]+/g
-const RELATIVE_FILE_PATH =
-  /(^|[\s"'`(])(?:(?:\.{1,2}[\\/])|(?:[^\\/\s"'`()<>:]+[\\/]))[^\r\n]*?(?:\.[A-Za-z0-9][A-Za-z0-9_-]*)+(?=$|[\s"',);:\]}])/gi
-const RELATIVE_PATH_TOKEN = /(^|[\s"'`(])(?:\.{1,2}[\\/]|[^\\/\s"'`()<>:]+[\\/])[^\\/\s"'`()<>:]+/g
-const RELATIVE_FILE =
-  /(^|[\s"'`(])[^\\/\s"'`()<>:]+(?:\.[A-Za-z0-9][A-Za-z0-9_-]*)+(?=$|[\s"',);:\]}])/gi
 const MAX_LOG_LINES = 80
 const MAX_LOG_BYTES = 8_192
-const MAX_LOG_ENTRY_BYTES = 512
 const MAX_PARTIAL_BYTES = 512
 const MAX_PARSE_PREFIX_BYTES = 512
 const TRUNCATION_MARKER = "[truncated] "
@@ -187,17 +175,24 @@ function boundedUtf8Head(value: string, maximumBytes: number): string {
     .replace(/\uFFFD+$/, "")
 }
 
-function scrub(line: string): string {
-  const redacted = normalized(line)
-    .replace(URL, "[url]")
-    .replace(WINDOWS_FILE_PATH, "[path]")
-    .replace(WINDOWS_PATH_TOKEN, "[path]")
-    .replace(RELATIVE_FILE_PATH, (_match, prefix: string) => `${prefix}[path]`)
-    .replace(RELATIVE_PATH_TOKEN, (_match, prefix: string) => `${prefix}[path]`)
-    .replace(RELATIVE_FILE, (_match, prefix: string) => `${prefix}[file]`)
-    .replace(POSIX_FILE_PATH, "[path]")
-    .replace(POSIX_PATH_TOKEN, "[path]")
-  return boundedUtf8Tail(redacted, MAX_LOG_ENTRY_BYTES)
+function safeDiagnostic(displayLine: string, diagnosticLine = displayLine): string {
+  const line = normalized(diagnosticLine).toLowerCase()
+  let summary = "Quartz preview diagnostic."
+  if (/eaddrinuse|address already in use|port .*already in use/i.test(line)) {
+    summary = "Quartz preview port is already in use."
+  } else if (line.includes("failed to build quartz")) {
+    summary = "Quartz build failed."
+  } else if (line.includes("rebuild failed:")) {
+    summary = "Quartz rebuild failed."
+  } else if (
+    line.includes("detected change, rebuilding") ||
+    line.includes("detected a source code change")
+  ) {
+    summary = "Quartz rebuild started."
+  } else if (line.includes("done rebuilding")) {
+    summary = "Quartz rebuild completed."
+  }
+  return displayLine.includes(TRUNCATION_MARKER) ? `${TRUNCATION_MARKER}${summary}` : summary
 }
 
 function validPort(port: number): boolean {
@@ -930,7 +925,7 @@ export class PreviewManager {
       return false
     }
 
-    this.appendTail(displayRaw)
+    this.appendTail(displayRaw, parseRaw)
     if (portRace) {
       this.settleAttempt(attempt, { kind: "port-race" })
       return true
@@ -1069,8 +1064,8 @@ export class PreviewManager {
     attempt.child.off("close", attempt.onClose)
   }
 
-  private appendTail(line: string): void {
-    const entry = scrub(line)
+  private appendTail(line: string, diagnosticLine = line): void {
+    const entry = safeDiagnostic(line, diagnosticLine)
     this.tail.push(entry)
     this.tailBytes += Buffer.byteLength(entry)
     while (this.tail.length > MAX_LOG_LINES || this.tailBytes > MAX_LOG_BYTES) {
