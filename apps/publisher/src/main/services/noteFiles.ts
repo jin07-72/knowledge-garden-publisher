@@ -27,6 +27,7 @@ export {
   inspectPendingTransactions,
   MAX_TRANSACTION_RETENTION_SCAN,
   MAX_TRANSACTION_RETENTION_TRASH_CALLS,
+  MAX_TRANSACTION_MANIFEST_BYTES,
   planRename,
   planVisibilityChange,
   type NoteTransactionAdapter,
@@ -607,7 +608,13 @@ async function removeFailedExclusiveFile(path: string, createdIdentity: string):
   await syncContainingDirectory(path)
 }
 
-async function exclusiveWrite(path: string, bytes: Buffer, displayPath: string): Promise<void> {
+async function exclusiveWrite(
+  path: string,
+  bytes: Buffer,
+  displayPath: string,
+  adapter: NoteFileAdapter,
+  assertLockOwned: () => Promise<void>,
+): Promise<void> {
   const temporary = `${path}.garden-publisher-create-${randomUUID()}`
   let handle
   let temporaryIdentity: string | undefined
@@ -621,12 +628,15 @@ async function exclusiveWrite(path: string, bytes: Buffer, displayPath: string):
     const created = await lstat(temporary, { bigint: true })
     if (created.isSymbolicLink() || !created.isFile()) throw new Error("invalid create staging")
     temporaryIdentity = stableFileIdentity(created)
+    await adapter.beforeTempWrite?.(temporary)
     await handle.writeFile(bytes)
+    await adapter.beforeTempSync?.(temporary)
     await handle.sync()
     const opened = await handle.stat({ bigint: true })
     if (!opened.isFile() || stableFileIdentity(opened) !== temporaryIdentity) {
       throw new Error("create staging identity changed")
     }
+    await adapter.beforeCommit?.(temporary)
     await handle.close()
     handle = undefined
     const parent = dirname(path)
@@ -638,6 +648,7 @@ async function exclusiveWrite(path: string, bytes: Buffer, displayPath: string):
     ) {
       throw unsafePath(displayPath)
     }
+    await assertLockOwned()
     await link(temporary, path)
     publishedIdentity = temporaryIdentity
     const installed = await lstat(path, { bigint: true })
@@ -650,7 +661,8 @@ async function exclusiveWrite(path: string, bytes: Buffer, displayPath: string):
     }
     await removeFailedExclusiveFile(temporary, temporaryIdentity)
     temporaryIdentity = undefined
-    await syncContainingDirectory(path)
+    await (adapter.syncDirectory ?? syncContainingDirectory)(path)
+    await assertLockOwned()
   } catch (error) {
     await handle?.close().catch(() => undefined)
     handle = undefined
@@ -2138,7 +2150,10 @@ function resultWithWarnings(
   return warnings.length === 0 ? writeResult : { ...writeResult, warnings }
 }
 
-function lockReleaseWarning(lockId: string, operation: "save" | "restore"): NoteOperationWarning {
+function lockReleaseWarning(
+  lockId: string,
+  operation: "create" | "save" | "restore",
+): NoteOperationWarning {
   return {
     code: "LOCK_RELEASE_FAILED",
     message: `The ${operation} completed, but its lock could not be cleaned up.`,
@@ -2155,7 +2170,7 @@ function attachCleanupWarning(error: unknown, warning: NoteOperationWarning): un
 
 async function preserveOutcomeAcrossLockRelease(
   lock: TargetLock,
-  operation: "save" | "restore",
+  operation: "create" | "save" | "restore",
   work: () => Promise<NoteWriteResult>,
 ): Promise<NoteWriteResult> {
   let writeResult: NoteWriteResult | undefined
@@ -2217,7 +2232,10 @@ async function verifyUnchanged(
   }
 }
 
-export async function createNote(input: CreateNoteInput): Promise<NoteWriteResult> {
+export async function createNote(
+  input: CreateNoteInput,
+  adapter: NoteFileAdapter = {},
+): Promise<NoteWriteResult> {
   assertMetadata(input)
   const workspace = await canonicalWorkspace(input.workspace)
   const root = await managedRoot(workspace, input.visibility)
@@ -2225,8 +2243,12 @@ export async function createNote(input: CreateNoteInput): Promise<NoteWriteResul
   const path = `${root.name}/${input.domain}/${input.slug}.md`
   const target = resolve(directory, `${input.slug}.md`)
   const bytes = Buffer.from(markdownFor(input), "utf8")
-  await exclusiveWrite(target, bytes, path)
-  return resultFromTarget(target, path, bytes)
+  const lock = await acquireTargetLock(workspace, path, adapter)
+  return preserveOutcomeAcrossLockRelease(lock, "create", async () => {
+    await lock.assertOwned()
+    await exclusiveWrite(target, bytes, path, adapter, () => lock.assertOwned())
+    return resultFromTarget(target, path, bytes)
+  })
 }
 
 export async function saveNote(

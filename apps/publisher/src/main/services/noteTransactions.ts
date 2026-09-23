@@ -30,11 +30,13 @@ const slugPattern = /^[a-z0-9]+(?:-[a-z0-9]+)*$/
 const hashPattern = /^[a-f0-9]{64}$/
 const stateName = ".garden-publisher"
 const transactionDirectoryName = "transactions"
+const pendingTransactionDirectoryName = "pending"
+const transactionHistoryDirectoryName = "history"
 export const DEFAULT_TRANSACTION_PER_NOTE_RETENTION = 20
 export const DEFAULT_TRANSACTION_GLOBAL_RETENTION = 200
 export const MAX_TRANSACTION_RETENTION_SCAN = 256
 export const MAX_TRANSACTION_RETENTION_TRASH_CALLS = 16
-const maximumJournalManifestBytes = 256 * 1024
+export const MAX_TRANSACTION_MANIFEST_BYTES = 256 * 1024
 
 export type NoteDomain = "technology" | "reading" | "language" | "life"
 
@@ -160,7 +162,7 @@ export interface TransactionContext {
   workspace: string
   adapter?: NoteTransactionAdapter
   /** Moves pruned authenticated terminal journals to the platform Trash. */
-  transactionTrash?: TrashAdapter
+  transactionTrash: TrashAdapter
 }
 
 export interface TransactionWarning {
@@ -310,6 +312,25 @@ function hmac(key: Buffer, value: unknown): string {
   return createHmac("sha256", key).update(canonicalJson(value)).digest("hex")
 }
 
+function canonicalByteLength(value: unknown): number {
+  return Buffer.byteLength(canonicalJson(value), "utf8")
+}
+
+function assertPlanWithinBound(value: unknown): void {
+  let bytes: number
+  try {
+    bytes = canonicalByteLength(value)
+  } catch {
+    throw transactionError("TRANSACTION_PLAN_INVALID", "The transaction plan is invalid.")
+  }
+  if (bytes > MAX_TRANSACTION_MANIFEST_BYTES) {
+    throw transactionError(
+      "TRANSACTION_PLAN_TOO_LARGE",
+      "The transaction plan exceeds the safe metadata limit.",
+    )
+  }
+}
+
 function sameMac(left: string, right: string): boolean {
   if (!hashPattern.test(left) || !hashPattern.test(right)) return false
   return timingSafeEqual(Buffer.from(left, "hex"), Buffer.from(right, "hex"))
@@ -457,14 +478,18 @@ async function ensureStateDirectories(workspace: string): Promise<void> {
     if ((error as NodeJS.ErrnoException).code !== "EEXIST") throw error
   }
   await ensureSafeDirectory(state, workspace)
-  for (const child of [transactionDirectoryName]) {
-    const path = resolve(state, child)
+  const transactions = resolve(state, transactionDirectoryName)
+  for (const [path, parent] of [
+    [transactions, state],
+    [resolve(transactions, pendingTransactionDirectoryName), transactions],
+    [resolve(transactions, transactionHistoryDirectoryName), transactions],
+  ] as const) {
     try {
       await mkdir(path, { mode: 0o700 })
     } catch (error) {
       if ((error as NodeJS.ErrnoException).code !== "EEXIST") throw error
     }
-    await ensureSafeDirectory(path, state)
+    await ensureSafeDirectory(path, parent)
   }
 }
 
@@ -537,7 +562,9 @@ function signPlan<T extends Omit<NoteTransactionPlan, "integrity">>(
   plan: T,
   key: Buffer,
 ): T & { integrity: string } {
-  return { ...plan, integrity: hmac(key, plan) }
+  const signed = { ...plan, integrity: hmac(key, plan) }
+  assertPlanWithinBound(signed)
+  return signed
 }
 
 async function attachmentFiles(
@@ -1327,6 +1354,7 @@ async function verifyPlan(
   expectedKind: NoteTransactionPlan["kind"],
   workspaceInput: string,
 ): Promise<{ plan: NoteTransactionPlan; workspace: string; key: Buffer }> {
+  assertPlanWithinBound(plan)
   if (!isPlanShape(plan) || plan.kind !== expectedKind) {
     throw transactionError("TRANSACTION_PLAN_INVALID", "The transaction plan is invalid.")
   }
@@ -1515,16 +1543,32 @@ function journalIntegrity(key: Buffer, payload: JournalPayload | LegacyJournalPa
   return hmac(key, payload)
 }
 
+function boundedTransactionJson(value: unknown, pretty: boolean): Buffer {
+  const bytes = Buffer.from(`${JSON.stringify(value, null, pretty ? 2 : undefined)}\n`, "utf8")
+  if (bytes.length > MAX_TRANSACTION_MANIFEST_BYTES) {
+    throw transactionError(
+      "TRANSACTION_JOURNAL_TOO_LARGE",
+      "The transaction journal exceeds the safe metadata limit.",
+    )
+  }
+  return bytes
+}
+
+function serializedJournalManifest(payload: JournalPayload, key: Buffer): Buffer {
+  const manifest: JournalManifest = { ...payload, integrity: journalIntegrity(key, payload) }
+  return boundedTransactionJson(manifest, true)
+}
+
 async function writeJournalManifest(
   directory: string,
   payload: JournalPayload,
   key: Buffer,
 ): Promise<void> {
-  const manifest: JournalManifest = { ...payload, integrity: journalIntegrity(key, payload) }
+  const bytes = serializedJournalManifest(payload, key)
   const target = resolve(directory, "manifest.json")
   const temporary = `${target}.tmp-${randomUUID()}`
   try {
-    await durableWrite(temporary, `${JSON.stringify(manifest, null, 2)}\n`)
+    await durableWrite(temporary, bytes)
     await rename(temporary, target)
     await syncDirectory(directory)
   } finally {
@@ -1537,10 +1581,10 @@ async function createJournal(
   plan: NoteTransactionPlan,
   key: Buffer,
 ): Promise<{ directory: string; manifest: JournalPayload; backupFiles: Map<string, SafeFile> }> {
-  await ensureStateDirectories(workspace)
   const transactions = resolve(workspace, stateName, transactionDirectoryName)
-  const directory = resolve(transactions, plan.id)
-  const staging = resolve(transactions, `.staging-${plan.id}-${randomUUID()}`)
+  const pending = resolve(transactions, pendingTransactionDirectoryName)
+  const directory = resolve(pending, plan.id)
+  const staging = resolve(pending, `.staging-${plan.id}-${randomUUID()}`)
   const backupFiles = new Map<string, SafeFile>()
   const paths = [
     ...new Set([
@@ -1548,36 +1592,43 @@ async function createJournal(
       ...plan.linkEdits.map(({ path }) => path),
     ]),
   ].sort((left, right) => left.localeCompare(right))
+  const backups: JournalBackup[] = []
+  for (const [index, path] of paths.entries()) {
+    const file = await safeFile(workspace, path)
+    backupFiles.set(path, file)
+    const name = `${String(index).padStart(4, "0")}-${sha256(path)}.bin`
+    backups.push({
+      path,
+      file: `backups/${name}`,
+      contentHash: file.revision.contentHash,
+      mode: file.mode,
+    })
+  }
+  const manifest: JournalPayload = {
+    version: 1,
+    id: plan.id,
+    kind: plan.kind,
+    createdAt: plan.createdAt,
+    phase: "prepared",
+    source: plan.source,
+    paths: [
+      ...new Set([
+        ...plan.moves.flatMap(({ source, target }) => [source, target]),
+        ...plan.linkEdits.map(({ path }) => path),
+      ]),
+    ].sort(),
+    backups,
+  }
+  serializedJournalManifest(manifest, key)
+  await ensureStateDirectories(workspace)
   try {
     await mkdir(staging, { mode: 0o700 })
     await mkdir(resolve(staging, "backups"), { mode: 0o700 })
-    const backups: JournalBackup[] = []
-    for (const [index, path] of paths.entries()) {
-      const file = await safeFile(workspace, path)
-      backupFiles.set(path, file)
-      const name = `${String(index).padStart(4, "0")}-${sha256(path)}.bin`
-      await durableWrite(resolve(staging, "backups", name), file.bytes)
-      backups.push({
-        path,
-        file: `backups/${name}`,
-        contentHash: file.revision.contentHash,
-        mode: file.mode,
-      })
-    }
-    const manifest: JournalPayload = {
-      version: 1,
-      id: plan.id,
-      kind: plan.kind,
-      createdAt: plan.createdAt,
-      phase: "prepared",
-      source: plan.source,
-      paths: [
-        ...new Set([
-          ...plan.moves.flatMap(({ source, target }) => [source, target]),
-          ...plan.linkEdits.map(({ path }) => path),
-        ]),
-      ].sort(),
-      backups,
+    for (const backup of backups) {
+      await durableWrite(
+        resolve(staging, ...backup.file.split("/")),
+        backupFiles.get(backup.path)!.bytes,
+      )
     }
     await writeJournalManifest(staging, manifest, key)
     await syncDirectory(resolve(staging, "backups"))
@@ -1593,7 +1644,7 @@ async function createJournal(
       }
       throw error
     }
-    await syncDirectory(transactions)
+    await syncDirectory(pending)
     return { directory, manifest, backupFiles }
   } catch (error) {
     await rm(staging, { recursive: true, force: true }).catch(() => undefined)
@@ -1623,11 +1674,21 @@ async function updateJournal(
     const target = resolve(journal.directory, "terminal.json")
     const temporary = `${target}.tmp-${randomUUID()}`
     try {
-      await durableWrite(temporary, `${JSON.stringify(marker)}\n`)
+      await durableWrite(temporary, boundedTransactionJson(marker, false))
       await rename(temporary, target)
       await syncDirectory(journal.directory)
     } finally {
       await rm(temporary, { force: true }).catch(() => undefined)
+    }
+    const currentParent = dirname(journal.directory)
+    const transactions = dirname(currentParent)
+    const history = resolve(transactions, transactionHistoryDirectoryName)
+    if (currentParent !== history) {
+      const retained = resolve(history, journal.manifest.id)
+      await rename(journal.directory, retained)
+      journal.directory = retained
+      await syncDirectory(currentParent)
+      await syncDirectory(history)
     }
   }
 }
@@ -2492,9 +2553,13 @@ function planPaths(plan: NoteTransactionPlan): string[] {
 function lockPaths(plan: NoteTransactionPlan): string[] {
   const source = parseNotePath(plan.source)
   const target = parseNotePath(plan.target)
+  const notePaths = plan.moves
+    .filter(({ kind }) => kind === "note")
+    .flatMap(({ source, target }) => [source, target])
   return [
     ...new Set([
-      ...planPaths(plan),
+      ...notePaths,
+      ...plan.linkEdits.map(({ path }) => path),
       `${source.root}/_assets/${source.slug}`,
       `${target.root}/_assets/${target.slug}`,
     ]),
@@ -2509,7 +2574,7 @@ async function readJournalManifest(
     const details = await lstat(directory)
     if (details.isSymbolicLink() || !details.isDirectory()) return undefined
     const manifestPath = resolve(directory, "manifest.json")
-    const checked = await safeAbsoluteFile(manifestPath, directory, maximumJournalManifestBytes)
+    const checked = await safeAbsoluteFile(manifestPath, directory, MAX_TRANSACTION_MANIFEST_BYTES)
     if (checked === undefined) return undefined
     const manifest = JSON.parse(checked.bytes.toString("utf8")) as Partial<JournalManifest>
     if (
@@ -2557,7 +2622,7 @@ async function readTerminalMarker(
     const checked = await safeAbsoluteFile(
       resolve(directory, "terminal.json"),
       directory,
-      maximumJournalManifestBytes,
+      MAX_TRANSACTION_MANIFEST_BYTES,
     )
     if (checked === undefined) return undefined
     const marker = JSON.parse(checked.bytes.toString("utf8")) as Partial<TerminalMarker>
@@ -2605,10 +2670,10 @@ async function inspectPendingTransactionsInternal(
     typeof input === "string" ? input : input.workspace,
   )
   const state = resolve(workspace, stateName)
-  const root = resolve(state, transactionDirectoryName)
+  const transactions = resolve(state, transactionDirectoryName)
   try {
     await ensureSafeDirectory(state, workspace)
-    await ensureSafeDirectory(root, state)
+    await ensureSafeDirectory(transactions, state)
   } catch (error) {
     if ((error as NodeJS.ErrnoException).code === "ENOENT") return []
     throw transactionError(
@@ -2617,59 +2682,68 @@ async function inspectPendingTransactionsInternal(
     )
   }
   const key = await trustKey(workspace, false)
-  let entries
-  try {
-    entries = await readdir(root, { withFileTypes: true })
-  } catch (error) {
-    if ((error as NodeJS.ErrnoException).code === "ENOENT") return []
-    throw transactionError(
-      "TRANSACTION_PLAN_INVALID",
-      "Transaction history could not be inspected.",
-    )
-  }
-  const transactionEntries = entries
-    .filter(
-      (entry) =>
-        entry.isDirectory() && !entry.isSymbolicLink() && !entry.name.startsWith(".staging-"),
-    )
-    .sort((left, right) => left.name.localeCompare(right.name))
-  if (transactionEntries.length > MAX_TRANSACTION_RETENTION_SCAN) {
-    throw transactionError(
-      "TRANSACTION_PENDING",
-      "Retained transaction evidence exceeds the bounded inspection limit.",
-    )
-  }
   const pending: PendingTransaction[] = []
-  for (const entry of transactionEntries) {
-    const directory = resolve(root, entry.name)
-    const manifest = await readJournalManifest(directory, key)
-    if (!manifest) {
-      const terminal = await readTerminalMarker(directory, key)
-      if (terminal !== undefined && terminal.marker.id === entry.name) {
-        pending.push({
-          id: terminal.marker.id,
-          kind: terminal.marker.kind,
-          createdAt: terminal.marker.createdAt,
-          phase: "terminal-invalid",
-          paths: [],
-          issue: "TRANSACTION_INVALID",
-        })
-        continue
-      }
+  async function inspectNamespace(root: string, legacy: boolean): Promise<void> {
+    let entries
+    try {
+      entries = await readdir(root, { withFileTypes: true })
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code === "ENOENT") return
       throw transactionError(
-        "TRANSACTION_PENDING",
-        "Retained transaction evidence failed authentication and must be inspected.",
+        "TRANSACTION_PLAN_INVALID",
+        "Transaction history could not be inspected.",
       )
     }
-    if (["complete", "rolled-back"].includes(manifest.phase)) continue
-    pending.push({
-      id: manifest.id,
-      kind: manifest.kind,
-      createdAt: manifest.createdAt,
-      phase: manifest.phase,
-      paths: [...manifest.paths],
-    })
+    const transactionEntries = entries
+      .filter(
+        (entry) =>
+          entry.isDirectory() &&
+          !entry.isSymbolicLink() &&
+          !entry.name.startsWith(".") &&
+          (!legacy ||
+            (entry.name !== pendingTransactionDirectoryName &&
+              entry.name !== transactionHistoryDirectoryName)),
+      )
+      .sort((left, right) => left.name.localeCompare(right.name))
+    if (transactionEntries.length > MAX_TRANSACTION_RETENTION_SCAN) {
+      throw transactionError(
+        "TRANSACTION_PENDING",
+        "Pending transaction evidence exceeds the bounded inspection limit.",
+      )
+    }
+    for (const entry of transactionEntries) {
+      const directory = resolve(root, entry.name)
+      const manifest = await readJournalManifest(directory, key)
+      if (!manifest) {
+        const terminal = await readTerminalMarker(directory, key)
+        if (terminal !== undefined && terminal.marker.id === entry.name) {
+          pending.push({
+            id: terminal.marker.id,
+            kind: terminal.marker.kind,
+            createdAt: terminal.marker.createdAt,
+            phase: "terminal-invalid",
+            paths: [],
+            issue: "TRANSACTION_INVALID",
+          })
+          continue
+        }
+        throw transactionError(
+          "TRANSACTION_PENDING",
+          "Retained transaction evidence failed authentication and must be inspected.",
+        )
+      }
+      if (["complete", "rolled-back"].includes(manifest.phase)) continue
+      pending.push({
+        id: manifest.id,
+        kind: manifest.kind,
+        createdAt: manifest.createdAt,
+        phase: manifest.phase,
+        paths: [...manifest.paths],
+      })
+    }
   }
+  await inspectNamespace(resolve(transactions, pendingTransactionDirectoryName), false)
+  await inspectNamespace(transactions, true)
   return pending
 }
 
@@ -2714,8 +2788,51 @@ async function assertNoPendingConflict(
 }
 
 interface RetainedTerminalTransaction extends AuthenticatedTerminalEvidence {
-  readonly directory: string
   readonly directoryName: string
+}
+
+const retentionQuarantinePattern = /^\.retention-([a-f0-9-]{36})-([a-f0-9-]{36})$/i
+
+async function migrateLegacyTerminalEvidence(workspace: string, key: Buffer): Promise<void> {
+  const root = resolve(workspace, stateName, transactionDirectoryName)
+  const history = resolve(root, transactionHistoryDirectoryName)
+  const entries = (await readdir(root, { withFileTypes: true }))
+    .filter(
+      (entry) =>
+        entry.isDirectory() &&
+        !entry.isSymbolicLink() &&
+        entry.name !== pendingTransactionDirectoryName &&
+        entry.name !== transactionHistoryDirectoryName &&
+        !entry.name.startsWith("."),
+    )
+    .sort((left, right) => left.name.localeCompare(right.name))
+    .slice(0, MAX_TRANSACTION_RETENTION_SCAN)
+  for (const entry of entries) {
+    const source = resolve(root, entry.name)
+    const terminal = await readTerminalMarker(source, key)
+    const manifest = terminal === undefined ? await readJournalManifest(source, key) : undefined
+    const authenticatedTerminal =
+      (terminal !== undefined && terminal.marker.id === entry.name) ||
+      (manifest !== undefined &&
+        manifest.id === entry.name &&
+        ["complete", "rolled-back"].includes(manifest.phase))
+    if (!authenticatedTerminal) continue
+    const identity = await currentDirectoryIdentity(source)
+    if (identity === undefined) continue
+    const target = resolve(history, entry.name)
+    if ((await currentDirectoryIdentity(target)) !== undefined) continue
+    try {
+      await rename(source, target)
+      if ((await currentDirectoryIdentity(target)) !== identity) {
+        await restoreTerminalQuarantine(source, target, identity)
+        continue
+      }
+      await syncDirectory(root)
+      await syncDirectory(history)
+    } catch {
+      await restoreTerminalQuarantine(source, target, identity)
+    }
+  }
 }
 
 async function restoreTerminalQuarantine(
@@ -2725,7 +2842,12 @@ async function restoreTerminalQuarantine(
 ): Promise<void> {
   if ((await currentDirectoryIdentity(quarantine)) !== expectedIdentity) return
   if ((await currentDirectoryIdentity(source)) !== undefined) return
-  await rename(quarantine, source).catch(() => undefined)
+  try {
+    await rename(quarantine, source)
+    await syncDirectory(dirname(source))
+  } catch {
+    // Preserve whichever identity remains when restoration cannot be proven.
+  }
 }
 
 async function trashAuthenticatedTerminal(
@@ -2767,24 +2889,66 @@ async function trashAuthenticatedTerminal(
   }
 }
 
+async function trashAbandonedTerminalQuarantine(
+  history: string,
+  directoryName: string,
+  evidence: AuthenticatedTerminalEvidence,
+  trash: TrashAdapter,
+): Promise<boolean> {
+  const match = retentionQuarantinePattern.exec(directoryName)
+  if (match === null || evidence.marker.id !== match[1]) return false
+  const quarantine = resolve(history, directoryName)
+  if ((await currentDirectoryIdentity(quarantine)) !== evidence.directoryIdentity) return false
+  const source = resolve(history, evidence.marker.id)
+  try {
+    await trash.trashItem(quarantine)
+    if ((await currentDirectoryIdentity(quarantine)) === undefined) return true
+  } catch {
+    // Restore below when the original history name is still available.
+  }
+  await restoreTerminalQuarantine(source, quarantine, evidence.directoryIdentity)
+  return false
+}
+
 async function maintainTransactionRetention(
   workspace: string,
   key: Buffer,
-  trash: TrashAdapter | undefined,
+  trash: TrashAdapter,
 ): Promise<TransactionWarning[]> {
-  if (trash === undefined) return []
-  const root = resolve(workspace, stateName, transactionDirectoryName)
-  const entries = (await readdir(root, { withFileTypes: true }))
+  const history = resolve(
+    workspace,
+    stateName,
+    transactionDirectoryName,
+    transactionHistoryDirectoryName,
+  )
+  const entries = (await readdir(history, { withFileTypes: true }))
     .filter(
-      (entry) => entry.isDirectory() && !entry.isSymbolicLink() && !entry.name.startsWith("."),
+      (entry) =>
+        entry.isDirectory() &&
+        !entry.isSymbolicLink() &&
+        (/^[a-f0-9-]{36}$/i.test(entry.name) || retentionQuarantinePattern.test(entry.name)),
     )
+    .sort((left, right) => left.name.localeCompare(right.name))
     .slice(0, MAX_TRANSACTION_RETENTION_SCAN)
   const terminal: RetainedTerminalTransaction[] = []
+  let failed = false
+  let trashCalls = 0
   for (const entry of entries) {
-    const directory = resolve(root, entry.name)
+    const directory = resolve(history, entry.name)
     const evidence = await readTerminalMarker(directory, key)
+    if (entry.name.startsWith(".retention-")) {
+      if (evidence === undefined) {
+        failed = true
+      } else if (trashCalls < MAX_TRANSACTION_RETENTION_TRASH_CALLS) {
+        trashCalls += 1
+        if (!(await trashAbandonedTerminalQuarantine(history, entry.name, evidence, trash))) {
+          failed = true
+        }
+      }
+      continue
+    }
     if (evidence !== undefined && evidence.marker.id === entry.name) {
-      terminal.push({ ...evidence, directory, directoryName: entry.name })
+      terminal.push({ ...evidence, directoryName: entry.name })
     }
   }
   terminal.sort((left, right) => right.marker.createdAt.localeCompare(left.marker.createdAt))
@@ -2804,9 +2968,9 @@ async function maintainTransactionRetention(
     retainedGlobal += 1
     retainedBySource.set(sourceKey, retainedForSource + 1)
   }
-  let failed = false
-  for (const entry of prune.slice(0, MAX_TRANSACTION_RETENTION_TRASH_CALLS)) {
-    if (!(await trashAuthenticatedTerminal(root, entry, trash))) failed = true
+  for (const entry of prune.slice(0, MAX_TRANSACTION_RETENTION_TRASH_CALLS - trashCalls)) {
+    trashCalls += 1
+    if (!(await trashAuthenticatedTerminal(history, entry, trash))) failed = true
   }
   return failed
     ? [
@@ -2823,9 +2987,14 @@ async function execute(
   expectedKind: NoteTransactionPlan["kind"],
   context: TransactionContext,
 ): Promise<TransactionResult> {
+  if (typeof context?.transactionTrash?.trashItem !== "function") {
+    throw transactionError("TRANSACTION_PLAN_INVALID", "A transaction Trash adapter is required.")
+  }
   const verified = await verifyPlan(rawPlan, expectedKind, context.workspace)
   const { plan, workspace, key } = verified
   const adapter = context.adapter ?? {}
+  await ensureStateDirectories(workspace)
+  await migrateLegacyTerminalEvidence(workspace, key)
   await assertNoPendingConflict(workspace, plan)
   const locks = await acquireLocks(workspace, lockPaths(plan), adapter)
   let journal:

@@ -211,41 +211,17 @@ describe("note files", () => {
     expect(publicNote.contentHash).toHaveLength(64)
   })
 
-  it.each(["writeFile", "sync", "close"] as const)(
-    "removes an exclusively-created destination when %s fails so a retry can succeed",
+  it.each(["writeFile", "sync", "commit"] as const)(
+    "removes an exclusively-created destination when the %s stage fails so a retry can succeed",
     async (method) => {
       const root = await createGarden()
-      const probe = join(root, "exclusive-write-probe")
-      const probeHandle = await open(probe, "wx", 0o600)
-      const prototype = Object.getPrototypeOf(probeHandle) as Record<string, unknown>
-      await probeHandle.close()
-      await rm(probe)
       const failure = Object.assign(new Error(`injected ${method} failure`), { code: "EIO" })
-      let restoreSpy: () => void
-      if (method === "close") {
-        const fileHandlePrototype = prototype as unknown as {
-          writeFile(value: string | Uint8Array): Promise<void>
-        }
-        const originalWriteFile = fileHandlePrototype.writeFile
-        const spy = vi
-          .spyOn(fileHandlePrototype, "writeFile")
-          .mockImplementationOnce(async function (this: typeof probeHandle, value) {
-            await Reflect.apply(originalWriteFile, this, [value])
-            const originalClose = this.close
-            this.close = async () => {
-              this.close = originalClose
-              throw failure
-            }
-          })
-        restoreSpy = () => spy.mockRestore()
-      } else {
-        const spy = vi.spyOn(prototype as never, method as never) as unknown as {
-          mockRejectedValueOnce(value: unknown): void
-          mockRestore(): void
-        }
-        spy.mockRejectedValueOnce(failure)
-        restoreSpy = () => spy.mockRestore()
-      }
+      const adapter: NoteFileAdapter =
+        method === "writeFile"
+          ? { beforeTempWrite: () => Promise.reject(failure) }
+          : method === "sync"
+            ? { beforeTempSync: () => Promise.reject(failure) }
+            : { beforeCommit: () => Promise.reject(failure) }
       const input = {
         workspace: root,
         visibility: "public" as const,
@@ -258,10 +234,11 @@ describe("note files", () => {
       }
       const destination = join(root, "content", "technology", `${input.slug}.md`)
 
-      await expect(createNote(input)).rejects.toMatchObject({ code: "NOTE_FILE_WRITE_FAILED" })
+      await expect(createNote(input, adapter)).rejects.toMatchObject({
+        code: "NOTE_FILE_WRITE_FAILED",
+      })
       await expect(lstat(destination)).rejects.toMatchObject({ code: "ENOENT" })
 
-      restoreSpy()
       await expect(createNote(input)).resolves.toMatchObject({
         path: `content/technology/${input.slug}.md`,
       })
@@ -271,29 +248,27 @@ describe("note files", () => {
   it("never removes a successor that replaces a failed exclusive destination", async () => {
     const root = await createGarden()
     const destination = join(root, "content", "technology", "exclusive-successor.md")
-    const probe = join(root, "exclusive-successor-probe")
-    const probeHandle = await open(probe, "wx", 0o600)
-    const prototype = Object.getPrototypeOf(probeHandle) as {
-      writeFile: (value: string | Uint8Array) => Promise<void>
-    }
-    await probeHandle.close()
-    await rm(probe)
-    vi.spyOn(prototype, "writeFile").mockImplementationOnce(async () => {
-      await writeFile(destination, "successor bytes")
-      throw Object.assign(new Error("injected write failure after replacement"), { code: "EIO" })
-    })
-
     await expect(
-      createNote({
-        workspace: root,
-        visibility: "public",
-        domain: "technology",
-        slug: "exclusive-successor",
-        title: "Exclusive successor",
-        date: "2026-09-20",
-        description: "Preserves replacement identity.",
-        tags: ["test"],
-      }),
+      createNote(
+        {
+          workspace: root,
+          visibility: "public",
+          domain: "technology",
+          slug: "exclusive-successor",
+          title: "Exclusive successor",
+          date: "2026-09-20",
+          description: "Preserves replacement identity.",
+          tags: ["test"],
+        },
+        {
+          async beforeTempWrite() {
+            await writeFile(destination, "successor bytes")
+            throw Object.assign(new Error("injected write failure after replacement"), {
+              code: "EIO",
+            })
+          },
+        },
+      ),
     ).rejects.toMatchObject({ code: "NOTE_FILE_WRITE_FAILED" })
     expect(await readFile(destination, "utf8")).toBe("successor bytes")
   })
@@ -306,11 +281,20 @@ describe("note files", () => {
     const prototype = Object.getPrototypeOf(probeHandle) as {
       stat: (options?: { bigint?: boolean }) => Promise<unknown>
     }
+    const originalStat = prototype.stat
     await probeHandle.close()
     await rm(probe)
-    vi.spyOn(prototype, "stat").mockRejectedValueOnce(
-      Object.assign(new Error("injected identity stat failure"), { code: "EIO" }),
-    )
+    let failNextStat = false
+    const spy = vi.spyOn(prototype, "stat").mockImplementation(async function (
+      this: typeof probeHandle,
+      options,
+    ) {
+      if (failNextStat) {
+        failNextStat = false
+        throw Object.assign(new Error("injected identity stat failure"), { code: "EIO" })
+      }
+      return Reflect.apply(originalStat, this, [options])
+    })
     const input = {
       workspace: root,
       visibility: "public" as const,
@@ -322,9 +306,15 @@ describe("note files", () => {
       tags: ["test"],
     }
 
-    await expect(createNote(input)).rejects.toMatchObject({ code: "NOTE_FILE_WRITE_FAILED" })
+    await expect(
+      createNote(input, {
+        beforeTempWrite() {
+          failNextStat = true
+        },
+      }),
+    ).rejects.toMatchObject({ code: "NOTE_FILE_WRITE_FAILED" })
     await expect(lstat(destination)).rejects.toMatchObject({ code: "ENOENT" })
-    vi.restoreAllMocks()
+    spy.mockRestore()
     await expect(createNote(input)).resolves.toMatchObject({
       path: "content/technology/exclusive-stat.md",
     })
@@ -333,22 +323,6 @@ describe("note files", () => {
   it("removes a published note when its final directory sync fails and allows retry", async () => {
     const root = await createGarden()
     const destination = join(root, "content", "technology", "exclusive-directory-sync.md")
-    const probe = join(root, "exclusive-directory-sync-probe")
-    const probeHandle = await open(probe, "wx", 0o600)
-    const prototype = Object.getPrototypeOf(probeHandle) as { sync: () => Promise<void> }
-    const originalSync = prototype.sync
-    await probeHandle.close()
-    await rm(probe)
-    let syncCalls = 0
-    const spy = vi.spyOn(prototype, "sync").mockImplementation(async function (
-      this: typeof prototype,
-    ) {
-      syncCalls += 1
-      if (syncCalls === 3) {
-        throw Object.assign(new Error("injected final directory sync failure"), { code: "EIO" })
-      }
-      await Reflect.apply(originalSync, this, [])
-    })
     const input = {
       workspace: root,
       visibility: "public" as const,
@@ -360,9 +334,14 @@ describe("note files", () => {
       tags: ["test"],
     }
 
-    await expect(createNote(input)).rejects.toMatchObject({ code: "NOTE_FILE_WRITE_FAILED" })
+    await expect(
+      createNote(input, {
+        syncDirectory: async () => {
+          throw Object.assign(new Error("injected final directory sync failure"), { code: "EIO" })
+        },
+      }),
+    ).rejects.toMatchObject({ code: "NOTE_FILE_WRITE_FAILED" })
     await expect(lstat(destination)).rejects.toMatchObject({ code: "ENOENT" })
-    spy.mockRestore()
     await expect(createNote(input)).resolves.toMatchObject({
       path: "content/technology/exclusive-directory-sync.md",
     })
@@ -485,7 +464,7 @@ describe("note files", () => {
     ])
     expect(results.filter((result) => result.status === "fulfilled")).toHaveLength(1)
     expect(results.find((result) => result.status === "rejected")).toMatchObject({
-      reason: { code: "NOTE_ALREADY_EXISTS" },
+      reason: { code: expect.stringMatching(/^NOTE_(?:ALREADY_EXISTS|FILE_LOCKED)$/) },
     })
     expect(
       (await readdir(join(root, "content", "technology"))).filter((name) =>
