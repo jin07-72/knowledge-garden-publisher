@@ -3,6 +3,7 @@ import { PassThrough } from "node:stream"
 import { describe, expect, it, vi } from "vitest"
 import {
   PreviewManager,
+  PreviewDisposeError,
   createProcessTreeTerminator,
   type PortRequest,
   type PreviewDependencies,
@@ -537,6 +538,40 @@ describe("PreviewManager", () => {
     expect(deps.children[0].alive).toBe(true)
   })
 
+  it("releases a failed startup cleanup after a later close and permits a fresh generation", async () => {
+    let terminateCalls = 0
+    const deps = dependencies({
+      terminate: async (child) => {
+        terminateCalls += 1
+        if (terminateCalls === 1) return false
+        ;(child as FakeProcess).close()
+        return true
+      },
+      probe: async () => deps.children.length >= 2,
+    })
+    const manager = new PreviewManager(deps)
+    const first = manager.start({ workspace: "C:\\Garden" })
+
+    await until(() => expect(deps.children).toHaveLength(1), "failed-cleanup first spawn")
+    const failedChild = deps.children[0]
+    failedChild.stderr.write("Failed to build Quartz. C:\\private\\plugin.ts\n")
+    await expect(first).resolves.toMatchObject({
+      state: "error",
+      generation: 1,
+      error: { code: "PREVIEW_STOP_FAILED" },
+    })
+
+    failedChild.close(1)
+    expect(failedChild.listenerCount("close")).toBe(0)
+    expect(failedChild.listenerCount("error")).toBe(0)
+
+    await expect(manager.start({ workspace: "C:\\Garden" })).resolves.toMatchObject({
+      state: "ready",
+      generation: 2,
+    })
+    expect(deps.children).toHaveLength(2)
+  })
+
   it("rejects an invalid allocated port before spawn", async () => {
     const deps = dependencies({ allocatePort: async () => 70_000 })
     const manager = new PreviewManager(deps)
@@ -659,6 +694,58 @@ describe("PreviewManager", () => {
     expect(observed).toHaveBeenCalledTimes(calls)
   })
 
+  it("shares concurrent dispose and remains retryable with subscribers after cleanup failure", async () => {
+    const firstTermination = new Deferred<boolean>()
+    const outcomes: Array<boolean | Promise<boolean>> = [firstTermination.promise, true]
+    const deps = dependencies({
+      probe: async () => true,
+      terminate: async (child) => {
+        const outcome = await (outcomes.shift() ?? false)
+        if (outcome) (child as FakeProcess).close()
+        return outcome
+      },
+    })
+    const manager = new PreviewManager(deps)
+    const observed = vi.fn()
+    manager.subscribe(observed)
+    await manager.start({ workspace: "C:\\Garden" })
+
+    const first = manager.dispose()
+    const concurrent = manager.dispose()
+    expect(first).toBe(concurrent)
+    firstTermination.resolve(false)
+    await expect(first).rejects.toBeInstanceOf(PreviewDisposeError)
+    expect(manager.getStatus()).toMatchObject({
+      state: "error",
+      error: { code: "PREVIEW_STOP_FAILED" },
+    })
+
+    const callsAfterFailure = observed.mock.calls.length
+    const retry = manager.dispose()
+    await expect(retry).resolves.toBeUndefined()
+    expect(observed.mock.calls.length).toBeGreaterThan(callsAfterFailure)
+    expect(manager.getStatus()).toEqual({ state: "stopped", generation: 1 })
+    await expect(manager.start({ workspace: "C:\\Garden" })).resolves.toEqual({
+      state: "stopped",
+      generation: 1,
+    })
+    expect(deps.children).toHaveLength(1)
+  })
+
+  it("allows dispose to succeed after an unconfirmed child later closes", async () => {
+    const deps = dependencies({ probe: async () => true, terminate: async () => false })
+    const manager = new PreviewManager(deps)
+    await manager.start({ workspace: "C:\\Garden" })
+    const child = deps.children[0]
+
+    await expect(manager.dispose()).rejects.toBeInstanceOf(PreviewDisposeError)
+    child.close(1)
+
+    await expect(manager.dispose()).resolves.toBeUndefined()
+    expect(manager.getStatus()).toEqual({ state: "stopped", generation: 1 })
+    expect(child.listenerCount("close")).toBe(0)
+  })
+
   it("keeps a failed-to-stop child tracked so a later stop can retry truthfully", async () => {
     const outcomes = [false, true]
     const terminate = vi.fn<PreviewDependencies["terminate"]>(async (child) => {
@@ -674,6 +761,36 @@ describe("PreviewManager", () => {
       state: "error",
       error: { code: "PREVIEW_STOP_FAILED" },
     })
+    await expect(manager.stop()).resolves.toEqual({ state: "stopped", generation: 1 })
+    expect(terminate).toHaveBeenCalledTimes(2)
+  })
+
+  it("does not treat a child error as confirmed exit during failed termination", async () => {
+    const firstTermination = new Deferred<boolean>()
+    const outcomes: Array<boolean | Promise<boolean>> = [firstTermination.promise, true]
+    const terminate = vi.fn<PreviewDependencies["terminate"]>(async (child) => {
+      const outcome = await (outcomes.shift() ?? false)
+      if (outcome) (child as FakeProcess).close()
+      return outcome
+    })
+    const deps = dependencies({ probe: async () => true, terminate })
+    const manager = new PreviewManager(deps)
+    await manager.start({ workspace: "C:\\Garden" })
+    const child = deps.children[0]
+
+    const stopping = manager.stop()
+    await until(
+      () => expect(manager.getStatus()).toMatchObject({ state: "stopping" }),
+      "error-during-stop state",
+    )
+    child.emit("error", new Error("kill failed"))
+    firstTermination.resolve(false)
+
+    await expect(stopping).resolves.toMatchObject({
+      state: "error",
+      error: { code: "PREVIEW_STOP_FAILED" },
+    })
+    expect(child.listenerCount("close")).toBe(1)
     await expect(manager.stop()).resolves.toEqual({ state: "stopped", generation: 1 })
     expect(terminate).toHaveBeenCalledTimes(2)
   })

@@ -99,8 +99,10 @@ interface ProcessAttempt {
   stderrRemainder: string
   settled: boolean
   inStartup: boolean
+  startupWaitActive: boolean
   stopping: boolean
   buildFailed: boolean
+  closeObserved: boolean
 }
 
 interface PreviewSession {
@@ -244,6 +246,14 @@ export function createProcessTreeTerminator(
   }
 }
 
+export class PreviewDisposeError extends Error {
+  readonly name = "PreviewDisposeError"
+
+  constructor(readonly error: AppError) {
+    super(error.message)
+  }
+}
+
 /** Manages one Quartz preview process and exposes only redacted, loopback-safe status. */
 export class PreviewManager {
   private status: PreviewStatus = { state: "stopped", generation: 0 }
@@ -262,6 +272,7 @@ export class PreviewManager {
   private nextOrdinal = 0
   private lifecycleEpoch = 0
   private disposed = false
+  private disposeFlight: Promise<void> | undefined
   private listeners = new Set<Listener>()
   private tail: string[] = []
   private tailBytes = 0
@@ -281,7 +292,7 @@ export class PreviewManager {
   }
 
   start(request: PreviewStartRequest): Promise<PreviewStatus> {
-    if (this.disposed) return Promise.resolve(this.status)
+    if (this.disposed || this.disposeFlight !== undefined) return Promise.resolve(this.status)
     const rawKey = this.key(this.pathApi().normalize(request.workspace))
     const epoch = this.lifecycleEpoch
     const existing = this.rawFlights.get(rawKey)
@@ -318,10 +329,32 @@ export class PreviewManager {
     return flight
   }
 
-  async dispose(): Promise<void> {
-    if (this.disposed) return
+  dispose(): Promise<void> {
+    if (this.disposed) return Promise.resolve()
+    if (this.disposeFlight !== undefined) return this.disposeFlight
+
+    const flight = this.performDispose()
+    this.disposeFlight = flight
+    const releaseFailedFlight = (): void => {
+      if (this.disposeFlight === flight) this.disposeFlight = undefined
+    }
+    void flight.catch(releaseFailedFlight)
+    return flight
+  }
+
+  private async performDispose(): Promise<void> {
+    const status = await this.stop()
+    if (this.session !== undefined || status.state !== "stopped") {
+      const failure =
+        status.error?.code === "PREVIEW_STOP_FAILED"
+          ? status.error
+          : appError("PREVIEW_STOP_FAILED", "Local preview could not be stopped safely.")
+      throw new PreviewDisposeError(failure)
+    }
+
     this.disposed = true
-    await this.stop()
+    this.rawFlights.clear()
+    this.canonicalFlights.clear()
     this.listeners.clear()
   }
 
@@ -504,6 +537,7 @@ export class PreviewManager {
         const attempt = this.attachAttempt(session, child, port, wsPort)
         session.attempt = attempt
         let outcome = await this.waitForReady(session, attempt)
+        attempt.startupWaitActive = false
         if (outcome.kind === "ready" && attempt.settled) {
           outcome = await attempt.events.promise
         }
@@ -649,15 +683,17 @@ export class PreviewManager {
       stderrRemainder: "",
       settled: false,
       inStartup: true,
+      startupWaitActive: true,
       stopping: false,
       buildFailed: false,
+      closeObserved: false,
       onStdout: (chunk: unknown): void =>
         this.consumeChunk(session, attempt, String(chunk), "stdout"),
       onStderr: (chunk: unknown): void =>
         this.consumeChunk(session, attempt, String(chunk), "stderr"),
-      onError: (): void => this.processEnded(session, attempt, null, null),
+      onError: (): void => this.processEnded(session, attempt, null, null, false),
       onClose: (code: number | null, signal?: string | null): void => {
-        this.processEnded(session, attempt, code, signal ?? null)
+        this.processEnded(session, attempt, code, signal ?? null, true)
       },
     } satisfies ProcessAttempt
 
@@ -675,16 +711,44 @@ export class PreviewManager {
     attempt: ProcessAttempt,
     code: number | null,
     signal: string | null,
+    confirmedClose: boolean,
   ): void {
     if (this.session !== session || session.attempt !== attempt) return
+    if (confirmedClose) attempt.closeObserved = true
     this.flushRemainders(session, attempt)
     this.settleAttempt(attempt, { kind: "exit", code, signal })
-    if (attempt.inStartup || attempt.stopping) return
+    if (attempt.stopping || (attempt.inStartup && attempt.startupWaitActive)) return
+    if (!confirmedClose) {
+      if (
+        attempt.buildFailed ||
+        (this.status.state === "error" && this.status.error?.code === "PREVIEW_STOP_FAILED")
+      ) {
+        return
+      }
+      this.transition({
+        state: "error",
+        generation: session.generation,
+        port: attempt.port,
+        lastSuccessfulUrl: session.lastSuccessfulUrl,
+        error: appError(
+          "PREVIEW_START_FAILED",
+          "Local preview reported a process error.",
+          this.logDetails(),
+        ),
+      })
+      return
+    }
 
     this.detachAttempt(attempt)
+    attempt.inStartup = false
     session.attempt = undefined
     this.clearSession(session)
-    if (attempt.buildFailed) return
+    if (
+      attempt.buildFailed ||
+      (this.status.state === "error" && this.status.error?.code === "PREVIEW_STOP_FAILED")
+    ) {
+      return
+    }
     this.transition({
       state: "error",
       generation: session.generation,
@@ -819,6 +883,11 @@ export class PreviewManager {
       terminated = false
     }
     if (!terminated) {
+      if (attempt.closeObserved) {
+        this.detachAttempt(attempt)
+        if (session.attempt === attempt) session.attempt = undefined
+        return true
+      }
       attempt.stopping = false
       return false
     }
