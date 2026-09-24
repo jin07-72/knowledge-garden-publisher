@@ -82,18 +82,8 @@ export async function disposePublisherRuntime(
   unregisterIpc: (() => void) | undefined,
   preview: { dispose(): Promise<void> },
 ): Promise<void> {
-  let failure: unknown
-  try {
-    unregisterIpc?.()
-  } catch (error) {
-    failure = error
-  }
-  try {
-    await preview.dispose()
-  } catch (error) {
-    failure ??= error
-  }
-  if (failure !== undefined) throw failure
+  await preview.dispose()
+  unregisterIpc?.()
 }
 
 export interface PublisherQuitCoordinator {
@@ -106,11 +96,11 @@ export function createPublisherQuitCoordinator(options: {
   readonly logFailure: (message: string) => void
   readonly maximumAttempts?: number
   readonly retryDelay?: () => Promise<void>
+  readonly restoreOperable?: () => void
 }): PublisherQuitCoordinator {
   const maximumAttempts = Math.max(1, options.maximumAttempts ?? 3)
   const retryDelay =
     options.retryDelay ?? (() => new Promise<void>((resolve) => setTimeout(resolve, 250)))
-  let attempts = 0
   let allowed = false
   let inFlight: Promise<void> | undefined
 
@@ -119,8 +109,8 @@ export function createPublisherQuitCoordinator(options: {
       if (allowed) return Promise.resolve()
       event.preventDefault()
       if (inFlight !== undefined) return inFlight
-      if (attempts >= maximumAttempts) return Promise.resolve()
       inFlight = (async () => {
+        let attempts = 0
         while (attempts < maximumAttempts) {
           attempts += 1
           try {
@@ -135,6 +125,11 @@ export function createPublisherQuitCoordinator(options: {
           }
         }
         options.logFailure("Publisher preview shutdown failed.")
+        try {
+          options.restoreOperable?.()
+        } catch {
+          // Failure recovery must remain fail-closed even if UI restoration races.
+        }
       })().finally(() => {
         inFlight = undefined
       })

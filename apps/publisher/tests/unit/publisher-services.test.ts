@@ -78,22 +78,24 @@ describe("publisher service wiring", () => {
     await expect(services.history.git({})).rejects.toMatchObject({ code: "SERVICE_UNAVAILABLE" })
   })
 
-  it("unregisters IPC before awaiting preview disposal and absorbs no failures", async () => {
+  it("keeps IPC registered until preview disposal succeeds", async () => {
     const order: string[] = []
     const unregister = vi.fn(() => order.push("ipc"))
     const dispose = vi.fn(async () => {
       order.push("preview")
     })
     await disposePublisherRuntime(unregister, { dispose })
-    expect(order).toEqual(["ipc", "preview"])
+    expect(order).toEqual(["preview", "ipc"])
 
+    const unregisterAfterFailedDispose = vi.fn()
     await expect(
-      disposePublisherRuntime(() => undefined, {
+      disposePublisherRuntime(unregisterAfterFailedDispose, {
         dispose: async () => {
           throw new Error("stop failed")
         },
       }),
     ).rejects.toThrow("stop failed")
+    expect(unregisterAfterFailedDispose).not.toHaveBeenCalled()
 
     const disposeAfterUnregisterFailure = vi.fn(async () => undefined)
     await expect(
@@ -141,17 +143,33 @@ describe("publisher service wiring", () => {
     expect(allowedEvent.preventDefault).not.toHaveBeenCalled()
   })
 
-  it("bounds failed quit cleanup attempts", async () => {
-    const cleanup = vi.fn(async () => Promise.reject(new Error("stop failed")))
+  it("bounds each failed quit flight, restores operability, and permits a later gesture", async () => {
+    const cleanup = vi
+      .fn<() => Promise<void>>()
+      .mockRejectedValueOnce(new Error("stop failed"))
+      .mockRejectedValueOnce(new Error("stop failed"))
+      .mockResolvedValueOnce(undefined)
+    const allowQuit = vi.fn()
+    const restoreOperable = vi.fn()
     const coordinator = createPublisherQuitCoordinator({
       cleanup,
-      allowQuit: vi.fn(),
+      allowQuit,
       logFailure: vi.fn(),
       maximumAttempts: 2,
       retryDelay: async () => undefined,
+      restoreOperable,
     })
-    await coordinator.beforeQuit({ preventDefault: vi.fn() })
-    await coordinator.beforeQuit({ preventDefault: vi.fn() })
+    const firstGesture = { preventDefault: vi.fn() }
+    await coordinator.beforeQuit(firstGesture)
     expect(cleanup).toHaveBeenCalledTimes(2)
+    expect(allowQuit).not.toHaveBeenCalled()
+    expect(restoreOperable).toHaveBeenCalledOnce()
+
+    const secondGesture = { preventDefault: vi.fn() }
+    await coordinator.beforeQuit(secondGesture)
+    expect(cleanup).toHaveBeenCalledTimes(3)
+    expect(allowQuit).toHaveBeenCalledOnce()
+    expect(firstGesture.preventDefault).toHaveBeenCalledOnce()
+    expect(secondGesture.preventDefault).toHaveBeenCalledOnce()
   })
 })

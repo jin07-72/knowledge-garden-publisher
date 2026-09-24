@@ -683,12 +683,13 @@ export async function trashNote(
       ) {
         throw uncertainTrash()
       }
-      let rejected = false
       try {
         await input.trash.trashItem(staged)
       } catch {
-        rejected = true
+        // A rejected shell promise can still mean the item moved. Reconcile
+        // from filesystem state instead of trusting the transport outcome.
       }
+      await assertTrashParents(root.directory, managedRootIdentity, directory, domainIdentity)
       const state = await inspectStagedTrash(
         staged,
         directory,
@@ -696,7 +697,7 @@ export async function trashNote(
         current.revision.contentHash,
       )
       if (state !== "absent") {
-        if (!rejected || state !== "exact") throw uncertainTrash()
+        if (state !== "exact") throw uncertainTrash()
         await assertTrashParents(root.directory, managedRootIdentity, directory, domainIdentity)
         if (!(await restoreStagedTrash(staged, target, current.stableIdentity)))
           throw uncertainTrash()

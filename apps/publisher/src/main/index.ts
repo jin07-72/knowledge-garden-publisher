@@ -27,17 +27,21 @@ const quitCoordinator = createPublisherQuitCoordinator({
   cleanup: async () => {
     const manager = previewManager
     const unregister = unregisterIpc
-    unregisterIpc = undefined
     if (manager === undefined) {
       unregister?.()
+      unregisterIpc = undefined
       return
     }
     await disposePublisherRuntime(unregister, manager)
+    unregisterIpc = undefined
     previewManager = undefined
   },
   allowQuit: () => app.quit(),
   logFailure: (message) => {
     console.error(message)
+  },
+  restoreOperable: () => {
+    if (app.isReady() && BrowserWindow.getAllWindows().length === 0) createWindow()
   },
 })
 

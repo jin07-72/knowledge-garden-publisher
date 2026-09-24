@@ -1,4 +1,4 @@
-import { mkdir, mkdtemp, readFile, rename, rm, symlink, writeFile } from "node:fs/promises"
+import { mkdir, mkdtemp, readFile, readdir, rename, rm, symlink, writeFile } from "node:fs/promises"
 import { tmpdir } from "node:os"
 import { join } from "node:path"
 import { afterEach, describe, expect, it, vi } from "vitest"
@@ -124,6 +124,46 @@ describe("note access", () => {
       }),
     ).resolves.toMatchObject({ path: "content/life/daily.md" })
     await expect(readFile(note, "utf8")).resolves.toBe("replacement")
+  })
+
+  it("fails uncertain when the Recycle Bin adapter replaces the managed parent", async () => {
+    const { root, note } = await garden()
+    const domain = join(root, "content", "life")
+    const oldDomain = join(root, "content", "life-old")
+    await expect(
+      trashNote({
+        workspace: root,
+        path: "content/life/daily.md",
+        trash: {
+          trashItem: async () => {
+            await rename(domain, oldDomain)
+            await mkdir(domain)
+            await writeFile(note, "attacker replacement")
+          },
+        },
+        isTracked: async () => false,
+      }),
+    ).rejects.toMatchObject({ code: "NOTE_FILE_COMMIT_UNCERTAIN" })
+    await expect(readFile(note, "utf8")).resolves.toBe("attacker replacement")
+  })
+
+  it("restores the original note when the Recycle Bin adapter resolves without moving it", async () => {
+    const { root, note, markdown } = await garden()
+    await expect(
+      trashNote({
+        workspace: root,
+        path: "content/life/daily.md",
+        trash: { trashItem: async () => undefined },
+        isTracked: async () => false,
+      }),
+    ).rejects.toMatchObject({
+      code: "NOTE_FILE_WRITE_FAILED",
+      message: "The note was not moved to the Recycle Bin and was safely restored.",
+    })
+    await expect(readFile(note, "utf8")).resolves.toBe(markdown)
+    await expect(readdir(join(root, "content", "life"))).resolves.not.toEqual(
+      expect.arrayContaining([expect.stringContaining(".garden-trash-")]),
+    )
   })
 
   it("fails uncertain without trashing when the staged final component is swapped", async () => {
