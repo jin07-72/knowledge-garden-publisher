@@ -69,6 +69,9 @@ export type AppErrorCode =
   | "PREVIEW_START_FAILED"
   | "PREVIEW_EXITED"
   | "PREVIEW_STOP_FAILED"
+  | "IPC_UNAUTHORIZED"
+  | "SERVICE_UNAVAILABLE"
+  | "INTERNAL_ERROR"
 
 export type AppError = {
   readonly [Code in AppErrorCode]: {
@@ -108,7 +111,15 @@ type PreviewError = Extract<
   }
 >
 
-export type WorkspaceIssue = Exclude<AppError, NoteIndexError | NoteFileError | PreviewError> & {
+type BridgeError = Extract<
+  AppError,
+  { readonly code: "IPC_UNAUTHORIZED" | "SERVICE_UNAVAILABLE" | "INTERNAL_ERROR" }
+>
+
+export type WorkspaceIssue = Exclude<
+  AppError,
+  NoteIndexError | NoteFileError | PreviewError | BridgeError
+> & {
   readonly path?: string
 }
 
@@ -184,6 +195,151 @@ export interface PreviewStatus {
   readonly url?: string
   readonly lastSuccessfulUrl?: string
   readonly error?: AppError
+}
+
+export const IPC_CHANNELS = {
+  requests: {
+    workspaceInspect: "garden:workspace:inspect",
+    notesList: "garden:notes:list",
+    notesRead: "garden:notes:read",
+    notesSave: "garden:notes:save",
+    notesCreate: "garden:notes:create",
+    notesRename: "garden:notes:rename",
+    notesChangeVisibility: "garden:notes:change-visibility",
+    notesTrash: "garden:notes:trash",
+    previewStart: "garden:preview:start",
+    previewStop: "garden:preview:stop",
+    previewStatus: "garden:preview:status",
+    changesList: "garden:changes:list",
+    publishStart: "garden:publish:start",
+    publishCancel: "garden:publish:cancel",
+    historyGit: "garden:history:git",
+    historyDeployments: "garden:history:deployments",
+  },
+  events: {
+    previewProgress: "garden:event:preview-progress",
+    publishProgress: "garden:event:publish-progress",
+  },
+} as const
+
+export type IpcResult<T> =
+  { readonly ok: true; readonly value: T } | { readonly ok: false; readonly error: AppError }
+
+export interface NotePathRequest {
+  readonly path: string
+}
+
+export interface NoteDocument extends NotePathRequest {
+  readonly markdown: string
+  readonly mtimeMs: number
+  readonly contentHash: string
+}
+
+export interface NoteSaveRequest extends NotePathRequest {
+  readonly markdown: string
+  readonly expectedMtimeMs: number
+  readonly expectedContentHash: string
+}
+
+export interface NoteCreateRequest {
+  readonly visibility: Visibility
+  readonly domain: NoteSummary["domain"]
+  readonly slug: string
+  readonly title: string
+  readonly date: string
+  readonly description: string
+  readonly tags: readonly string[]
+  readonly body?: string
+}
+
+export interface NoteRenameRequest extends NotePathRequest {
+  readonly newDomain?: NoteSummary["domain"]
+  readonly newSlug?: string
+}
+
+export interface NoteVisibilityRequest extends NotePathRequest {
+  readonly visibility: Visibility
+}
+
+export interface NoteWriteReceipt {
+  readonly path: string
+  readonly updatedAt: string
+  readonly mtimeMs: number
+  readonly contentHash: string
+  readonly warnings?: readonly {
+    readonly code: string
+    readonly message: string
+  }[]
+}
+
+export interface NoteTransactionReceipt {
+  readonly id: string
+  readonly changedPaths: readonly string[]
+  readonly pendingPublicDeletion?: string
+  readonly historyWarning: boolean
+  readonly warnings: readonly { readonly code: string; readonly message: string }[]
+}
+
+export interface NoteTrashReceipt {
+  readonly path: string
+}
+
+export interface PreviewStartRequest {
+  readonly preferredPort?: number
+}
+
+export interface PublishCancelRequest {
+  readonly operationId: string
+}
+
+export interface PublishStartReceipt {
+  readonly operationId: string
+}
+
+export interface HistoryRequest {
+  readonly limit?: number
+}
+
+export interface GitCommit {
+  readonly id: string
+  readonly authoredAt: string
+  readonly subject: string
+  readonly author?: string
+}
+
+export type Unsubscribe = () => void
+
+export interface GardenApi {
+  readonly workspace: {
+    inspect(): Promise<IpcResult<WorkspaceInspection>>
+  }
+  readonly notes: {
+    list(): Promise<IpcResult<readonly NoteSummary[]>>
+    read(request: NotePathRequest): Promise<IpcResult<NoteDocument>>
+    save(request: NoteSaveRequest): Promise<IpcResult<NoteWriteReceipt>>
+    create(request: NoteCreateRequest): Promise<IpcResult<NoteWriteReceipt>>
+    rename(request: NoteRenameRequest): Promise<IpcResult<NoteTransactionReceipt>>
+    changeVisibility(request: NoteVisibilityRequest): Promise<IpcResult<NoteTransactionReceipt>>
+    trash(request: NotePathRequest): Promise<IpcResult<NoteTrashReceipt>>
+  }
+  readonly preview: {
+    start(request?: PreviewStartRequest): Promise<IpcResult<PreviewStatus>>
+    stop(): Promise<IpcResult<PreviewStatus>>
+    status(): Promise<IpcResult<PreviewStatus>>
+    onProgress(listener: (status: PreviewStatus) => void): Unsubscribe
+  }
+  readonly changes: {
+    list(): Promise<IpcResult<readonly ChangeGroup[]>>
+  }
+  readonly publish: {
+    start(request: PublishRequest): Promise<IpcResult<PublishStartReceipt>>
+    cancel(request: PublishCancelRequest): Promise<IpcResult<void>>
+    onProgress(listener: (progress: PublishProgress) => void): Unsubscribe
+  }
+  readonly history: {
+    git(request?: HistoryRequest): Promise<IpcResult<readonly GitCommit[]>>
+    deployments(request?: HistoryRequest): Promise<IpcResult<readonly DeploymentRun[]>>
+  }
 }
 
 export const DEFAULT_GARDEN_PATH = String.raw`C:\Users\11546\Desktop\web`

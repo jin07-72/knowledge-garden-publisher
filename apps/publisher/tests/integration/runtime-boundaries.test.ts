@@ -13,7 +13,7 @@ describe("production runtime boundaries", () => {
   beforeAll(() => {
     execFileSync(process.execPath, [electronVite, "build"], {
       cwd: publisherRoot,
-      stdio: "pipe"
+      stdio: "pipe",
     })
 
     mainOutput = readFileSync(`${publisherRoot}/out/main/index.js`, "utf8")
@@ -26,9 +26,36 @@ describe("production runtime boundaries", () => {
 
   it("emits the sandbox preload as a CommonJS script", () => {
     expect(preloadOutput).not.toMatch(/\b(?:import|export)\b/)
-    expect(preloadOutput).toMatch(/\b(?:module\.exports|exports\.)/)
+    const required: string[] = []
+    const exposed: Array<[string, unknown]> = []
+    const electron = {
+      contextBridge: {
+        exposeInMainWorld: (name: string, value: unknown) => exposed.push([name, value]),
+      },
+      ipcRenderer: {
+        invoke: () => undefined,
+        on: () => undefined,
+        removeListener: () => undefined,
+      },
+    }
     expect(() =>
-      new Script(preloadOutput).runInNewContext({ module: { exports: {} }, exports: {} })
+      new Script(preloadOutput).runInNewContext({
+        module: { exports: {} },
+        exports: {},
+        require: (id: string) => {
+          required.push(id)
+          if (id === "electron") return electron
+          throw new Error(`Unexpected preload dependency: ${id}`)
+        },
+      }),
     ).not.toThrow()
+    expect(required).toEqual(["electron"])
+    expect(exposed).toHaveLength(1)
+    const [name, api] = exposed[0]!
+    expect(name).toBe("garden")
+    expect(Object.isFrozen(api)).toBe(true)
+    expect(api).not.toHaveProperty("ipcRenderer")
+    expect(api).not.toHaveProperty("shell")
+    expect(api).not.toHaveProperty("exec")
   })
 })

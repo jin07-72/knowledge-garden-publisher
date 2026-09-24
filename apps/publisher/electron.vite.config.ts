@@ -5,7 +5,7 @@ import { defineConfig } from "electron-vite"
 const runtimeExternals = [
   "electron",
   /^electron\/.+/,
-  ...builtinModules.flatMap((moduleName) => [moduleName, `node:${moduleName}`])
+  ...builtinModules.flatMap((moduleName) => [moduleName, `node:${moduleName}`]),
 ]
 
 export default defineConfig({
@@ -14,28 +14,29 @@ export default defineConfig({
       externalizeDeps: false,
       rollupOptions: {
         input: resolve(__dirname, "src/main/index.ts"),
-        external: runtimeExternals
-      }
-    }
+        external: runtimeExternals,
+      },
+    },
   },
   preload: {
     build: {
       externalizeDeps: false,
       rollupOptions: {
         input: resolve(__dirname, "src/preload/index.ts"),
+        external: runtimeExternals,
         output: {
           format: "cjs",
-          entryFileNames: "[name].js"
-        }
-      }
-    }
+          entryFileNames: "[name].js",
+        },
+      },
+    },
   },
   renderer: {
     root: resolve(__dirname, "src/renderer"),
     build: {
       rollupOptions: {
-        input: resolve(__dirname, "src/renderer/index.html")
-      }
-    }
-  }
+        input: resolve(__dirname, "src/renderer/index.html"),
+      },
+    },
+  },
 })
