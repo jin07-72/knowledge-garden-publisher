@@ -126,4 +126,25 @@ describe("renderer trust policy", () => {
       ),
     ).toBe(false)
   })
+
+  it("returns false when Electron lifecycle accessors throw during destruction", () => {
+    const policy = createRendererTrustPolicy(
+      "C:/publisher/renderer/index.html",
+      "http://127.0.0.1:5173/",
+    )
+    const webContents = {
+      isDestroyed: () => false,
+      getURL: () => {
+        throw new Error("destroyed")
+      },
+      mainFrame: { url: policy.trustedUrl },
+    }
+    expect(
+      isTrustedRendererSender(
+        { sender: webContents, senderFrame: webContents.mainFrame },
+        { isDestroyed: () => false, webContents },
+        policy,
+      ),
+    ).toBe(false)
+  })
 })

@@ -83,13 +83,17 @@ export function isTrustedRendererSender(
   window: RendererWindowPort,
   trust: RendererTrustPolicy,
 ): boolean {
-  return (
-    !window.isDestroyed() &&
-    !event.sender.isDestroyed() &&
-    event.senderFrame !== null &&
-    event.sender === window.webContents &&
-    event.senderFrame === window.webContents.mainFrame &&
-    trust.isTrustedUrl(event.senderFrame.url) &&
-    trust.isTrustedUrl(window.webContents.getURL())
-  )
+  try {
+    return (
+      !window.isDestroyed() &&
+      !event.sender.isDestroyed() &&
+      event.senderFrame !== null &&
+      event.sender === window.webContents &&
+      event.senderFrame === window.webContents.mainFrame &&
+      trust.isTrustedUrl(event.senderFrame.url) &&
+      trust.isTrustedUrl(window.webContents.getURL())
+    )
+  } catch {
+    return false
+  }
 }

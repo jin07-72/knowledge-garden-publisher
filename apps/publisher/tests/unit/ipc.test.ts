@@ -136,6 +136,19 @@ describe("secure publisher IPC", () => {
       [IPC_CHANNELS.requests.notesSave, { path: "content/life/a.md" }, "notesSave"],
       [IPC_CHANNELS.requests.notesCreate, { domain: "secrets" }, "notesCreate"],
       [
+        IPC_CHANNELS.requests.notesCreate,
+        {
+          visibility: "public",
+          domain: "life",
+          slug: "empty-tags",
+          title: "Empty tags",
+          date: "2026-09-24",
+          description: "Invalid note",
+          tags: [],
+        },
+        "notesCreate",
+      ],
+      [
         IPC_CHANNELS.requests.notesRename,
         { path: "content/life/a.md", slug: "../b" },
         "notesRename",
@@ -151,6 +164,11 @@ describe("secure publisher IPC", () => {
       [IPC_CHANNELS.requests.previewStatus, {}, "previewStatus"],
       [IPC_CHANNELS.requests.changesList, [], "changesList"],
       [IPC_CHANNELS.requests.publishStart, { changeGroupIds: ["../secret"] }, "publishStart"],
+      [
+        IPC_CHANNELS.requests.publishStart,
+        { changeGroupIds: ["note:a", "note:a"] },
+        "publishStart",
+      ],
       [IPC_CHANNELS.requests.publishCancel, { operationId: "../bad" }, "publishCancel"],
       [IPC_CHANNELS.requests.historyGit, { limit: 0 }, "historyGit"],
       [IPC_CHANNELS.requests.historyDeployments, { limit: 501 }, "historyDeployments"],
@@ -180,11 +198,25 @@ describe("secure publisher IPC", () => {
     }
     expect(servicePorts.calls.notesRead).not.toHaveBeenCalled()
 
+    servicePorts.calls.notesRead.mockResolvedValueOnce({
+      path: "private/life/daily-note.md",
+      markdown: "# Daily",
+      mtimeMs: 1,
+      contentHash: "a".repeat(64),
+    })
     await expect(
       ipc.invoke(IPC_CHANNELS.requests.notesRead, trustedEvent, {
         path: "private/life/daily-note.md",
       }),
-    ).resolves.toEqual({ ok: true, value: { source: "notesRead" } })
+    ).resolves.toEqual({
+      ok: true,
+      value: {
+        path: "private/life/daily-note.md",
+        markdown: "# Daily",
+        mtimeMs: 1,
+        contentHash: "a".repeat(64),
+      },
+    })
     expect(servicePorts.calls.notesRead).toHaveBeenCalledWith({
       path: "private/life/daily-note.md",
     })
@@ -196,6 +228,25 @@ describe("secure publisher IPC", () => {
       sender: { id: 7, isDestroyed: () => true },
     })
     expect(result).toEqual({
+      ok: false,
+      error: { code: "IPC_UNAUTHORIZED", message: "This application window is not authorized." },
+    })
+    expect(servicePorts.calls.notesList).not.toHaveBeenCalled()
+  })
+
+  it("fails closed when sender authorization races with destruction", async () => {
+    const ipc = new FakeIpcMain()
+    const servicePorts = services()
+    registerPublisherIpc({
+      ipcMain: ipc,
+      services: servicePorts,
+      isTrustedSender: () => {
+        throw new Error("window destroyed")
+      },
+      eventTargets: () => [],
+    })
+
+    await expect(ipc.invoke(IPC_CHANNELS.requests.notesList, trustedEvent)).resolves.toEqual({
       ok: false,
       error: { code: "IPC_UNAUTHORIZED", message: "This application window is not authorized." },
     })
@@ -225,6 +276,96 @@ describe("secure publisher IPC", () => {
     })
   })
 
+  it("validates and strips every successful service response", async () => {
+    const { ipc, servicePorts } = setup()
+    const extra = { privateSource: "secret", callback: () => undefined }
+    const cyclic: Record<string, unknown> = {}
+    cyclic.self = cyclic
+    servicePorts.calls.notesList.mockResolvedValueOnce([
+      {
+        path: "content/life/daily.md",
+        domain: "life",
+        slug: "daily",
+        title: "Daily",
+        date: "2026-09-24",
+        description: "Daily note",
+        visibility: "public",
+        updatedAt: "2026-09-24T00:00:00.000Z",
+        tags: ["life"],
+        privateSource: "secret",
+      },
+    ])
+    await expect(ipc.invoke(IPC_CHANNELS.requests.notesList, trustedEvent)).resolves.toEqual({
+      ok: true,
+      value: [
+        {
+          path: "content/life/daily.md",
+          domain: "life",
+          slug: "daily",
+          title: "Daily",
+          date: "2026-09-24",
+          description: "Daily note",
+          visibility: "public",
+          updatedAt: "2026-09-24T00:00:00.000Z",
+          tags: ["life"],
+        },
+      ],
+    })
+
+    servicePorts.calls.notesRead.mockResolvedValueOnce({
+      path: "content/life/daily.md",
+      markdown: "# Daily",
+      mtimeMs: 1,
+      contentHash: "a".repeat(64),
+      extra,
+      cyclic,
+    })
+    await expect(
+      ipc.invoke(IPC_CHANNELS.requests.notesRead, trustedEvent, {
+        path: "content/life/daily.md",
+      }),
+    ).resolves.toEqual({
+      ok: true,
+      value: {
+        path: "content/life/daily.md",
+        markdown: "# Daily",
+        mtimeMs: 1,
+        contentHash: "a".repeat(64),
+      },
+    })
+
+    servicePorts.calls.notesRead.mockResolvedValueOnce({ path: "content/life/daily.md" })
+    await expect(
+      ipc.invoke(IPC_CHANNELS.requests.notesRead, trustedEvent, {
+        path: "content/life/daily.md",
+      }),
+    ).resolves.toEqual({
+      ok: false,
+      error: { code: "INTERNAL_ERROR", message: "The application could not complete the request." },
+    })
+  })
+
+  it("bounds public error details and removes unsafe values", async () => {
+    const { ipc, servicePorts } = setup()
+    const cyclic: Record<string, unknown> = { command: "secret", huge: "x".repeat(20_000) }
+    cyclic.self = cyclic
+    servicePorts.calls.notesRead.mockRejectedValueOnce({
+      code: "NOTE_FILE_ACCESS_FAILED",
+      message: "Could not read note.",
+      details: { path: "content/life/daily.md", cyclic, callback: () => undefined },
+    })
+    const result = await ipc.invoke(IPC_CHANNELS.requests.notesRead, trustedEvent, {
+      path: "content/life/daily.md",
+    })
+    expect(result).toMatchObject({
+      ok: false,
+      error: { code: "NOTE_FILE_ACCESS_FAILED", message: "Could not read note." },
+    })
+    expect(Buffer.byteLength(JSON.stringify(result), "utf8")).toBeLessThanOrEqual(8_192)
+    expect(JSON.stringify(result)).not.toContain("callback")
+    expect(JSON.stringify(result)).not.toContain("secret")
+  })
+
   it("forwards validated progress only to live authorized targets and cleans subscriptions", () => {
     const { servicePorts, sent, dispose } = setup()
     expect(servicePorts.previewSubscriptions()).toBe(1)
@@ -245,6 +386,20 @@ describe("secure publisher IPC", () => {
     dispose()
     expect(servicePorts.previewSubscriptions()).toBe(0)
     expect(servicePorts.publishSubscriptions()).toBe(0)
+  })
+
+  it("isolates event target destruction races from service producers", () => {
+    const ipc = new FakeIpcMain()
+    const servicePorts = services()
+    registerPublisherIpc({
+      ipcMain: ipc,
+      services: servicePorts,
+      isTrustedSender: () => true,
+      eventTargets: () => {
+        throw new Error("window destroyed")
+      },
+    })
+    expect(() => servicePorts.emitPreview({ state: "starting", generation: 1 })).not.toThrow()
   })
 
   it("removes every handler even when a service unsubscribe fails", () => {
@@ -375,6 +530,16 @@ describe("preload garden API", () => {
     expect(ipc.invokes.map(([channel]) => channel)).toEqual(Object.values(IPC_CHANNELS.requests))
   })
 
+  it("replaces malformed main-process envelopes with a fixed internal error", async () => {
+    const ipc = new FakeIpcRenderer()
+    ipc.invoke = vi.fn(async () => ({ ok: true, value: { path: "private/life/a.md" } }))
+    const result = await createGardenApi(ipc).notes.read({ path: "content/life/a.md" })
+    expect(result).toEqual({
+      ok: false,
+      error: { code: "INTERNAL_ERROR", message: "The application returned an invalid response." },
+    })
+  })
+
   it("returns unsubscribe functions that remove only their wrapped listener", () => {
     const ipc = new FakeIpcRenderer()
     const api = createGardenApi(ipc)
@@ -382,6 +547,7 @@ describe("preload garden API", () => {
     const second = vi.fn()
     const unsubscribeFirst = api.preview.onProgress(first)
     api.preview.onProgress(second)
+    ipc.emit(IPC_CHANNELS.events.previewProgress, { state: "ready", generation: -1 })
     ipc.emit(IPC_CHANNELS.events.previewProgress, { state: "starting", generation: 1 })
     unsubscribeFirst()
     ipc.emit(IPC_CHANNELS.events.previewProgress, { state: "ready", generation: 1 })

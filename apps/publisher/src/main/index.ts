@@ -1,7 +1,9 @@
 import { app, BrowserWindow, ipcMain, shell } from "electron"
 import { join } from "node:path"
-import { DEFAULT_GARDEN_PATH, type AppError } from "../shared/contracts"
-import { registerPublisherIpc, type PublisherIpcServices } from "./ipc"
+import { DEFAULT_GARDEN_PATH } from "../shared/contracts"
+import { systemCommandRunner } from "./lib/commandRunner"
+import { registerPublisherIpc } from "./ipc"
+import { createPublisherServices, disposePublisherRuntime } from "./publisherServices"
 import {
   configureTrustedRendererNavigation,
   createRendererTrustPolicy,
@@ -9,68 +11,25 @@ import {
   trustedRendererArgument,
   type RendererTrustPolicy,
 } from "./rendererTrust"
-import {
-  createNote,
-  executeRename,
-  executeVisibilityChange,
-  planRename,
-  planVisibilityChange,
-  saveNote,
-} from "./services/noteFiles"
-import { scanNotes } from "./services/noteIndex"
-import { inspectWorkspace } from "./services/workspace"
+import type { PreviewManager } from "./services/preview"
+import { createProductionPreviewManager } from "./services/previewRuntime"
 
 let mainWindow: BrowserWindow | undefined
 let mainWindowTrust: RendererTrustPolicy | undefined
 let unregisterIpc: (() => void) | undefined
+let previewManager: PreviewManager | undefined
+let quitInProgress = false
+let quitAllowed = false
 
-function unavailable(name: string): AppError {
-  return { code: "SERVICE_UNAVAILABLE", message: `${name} is not available yet.` }
-}
-
-function createPublisherServices(): PublisherIpcServices {
-  const reject = async <T>(name: string): Promise<T> => Promise.reject(unavailable(name))
-  const trash = { trashItem: (absolutePath: string) => shell.trashItem(absolutePath) }
-  return {
-    workspace: {
-      inspect: () => inspectWorkspace(DEFAULT_GARDEN_PATH, { checkGit: true }),
-    },
-    notes: {
-      list: () => scanNotes(DEFAULT_GARDEN_PATH),
-      read: () => reject("Opening notes"),
-      save: (request) =>
-        saveNote({ workspace: DEFAULT_GARDEN_PATH, recoveryTrash: trash, ...request }),
-      create: (request) => createNote({ workspace: DEFAULT_GARDEN_PATH, ...request }),
-      rename: async (request) => {
-        const plan = await planRename({ workspace: DEFAULT_GARDEN_PATH, ...request })
-        return executeRename(plan, { workspace: DEFAULT_GARDEN_PATH, transactionTrash: trash })
-      },
-      changeVisibility: async (request) => {
-        const plan = await planVisibilityChange({ workspace: DEFAULT_GARDEN_PATH, ...request })
-        return executeVisibilityChange(plan, {
-          workspace: DEFAULT_GARDEN_PATH,
-          transactionTrash: trash,
-        })
-      },
-      trash: () => reject("Moving notes to the Recycle Bin"),
-    },
-    preview: {
-      start: () => reject("Local preview"),
-      stop: () => reject("Local preview"),
-      status: () => reject("Local preview"),
-      subscribe: () => () => undefined,
-    },
-    changes: { list: () => reject("Change review") },
-    publish: {
-      start: () => reject("Publishing"),
-      cancel: () => reject("Publishing"),
-      subscribe: () => () => undefined,
-    },
-    history: {
-      git: () => reject("Git history"),
-      deployments: () => reject("Deployment history"),
-    },
-  }
+async function isTracked(workspace: string, path: string): Promise<boolean> {
+  const result = await systemCommandRunner.run({
+    executable: "git",
+    args: ["ls-files", "--error-unmatch", "--", path],
+    cwd: workspace,
+  })
+  if (result.exitCode === 0) return true
+  if (result.exitCode === 1) return false
+  throw new Error("Git tracking state is unavailable")
 }
 
 function createWindow(): BrowserWindow {
@@ -109,10 +68,18 @@ function createWindow(): BrowserWindow {
 }
 
 app.whenReady().then(() => {
-  createWindow()
+  const runtimePath = app.isPackaged
+    ? join(process.resourcesPath, "node", "node.exe")
+    : join(app.getAppPath(), "vendor", "node", "node.exe")
+  previewManager = createProductionPreviewManager(runtimePath)
   unregisterIpc = registerPublisherIpc({
     ipcMain,
-    services: createPublisherServices(),
+    services: createPublisherServices({
+      workspace: DEFAULT_GARDEN_PATH,
+      trash: { trashItem: (absolutePath) => shell.trashItem(absolutePath) },
+      isTracked,
+      preview: previewManager,
+    }),
     isTrustedSender: (event) => {
       const window = mainWindow
       const trust = mainWindowTrust
@@ -131,6 +98,7 @@ app.whenReady().then(() => {
         : [window.webContents]
     },
   })
+  createWindow()
 
   app.on("activate", () => {
     if (BrowserWindow.getAllWindows().length === 0) {
@@ -139,9 +107,28 @@ app.whenReady().then(() => {
   })
 })
 
-app.once("will-quit", () => {
-  unregisterIpc?.()
+app.on("before-quit", (event) => {
+  if (quitAllowed) return
+  event.preventDefault()
+  if (quitInProgress) return
+  quitInProgress = true
+  const manager = previewManager
+  const unregister = unregisterIpc
   unregisterIpc = undefined
+  const shutdown =
+    manager === undefined
+      ? Promise.resolve().then(() => unregister?.())
+      : disposePublisherRuntime(unregister, manager)
+  void shutdown
+    .catch(() => {
+      process.exitCode = 1
+      console.error("Publisher preview shutdown failed.")
+    })
+    .finally(() => {
+      previewManager = undefined
+      quitAllowed = true
+      app.quit()
+    })
 })
 
 app.on("window-all-closed", () => {

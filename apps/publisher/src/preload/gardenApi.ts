@@ -24,6 +24,13 @@ import {
   type PublishStartReceipt,
   type WorkspaceInspection,
 } from "../shared/contracts"
+import {
+  IPC_SUCCESS_SCHEMAS,
+  ipcResultSchema,
+  previewProgressSchema,
+  publishProgressSchema,
+} from "../shared/ipcSchemas"
+import { z } from "zod"
 
 declare global {
   interface Window {
@@ -39,19 +46,40 @@ export interface IpcRendererPort {
 
 function invoke<T>(
   ipc: IpcRendererPort,
-  channel: string,
+  channel: keyof typeof IPC_SUCCESS_SCHEMAS,
   request?: unknown,
 ): Promise<IpcResult<T>> {
-  return ipc.invoke(channel, request) as Promise<IpcResult<T>>
+  return ipc.invoke(channel, request).then((result) => {
+    try {
+      const parsed = ipcResultSchema(IPC_SUCCESS_SCHEMAS[channel] as z.ZodType<unknown>).safeParse(
+        result,
+      )
+      if (parsed.success) return parsed.data as IpcResult<T>
+    } catch {
+      // Invalid or hostile main-process values collapse to one fixed renderer-safe error.
+    }
+    return {
+      ok: false,
+      error: { code: "INTERNAL_ERROR", message: "The application returned an invalid response." },
+    }
+  })
 }
 
 function subscription<T>(
   ipc: IpcRendererPort,
   channel: string,
+  schema: { safeParse(value: unknown): { success: boolean; data?: T } },
   listener: (payload: T) => void,
 ): () => void {
   if (typeof listener !== "function") throw new TypeError("A progress listener is required.")
-  const wrapped = (_event: unknown, payload: unknown): void => listener(payload as T)
+  const wrapped = (_event: unknown, payload: unknown): void => {
+    try {
+      const parsed = schema.safeParse(payload)
+      if (parsed.success) listener(parsed.data as T)
+    } catch {
+      // Malformed events never cross the preload boundary.
+    }
+  }
   ipc.on(channel, wrapped)
   let active = true
   return () => {
@@ -87,7 +115,7 @@ export function createGardenApi(ipc: IpcRendererPort): GardenApi {
     stop: () => invoke<PreviewStatus>(ipc, IPC_CHANNELS.requests.previewStop),
     status: () => invoke<PreviewStatus>(ipc, IPC_CHANNELS.requests.previewStatus),
     onProgress: (listener: (status: PreviewStatus) => void) =>
-      subscription(ipc, IPC_CHANNELS.events.previewProgress, listener),
+      subscription(ipc, IPC_CHANNELS.events.previewProgress, previewProgressSchema, listener),
   })
   const changes = Object.freeze({
     list: () => invoke<readonly ChangeGroup[]>(ipc, IPC_CHANNELS.requests.changesList),
@@ -98,7 +126,7 @@ export function createGardenApi(ipc: IpcRendererPort): GardenApi {
     cancel: (request: PublishCancelRequest) =>
       invoke<void>(ipc, IPC_CHANNELS.requests.publishCancel, request),
     onProgress: (listener: (progress: PublishProgress) => void) =>
-      subscription(ipc, IPC_CHANNELS.events.publishProgress, listener),
+      subscription(ipc, IPC_CHANNELS.events.publishProgress, publishProgressSchema, listener),
   })
   const history = Object.freeze({
     git: (request?: HistoryRequest) =>

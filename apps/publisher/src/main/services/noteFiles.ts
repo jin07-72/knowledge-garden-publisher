@@ -15,7 +15,14 @@ import {
 } from "node:fs/promises"
 import { dirname, isAbsolute, posix, relative, resolve } from "node:path"
 import { stringify } from "yaml"
-import type { AppError, SerializableValue, TrashAdapter, Visibility } from "../../shared/contracts"
+import type {
+  AppError,
+  NoteDocument,
+  NoteTrashReceipt,
+  SerializableValue,
+  TrashAdapter,
+  Visibility,
+} from "../../shared/contracts"
 
 // Transactions are kept in a focused internal module because this service also
 // owns the lower-level 2,500-line atomic save/recovery implementation.
@@ -189,6 +196,21 @@ export interface NoteFileAdapter {
   readonly lockGraceMs?: number
   readonly heartbeatRetryLimit?: number
   readonly heartbeatRetryDelayMs?: number
+}
+
+export interface NoteReadAdapter {
+  readonly beforeOpen?: (path: string) => Promise<void> | void
+  readonly afterRead?: (path: string) => Promise<void> | void
+}
+
+export interface ReadNoteInput {
+  readonly workspace: string
+  readonly path: string
+}
+
+export interface TrashNoteInput extends ReadNoteInput {
+  readonly trash: TrashAdapter
+  readonly isTracked: (workspace: string, path: string) => Promise<boolean>
 }
 
 interface ManagedRoot {
@@ -471,6 +493,7 @@ async function readCheckedFileState(
   root: ManagedRoot,
   domain: string,
   filename: string,
+  options: NoteReadAdapter & { readonly maximumBytes?: number } = {},
 ): Promise<CheckedFileState> {
   const directory = await checkedDomain(root, domain as NoteDomain, false)
   const candidate = resolve(directory, filename)
@@ -484,13 +507,18 @@ async function readCheckedFileState(
     throw accessFailure(displayPath)
   }
   if (before.isSymbolicLink()) throw unsafePath(displayPath)
-  if (!before.isFile()) throw accessFailure(displayPath)
+  if (
+    !before.isFile() ||
+    (options.maximumBytes !== undefined && before.size > BigInt(options.maximumBytes))
+  )
+    throw accessFailure(displayPath)
   try {
     canonical = await realpath(candidate)
   } catch {
     throw accessFailure(displayPath)
   }
   if (!isInside(directory, canonical)) throw unsafePath(displayPath)
+  await options.beforeOpen?.(displayPath)
   // POSIX makes the final-component check atomic with O_NOFOLLOW. Windows has
   // no equivalent Node flag; these pre/open/post identity and realpath checks
   // reject observable reparse-point swaps but cannot provide that kernel-level
@@ -504,11 +532,21 @@ async function readCheckedFileState(
   }
   try {
     const opened = await handle.stat({ bigint: true })
-    if (!opened.isFile() || identity(before) !== identity(opened)) throw accessFailure(displayPath)
+    if (
+      !opened.isFile() ||
+      identity(before) !== identity(opened) ||
+      (options.maximumBytes !== undefined && opened.size > BigInt(options.maximumBytes))
+    )
+      throw accessFailure(displayPath)
     // The public revision token matches Node's conventional stat().mtimeMs
     // precision, while bigint stats above retain exact identity fields.
     const openedTimes = await handle.stat()
-    const bytes = await handle.readFile()
+    const bytes =
+      options.maximumBytes === undefined
+        ? await handle.readFile()
+        : await readBoundedHandle(handle, options.maximumBytes)
+    if (bytes === undefined) throw accessFailure(displayPath)
+    await options.afterRead?.(displayPath)
     const after = await lstat(candidate, { bigint: true })
     const afterCanonical = await realpath(candidate)
     if (
@@ -541,12 +579,90 @@ async function readCheckedFile(
   root: ManagedRoot,
   domain: string,
   filename: string,
+  options: NoteReadAdapter & { readonly maximumBytes?: number } = {},
 ): Promise<CheckedFile> {
-  const state = await readCheckedFileState(root, domain, filename)
+  const state = await readCheckedFileState(root, domain, filename, options)
   if (state.kind === "absent") {
     throw accessFailure(safeRelative(root.workspace, resolve(root.directory, domain, filename)))
   }
   return state.file
+}
+
+export async function readNote(
+  input: ReadNoteInput,
+  adapter: NoteReadAdapter = {},
+): Promise<NoteDocument> {
+  const workspace = await canonicalWorkspace(input.workspace)
+  const parsed = parseManagedPath(workspace, input.path)
+  const root = await managedRoot(workspace, parsed.visibility)
+  const file = await readCheckedFile(root, parsed.domain, parsed.filename, {
+    ...adapter,
+    maximumBytes: 16 * 1024 * 1024,
+  })
+  let markdown: string
+  try {
+    markdown = new TextDecoder("utf-8", { fatal: true }).decode(file.bytes)
+  } catch {
+    throw accessFailure(parsed.displayPath)
+  }
+  return { path: parsed.displayPath, markdown, ...file.revision }
+}
+
+export async function trashNote(
+  input: TrashNoteInput,
+  adapter: NoteReadAdapter = {},
+): Promise<NoteTrashReceipt> {
+  if (typeof input.trash?.trashItem !== "function" || typeof input.isTracked !== "function")
+    throw invalidInput(input.path || ".")
+  const workspace = await canonicalWorkspace(input.workspace)
+  const parsed = parseManagedPath(workspace, input.path)
+  const root = await managedRoot(workspace, parsed.visibility)
+  const lock = await acquireTargetLock(workspace, parsed.displayPath, {})
+  let primaryError: unknown
+  let result: NoteTrashReceipt | undefined
+  try {
+    await lock.assertOwned()
+    const current = await readCheckedFile(root, parsed.domain, parsed.filename, {
+      ...adapter,
+      maximumBytes: 16 * 1024 * 1024,
+    })
+    let tracked: boolean
+    try {
+      tracked =
+        parsed.visibility === "public" && (await input.isTracked(workspace, parsed.displayPath))
+    } catch {
+      throw accessFailure(parsed.displayPath)
+    }
+    if (!(await verifyUnchanged(root, parsed.domain, parsed.filename, current)))
+      throw accessFailure(parsed.displayPath)
+    await lock.assertOwned()
+    const directory = await checkedDomain(root, parsed.domain, false)
+    const target = resolve(directory, parsed.filename)
+    try {
+      await input.trash.trashItem(target)
+      await lstat(target)
+      throw new Error("trash target still exists")
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code !== "ENOENT") {
+        if (isNoteError(error)) throw error
+        throw writeFailure(parsed.displayPath)
+      }
+    }
+    result = {
+      path: parsed.displayPath,
+      ...(tracked ? { pendingPublicDeletion: parsed.displayPath } : {}),
+      historyWarning: tracked,
+    }
+  } catch (error) {
+    primaryError = error
+  }
+  try {
+    await lock.release()
+  } catch {
+    if (primaryError === undefined) primaryError = uncertainCommit()
+  }
+  if (primaryError !== undefined) throw primaryError
+  return result as NoteTrashReceipt
 }
 
 function markdownFor(input: CreateNoteInput): string {
