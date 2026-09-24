@@ -3,6 +3,13 @@ import { join } from "node:path"
 import { DEFAULT_GARDEN_PATH, type AppError } from "../shared/contracts"
 import { registerPublisherIpc, type PublisherIpcServices } from "./ipc"
 import {
+  configureTrustedRendererNavigation,
+  createRendererTrustPolicy,
+  isTrustedRendererSender,
+  trustedRendererArgument,
+  type RendererTrustPolicy,
+} from "./rendererTrust"
+import {
   createNote,
   executeRename,
   executeVisibilityChange,
@@ -14,6 +21,7 @@ import { scanNotes } from "./services/noteIndex"
 import { inspectWorkspace } from "./services/workspace"
 
 let mainWindow: BrowserWindow | undefined
+let mainWindowTrust: RendererTrustPolicy | undefined
 let unregisterIpc: (() => void) | undefined
 
 function unavailable(name: string): AppError {
@@ -66,6 +74,8 @@ function createPublisherServices(): PublisherIpcServices {
 }
 
 function createWindow(): BrowserWindow {
+  const rendererFile = join(__dirname, "../renderer/index.html")
+  const trust = createRendererTrustPolicy(rendererFile, process.env.ELECTRON_RENDERER_URL)
   const window = new BrowserWindow({
     width: 1440,
     height: 900,
@@ -76,22 +86,24 @@ function createWindow(): BrowserWindow {
       nodeIntegration: false,
       sandbox: true,
       preload: join(__dirname, "../preload/index.js"),
+      additionalArguments: [trustedRendererArgument(trust.trustedUrl)],
     },
   })
   mainWindow = window
+  mainWindowTrust = trust
 
-  window.webContents.setWindowOpenHandler(() => ({ action: "deny" }))
-  window.webContents.on("will-navigate", (event, url) => {
-    if (url !== window.webContents.getURL()) event.preventDefault()
-  })
+  configureTrustedRendererNavigation(window.webContents, trust)
   window.once("closed", () => {
-    if (mainWindow === window) mainWindow = undefined
+    if (mainWindow === window) {
+      mainWindow = undefined
+      mainWindowTrust = undefined
+    }
   })
 
-  if (process.env.ELECTRON_RENDERER_URL) {
-    void window.loadURL(process.env.ELECTRON_RENDERER_URL)
+  if (trust.target.kind === "url") {
+    void window.loadURL(trust.target.value)
   } else {
-    void window.loadFile(join(__dirname, "../renderer/index.html"))
+    void window.loadFile(trust.target.value)
   }
   return window
 }
@@ -103,17 +115,20 @@ app.whenReady().then(() => {
     services: createPublisherServices(),
     isTrustedSender: (event) => {
       const window = mainWindow
-      if (window === undefined || window.isDestroyed()) return false
+      const trust = mainWindowTrust
+      if (window === undefined || trust === undefined) return false
       const invokeEvent = event as Electron.IpcMainInvokeEvent
-      return (
-        !invokeEvent.sender.isDestroyed() &&
-        invokeEvent.sender === window.webContents &&
-        invokeEvent.senderFrame === window.webContents.mainFrame
-      )
+      return isTrustedRendererSender(invokeEvent, window, trust)
     },
     eventTargets: () => {
       const window = mainWindow
-      return window === undefined || window.isDestroyed() ? [] : [window.webContents]
+      const trust = mainWindowTrust
+      return window === undefined ||
+        trust === undefined ||
+        window.isDestroyed() ||
+        !trust.isTrustedUrl(window.webContents.getURL())
+        ? []
+        : [window.webContents]
     },
   })
 

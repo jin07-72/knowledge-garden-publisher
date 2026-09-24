@@ -80,7 +80,7 @@ export interface RegisterPublisherIpcOptions {
 }
 
 function bestEffortCleanup(actions: readonly (() => void)[]): void {
-  for (const action of actions) {
+  for (const action of [...actions].reverse()) {
     try {
       action()
     } catch {
@@ -417,14 +417,16 @@ export function registerPublisherIpc(options: RegisterPublisherIpcOptions): () =
       services.preview.subscribe((status) =>
         broadcast(IPC_CHANNELS.events.previewProgress, previewStatusSchema, status),
       ),
+    )
+    subscriptions.push(
       services.publish.subscribe((progress) =>
         broadcast(IPC_CHANNELS.events.publishProgress, publishProgressSchema, progress),
       ),
     )
   } catch (error) {
     bestEffortCleanup([
-      ...subscriptions,
       ...registered.map((channel) => () => ipcMain.removeHandler(channel)),
+      ...subscriptions,
     ])
     throw error
   }
@@ -434,8 +436,8 @@ export function registerPublisherIpc(options: RegisterPublisherIpcOptions): () =
     if (!active) return
     active = false
     bestEffortCleanup([
-      ...subscriptions,
       ...registered.map((channel) => () => ipcMain.removeHandler(channel)),
+      ...subscriptions,
     ])
   }
 }

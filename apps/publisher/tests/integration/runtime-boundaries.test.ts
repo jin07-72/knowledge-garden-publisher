@@ -2,6 +2,7 @@ import { execFileSync } from "node:child_process"
 import { readFileSync } from "node:fs"
 import { Script } from "node:vm"
 import { beforeAll, describe, expect, it } from "vitest"
+import { trustedRendererArgument } from "../../src/main/rendererTrust"
 
 const publisherRoot = process.cwd()
 const electronVite = "node_modules/electron-vite/bin/electron-vite.js"
@@ -38,10 +39,14 @@ describe("production runtime boundaries", () => {
         removeListener: () => undefined,
       },
     }
+    const trustedUrl = "http://127.0.0.1:5173/"
     expect(() =>
       new Script(preloadOutput).runInNewContext({
         module: { exports: {} },
         exports: {},
+        location: { href: trustedUrl },
+        process: { argv: ["electron", trustedRendererArgument(trustedUrl)] },
+        URL,
         require: (id: string) => {
           required.push(id)
           if (id === "electron") return electron
@@ -57,5 +62,29 @@ describe("production runtime boundaries", () => {
     expect(api).not.toHaveProperty("ipcRenderer")
     expect(api).not.toHaveProperty("shell")
     expect(api).not.toHaveProperty("exec")
+
+    const remoteExposures: Array<[string, unknown]> = []
+    expect(() =>
+      new Script(preloadOutput).runInNewContext({
+        module: { exports: {} },
+        exports: {},
+        location: { href: "https://example.com/" },
+        process: { argv: ["electron", trustedRendererArgument(trustedUrl)] },
+        URL,
+        require: (id: string) => {
+          if (id === "electron") {
+            return {
+              ...electron,
+              contextBridge: {
+                exposeInMainWorld: (name: string, value: unknown) =>
+                  remoteExposures.push([name, value]),
+              },
+            }
+          }
+          throw new Error(`Unexpected preload dependency: ${id}`)
+        },
+      }),
+    ).not.toThrow()
+    expect(remoteExposures).toEqual([])
   })
 })

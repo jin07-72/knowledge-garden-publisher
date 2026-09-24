@@ -1,4 +1,7 @@
 import { contextBridge, ipcRenderer } from "electron"
+import { shouldExposeGardenApi } from "../shared/rendererTrust"
 import { createGardenApi } from "./gardenApi"
 
-contextBridge.exposeInMainWorld("garden", createGardenApi(ipcRenderer))
+if (shouldExposeGardenApi(globalThis.location.href, process.argv)) {
+  contextBridge.exposeInMainWorld("garden", createGardenApi(ipcRenderer))
+}

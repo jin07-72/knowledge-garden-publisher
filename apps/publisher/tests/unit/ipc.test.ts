@@ -272,6 +272,31 @@ describe("secure publisher IPC", () => {
     expect(publishUnsubscribe).toHaveBeenCalledOnce()
     expect(ipc.handlers.size).toBe(0)
   })
+
+  it("rolls back an earlier subscription when a later subscription fails", () => {
+    const ipc = new FakeIpcMain()
+    const servicePorts = services()
+    const previewUnsubscribe = vi.fn()
+    Object.defineProperty(servicePorts.preview, "subscribe", {
+      value: vi.fn(() => previewUnsubscribe),
+    })
+    Object.defineProperty(servicePorts.publish, "subscribe", {
+      value: vi.fn(() => {
+        throw new Error("publish subscription failed")
+      }),
+    })
+
+    expect(() =>
+      registerPublisherIpc({
+        ipcMain: ipc,
+        services: servicePorts,
+        isTrustedSender: () => true,
+        eventTargets: () => [],
+      }),
+    ).toThrow("publish subscription failed")
+    expect(previewUnsubscribe).toHaveBeenCalledOnce()
+    expect(ipc.handlers.size).toBe(0)
+  })
 })
 
 class FakeIpcRenderer implements IpcRendererPort {
