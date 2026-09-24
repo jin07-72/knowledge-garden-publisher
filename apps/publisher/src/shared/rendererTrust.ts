@@ -9,11 +9,16 @@ function parseExactUrl(value: string): URL | undefined {
   }
 }
 
-export function isStrictLoopbackRendererUrl(value: string): boolean {
-  const url = parseExactUrl(value)
-  if (url === undefined) return false
-  return (
-    url.protocol === "http:" &&
+export function normalizeStrictLoopbackRendererUrl(value: string): string | undefined {
+  let url: URL
+  try {
+    url = new URL(value)
+  } catch {
+    return undefined
+  }
+  const canonical = url.href
+  if (value !== canonical && `${value}/` !== canonical) return undefined
+  return url.protocol === "http:" &&
     ["127.0.0.1", "[::1]"].includes(url.hostname) &&
     url.port.length > 0 &&
     url.username === "" &&
@@ -21,7 +26,8 @@ export function isStrictLoopbackRendererUrl(value: string): boolean {
     url.pathname === "/" &&
     url.search === "" &&
     url.hash === ""
-  )
+    ? canonical
+    : undefined
 }
 
 function isPackagedRendererUrl(value: string): boolean {
@@ -45,7 +51,7 @@ export function trustedRendererUrlFromArguments(argv: readonly string[]): string
   if (encoded.length !== 1) return undefined
   try {
     const url = decodeURIComponent(encoded[0]!.slice(TRUSTED_RENDERER_ARGUMENT_PREFIX.length))
-    return isStrictLoopbackRendererUrl(url) || isPackagedRendererUrl(url) ? url : undefined
+    return normalizeStrictLoopbackRendererUrl(url) ?? (isPackagedRendererUrl(url) ? url : undefined)
   } catch {
     return undefined
   }

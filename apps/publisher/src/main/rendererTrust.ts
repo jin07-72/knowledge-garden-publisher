@@ -1,6 +1,6 @@
 import { pathToFileURL } from "node:url"
 import {
-  isStrictLoopbackRendererUrl,
+  normalizeStrictLoopbackRendererUrl,
   trustedRendererArgument,
   trustedRendererUrlFromArguments,
 } from "../shared/rendererTrust"
@@ -45,16 +45,18 @@ export function createRendererTrustPolicy(
   rendererFile: string,
   devRendererUrl?: string,
 ): RendererTrustPolicy {
-  if (devRendererUrl !== undefined && !isStrictLoopbackRendererUrl(devRendererUrl)) {
+  const normalizedDevRendererUrl =
+    devRendererUrl === undefined ? undefined : normalizeStrictLoopbackRendererUrl(devRendererUrl)
+  if (devRendererUrl !== undefined && normalizedDevRendererUrl === undefined) {
     throw new Error(
       "ELECTRON_RENDERER_URL must be an exact loopback HTTP origin with an explicit port.",
     )
   }
 
   const target =
-    devRendererUrl === undefined
+    normalizedDevRendererUrl === undefined
       ? ({ kind: "file", value: rendererFile } as const)
-      : ({ kind: "url", value: devRendererUrl } as const)
+      : ({ kind: "url", value: normalizedDevRendererUrl } as const)
   const trustedUrl = target.kind === "file" ? pathToFileURL(target.value).href : target.value
 
   return Object.freeze({

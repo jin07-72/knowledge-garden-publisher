@@ -10,12 +10,19 @@ import {
 
 describe("renderer trust policy", () => {
   it("accepts only an exact loopback development entry URL", () => {
-    const trusted = ["http://127.0.0.1:5173/", "http://[::1]:5173/"]
-    for (const url of trusted) {
-      const policy = createRendererTrustPolicy("C:/publisher/renderer/index.html", url)
-      expect(policy.target).toEqual({ kind: "url", value: url })
-      expect(policy.isTrustedUrl(url)).toBe(true)
-      expect(policy.isTrustedUrl(`${url}remote`)).toBe(false)
+    const trusted = [
+      ["http://127.0.0.1:5173", "http://127.0.0.1:5173/"],
+      ["http://127.0.0.1:5173/", "http://127.0.0.1:5173/"],
+      ["http://[::1]:5173", "http://[::1]:5173/"],
+      ["http://[::1]:5173/", "http://[::1]:5173/"],
+    ] as const
+    for (const [input, canonical] of trusted) {
+      const policy = createRendererTrustPolicy("C:/publisher/renderer/index.html", input)
+      expect(policy.target).toEqual({ kind: "url", value: canonical })
+      expect(policy.trustedUrl).toBe(canonical)
+      expect(policy.isTrustedUrl(canonical)).toBe(true)
+      expect(policy.isTrustedUrl(input)).toBe(input === canonical)
+      expect(policy.isTrustedUrl(`${canonical}remote`)).toBe(false)
     }
   })
 
