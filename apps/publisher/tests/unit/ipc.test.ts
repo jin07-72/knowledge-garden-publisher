@@ -345,9 +345,35 @@ describe("secure publisher IPC", () => {
     })
   })
 
-  it("bounds public error details and removes unsafe values", async () => {
+  it("rejects semantically inconsistent workspace inspection results", async () => {
     const { ipc, servicePorts } = setup()
-    const cyclic: Record<string, unknown> = { command: "secret", huge: "x".repeat(20_000) }
+    servicePorts.calls.workspaceInspect.mockResolvedValueOnce({
+      ok: true,
+      root: "C:/garden",
+      capabilities: { files: true, preview: true, git: false, publish: false },
+      issues: [{ code: "GIT_UNAVAILABLE", message: "Git is unavailable." }],
+    })
+    await expect(ipc.invoke(IPC_CHANNELS.requests.workspaceInspect, trustedEvent)).resolves.toEqual(
+      {
+        ok: false,
+        error: {
+          code: "INTERNAL_ERROR",
+          message: "The application could not complete the request.",
+        },
+      },
+    )
+  })
+
+  it("drops public error details so secret-shaped fields cannot cross", async () => {
+    const { ipc, servicePorts } = setup()
+    const cyclic: Record<string, unknown> = {
+      command: "secret",
+      huge: "x".repeat(20_000),
+      apiKey: "api-secret",
+      authorization: "bearer-secret",
+      cookie: "session-secret",
+      privateSource: "private-secret",
+    }
     cyclic.self = cyclic
     servicePorts.calls.notesRead.mockRejectedValueOnce({
       code: "NOTE_FILE_ACCESS_FAILED",
@@ -358,6 +384,10 @@ describe("secure publisher IPC", () => {
       path: "content/life/daily.md",
     })
     expect(result).toMatchObject({
+      ok: false,
+      error: { code: "NOTE_FILE_ACCESS_FAILED", message: "Could not read note." },
+    })
+    expect(result).toEqual({
       ok: false,
       error: { code: "NOTE_FILE_ACCESS_FAILED", message: "Could not read note." },
     })
@@ -535,6 +565,39 @@ describe("preload garden API", () => {
     ipc.invoke = vi.fn(async () => ({ ok: true, value: { path: "private/life/a.md" } }))
     const result = await createGardenApi(ipc).notes.read({ path: "content/life/a.md" })
     expect(result).toEqual({
+      ok: false,
+      error: { code: "INTERNAL_ERROR", message: "The application returned an invalid response." },
+    })
+  })
+
+  it("converts synchronous invoke throws and asynchronous rejections to fixed results", async () => {
+    const expected = {
+      ok: false,
+      error: { code: "INTERNAL_ERROR", message: "The application returned an invalid response." },
+    }
+    const synchronous = new FakeIpcRenderer()
+    synchronous.invoke = vi.fn(() => {
+      throw new Error("sync transport failure")
+    })
+    await expect(createGardenApi(synchronous).notes.list()).resolves.toEqual(expected)
+
+    const asynchronous = new FakeIpcRenderer()
+    asynchronous.invoke = vi.fn(async () => Promise.reject(new Error("async transport failure")))
+    await expect(createGardenApi(asynchronous).notes.list()).resolves.toEqual(expected)
+  })
+
+  it("rejects inconsistent workspace inspection envelopes in preload", async () => {
+    const ipc = new FakeIpcRenderer()
+    ipc.invoke = vi.fn(async () => ({
+      ok: true,
+      value: {
+        ok: true,
+        root: "C:/garden",
+        capabilities: { files: false, preview: false, git: false, publish: false },
+        issues: [{ code: "GIT_UNAVAILABLE", message: "Git is unavailable." }],
+      },
+    }))
+    await expect(createGardenApi(ipc).workspace.inspect()).resolves.toEqual({
       ok: false,
       error: { code: "INTERNAL_ERROR", message: "The application returned an invalid response." },
     })

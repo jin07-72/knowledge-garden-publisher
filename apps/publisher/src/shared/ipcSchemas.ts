@@ -1,114 +1,6 @@
 import { z } from "zod"
 import { APP_ERROR_CODES, IPC_CHANNELS, type AppError, type IpcResult } from "./contracts"
 
-const MAX_DETAILS_BYTES = 4_096
-const MAX_DETAILS_DEPTH = 4
-const MAX_DETAILS_KEYS = 32
-const MAX_DETAILS_ARRAY = 32
-const MAX_DETAILS_STRING_BYTES = 512
-const OMITTED = Symbol("omitted")
-const unsafeDetailKeys = new Set([
-  "command",
-  "cwd",
-  "env",
-  "stack",
-  "stderr",
-  "stdout",
-  "token",
-  "password",
-  "secret",
-])
-
-interface DetailBudget {
-  remainingBytes: number
-  remainingKeys: number
-  readonly ancestors: WeakSet<object>
-}
-
-function boundedString(value: string, budget: DetailBudget): string | typeof OMITTED {
-  if (budget.remainingBytes <= 0) return OMITTED
-  const bytes = Buffer.from(value, "utf8")
-  const maximum = Math.min(MAX_DETAILS_STRING_BYTES, budget.remainingBytes)
-  const sliced = bytes
-    .subarray(0, maximum)
-    .toString("utf8")
-    .replace(/\uFFFD+$/, "")
-  budget.remainingBytes -= Buffer.byteLength(sliced, "utf8")
-  return sliced
-}
-
-function safeDetailValue(
-  value: unknown,
-  budget: DetailBudget,
-  depth: number,
-): unknown | typeof OMITTED {
-  if (depth > MAX_DETAILS_DEPTH || budget.remainingBytes <= 0) return OMITTED
-  if (value === null || typeof value === "boolean") return value
-  if (typeof value === "number") return Number.isFinite(value) ? value : OMITTED
-  if (typeof value === "string") return boundedString(value, budget)
-  if (typeof value !== "object") return OMITTED
-  if (budget.ancestors.has(value)) return "[circular]"
-  budget.ancestors.add(value)
-  try {
-    if (Array.isArray(value)) {
-      const result: unknown[] = []
-      for (const entry of value.slice(0, MAX_DETAILS_ARRAY)) {
-        const safe = safeDetailValue(entry, budget, depth + 1)
-        if (safe !== OMITTED) result.push(safe)
-      }
-      return result
-    }
-    const result: Record<string, unknown> = {}
-    for (const key of Object.keys(value).sort()) {
-      if (
-        budget.remainingKeys <= 0 ||
-        !/^[a-zA-Z][a-zA-Z0-9_.-]{0,63}$/.test(key) ||
-        unsafeDetailKeys.has(key.toLowerCase())
-      ) {
-        continue
-      }
-      const safeKey = boundedString(key, budget)
-      if (safeKey === OMITTED) break
-      let entry: unknown
-      try {
-        entry = (value as Record<string, unknown>)[key]
-      } catch {
-        continue
-      }
-      const safe = safeDetailValue(entry, budget, depth + 1)
-      if (safe === OMITTED) continue
-      budget.remainingKeys -= 1
-      result[safeKey] = safe
-    }
-    return result
-  } finally {
-    budget.ancestors.delete(value)
-  }
-}
-
-function safeDetails(value: unknown): Readonly<Record<string, unknown>> | undefined {
-  if (typeof value !== "object" || value === null || Array.isArray(value)) return undefined
-  try {
-    const safe = safeDetailValue(
-      value,
-      {
-        remainingBytes: MAX_DETAILS_BYTES,
-        remainingKeys: MAX_DETAILS_KEYS,
-        ancestors: new WeakSet(),
-      },
-      0,
-    )
-    if (safe === OMITTED || typeof safe !== "object" || safe === null || Array.isArray(safe))
-      return undefined
-    const record = safe as Readonly<Record<string, unknown>>
-    return Buffer.byteLength(JSON.stringify(record), "utf8") <= MAX_DETAILS_BYTES
-      ? record
-      : { truncated: true }
-  } catch {
-    return undefined
-  }
-}
-
 export const appErrorSchema = z
   .object({
     code: z.enum(APP_ERROR_CODES),
@@ -116,12 +8,7 @@ export const appErrorSchema = z
     details: z.unknown().optional(),
   })
   .strip()
-  .transform(({ code, message, details }): AppError => {
-    const sanitized = safeDetails(details)
-    return sanitized === undefined || Object.keys(sanitized).length === 0
-      ? ({ code, message } as AppError)
-      : ({ code, message, details: sanitized } as AppError)
-  })
+  .transform(({ code, message }): AppError => ({ code, message }) as AppError)
 
 const pathSchema = z.string().min(1).max(512)
 const hashSchema = z.string().regex(/^[a-f0-9]{64}$/)
@@ -139,25 +26,31 @@ const workspaceIssueSchema = z
     path: pathSchema.optional(),
   })
   .strip()
-  .transform(({ code, message, details, path }) => {
-    const sanitized = safeDetails(details)
+  .transform(({ code, message, path }) => {
     return {
       code,
       message,
-      ...(sanitized === undefined || Object.keys(sanitized).length === 0
-        ? {}
-        : { details: sanitized }),
       ...(path === undefined ? {} : { path }),
     }
   })
-const workspaceInspectionSchema = z
-  .object({
-    ok: z.boolean(),
-    root: pathSchema,
-    capabilities: capabilitiesSchema,
-    issues: z.array(workspaceIssueSchema).max(100),
-  })
-  .strip()
+const workspaceInspectionSchema = z.discriminatedUnion("ok", [
+  z
+    .object({
+      ok: z.literal(true),
+      root: pathSchema,
+      capabilities: capabilitiesSchema,
+      issues: z.tuple([]),
+    })
+    .strip(),
+  z
+    .object({
+      ok: z.literal(false),
+      root: pathSchema,
+      capabilities: capabilitiesSchema,
+      issues: z.array(workspaceIssueSchema).max(100),
+    })
+    .strip(),
+])
 const noteSummarySchema = z
   .object({
     path: pathSchema,

@@ -12,6 +12,7 @@ import {
   rename as nodeRename,
   rm,
   stat,
+  unlink,
 } from "node:fs/promises"
 import { dirname, isAbsolute, posix, relative, resolve } from "node:path"
 import { stringify } from "yaml"
@@ -203,6 +204,10 @@ export interface NoteReadAdapter {
   readonly afterRead?: (path: string) => Promise<void> | void
 }
 
+export interface TrashNoteAdapter extends NoteReadAdapter {
+  readonly afterStage?: (stagedPath: string, originalPath: string) => Promise<void> | void
+}
+
 export interface ReadNoteInput {
   readonly workspace: string
   readonly path: string
@@ -225,6 +230,7 @@ interface CheckedFile {
   readonly revision: NoteRevision
   readonly mode: number
   readonly identity: string
+  readonly stableIdentity: string
 }
 
 interface RecoveryManifest {
@@ -354,6 +360,20 @@ function uncertainCommit(): AppError {
   return appError(
     "NOTE_FILE_COMMIT_UNCERTAIN",
     "The note commit could not be safely confirmed or rolled back.",
+  )
+}
+
+function uncertainTrash(): AppError {
+  return appError(
+    "NOTE_FILE_COMMIT_UNCERTAIN",
+    "The note's Recycle Bin state could not be confirmed. Do not retry until the garden is inspected.",
+  )
+}
+
+function restoredTrashFailure(): AppError {
+  return appError(
+    "NOTE_FILE_WRITE_FAILED",
+    "The note was not moved to the Recycle Bin and was safely restored.",
   )
 }
 
@@ -565,6 +585,7 @@ async function readCheckedFileState(
         revision: { mtimeMs: openedTimes.mtimeMs, contentHash: hash(bytes) },
         mode: Number(opened.mode),
         identity: identity(opened),
+        stableIdentity: stableFileIdentity(opened),
       },
     }
   } catch (error) {
@@ -610,7 +631,7 @@ export async function readNote(
 
 export async function trashNote(
   input: TrashNoteInput,
-  adapter: NoteReadAdapter = {},
+  adapter: TrashNoteAdapter = {},
 ): Promise<NoteTrashReceipt> {
   if (typeof input.trash?.trashItem !== "function" || typeof input.isTracked !== "function")
     throw invalidInput(input.path || ".")
@@ -633,20 +654,57 @@ export async function trashNote(
     } catch {
       throw accessFailure(parsed.displayPath)
     }
+    const directory = await checkedDomain(root, parsed.domain, false)
+    const target = resolve(directory, parsed.filename)
     if (!(await verifyUnchanged(root, parsed.domain, parsed.filename, current)))
       throw accessFailure(parsed.displayPath)
     await lock.assertOwned()
-    const directory = await checkedDomain(root, parsed.domain, false)
-    const target = resolve(directory, parsed.filename)
+    const managedRootIdentity = stableFileIdentity(await lstat(root.directory, { bigint: true }))
+    const domainIdentity = stableFileIdentity(await lstat(directory, { bigint: true }))
+    const staged = resolve(directory, `.garden-trash-${randomUUID()}.md`)
     try {
-      await input.trash.trashItem(target)
-      await lstat(target)
-      throw new Error("trash target still exists")
+      await nodeRename(target, staged)
     } catch (error) {
-      if ((error as NodeJS.ErrnoException).code !== "ENOENT") {
-        if (isNoteError(error)) throw error
-        throw writeFailure(parsed.displayPath)
+      if (isNoteError(error)) throw error
+      throw writeFailure(parsed.displayPath)
+    }
+    try {
+      await adapter.afterStage?.(staged, target)
+      await assertTrashParents(root.directory, managedRootIdentity, directory, domainIdentity)
+      const stagedFile = await readCheckedFile(
+        root,
+        parsed.domain,
+        staged.slice(directory.length + 1),
+        { maximumBytes: 16 * 1024 * 1024 },
+      )
+      if (
+        stagedFile.stableIdentity !== current.stableIdentity ||
+        stagedFile.revision.contentHash !== current.revision.contentHash
+      ) {
+        throw uncertainTrash()
       }
+      let rejected = false
+      try {
+        await input.trash.trashItem(staged)
+      } catch {
+        rejected = true
+      }
+      const state = await inspectStagedTrash(
+        staged,
+        directory,
+        current.stableIdentity,
+        current.revision.contentHash,
+      )
+      if (state !== "absent") {
+        if (!rejected || state !== "exact") throw uncertainTrash()
+        await assertTrashParents(root.directory, managedRootIdentity, directory, domainIdentity)
+        if (!(await restoreStagedTrash(staged, target, current.stableIdentity)))
+          throw uncertainTrash()
+        throw restoredTrashFailure()
+      }
+    } catch (error) {
+      if (isNoteError(error)) throw error
+      throw uncertainTrash()
     }
     result = {
       path: parsed.displayPath,
@@ -675,6 +733,90 @@ function markdownFor(input: CreateNoteInput): string {
 
 function stableFileIdentity(details: BigIntStats): string {
   return `${details.dev}:${details.ino}:${details.birthtimeNs}`
+}
+
+async function assertTrashParents(
+  managedRootPath: string,
+  managedRootIdentity: string,
+  domainPath: string,
+  domainIdentity: string,
+): Promise<void> {
+  const [rootDetails, domainDetails, canonicalRoot, canonicalDomain] = await Promise.all([
+    lstat(managedRootPath, { bigint: true }),
+    lstat(domainPath, { bigint: true }),
+    realpath(managedRootPath),
+    realpath(domainPath),
+  ])
+  if (
+    rootDetails.isSymbolicLink() ||
+    domainDetails.isSymbolicLink() ||
+    !rootDetails.isDirectory() ||
+    !domainDetails.isDirectory() ||
+    stableFileIdentity(rootDetails) !== managedRootIdentity ||
+    stableFileIdentity(domainDetails) !== domainIdentity ||
+    !pathsEqual(canonicalRoot, managedRootPath) ||
+    !pathsEqual(canonicalDomain, domainPath) ||
+    !isInside(canonicalRoot, canonicalDomain)
+  ) {
+    throw uncertainTrash()
+  }
+}
+
+async function inspectStagedTrash(
+  staged: string,
+  domain: string,
+  expectedIdentity: string,
+  expectedHash: string,
+): Promise<"absent" | "exact" | "different"> {
+  let details: BigIntStats
+  try {
+    details = await lstat(staged, { bigint: true })
+  } catch (error) {
+    return (error as NodeJS.ErrnoException).code === "ENOENT" ? "absent" : "different"
+  }
+  if (details.isSymbolicLink() || !details.isFile()) return "different"
+  let handle: FileHandle | undefined
+  try {
+    const canonical = await realpath(staged)
+    if (!isInside(domain, canonical) || stableFileIdentity(details) !== expectedIdentity)
+      return "different"
+    handle = await open(
+      staged,
+      process.platform === "win32" ? "r" : constants.O_RDONLY | constants.O_NOFOLLOW,
+    )
+    const opened = await handle.stat({ bigint: true })
+    const bytes = await readBoundedHandle(handle, 16 * 1024 * 1024)
+    return stableFileIdentity(opened) === expectedIdentity &&
+      bytes !== undefined &&
+      hash(bytes) === expectedHash
+      ? "exact"
+      : "different"
+  } catch {
+    return "different"
+  } finally {
+    await handle?.close().catch(() => undefined)
+  }
+}
+
+async function restoreStagedTrash(
+  staged: string,
+  target: string,
+  expectedIdentity: string,
+): Promise<boolean> {
+  try {
+    // link() is an atomic no-overwrite restore: unlike rename(), it cannot
+    // replace a note recreated at the original pathname.
+    await link(staged, target)
+    const restored = await lstat(target, { bigint: true })
+    if (!restored.isFile() || stableFileIdentity(restored) !== expectedIdentity) return false
+    // Only remove the temporary hard-link name after the original pathname is
+    // confirmed to reference the same file; the note content remains intact.
+    await unlink(staged)
+    const confirmed = await lstat(target, { bigint: true })
+    return confirmed.isFile() && stableFileIdentity(confirmed) === expectedIdentity
+  } catch {
+    return false
+  }
 }
 
 async function readBoundedHandle(

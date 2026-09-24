@@ -2,7 +2,11 @@ import { mkdir, mkdtemp, rm, writeFile } from "node:fs/promises"
 import { tmpdir } from "node:os"
 import { join } from "node:path"
 import { afterEach, describe, expect, it, vi } from "vitest"
-import { createPublisherServices, disposePublisherRuntime } from "../../src/main/publisherServices"
+import {
+  createPublisherQuitCoordinator,
+  createPublisherServices,
+  disposePublisherRuntime,
+} from "../../src/main/publisherServices"
 import type { PreviewStatus } from "../../src/shared/contracts"
 
 const temporaryDirectories: string[] = []
@@ -101,5 +105,53 @@ describe("publisher service wiring", () => {
       ),
     ).rejects.toThrow("unregister failed")
     expect(disposeAfterUnregisterFailure).toHaveBeenCalledOnce()
+  })
+
+  it("keeps quit blocked after cleanup failure and retries without concurrent cleanup", async () => {
+    let resolveFirst!: () => void
+    const first = new Promise<void>((resolve) => {
+      resolveFirst = resolve
+    })
+    const cleanup = vi
+      .fn<() => Promise<void>>()
+      .mockImplementationOnce(() => first.then(() => Promise.reject(new Error("stop failed"))))
+      .mockResolvedValueOnce(undefined)
+    const allowQuit = vi.fn()
+    const logFailure = vi.fn()
+    const coordinator = createPublisherQuitCoordinator({
+      cleanup,
+      allowQuit,
+      logFailure,
+      retryDelay: async () => undefined,
+    })
+    const firstEvent = { preventDefault: vi.fn() }
+    const repeatedEvent = { preventDefault: vi.fn() }
+    const pending = coordinator.beforeQuit(firstEvent)
+    const repeated = coordinator.beforeQuit(repeatedEvent)
+    expect(cleanup).toHaveBeenCalledOnce()
+    expect(firstEvent.preventDefault).toHaveBeenCalledOnce()
+    expect(repeatedEvent.preventDefault).toHaveBeenCalledOnce()
+    resolveFirst()
+    await Promise.all([pending, repeated])
+    expect(cleanup).toHaveBeenCalledTimes(2)
+    expect(allowQuit).toHaveBeenCalledOnce()
+    expect(logFailure).not.toHaveBeenCalled()
+    const allowedEvent = { preventDefault: vi.fn() }
+    await coordinator.beforeQuit(allowedEvent)
+    expect(allowedEvent.preventDefault).not.toHaveBeenCalled()
+  })
+
+  it("bounds failed quit cleanup attempts", async () => {
+    const cleanup = vi.fn(async () => Promise.reject(new Error("stop failed")))
+    const coordinator = createPublisherQuitCoordinator({
+      cleanup,
+      allowQuit: vi.fn(),
+      logFailure: vi.fn(),
+      maximumAttempts: 2,
+      retryDelay: async () => undefined,
+    })
+    await coordinator.beforeQuit({ preventDefault: vi.fn() })
+    await coordinator.beforeQuit({ preventDefault: vi.fn() })
+    expect(cleanup).toHaveBeenCalledTimes(2)
   })
 })

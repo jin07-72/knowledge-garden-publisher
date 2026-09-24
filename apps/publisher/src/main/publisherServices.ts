@@ -95,3 +95,50 @@ export async function disposePublisherRuntime(
   }
   if (failure !== undefined) throw failure
 }
+
+export interface PublisherQuitCoordinator {
+  beforeQuit(event: { preventDefault(): void }): Promise<void>
+}
+
+export function createPublisherQuitCoordinator(options: {
+  readonly cleanup: () => Promise<void>
+  readonly allowQuit: () => void
+  readonly logFailure: (message: string) => void
+  readonly maximumAttempts?: number
+  readonly retryDelay?: () => Promise<void>
+}): PublisherQuitCoordinator {
+  const maximumAttempts = Math.max(1, options.maximumAttempts ?? 3)
+  const retryDelay =
+    options.retryDelay ?? (() => new Promise<void>((resolve) => setTimeout(resolve, 250)))
+  let attempts = 0
+  let allowed = false
+  let inFlight: Promise<void> | undefined
+
+  return {
+    beforeQuit(event) {
+      if (allowed) return Promise.resolve()
+      event.preventDefault()
+      if (inFlight !== undefined) return inFlight
+      if (attempts >= maximumAttempts) return Promise.resolve()
+      inFlight = (async () => {
+        while (attempts < maximumAttempts) {
+          attempts += 1
+          try {
+            await options.cleanup()
+            allowed = true
+            options.allowQuit()
+            return
+          } catch {
+            if (attempts < maximumAttempts) {
+              await retryDelay()
+            }
+          }
+        }
+        options.logFailure("Publisher preview shutdown failed.")
+      })().finally(() => {
+        inFlight = undefined
+      })
+      return inFlight
+    },
+  }
+}

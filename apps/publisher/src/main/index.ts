@@ -3,7 +3,11 @@ import { join } from "node:path"
 import { DEFAULT_GARDEN_PATH } from "../shared/contracts"
 import { systemCommandRunner } from "./lib/commandRunner"
 import { registerPublisherIpc } from "./ipc"
-import { createPublisherServices, disposePublisherRuntime } from "./publisherServices"
+import {
+  createPublisherQuitCoordinator,
+  createPublisherServices,
+  disposePublisherRuntime,
+} from "./publisherServices"
 import {
   configureTrustedRendererNavigation,
   createRendererTrustPolicy,
@@ -18,8 +22,24 @@ let mainWindow: BrowserWindow | undefined
 let mainWindowTrust: RendererTrustPolicy | undefined
 let unregisterIpc: (() => void) | undefined
 let previewManager: PreviewManager | undefined
-let quitInProgress = false
-let quitAllowed = false
+
+const quitCoordinator = createPublisherQuitCoordinator({
+  cleanup: async () => {
+    const manager = previewManager
+    const unregister = unregisterIpc
+    unregisterIpc = undefined
+    if (manager === undefined) {
+      unregister?.()
+      return
+    }
+    await disposePublisherRuntime(unregister, manager)
+    previewManager = undefined
+  },
+  allowQuit: () => app.quit(),
+  logFailure: (message) => {
+    console.error(message)
+  },
+})
 
 async function isTracked(workspace: string, path: string): Promise<boolean> {
   const result = await systemCommandRunner.run({
@@ -108,27 +128,7 @@ app.whenReady().then(() => {
 })
 
 app.on("before-quit", (event) => {
-  if (quitAllowed) return
-  event.preventDefault()
-  if (quitInProgress) return
-  quitInProgress = true
-  const manager = previewManager
-  const unregister = unregisterIpc
-  unregisterIpc = undefined
-  const shutdown =
-    manager === undefined
-      ? Promise.resolve().then(() => unregister?.())
-      : disposePublisherRuntime(unregister, manager)
-  void shutdown
-    .catch(() => {
-      process.exitCode = 1
-      console.error("Publisher preview shutdown failed.")
-    })
-    .finally(() => {
-      previewManager = undefined
-      quitAllowed = true
-      app.quit()
-    })
+  void quitCoordinator.beforeQuit(event)
 })
 
 app.on("window-all-closed", () => {

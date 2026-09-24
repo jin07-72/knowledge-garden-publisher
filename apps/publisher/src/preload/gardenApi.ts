@@ -49,20 +49,22 @@ function invoke<T>(
   channel: keyof typeof IPC_SUCCESS_SCHEMAS,
   request?: unknown,
 ): Promise<IpcResult<T>> {
-  return ipc.invoke(channel, request).then((result) => {
-    try {
-      const parsed = ipcResultSchema(IPC_SUCCESS_SCHEMAS[channel] as z.ZodType<unknown>).safeParse(
-        result,
-      )
-      if (parsed.success) return parsed.data as IpcResult<T>
-    } catch {
-      // Invalid or hostile main-process values collapse to one fixed renderer-safe error.
-    }
-    return {
-      ok: false,
-      error: { code: "INTERNAL_ERROR", message: "The application returned an invalid response." },
-    }
+  const invalid = (): IpcResult<T> => ({
+    ok: false,
+    error: { code: "INTERNAL_ERROR", message: "The application returned an invalid response." },
   })
+  return Promise.resolve()
+    .then(() => ipc.invoke(channel, request))
+    .then((result) => {
+      try {
+        const parsed = ipcResultSchema(
+          IPC_SUCCESS_SCHEMAS[channel] as z.ZodType<unknown>,
+        ).safeParse(result)
+        return parsed.success ? (parsed.data as IpcResult<T>) : invalid()
+      } catch {
+        return invalid()
+      }
+    }, invalid)
 }
 
 function subscription<T>(
