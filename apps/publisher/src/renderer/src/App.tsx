@@ -12,6 +12,7 @@ import type {
 } from "../../shared/contracts"
 import { NoteSidebar } from "./components/NoteSidebar"
 import { ModalShell } from "./components/ModalShell"
+import { MarkdownEditor, type MarkdownEditorHandle } from "./components/MarkdownEditor"
 import { PreviewPane } from "./components/PreviewPane"
 import { VisibilityMenu } from "./components/VisibilityMenu"
 import "./app.css"
@@ -153,6 +154,7 @@ function PublisherApp({ api }: { readonly api: GardenApi }): React.JSX.Element {
   const [changeCount, setChangeCount] = useState<number>()
   const [publishMessage, setPublishMessage] = useState("正在检查可发布变化…")
   const [publishProgress, setPublishProgress] = useState<PublishProgress>()
+  const [saveStateLabel, setSaveStateLabel] = useState("已保存")
   const [visibilityBusy, setVisibilityBusy] = useState(false)
   const [visibilityError, setVisibilityError] = useState<{
     path: string
@@ -174,6 +176,7 @@ function PublisherApp({ api }: { readonly api: GardenApi }): React.JSX.Element {
   const confirmationCancel = useRef<HTMLButtonElement>(null)
   const appMounted = useRef(true)
   const workspace = useRef<HTMLDivElement>(null)
+  const markdownEditor = useRef<MarkdownEditorHandle>(null)
   const notesRequest = useRef(0)
   const previewRequest = useRef(0)
   const changesRequest = useRef(0)
@@ -187,6 +190,18 @@ function PublisherApp({ api }: { readonly api: GardenApi }): React.JSX.Element {
   const selectedNote = useMemo(
     () => notes.find((note) => note.path === selectedPath),
     [notes, selectedPath],
+  )
+
+  const selectNote = useCallback(
+    async (path: string): Promise<void> => {
+      if (path === selectedPath) return
+      const safeToSwitch = (await markdownEditor.current?.flush()) ?? true
+      if (safeToSwitch && appMounted.current) {
+        setDocument(undefined)
+        setSelectedPath(path)
+      }
+    },
+    [selectedPath],
   )
 
   useEffect(() => {
@@ -396,6 +411,9 @@ function PublisherApp({ api }: { readonly api: GardenApi }): React.JSX.Element {
   }, [api, documentRetry, selectedPath])
 
   const createNote = async (request: NoteCreateRequest): Promise<string | undefined> => {
+    if (!((await markdownEditor.current?.flush()) ?? true)) {
+      return "当前笔记保存失败，已保留编辑内容。"
+    }
     const result = await api.notes.create(request)
     if (!appMounted.current) return undefined
     if (!result.ok) return result.error.message
@@ -423,6 +441,14 @@ function PublisherApp({ api }: { readonly api: GardenApi }): React.JSX.Element {
 
   const changeVisibility = async (note: NoteSummary, visibility: Visibility): Promise<void> => {
     if (visibility === note.visibility || visibilityBusy) return
+    if (note.path === selectedPath && !((await markdownEditor.current?.flush()) ?? true)) {
+      setVisibilityError({
+        path: note.path,
+        title: note.title,
+        message: "当前笔记保存失败，已保留编辑内容。",
+      })
+      return
+    }
     setVisibilityBusy(true)
     setVisibilityError(undefined)
     try {
@@ -537,7 +563,7 @@ function PublisherApp({ api }: { readonly api: GardenApi }): React.JSX.Element {
           loadState={notesState}
           message={notesMessage}
           selectedPath={selectedPath}
-          onSelect={setSelectedPath}
+          onSelect={(path) => void selectNote(path)}
           onCreate={createNote}
           onRetry={() => void loadNotes()}
           separator={
@@ -600,18 +626,41 @@ function PublisherApp({ api }: { readonly api: GardenApi }): React.JSX.Element {
                     重试读取
                   </button>
                 </div>
+              ) : document ? (
+                <MarkdownEditor
+                  key={document.path}
+                  ref={markdownEditor}
+                  document={document}
+                  notes={notes}
+                  save={api.notes.save}
+                  read={() => api.notes.read({ path: document.path })}
+                  recovery={{
+                    get: () => api.notes.recovery.get({ path: document.path }),
+                    write: api.notes.recovery.write,
+                    discard: api.notes.recovery.discard,
+                  }}
+                  onSaved={(receipt) => {
+                    setDocument((current) =>
+                      current?.path === receipt.path
+                        ? {
+                            ...current,
+                            mtimeMs: receipt.mtimeMs,
+                            contentHash: receipt.contentHash,
+                          }
+                        : current,
+                    )
+                    setNotes((current) =>
+                      current.map((note) =>
+                        note.path === receipt.path
+                          ? { ...note, updatedAt: receipt.updatedAt }
+                          : note,
+                      ),
+                    )
+                  }}
+                  onSaveStateChange={setSaveStateLabel}
+                />
               ) : (
-                <>
-                  <div className="editor-gutter" aria-hidden="true">
-                    1<br />2<br />3<br />4<br />5<br />6
-                  </div>
-                  <pre aria-label="Markdown 源文档预览">
-                    {document?.markdown ?? "正在载入 Markdown…"}
-                  </pre>
-                  <p className="editor-notice">
-                    编辑器接口已就绪；Markdown 编辑、自动保存与 Wiki 补全将在下一阶段接入。
-                  </p>
-                </>
+                <p className="editor-notice">正在载入 Markdown…</p>
               )
             ) : (
               <div className="empty-state">
@@ -630,7 +679,7 @@ function PublisherApp({ api }: { readonly api: GardenApi }): React.JSX.Element {
         <div className="status-live" role="status" aria-live="polite" aria-label="发布状态">
           <div className="status-item">
             <Check size={14} aria-hidden="true" />
-            <span>已保存</span>
+            <span>{saveStateLabel}</span>
           </div>
           <div className="status-item">
             {preview.state === "starting" || preview.state === "building" ? (

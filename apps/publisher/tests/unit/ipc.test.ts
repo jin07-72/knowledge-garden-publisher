@@ -62,6 +62,11 @@ function services(): PublisherIpcServices & {
       rename: call("notesRename"),
       changeVisibility: call("notesChangeVisibility"),
       trash: call("notesTrash"),
+      recovery: {
+        get: call("notesRecoveryGet"),
+        write: call("notesRecoveryWrite"),
+        discard: call("notesRecoveryDiscard"),
+      },
     },
     preview: {
       start: call("previewStart"),
@@ -548,6 +553,17 @@ describe("preload garden API", () => {
     await api.notes.rename({ path: "content/life/a.md", newSlug: "b" })
     await api.notes.changeVisibility({ path: "content/life/a.md", visibility: "private" })
     await api.notes.trash({ path: "content/life/a.md" })
+    await api.notes.recovery.get({ path: "content/life/a.md" })
+    await api.notes.recovery.write({
+      path: "content/life/a.md",
+      markdown: "# draft",
+      baseMtimeMs: 1,
+      baseContentHash: "a".repeat(64),
+    })
+    await api.notes.recovery.discard({
+      path: "content/life/a.md",
+      contentHash: "b".repeat(64),
+    })
     await api.preview.start({ preferredPort: 4173 })
     await api.preview.stop()
     await api.preview.status()

@@ -10,6 +10,11 @@ import {
   saveNote,
   trashNote,
 } from "./services/noteFiles"
+import {
+  discardEditorRecovery,
+  getEditorRecovery,
+  writeEditorRecovery,
+} from "./services/editorRecovery"
 import { scanNotes } from "./services/noteIndex"
 import { inspectWorkspace } from "./services/workspace"
 
@@ -58,6 +63,11 @@ export function createPublisherServices(
         return executeVisibilityChange(plan, { workspace, transactionTrash: trash })
       },
       trash: (request) => trashNote({ workspace, trash, isTracked, ...request }),
+      recovery: {
+        get: (request) => getEditorRecovery(workspace, request),
+        write: (request) => writeEditorRecovery(workspace, request),
+        discard: (request) => discardEditorRecovery(workspace, request, trash),
+      },
     },
     preview: {
       start: (request) => preview.start({ workspace, ...request }),

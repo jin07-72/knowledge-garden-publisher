@@ -210,6 +210,9 @@ export const IPC_CHANNELS = {
     notesRename: "garden:notes:rename",
     notesChangeVisibility: "garden:notes:change-visibility",
     notesTrash: "garden:notes:trash",
+    notesRecoveryGet: "garden:notes:recovery:get",
+    notesRecoveryWrite: "garden:notes:recovery:write",
+    notesRecoveryDiscard: "garden:notes:recovery:discard",
     previewStart: "garden:preview:start",
     previewStop: "garden:preview:stop",
     previewStatus: "garden:preview:status",
@@ -242,6 +245,25 @@ export interface NoteSaveRequest extends NotePathRequest {
   readonly markdown: string
   readonly expectedMtimeMs: number
   readonly expectedContentHash: string
+}
+
+export interface NoteRecoveryWriteRequest extends NotePathRequest {
+  readonly markdown: string
+  readonly baseMtimeMs: number
+  readonly baseContentHash: string
+}
+
+export interface NoteRecovery extends NoteRecoveryWriteRequest {
+  readonly createdAt: string
+  readonly contentHash: string
+}
+
+export interface NoteRecoveryReceipt {
+  readonly contentHash: string
+}
+
+export interface NoteRecoveryDiscardRequest extends NotePathRequest {
+  readonly contentHash: string
 }
 
 export interface NoteCreateRequest {
@@ -326,6 +348,11 @@ export interface GardenApi {
     rename(request: NoteRenameRequest): Promise<IpcResult<NoteTransactionReceipt>>
     changeVisibility(request: NoteVisibilityRequest): Promise<IpcResult<NoteTransactionReceipt>>
     trash(request: NotePathRequest): Promise<IpcResult<NoteTrashReceipt>>
+    recovery: {
+      get(request: NotePathRequest): Promise<IpcResult<NoteRecovery | undefined>>
+      write(request: NoteRecoveryWriteRequest): Promise<IpcResult<NoteRecoveryReceipt>>
+      discard(request: NoteRecoveryDiscardRequest): Promise<IpcResult<void>>
+    }
   }
   readonly preview: {
     start(request?: PreviewStartRequest): Promise<IpcResult<PreviewStatus>>

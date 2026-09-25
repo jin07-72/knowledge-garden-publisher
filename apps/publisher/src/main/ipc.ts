@@ -10,6 +10,10 @@ import {
   type NoteDocument,
   type NotePathRequest,
   type NoteRenameRequest,
+  type NoteRecovery,
+  type NoteRecoveryDiscardRequest,
+  type NoteRecoveryReceipt,
+  type NoteRecoveryWriteRequest,
   type NoteSaveRequest,
   type NoteSummary,
   type NoteTransactionReceipt,
@@ -56,6 +60,11 @@ export interface PublisherIpcServices {
     rename(request: NoteRenameRequest): Promise<NoteTransactionReceipt>
     changeVisibility(request: NoteVisibilityRequest): Promise<NoteTransactionReceipt>
     trash(request: NotePathRequest): Promise<NoteTrashReceipt>
+    recovery: {
+      get(request: NotePathRequest): Promise<NoteRecovery | undefined>
+      write(request: NoteRecoveryWriteRequest): Promise<NoteRecoveryReceipt>
+      discard(request: NoteRecoveryDiscardRequest): Promise<void>
+    }
   }
   readonly preview: {
     start(request: PreviewStartRequest): Promise<PreviewStatus>
@@ -116,6 +125,17 @@ const noteSaveSchema = z
     expectedMtimeMs: z.number().finite().nonnegative(),
     expectedContentHash: hashSchema,
   })
+  .strict()
+const noteRecoveryWriteSchema = z
+  .object({
+    path: notePathSchema,
+    markdown: z.string().max(16 * 1024 * 1024),
+    baseMtimeMs: z.number().finite().nonnegative(),
+    baseContentHash: hashSchema,
+  })
+  .strict()
+const noteRecoveryDiscardSchema = z
+  .object({ path: notePathSchema, contentHash: hashSchema })
   .strict()
 const noteCreateSchema = z
   .object({
@@ -297,6 +317,33 @@ export function registerPublisherIpc(options: RegisterPublisherIpcOptions): () =
         notePathRequestSchema,
         isTrustedSender,
         (request) => services.notes.trash(request),
+      ),
+    ],
+    [
+      IPC_CHANNELS.requests.notesRecoveryGet,
+      secureHandler(
+        IPC_CHANNELS.requests.notesRecoveryGet,
+        notePathRequestSchema,
+        isTrustedSender,
+        (request) => services.notes.recovery.get(request),
+      ),
+    ],
+    [
+      IPC_CHANNELS.requests.notesRecoveryWrite,
+      secureHandler(
+        IPC_CHANNELS.requests.notesRecoveryWrite,
+        noteRecoveryWriteSchema,
+        isTrustedSender,
+        (request) => services.notes.recovery.write(request),
+      ),
+    ],
+    [
+      IPC_CHANNELS.requests.notesRecoveryDiscard,
+      secureHandler(
+        IPC_CHANNELS.requests.notesRecoveryDiscard,
+        noteRecoveryDiscardSchema,
+        isTrustedSender,
+        (request) => services.notes.recovery.discard(request),
       ),
     ],
     [

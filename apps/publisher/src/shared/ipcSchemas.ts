@@ -81,6 +81,16 @@ const noteWriteReceiptSchema = z
     warnings: z.array(warningSchema).max(100).optional(),
   })
   .strip()
+const noteRecoverySchema = z
+  .object({
+    path: pathSchema,
+    markdown: z.string().max(16 * 1024 * 1024),
+    baseMtimeMs: z.number().finite().nonnegative(),
+    baseContentHash: hashSchema,
+    createdAt: z.string().datetime(),
+    contentHash: hashSchema,
+  })
+  .strip()
 const noteTransactionReceiptSchema = z
   .object({
     id: z.string().min(1).max(128),
@@ -162,6 +172,9 @@ export const IPC_SUCCESS_SCHEMAS = {
   [IPC_CHANNELS.requests.notesRename]: noteTransactionReceiptSchema,
   [IPC_CHANNELS.requests.notesChangeVisibility]: noteTransactionReceiptSchema,
   [IPC_CHANNELS.requests.notesTrash]: noteTrashReceiptSchema,
+  [IPC_CHANNELS.requests.notesRecoveryGet]: noteRecoverySchema.optional(),
+  [IPC_CHANNELS.requests.notesRecoveryWrite]: z.object({ contentHash: hashSchema }).strip(),
+  [IPC_CHANNELS.requests.notesRecoveryDiscard]: z.undefined(),
   [IPC_CHANNELS.requests.previewStart]: previewStatusSchema,
   [IPC_CHANNELS.requests.previewStop]: previewStatusSchema,
   [IPC_CHANNELS.requests.previewStatus]: previewStatusSchema,

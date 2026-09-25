@@ -10,6 +10,10 @@ import {
   type NoteDocument,
   type NotePathRequest,
   type NoteRenameRequest,
+  type NoteRecovery,
+  type NoteRecoveryDiscardRequest,
+  type NoteRecoveryReceipt,
+  type NoteRecoveryWriteRequest,
   type NoteSaveRequest,
   type NoteSummary,
   type NoteTransactionReceipt,
@@ -110,6 +114,14 @@ export function createGardenApi(ipc: IpcRendererPort): GardenApi {
       invoke<NoteTransactionReceipt>(ipc, IPC_CHANNELS.requests.notesChangeVisibility, request),
     trash: (request: NotePathRequest) =>
       invoke<NoteTrashReceipt>(ipc, IPC_CHANNELS.requests.notesTrash, request),
+    recovery: Object.freeze({
+      get: (request: NotePathRequest) =>
+        invoke<NoteRecovery | undefined>(ipc, IPC_CHANNELS.requests.notesRecoveryGet, request),
+      write: (request: NoteRecoveryWriteRequest) =>
+        invoke<NoteRecoveryReceipt>(ipc, IPC_CHANNELS.requests.notesRecoveryWrite, request),
+      discard: (request: NoteRecoveryDiscardRequest) =>
+        invoke<void>(ipc, IPC_CHANNELS.requests.notesRecoveryDiscard, request),
+    }),
   })
   const preview = Object.freeze({
     start: (request?: PreviewStartRequest) =>

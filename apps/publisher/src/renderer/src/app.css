@@ -460,9 +460,8 @@ button {
 .editor-placeholder {
   position: relative;
   min-height: 0;
-  padding: 23px 22px 65px 58px;
-  overflow: auto;
-  background: linear-gradient(90deg, #12161b 45px, #20262e 46px, transparent 47px);
+  overflow: hidden;
+  background: #161b21;
 }
 .editor-placeholder pre {
   margin: 0;
@@ -535,6 +534,126 @@ button {
   background: #181d23e8;
   font-size: 11px;
   line-height: 1.5;
+}
+.markdown-editor {
+  display: grid;
+  height: 100%;
+  min-height: 0;
+  grid-template-rows: auto minmax(0, 1fr) auto;
+}
+.editor-toolbar {
+  display: flex;
+  gap: 6px;
+  padding: 7px 10px;
+  border-bottom: 1px solid #2a3039;
+  background: #14191f;
+}
+.editor-toolbar button,
+.save-state button,
+.editor-dialog button {
+  padding: 5px 9px;
+  border: 1px solid #3d4753;
+  border-radius: 5px;
+  color: #d7dde4;
+  background: #222933;
+  cursor: pointer;
+}
+.codemirror-host {
+  min-height: 0;
+  overflow: hidden;
+}
+.codemirror-host .cm-editor {
+  height: 100%;
+  color: #d9dee4;
+  background: #161b21;
+  font:
+    13px/1.75 "Cascadia Code",
+    Consolas,
+    monospace;
+}
+.codemirror-host .cm-scroller {
+  overflow: auto;
+}
+.codemirror-host .cm-gutters {
+  border-right: 1px solid #282f38;
+  color: #58616d;
+  background: #12161b;
+}
+.codemirror-host .cm-content {
+  caret-color: #f5a97f;
+}
+.codemirror-host .cm-focused {
+  outline: 1px solid #49677c;
+  outline-offset: -1px;
+}
+.save-state {
+  display: flex;
+  min-height: 34px;
+  align-items: center;
+  gap: 10px;
+  padding: 6px 10px;
+  border-top: 1px solid #2a3039;
+  color: #aeb7c1;
+  background: #14191f;
+  font-size: 11px;
+}
+.save-state small {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.save-failed,
+.save-conflict {
+  color: #ffd0bd;
+  background: #30201d;
+}
+.conflict-actions {
+  display: flex;
+  gap: 6px;
+  margin-left: auto;
+}
+.editor-dialog-backdrop {
+  position: fixed;
+  z-index: 70;
+  inset: 0;
+  display: grid;
+  place-items: center;
+  padding: 24px;
+  background: #080a0dbd;
+}
+.editor-dialog {
+  width: min(560px, 100%);
+  padding: 18px;
+  border: 1px solid #46515e;
+  border-radius: 10px;
+  color: #e6ebef;
+  background: #191f26;
+  box-shadow: 0 20px 60px #000a;
+}
+.editor-dialog h2 {
+  margin-top: 0;
+}
+.editor-dialog > div:last-child {
+  display: flex;
+  justify-content: flex-end;
+  gap: 8px;
+}
+.compare-dialog {
+  width: min(1000px, 100%);
+}
+.compare-columns {
+  display: grid;
+  max-height: 60vh;
+  grid-template-columns: 1fr 1fr;
+  gap: 12px;
+  overflow: auto;
+}
+.compare-columns pre {
+  min-width: 0;
+  padding: 10px;
+  border: 1px solid #343d48;
+  border-radius: 6px;
+  background: #11161b;
 }
 
 .preview-pane {

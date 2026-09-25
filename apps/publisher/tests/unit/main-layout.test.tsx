@@ -1,5 +1,6 @@
 import { act, cleanup, fireEvent, render, screen, waitFor, within } from "@testing-library/react"
 import userEvent from "@testing-library/user-event"
+import { EditorView } from "@codemirror/view"
 import { StrictMode } from "react"
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest"
 import { App } from "../../src/renderer/src/App"
@@ -125,6 +126,11 @@ function createGardenMock(): GardenApi {
         ok({ id: "visibility-1", changedPaths: [path], historyWarning: false, warnings: [] }),
       ),
       trash: vi.fn(),
+      recovery: {
+        get: vi.fn(async () => ok(undefined)),
+        write: vi.fn(async () => ok({ contentHash: "c".repeat(64) })),
+        discard: vi.fn(async () => ok(undefined)),
+      },
     },
     preview: {
       start: vi.fn(async () => ok(ready)),
@@ -157,6 +163,13 @@ describe("publisher main layout", () => {
     Object.defineProperty(window, "innerWidth", { configurable: true, value: 1440 })
     garden = createGardenMock()
     Object.defineProperty(window, "garden", { configurable: true, value: garden })
+    Object.defineProperties(Range.prototype, {
+      getClientRects: { configurable: true, value: () => [] },
+      getBoundingClientRect: {
+        configurable: true,
+        value: () => ({ top: 0, right: 0, bottom: 0, left: 0, width: 0, height: 0 }),
+      },
+    })
   })
 
   afterEach(() => {
@@ -545,11 +558,50 @@ describe("publisher main layout", () => {
 
     expect(await screen.findByText("# CSS Grid 布局", { exact: false })).toBeVisible()
     await user.click(screen.getByRole("button", { name: /私密阅读札记/ }))
-    expect(screen.getByText("正在载入 Markdown…")).toBeVisible()
+    expect(await screen.findByText("正在载入 Markdown…")).toBeVisible()
     expect(screen.queryByText("# CSS Grid 布局", { exact: false })).not.toBeInTheDocument()
 
     resolvePrivate?.(ok(documents.get(notes[1].path)!))
     expect(await screen.findByText("# 私密阅读札记", { exact: false })).toBeVisible()
+  })
+
+  it("flushes a changed note before reading the next selection", async () => {
+    const user = userEvent.setup()
+    vi.mocked(garden.notes.save).mockResolvedValueOnce(
+      ok({
+        path: notes[0].path,
+        updatedAt: "2026-09-25T01:00:00.000Z",
+        mtimeMs: 3,
+        contentHash: "c".repeat(64),
+      }),
+    )
+    render(<App />)
+    await screen.findByText("# CSS Grid 布局", { exact: false })
+    const content = document.querySelector(".cm-content") as HTMLElement
+    const view = EditorView.findFromDOM(content)!
+    act(() => view.dispatch({ changes: { from: view.state.doc.length, insert: "\nchanged" } }))
+
+    await user.click(screen.getByRole("button", { name: /私密阅读札记/ }))
+    await waitFor(() => expect(garden.notes.save).toHaveBeenCalledTimes(1))
+    expect(garden.notes.read).toHaveBeenCalledWith({ path: notes[1].path })
+  })
+
+  it("blocks a note switch and retains the buffer when its flush fails", async () => {
+    const user = userEvent.setup()
+    vi.mocked(garden.notes.save).mockResolvedValueOnce({
+      ok: false,
+      error: { code: "NOTE_FILE_WRITE_FAILED", message: "磁盘不可写" },
+    })
+    render(<App />)
+    await screen.findByText("# CSS Grid 布局", { exact: false })
+    const view = EditorView.findFromDOM(document.querySelector(".cm-content") as HTMLElement)!
+    act(() => view.dispatch({ changes: { from: view.state.doc.length, insert: "\nretained" } }))
+
+    await user.click(screen.getByRole("button", { name: /私密阅读札记/ }))
+    expect(await screen.findByRole("alert", { name: "保存状态" })).toHaveTextContent("保存失败")
+    expect(view.state.doc.toString()).toContain("retained")
+    expect(screen.getByText(notes[0].path)).toBeVisible()
+    expect(garden.notes.read).not.toHaveBeenCalledWith({ path: notes[1].path })
   })
 
   it("shows note-read failures in the editor and supports retry", async () => {
