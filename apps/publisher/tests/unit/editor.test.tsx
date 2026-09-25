@@ -49,6 +49,16 @@ function ok<T>(value: T): IpcResult<T> {
   return { ok: true, value }
 }
 
+function deferred<T>() {
+  let resolve!: (value: T) => void
+  let reject!: (reason?: unknown) => void
+  const promise = new Promise<T>((done, fail) => {
+    resolve = done
+    reject = fail
+  })
+  return { promise, resolve, reject }
+}
+
 function receipt(markdown: string): NoteWriteReceipt {
   return {
     path: publicNote.path,
@@ -63,13 +73,14 @@ function setup(
     save?: (markdown: string) => Promise<IpcResult<NoteWriteReceipt>>
     read?: () => Promise<IpcResult<NoteDocument>>
     recovery?: NoteRecovery
+    discardRecovery?: () => Promise<IpcResult<void>>
   } = {},
 ) {
   const save = vi.fn(options.save ?? (async (markdown: string) => ok(receipt(markdown))))
   const read = vi.fn(options.read ?? (async () => ok(document)))
   const getRecovery = vi.fn(async () => ok(options.recovery))
   const writeRecovery = vi.fn(async () => ok({ contentHash: "c".repeat(64) }))
-  const discardRecovery = vi.fn(async () => ok(undefined))
+  const discardRecovery = vi.fn(options.discardRecovery ?? (async () => ok(undefined)))
   const ref = createRef<MarkdownEditorHandle>()
   const view = render(
     <MarkdownEditor
@@ -135,25 +146,102 @@ describe("MarkdownEditor", () => {
     expect(screen.getByRole("status", { name: "保存状态" })).toHaveTextContent("已保存")
   })
 
-  it("does not let an older in-flight save clear recovery for a newer buffer", async () => {
-    let resolveSave!: (value: IpcResult<NoteWriteReceipt>) => void
-    const pendingSave = new Promise<IpcResult<NoteWriteReceipt>>((resolve) => {
-      resolveSave = resolve
+  it("keeps one flush pending until edits made during save1 are durably saved by save2", async () => {
+    const save1 = deferred<IpcResult<NoteWriteReceipt>>()
+    const save2 = deferred<IpcResult<NoteWriteReceipt>>()
+    let call = 0
+    const { ref, save, discardRecovery, writeRecovery } = setup({
+      save: async () => (++call === 1 ? save1.promise : save2.promise),
     })
-    const { ref, discardRecovery, writeRecovery } = setup({ save: async () => pendingSave })
     replaceDoc(`${original}first buffer`)
-    const flush = ref.current!.flush()
-    await waitFor(() => expect(writeRecovery).toHaveBeenCalled())
+    let barrierResolved = false
+    const barrier = ref.current!.flush().then((result) => {
+      barrierResolved = true
+      return result
+    })
+    await waitFor(() => expect(save).toHaveBeenCalledTimes(1))
     replaceDoc(`${original}newer buffer`)
     await act(async () => {
-      resolveSave(ok(receipt(`${original}first buffer`)))
-      await flush
+      save1.resolve(ok(receipt(`${original}first buffer`)))
       await Promise.resolve()
     })
 
+    await waitFor(() => expect(save).toHaveBeenCalledTimes(2))
+    expect(barrierResolved).toBe(false)
     expect(discardRecovery).not.toHaveBeenCalled()
     expect(writeRecovery).toHaveBeenLastCalledWith(
       expect.objectContaining({ markdown: `${original}newer buffer` }),
+    )
+    await act(async () => {
+      save2.resolve(ok(receipt(`${original}newer buffer`)))
+      await expect(barrier).resolves.toBe(true)
+    })
+    expect(discardRecovery).toHaveBeenCalledTimes(1)
+  })
+
+  it("returns false from every coalesced flush when save2 fails", async () => {
+    const save1 = deferred<IpcResult<NoteWriteReceipt>>()
+    const save2 = deferred<IpcResult<NoteWriteReceipt>>()
+    let call = 0
+    const { ref, save } = setup({
+      save: async () => (++call === 1 ? save1.promise : save2.promise),
+    })
+    replaceDoc(`${original}v1`)
+    const first = ref.current!.flush()
+    await waitFor(() => expect(save).toHaveBeenCalledTimes(1))
+    replaceDoc(`${original}v2`)
+    const second = ref.current!.flush()
+    save1.resolve(ok(receipt(`${original}v1`)))
+    await waitFor(() => expect(save).toHaveBeenCalledTimes(2))
+    save2.resolve({
+      ok: false,
+      error: { code: "NOTE_FILE_WRITE_FAILED", message: "save2 failed" },
+    })
+
+    await act(async () => {
+      await expect(first).resolves.toBe(false)
+      await expect(second).resolves.toBe(false)
+    })
+    expect(editorView().state.sliceDoc()).toContain("v2")
+  })
+
+  it("blocks a durable flush until the matching recovery draft is cleaned", async () => {
+    let discardAttempt = 0
+    const { ref, save, discardRecovery } = setup({
+      discardRecovery: async () =>
+        ++discardAttempt === 1
+          ? {
+              ok: false,
+              error: { code: "RECOVERY_DISCARD_FAILED", message: "cleanup failed" },
+            }
+          : ok(undefined),
+    })
+    replaceDoc(`${original}saved but draft pending`)
+
+    await act(async () => {
+      await expect(ref.current!.flush()).resolves.toBe(false)
+    })
+    expect(save).toHaveBeenCalledTimes(1)
+    expect(discardRecovery).toHaveBeenCalledTimes(1)
+
+    await act(async () => {
+      await expect(ref.current!.flush()).resolves.toBe(true)
+    })
+    expect(save).toHaveBeenCalledTimes(1)
+    expect(discardRecovery).toHaveBeenCalledTimes(2)
+  })
+
+  it("automatically cleans an immediate recovery when the buffer returns to disk content", async () => {
+    const { ref, save, writeRecovery, discardRecovery } = setup()
+    replaceDoc(`${original}temporary edit`)
+    replaceDoc(original)
+
+    await waitFor(() => expect(discardRecovery).toHaveBeenCalled())
+    await expect(ref.current!.flush()).resolves.toBe(true)
+    expect(save).not.toHaveBeenCalled()
+    expect(writeRecovery).toHaveBeenCalled()
+    expect(discardRecovery).toHaveBeenCalledWith(
+      expect.objectContaining({ contentHash: "c".repeat(64) }),
     )
   })
 
@@ -273,6 +361,7 @@ describe("MarkdownEditor", () => {
       rejectSave = reject
     })
     const ref = createRef<MarkdownEditorHandle>()
+    const writeRecovery = vi.fn(async () => ok({ contentHash: "c".repeat(64) }))
     const view = render(
       <StrictMode>
         <MarkdownEditor
@@ -283,7 +372,7 @@ describe("MarkdownEditor", () => {
           read={async () => ok(document)}
           recovery={{
             get: async () => ok(undefined),
-            write: async () => ok({ contentHash: "c".repeat(64) }),
+            write: writeRecovery,
             discard: async () => ok(undefined),
           }}
         />
@@ -296,6 +385,30 @@ describe("MarkdownEditor", () => {
       rejectSave(new Error("late rejection PRIVATE_BODY_MUST_NOT_APPEAR"))
       await flush
     })
+    expect(writeRecovery).toHaveBeenLastCalledWith(
+      expect.objectContaining({ markdown: `${original}late` }),
+    )
+    expect(error).not.toHaveBeenCalled()
+  })
+
+  it("finishes the latest durable generation when unmounted during an active flush", async () => {
+    const save1 = deferred<IpcResult<NoteWriteReceipt>>()
+    const save2 = deferred<IpcResult<NoteWriteReceipt>>()
+    let call = 0
+    const error = vi.spyOn(console, "error").mockImplementation(() => undefined)
+    const { ref, save, unmount } = setup({
+      save: async () => (++call === 1 ? save1.promise : save2.promise),
+    })
+    replaceDoc(`${original}v1 before unmount`)
+    const barrier = ref.current!.flush()
+    await waitFor(() => expect(save).toHaveBeenCalledTimes(1))
+    replaceDoc(`${original}v2 before unmount`)
+    unmount()
+
+    save1.resolve(ok(receipt(`${original}v1 before unmount`)))
+    await waitFor(() => expect(save).toHaveBeenCalledTimes(2))
+    save2.resolve(ok(receipt(`${original}v2 before unmount`)))
+    await expect(barrier).resolves.toBe(true)
     expect(error).not.toHaveBeenCalled()
   })
 })

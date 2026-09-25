@@ -14,6 +14,7 @@ import type {
   NoteDocument,
   NoteSummary,
   NoteTransactionReceipt,
+  NoteWriteReceipt,
   PreviewStatus,
   WorkspaceInspection,
 } from "../../src/shared/contracts"
@@ -602,6 +603,137 @@ describe("publisher main layout", () => {
     expect(view.state.doc.toString()).toContain("retained")
     expect(screen.getByText(notes[0].path)).toBeVisible()
     expect(garden.notes.read).not.toHaveBeenCalledWith({ path: notes[1].path })
+  })
+
+  it("waits for the latest buffer and cleans its old-path recovery before a visibility move", async () => {
+    const user = userEvent.setup()
+    const save1 = deferred<IpcResult<NoteWriteReceipt>>()
+    const save2 = deferred<IpcResult<NoteWriteReceipt>>()
+    const events: string[] = []
+    vi.mocked(garden.notes.save)
+      .mockImplementationOnce(async () => save1.promise)
+      .mockImplementationOnce(async () => save2.promise)
+    vi.mocked(garden.notes.recovery.write).mockImplementation(async (request) => {
+      const contentHash = request.markdown.includes("v2") ? "e".repeat(64) : "d".repeat(64)
+      return ok({ contentHash })
+    })
+    vi.mocked(garden.notes.recovery.discard).mockImplementation(async (request) => {
+      events.push(`discard:${request.path}:${request.contentHash}`)
+      return ok(undefined)
+    })
+    vi.mocked(garden.notes.changeVisibility).mockImplementation(async ({ path }) => {
+      events.push(`move:${path}`)
+      return ok({
+        id: "move-after-flush",
+        changedPaths: [path],
+        historyWarning: false,
+        warnings: [],
+      })
+    })
+    vi.mocked(garden.notes.read).mockImplementation(async ({ path }) =>
+      ok(
+        path === "private/technology/css-grid.md"
+          ? {
+              ...documents.get(notes[0].path)!,
+              path,
+              markdown: "# CSS Grid 布局\n\nv1\nv2",
+              mtimeMs: 4,
+              contentHash: "f".repeat(64),
+            }
+          : documents.get(path)!,
+      ),
+    )
+    render(<App />)
+    await screen.findByText("# CSS Grid 布局", { exact: false })
+    const view = EditorView.findFromDOM(document.querySelector(".cm-content") as HTMLElement)!
+    act(() => view.dispatch({ changes: { from: view.state.doc.length, insert: "\nv1" } }))
+
+    await user.click(screen.getByRole("button", { name: "可见性：公开" }))
+    await user.click(screen.getByRole("menuitemradio", { name: /私密/ }))
+    await user.click(
+      within(screen.getByRole("dialog", { name: "确认设为私密" })).getByRole("button", {
+        name: "确认设为私密",
+      }),
+    )
+    await waitFor(() => expect(garden.notes.save).toHaveBeenCalledTimes(1))
+    act(() => view.dispatch({ changes: { from: view.state.doc.length, insert: "\nv2" } }))
+    save1.resolve(
+      ok({
+        path: notes[0].path,
+        updatedAt: "2026-09-25T01:00:00.000Z",
+        mtimeMs: 3,
+        contentHash: "c".repeat(64),
+      }),
+    )
+    await waitFor(() => expect(garden.notes.save).toHaveBeenCalledTimes(2))
+    expect(garden.notes.changeVisibility).not.toHaveBeenCalled()
+    expect(garden.notes.save).toHaveBeenLastCalledWith(
+      expect.objectContaining({
+        path: notes[0].path,
+        markdown: expect.stringContaining("v2"),
+        expectedMtimeMs: 3,
+        expectedContentHash: "c".repeat(64),
+      }),
+    )
+
+    save2.resolve(
+      ok({
+        path: notes[0].path,
+        updatedAt: "2026-09-25T01:01:00.000Z",
+        mtimeMs: 4,
+        contentHash: "f".repeat(64),
+      }),
+    )
+    await waitFor(() => expect(garden.notes.changeVisibility).toHaveBeenCalledTimes(1))
+    expect(events).toContain(`discard:${notes[0].path}:${"e".repeat(64)}`)
+    expect(events.at(-1)).toBe(`move:${notes[0].path}`)
+    await waitFor(() =>
+      expect(garden.notes.recovery.get).toHaveBeenCalledWith({
+        path: "private/technology/css-grid.md",
+      }),
+    )
+  })
+
+  it("blocks a visibility move when the latest save in the flush barrier fails", async () => {
+    const user = userEvent.setup()
+    const save1 = deferred<IpcResult<NoteWriteReceipt>>()
+    const save2 = deferred<IpcResult<NoteWriteReceipt>>()
+    vi.mocked(garden.notes.save)
+      .mockImplementationOnce(async () => save1.promise)
+      .mockImplementationOnce(async () => save2.promise)
+    render(<App />)
+    await screen.findByText("# CSS Grid 布局", { exact: false })
+    const view = EditorView.findFromDOM(document.querySelector(".cm-content") as HTMLElement)!
+    act(() => view.dispatch({ changes: { from: view.state.doc.length, insert: "\nv1" } }))
+
+    await user.click(screen.getByRole("button", { name: "可见性：公开" }))
+    await user.click(screen.getByRole("menuitemradio", { name: /私密/ }))
+    await user.click(
+      within(screen.getByRole("dialog", { name: "确认设为私密" })).getByRole("button", {
+        name: "确认设为私密",
+      }),
+    )
+    await waitFor(() => expect(garden.notes.save).toHaveBeenCalledTimes(1))
+    act(() => view.dispatch({ changes: { from: view.state.doc.length, insert: "\nv2" } }))
+    save1.resolve(
+      ok({
+        path: notes[0].path,
+        updatedAt: "2026-09-25T01:00:00.000Z",
+        mtimeMs: 3,
+        contentHash: "c".repeat(64),
+      }),
+    )
+    await waitFor(() => expect(garden.notes.save).toHaveBeenCalledTimes(2))
+    save2.resolve({
+      ok: false,
+      error: { code: "NOTE_FILE_WRITE_FAILED", message: "v2 保存失败" },
+    })
+
+    expect(await screen.findByRole("alert", { name: "保存状态" })).toHaveTextContent("保存失败")
+    expect(garden.notes.changeVisibility).not.toHaveBeenCalled()
+    expect(screen.getByRole("button", { name: "可见性：公开" })).toBeVisible()
+    expect(screen.getByText(notes[0].path)).toBeVisible()
+    expect(view.state.doc.toString()).toContain("v2")
   })
 
   it("shows note-read failures in the editor and supports retry", async () => {
