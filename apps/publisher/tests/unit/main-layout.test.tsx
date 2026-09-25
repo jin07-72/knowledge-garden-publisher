@@ -74,9 +74,18 @@ function unavailable<T>(message: string): IpcResult<T> {
 function deferred<T>(): {
   promise: Promise<T>
   resolve: (value: T) => void
+  reject: (reason?: unknown) => void
 } {
   let resolve!: (value: T) => void
-  return { promise: new Promise<T>((done) => (resolve = done)), resolve }
+  let reject!: (reason?: unknown) => void
+  return {
+    promise: new Promise<T>((done, fail) => {
+      resolve = done
+      reject = fail
+    }),
+    resolve,
+    reject,
+  }
 }
 
 function createGardenMock(): GardenApi {
@@ -153,6 +162,7 @@ describe("publisher main layout", () => {
   afterEach(() => {
     cleanup()
     vi.restoreAllMocks()
+    vi.unstubAllGlobals()
   })
 
   it("keeps modal isolation and focus stable under StrictMode effect replay", async () => {
@@ -373,6 +383,58 @@ describe("publisher main layout", () => {
     })
   })
 
+  it("creates and closes the new-note dialog after StrictMode effect replay", async () => {
+    const user = userEvent.setup()
+    render(
+      <StrictMode>
+        <App />
+      </StrictMode>,
+    )
+
+    await user.click(await screen.findByRole("button", { name: "新建笔记" }))
+    const dialog = screen.getByRole("dialog", { name: "新建笔记" })
+    await user.type(within(dialog).getByRole("textbox", { name: "标题" }), "严格模式笔记")
+    await user.type(within(dialog).getByRole("textbox", { name: "描述" }), "严格模式描述")
+    await user.type(within(dialog).getByRole("textbox", { name: "标签" }), "测试")
+    await user.click(within(dialog).getByRole("button", { name: "创建" }))
+
+    expect(await screen.findByText("content/technology/new-note.md")).toBeVisible()
+    expect(screen.queryByRole("dialog", { name: "新建笔记" })).not.toBeInTheDocument()
+  })
+
+  it("recovers a StrictMode new-note dialog after create rejects", async () => {
+    const user = userEvent.setup()
+    vi.mocked(garden.notes.create)
+      .mockRejectedValueOnce(new Error("创建通道断开"))
+      .mockResolvedValueOnce(
+        ok({
+          path: "content/technology/new-note.md",
+          updatedAt: "2026-09-25T00:00:00.000Z",
+          mtimeMs: 4,
+          contentHash: "retry",
+        }),
+      )
+    render(
+      <StrictMode>
+        <App />
+      </StrictMode>,
+    )
+
+    await user.click(await screen.findByRole("button", { name: "新建笔记" }))
+    const dialog = screen.getByRole("dialog", { name: "新建笔记" })
+    await user.type(within(dialog).getByRole("textbox", { name: "标题" }), "重试笔记")
+    await user.type(within(dialog).getByRole("textbox", { name: "描述" }), "失败后重试")
+    await user.type(within(dialog).getByRole("textbox", { name: "标签" }), "测试")
+    await user.click(within(dialog).getByRole("button", { name: "创建" }))
+
+    expect(await within(dialog).findByRole("alert")).toHaveTextContent("创建通道断开")
+    const retry = within(dialog).getByRole("button", { name: "创建" })
+    expect(retry).toBeEnabled()
+    await user.click(retry)
+    expect(await screen.findByText("content/technology/new-note.md")).toBeVisible()
+    expect(screen.queryByRole("dialog", { name: "新建笔记" })).not.toBeInTheDocument()
+  })
+
   it("traps focus in the inert new-note modal and restores trigger focus", async () => {
     const user = userEvent.setup()
     render(<App />)
@@ -583,6 +645,38 @@ describe("publisher main layout", () => {
     )
   })
 
+  it.each(["success", "failure"] as const)(
+    "ignores a pending visibility %s after unmount",
+    async (outcome) => {
+      const user = userEvent.setup()
+      const visibility = deferred<IpcResult<NoteTransactionReceipt>>()
+      vi.mocked(garden.notes.changeVisibility).mockReturnValueOnce(visibility.promise)
+      const consoleError = vi.spyOn(console, "error").mockImplementation(() => undefined)
+      const view = render(<App />)
+
+      await user.click(await screen.findByRole("button", { name: "可见性：公开" }))
+      await user.click(screen.getByRole("menuitemradio", { name: /私密/ }))
+      await user.click(
+        within(screen.getByRole("dialog", { name: "确认设为私密" })).getByRole("button", {
+          name: "确认设为私密",
+        }),
+      )
+      view.unmount()
+      await act(async () => {
+        if (outcome === "success") {
+          visibility.resolve(
+            ok({ id: "visibility-late", changedPaths: [], historyWarning: false, warnings: [] }),
+          )
+        } else {
+          visibility.reject(new Error("late failure"))
+        }
+        await Promise.resolve()
+      })
+
+      expect(consoleError).not.toHaveBeenCalled()
+    },
+  )
+
   it("keeps exact-note preview primary and offers secondary destinations", async () => {
     const user = userEvent.setup()
     render(<App />)
@@ -612,6 +706,16 @@ describe("publisher main layout", () => {
 
     await user.click(within(preview).getByRole("tab", { name: "历史" }))
     expect(await within(preview).findByText(/历史服务暂不可用/)).toBeVisible()
+  })
+
+  it("shows a safe history error when history loading rejects", async () => {
+    const user = userEvent.setup()
+    vi.mocked(garden.history.git).mockRejectedValueOnce(new Error("历史通道断开"))
+    render(<App />)
+
+    const preview = await screen.findByRole("region", { name: "本地预览" })
+    await user.click(within(preview).getByRole("tab", { name: "历史" }))
+    expect(await within(preview).findByText("无法读取历史记录，请稍后重试。")).toBeVisible()
   })
 
   it("reports unavailable future services honestly in the status bar", async () => {
@@ -682,17 +786,18 @@ describe("publisher main layout", () => {
 
     sidebarSeparator.focus()
     fireEvent.keyDown(sidebarSeparator, { key: "ArrowRight" })
-    expect(workspace).toHaveStyle({ gridTemplateColumns: "252px 520px minmax(360px, 1fr)" })
+    expect((workspace as HTMLElement).style.getPropertyValue("--sidebar-width")).toBe("252px")
+    expect((workspace as HTMLElement).style.getPropertyValue("--editor-width")).toBe("520px")
 
     fireEvent.pointerDown(sidebarSeparator, { clientX: 200 })
     fireEvent.pointerMove(sidebarSeparator, { clientX: 240 })
     fireEvent.pointerUp(sidebarSeparator)
-    expect(workspace).toHaveStyle({ gridTemplateColumns: "292px 520px minmax(360px, 1fr)" })
+    expect((workspace as HTMLElement).style.getPropertyValue("--sidebar-width")).toBe("292px")
 
     fireEvent.pointerDown(sidebarSeparator, { clientX: 240 })
     fireEvent.pointerCancel(sidebarSeparator)
     fireEvent.pointerMove(sidebarSeparator, { clientX: 300 })
-    expect(workspace).toHaveStyle({ gridTemplateColumns: "292px 520px minmax(360px, 1fr)" })
+    expect((workspace as HTMLElement).style.getPropertyValue("--sidebar-width")).toBe("292px")
   })
 
   it("jointly bounds both separators, stops on lost capture, and persists safe sizes", () => {
@@ -703,18 +808,29 @@ describe("publisher main layout", () => {
     Object.defineProperty(workspace, "clientWidth", { configurable: true, value: 1440 })
     Object.assign(sidebar, { setPointerCapture: vi.fn(), releasePointerCapture: vi.fn() })
     Object.assign(editor, { setPointerCapture: vi.fn(), releasePointerCapture: vi.fn() })
+    expect(sidebar).toHaveAttribute("aria-valuemin", "190")
+    expect(sidebar).toHaveAttribute("aria-valuemax", "420")
+    expect(sidebar).toHaveAttribute("aria-valuenow", "240")
+    expect(editor).toHaveAttribute("aria-valuemin", "360")
+    expect(editor).toHaveAttribute("aria-valuemax", "840")
+    expect(editor).toHaveAttribute("aria-valuenow", "520")
 
     fireEvent.pointerDown(sidebar, { pointerId: 1, clientX: 0 })
     fireEvent.pointerMove(sidebar, { pointerId: 1, clientX: 1000 })
-    expect(workspace).toHaveStyle({ gridTemplateColumns: "420px 520px minmax(360px, 1fr)" })
+    expect((workspace as HTMLElement).style.getPropertyValue("--sidebar-width")).toBe("420px")
     fireEvent.lostPointerCapture(sidebar, { pointerId: 1 })
     fireEvent.pointerMove(sidebar, { pointerId: 1, clientX: 0 })
-    expect(workspace).toHaveStyle({ gridTemplateColumns: "420px 520px minmax(360px, 1fr)" })
+    expect((workspace as HTMLElement).style.getPropertyValue("--sidebar-width")).toBe("420px")
 
     fireEvent.pointerDown(editor, { pointerId: 2, clientX: 0 })
     fireEvent.pointerMove(editor, { pointerId: 2, clientX: 1000 })
     fireEvent.pointerUp(editor, { pointerId: 2, clientX: 1000 })
-    expect(workspace).toHaveStyle({ gridTemplateColumns: "420px 660px minmax(360px, 1fr)" })
+    expect((workspace as HTMLElement).style.getPropertyValue("--sidebar-width")).toBe("420px")
+    expect((workspace as HTMLElement).style.getPropertyValue("--editor-width")).toBe("660px")
+    expect(editor).toHaveAttribute("aria-valuemax", "660")
+    expect(editor).toHaveAttribute("aria-valuenow", "660")
+    fireEvent.keyDown(editor, { key: "ArrowRight" })
+    expect(editor).toHaveAttribute("aria-valuenow", "660")
     expect(JSON.parse(localStorage.getItem("garden-publisher:pane-sizes")!)).toEqual({
       sidebar: 420,
       editor: 660,
@@ -722,14 +838,75 @@ describe("publisher main layout", () => {
 
     view.unmount()
     render(<App />)
-    expect(document.querySelector(".workspace-grid")).toHaveStyle({
-      gridTemplateColumns: "420px 660px minmax(360px, 1fr)",
-    })
+    const restored = document.querySelector<HTMLElement>(".workspace-grid")!
+    expect(restored.style.getPropertyValue("--sidebar-width")).toBe("420px")
+    expect(restored.style.getPropertyValue("--editor-width")).toBe("660px")
   })
 
   it("falls back from malformed persisted pane sizes", () => {
     localStorage.setItem("garden-publisher:pane-sizes", '{"sidebar":"huge","editor":99999}')
     render(<App />)
     expect(document.querySelector(".workspace-grid")).not.toHaveAttribute("style")
+  })
+
+  it("uses the two-column responsive model at 960px without inapplicable separators", async () => {
+    Object.defineProperty(window, "innerWidth", { configurable: true, value: 960 })
+    localStorage.setItem("garden-publisher:pane-sizes", '{"sidebar":420,"editor":900}')
+    render(<App />)
+
+    expect(screen.queryByRole("separator")).not.toBeInTheDocument()
+    const workspace = document.querySelector<HTMLElement>(".workspace-grid")!
+    expect(workspace.style.getPropertyValue("--sidebar-width")).toBe("420px")
+    expect(workspace.style.getPropertyValue("--editor-width")).toBe("360px")
+    await waitFor(() =>
+      expect(JSON.parse(localStorage.getItem("garden-publisher:pane-sizes")!)).toEqual({
+        sidebar: 420,
+        editor: 360,
+      }),
+    )
+  })
+
+  it("reclamps persisted panes when a ResizeObserver reports a wide-to-narrow change", async () => {
+    let reportWidth: ((width: number) => void) | undefined
+    class TestResizeObserver {
+      constructor(callback: ResizeObserverCallback) {
+        reportWidth = (width) =>
+          callback(
+            [{ contentRect: { width } } as ResizeObserverEntry],
+            this as unknown as ResizeObserver,
+          )
+      }
+      observe(): void {}
+      unobserve(): void {}
+      disconnect(): void {}
+    }
+    vi.stubGlobal("ResizeObserver", TestResizeObserver)
+    localStorage.setItem("garden-publisher:pane-sizes", '{"sidebar":420,"editor":660}')
+    render(<App />)
+    expect(screen.getAllByRole("separator")).toHaveLength(2)
+
+    act(() => reportWidth?.(960))
+
+    expect(screen.queryByRole("separator")).not.toBeInTheDocument()
+    const workspace = document.querySelector<HTMLElement>(".workspace-grid")!
+    expect(workspace.style.getPropertyValue("--sidebar-width")).toBe("420px")
+    expect(workspace.style.getPropertyValue("--editor-width")).toBe("360px")
+    await waitFor(() =>
+      expect(JSON.parse(localStorage.getItem("garden-publisher:pane-sizes")!)).toEqual({
+        sidebar: 420,
+        editor: 360,
+      }),
+    )
+  })
+
+  it("keeps pane resizing usable when localStorage persistence throws", () => {
+    vi.spyOn(Storage.prototype, "setItem").mockImplementation(() => {
+      throw new DOMException("Quota exceeded", "QuotaExceededError")
+    })
+    render(<App />)
+
+    const sidebar = screen.getByRole("separator", { name: "调整笔记栏宽度" })
+    fireEvent.keyDown(sidebar, { key: "ArrowRight" })
+    expect(sidebar).toHaveAttribute("aria-valuenow", "252")
   })
 })

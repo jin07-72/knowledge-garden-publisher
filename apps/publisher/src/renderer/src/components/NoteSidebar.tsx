@@ -61,31 +61,40 @@ function NewNoteDialog({
   const titleInput = useRef<HTMLInputElement>(null)
   const mounted = useRef(true)
 
-  useEffect(
-    () => () => {
+  useEffect(() => {
+    mounted.current = true
+    return () => {
       mounted.current = false
-    },
-    [],
-  )
+    }
+  }, [])
 
   const submit = async (event: React.FormEvent<HTMLFormElement>): Promise<void> => {
     event.preventDefault()
     if (busy) return
     if (!title.trim() || !slug.trim()) return
     setBusy(true)
-    const result = await onCreate({
-      title: title.trim(),
-      slug: slug.trim(),
-      domain,
-      visibility,
-      date: shanghaiCalendarDate(),
-      description: description.trim(),
-      tags: tags
-        .split(/[,，]/)
-        .map((tag) => tag.trim())
-        .filter(Boolean),
-      body: `# ${title.trim()}\n`,
-    })
+    setError("")
+    let result: string | undefined
+    try {
+      result = await onCreate({
+        title: title.trim(),
+        slug: slug.trim(),
+        domain,
+        visibility,
+        date: shanghaiCalendarDate(),
+        description: description.trim(),
+        tags: tags
+          .split(/[,，]/)
+          .map((tag) => tag.trim())
+          .filter(Boolean),
+        body: `# ${title.trim()}\n`,
+      })
+    } catch (caught) {
+      if (!mounted.current) return
+      setBusy(false)
+      setError(caught instanceof Error ? caught.message : "无法创建笔记，请稍后重试。")
+      return
+    }
     if (!mounted.current) return
     setBusy(false)
     if (result) setError(result)

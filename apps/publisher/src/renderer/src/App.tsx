@@ -26,8 +26,34 @@ const MAX_SIDEBAR = 420
 const MIN_EDITOR = 360
 const MAX_EDITOR = 900
 const MIN_PREVIEW = 360
+const COMPACT_PANE_BREAKPOINT = 1050
 
-function storedPaneSizes(): { sidebar: number; editor: number } | undefined {
+type PaneSizes = { sidebar: number; editor: number }
+
+function clampPaneSizes(value: PaneSizes, width: number): PaneSizes {
+  if (width <= COMPACT_PANE_BREAKPOINT) {
+    return {
+      sidebar: Math.min(
+        value.sidebar,
+        Math.min(MAX_SIDEBAR, Math.max(MIN_SIDEBAR, width - MIN_EDITOR)),
+      ),
+      editor: MIN_EDITOR,
+    }
+  }
+  const sidebar = Math.min(
+    value.sidebar,
+    Math.min(MAX_SIDEBAR, Math.max(MIN_SIDEBAR, width - MIN_EDITOR - MIN_PREVIEW)),
+  )
+  return {
+    sidebar,
+    editor: Math.min(
+      value.editor,
+      Math.min(MAX_EDITOR, Math.max(MIN_EDITOR, width - sidebar - MIN_PREVIEW)),
+    ),
+  }
+}
+
+function storedPaneSizes(width: number): PaneSizes | undefined {
   try {
     const value = JSON.parse(localStorage.getItem(PANE_STORAGE_KEY) ?? "null") as unknown
     if (
@@ -46,10 +72,10 @@ function storedPaneSizes(): { sidebar: number; editor: number } | undefined {
     ) {
       return undefined
     }
-    const width = window.innerWidth || 1440
-    const sidebar = Math.min(value.sidebar, Math.max(MIN_SIDEBAR, width - MIN_EDITOR - MIN_PREVIEW))
-    const editor = Math.min(value.editor, Math.max(MIN_EDITOR, width - sidebar - MIN_PREVIEW))
-    return { sidebar, editor }
+    return clampPaneSizes(
+      { sidebar: value.sidebar as number, editor: value.editor as number },
+      width,
+    )
   } catch {
     return undefined
   }
@@ -141,7 +167,8 @@ function PublisherApp({ api }: { readonly api: GardenApi }): React.JSX.Element {
     path: string
     messages: readonly string[]
   }>()
-  const initialPaneSizes = useRef(storedPaneSizes())
+  const [workspaceWidth, setWorkspaceWidth] = useState(window.innerWidth || 1440)
+  const initialPaneSizes = useRef(storedPaneSizes(workspaceWidth))
   const [paneSizes, setPaneSizes] = useState(initialPaneSizes.current ?? DEFAULT_PANE_SIZES)
   const [customPaneSizes, setCustomPaneSizes] = useState(Boolean(initialPaneSizes.current))
   const confirmationCancel = useRef<HTMLButtonElement>(null)
@@ -151,6 +178,11 @@ function PublisherApp({ api }: { readonly api: GardenApi }): React.JSX.Element {
   const previewRequest = useRef(0)
   const changesRequest = useRef(0)
   const previewStart = useRef<ReturnType<GardenApi["preview"]["start"]> | undefined>(undefined)
+  const safePaneSizes = useMemo(
+    () => clampPaneSizes(paneSizes, workspaceWidth),
+    [paneSizes, workspaceWidth],
+  )
+  const compactPanes = workspaceWidth <= COMPACT_PANE_BREAKPOINT
 
   const selectedNote = useMemo(
     () => notes.find((note) => note.path === selectedPath),
@@ -161,6 +193,28 @@ function PublisherApp({ api }: { readonly api: GardenApi }): React.JSX.Element {
     appMounted.current = true
     return () => {
       appMounted.current = false
+    }
+  }, [])
+
+  useEffect(() => {
+    const updateWidth = (width: number): void => {
+      if (Number.isFinite(width) && width > 0) setWorkspaceWidth(width)
+    }
+    const measure = (): void => {
+      updateWidth(workspace.current?.clientWidth || window.innerWidth || 1440)
+    }
+    measure()
+    const observer =
+      typeof ResizeObserver === "undefined"
+        ? undefined
+        : new ResizeObserver((entries) => {
+            updateWidth(entries[0]?.contentRect.width || window.innerWidth || 1440)
+          })
+    if (workspace.current) observer?.observe(workspace.current)
+    window.addEventListener("resize", measure)
+    return () => {
+      observer?.disconnect()
+      window.removeEventListener("resize", measure)
     }
   }, [])
 
@@ -279,17 +333,26 @@ function PublisherApp({ api }: { readonly api: GardenApi }): React.JSX.Element {
 
   useEffect(() => {
     if (!customPaneSizes) return
-    localStorage.setItem(PANE_STORAGE_KEY, JSON.stringify(paneSizes))
-  }, [customPaneSizes, paneSizes])
+    if (paneSizes.sidebar !== safePaneSizes.sidebar || paneSizes.editor !== safePaneSizes.editor) {
+      setPaneSizes(safePaneSizes)
+    }
+    try {
+      localStorage.setItem(PANE_STORAGE_KEY, JSON.stringify(safePaneSizes))
+    } catch {
+      // Persistence is optional; resizing must keep working when storage is unavailable or full.
+    }
+  }, [customPaneSizes, paneSizes, safePaneSizes])
 
-  const availableWidth = (): number => workspace.current?.clientWidth || 1440
   const resizeSidebar = (sidebar: number): void => {
     setCustomPaneSizes(true)
     setPaneSizes((current) => ({
       ...current,
       sidebar: Math.min(
         MAX_SIDEBAR,
-        Math.max(MIN_SIDEBAR, Math.min(sidebar, availableWidth() - current.editor - MIN_PREVIEW)),
+        Math.max(
+          MIN_SIDEBAR,
+          Math.min(sidebar, workspaceWidth - safePaneSizes.editor - MIN_PREVIEW),
+        ),
       ),
     }))
   }
@@ -299,7 +362,10 @@ function PublisherApp({ api }: { readonly api: GardenApi }): React.JSX.Element {
       ...current,
       editor: Math.min(
         MAX_EDITOR,
-        Math.max(MIN_EDITOR, Math.min(editor, availableWidth() - current.sidebar - MIN_PREVIEW)),
+        Math.max(
+          MIN_EDITOR,
+          Math.min(editor, workspaceWidth - safePaneSizes.sidebar - MIN_PREVIEW),
+        ),
       ),
     }))
   }
@@ -361,6 +427,7 @@ function PublisherApp({ api }: { readonly api: GardenApi }): React.JSX.Element {
     setVisibilityError(undefined)
     try {
       const result = await api.notes.changeVisibility({ path: note.path, visibility })
+      if (!appMounted.current) return
       if (!result.ok) {
         setVisibilityError({ path: note.path, title: note.title, message: result.error.message })
         return
@@ -386,13 +453,14 @@ function PublisherApp({ api }: { readonly api: GardenApi }): React.JSX.Element {
           : undefined,
       )
     } catch (error) {
+      if (!appMounted.current) return
       setVisibilityError({
         path: note.path,
         title: note.title,
         message: error instanceof Error ? error.message : "无法更改这篇笔记的可见性",
       })
     } finally {
-      setVisibilityBusy(false)
+      if (appMounted.current) setVisibilityBusy(false)
     }
   }
 
@@ -454,12 +522,13 @@ function PublisherApp({ api }: { readonly api: GardenApi }): React.JSX.Element {
 
       <div
         ref={workspace}
-        className="workspace-grid"
+        className={`workspace-grid${compactPanes ? " compact-panes" : ""}`}
         style={
           customPaneSizes
-            ? {
-                gridTemplateColumns: `${paneSizes.sidebar}px ${paneSizes.editor}px minmax(360px, 1fr)`,
-              }
+            ? ({
+                "--sidebar-width": `${safePaneSizes.sidebar}px`,
+                "--editor-width": `${safePaneSizes.editor}px`,
+              } as React.CSSProperties)
             : undefined
         }
       >
@@ -472,30 +541,34 @@ function PublisherApp({ api }: { readonly api: GardenApi }): React.JSX.Element {
           onCreate={createNote}
           onRetry={() => void loadNotes()}
           separator={
-            <PaneSeparator
-              label="调整笔记栏宽度"
-              value={paneSizes.sidebar}
-              minimum={MIN_SIDEBAR}
-              maximum={Math.max(
-                MIN_SIDEBAR,
-                Math.min(MAX_SIDEBAR, availableWidth() - paneSizes.editor - MIN_PREVIEW),
-              )}
-              onResize={resizeSidebar}
-            />
+            !compactPanes ? (
+              <PaneSeparator
+                label="调整笔记栏宽度"
+                value={safePaneSizes.sidebar}
+                minimum={MIN_SIDEBAR}
+                maximum={Math.max(
+                  MIN_SIDEBAR,
+                  Math.min(MAX_SIDEBAR, workspaceWidth - safePaneSizes.editor - MIN_PREVIEW),
+                )}
+                onResize={resizeSidebar}
+              />
+            ) : undefined
           }
         />
 
         <section className="editor-pane pane" aria-label="Markdown 编辑器" role="region">
-          <PaneSeparator
-            label="调整编辑器宽度"
-            value={paneSizes.editor}
-            minimum={MIN_EDITOR}
-            maximum={Math.max(
-              MIN_EDITOR,
-              Math.min(MAX_EDITOR, availableWidth() - paneSizes.sidebar - MIN_PREVIEW),
-            )}
-            onResize={resizeEditor}
-          />
+          {!compactPanes ? (
+            <PaneSeparator
+              label="调整编辑器宽度"
+              value={safePaneSizes.editor}
+              minimum={MIN_EDITOR}
+              maximum={Math.max(
+                MIN_EDITOR,
+                Math.min(MAX_EDITOR, workspaceWidth - safePaneSizes.sidebar - MIN_PREVIEW),
+              )}
+              onResize={resizeEditor}
+            />
+          ) : null}
           <header className="editor-header">
             <div className="path-heading">
               <span className="eyebrow">当前笔记</span>

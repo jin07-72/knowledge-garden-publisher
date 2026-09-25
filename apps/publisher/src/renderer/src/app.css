@@ -129,7 +129,9 @@ button {
   min-width: 0;
   min-height: 0;
   display: grid;
-  grid-template-columns: minmax(190px, 0.22fr) minmax(360px, 0.9fr) minmax(360px, 1fr);
+  grid-template-columns:
+    var(--sidebar-width, minmax(190px, 0.22fr))
+    var(--editor-width, minmax(360px, 0.9fr)) minmax(360px, 1fr);
   overflow: auto;
 }
 .pane {
@@ -166,6 +168,14 @@ button {
 .pane-separator:hover::after,
 .pane-separator:focus-visible::after {
   background: #8bd5ca;
+}
+.workspace-grid.compact-panes {
+  grid-template-columns: var(--sidebar-width, minmax(190px, 0.42fr)) minmax(360px, 1fr);
+}
+.workspace-grid.compact-panes .preview-pane {
+  grid-column: 1 / -1;
+  min-height: 420px;
+  border-top: 1px solid #303640;
 }
 .sidebar {
   display: flex;
@@ -830,7 +840,7 @@ button {
 
 @media (max-width: 1050px) {
   .workspace-grid {
-    grid-template-columns: minmax(190px, 0.42fr) minmax(360px, 1fr) !important;
+    grid-template-columns: var(--sidebar-width, minmax(190px, 0.42fr)) minmax(360px, 1fr) !important;
   }
   .preview-pane {
     grid-column: 1 / -1;

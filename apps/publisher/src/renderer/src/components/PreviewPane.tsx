@@ -30,9 +30,13 @@ export function PreviewPane({ note, preview, onLoadHistory }: PreviewPaneProps):
     if (tab !== "history") return
     let active = true
     setHistoryMessage("正在读取历史记录…")
-    void onLoadHistory().then((message) => {
-      if (active) setHistoryMessage(message)
-    })
+    void onLoadHistory()
+      .then((message) => {
+        if (active) setHistoryMessage(message)
+      })
+      .catch(() => {
+        if (active) setHistoryMessage("无法读取历史记录，请稍后重试。")
+      })
     return () => {
       active = false
     }
