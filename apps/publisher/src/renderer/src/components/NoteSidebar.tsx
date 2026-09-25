@@ -1,6 +1,7 @@
 import { useMemo, useRef, useState } from "react"
 import { FilePlus2, Search, X } from "lucide-react"
 import type { NoteCreateRequest, NoteSummary, Visibility } from "../../../shared/contracts"
+import { ModalShell } from "./ModalShell"
 
 type DomainFilter = NoteSummary["domain"] | "all"
 type VisibilityFilter = Visibility | "all"
@@ -44,6 +45,7 @@ function NewNoteDialog({
   const [visibility, setVisibility] = useState<Visibility>("public")
   const [error, setError] = useState("")
   const [busy, setBusy] = useState(false)
+  const titleInput = useRef<HTMLInputElement>(null)
 
   const submit = async (event: React.FormEvent<HTMLFormElement>): Promise<void> => {
     event.preventDefault()
@@ -68,118 +70,109 @@ function NewNoteDialog({
   }
 
   return (
-    <div className="dialog-backdrop">
-      <section
-        className="new-note-dialog"
-        role="dialog"
-        aria-modal="true"
-        aria-labelledby="new-note-title"
-        onKeyDown={(event) => {
-          if (event.key !== "Escape") return
-          event.preventDefault()
-          onClose()
-        }}
-      >
-        <header>
-          <h2 id="new-note-title">新建笔记</h2>
-          <button type="button" className="icon-button" aria-label="关闭" onClick={onClose}>
-            <X size={18} />
+    <ModalShell
+      labelId="new-note-title"
+      className="new-note-dialog"
+      initialFocus={titleInput}
+      onClose={onClose}
+    >
+      <header>
+        <h2 id="new-note-title">新建笔记</h2>
+        <button type="button" className="icon-button" aria-label="关闭" onClick={onClose}>
+          <X size={18} />
+        </button>
+      </header>
+      <form onSubmit={(event) => void submit(event)}>
+        <label>
+          标题
+          <input
+            ref={titleInput}
+            value={title}
+            onChange={(event) => setTitle(event.target.value)}
+            required
+          />
+        </label>
+        <label>
+          文件名
+          <input
+            value={slug}
+            onChange={(event) => setSlug(event.target.value)}
+            required
+            pattern="[a-z0-9][a-z0-9-]*"
+          />
+        </label>
+        <label>
+          描述
+          <input
+            value={description}
+            onChange={(event) => setDescription(event.target.value)}
+            required
+          />
+        </label>
+        <label>
+          标签
+          <input
+            value={tags}
+            onChange={(event) => setTags(event.target.value)}
+            placeholder="用逗号分隔"
+            required
+          />
+        </label>
+        <label>
+          领域
+          <select
+            value={domain}
+            onChange={(event) => setDomain(event.target.value as NoteSummary["domain"])}
+          >
+            {domains.slice(1).map((item) => (
+              <option key={item.value} value={item.value}>
+                {item.label}
+              </option>
+            ))}
+          </select>
+        </label>
+        <fieldset>
+          <legend>可见性</legend>
+          <label>
+            <input
+              type="radio"
+              name="visibility"
+              value="public"
+              checked={visibility === "public"}
+              onChange={() => setVisibility("public")}
+            />
+            公开
+          </label>
+          <label>
+            <input
+              type="radio"
+              name="visibility"
+              value="private"
+              checked={visibility === "private"}
+              onChange={() => setVisibility("private")}
+            />
+            私密
+          </label>
+        </fieldset>
+        {error ? (
+          <p className="form-error" role="alert">
+            {error}
+          </p>
+        ) : null}
+        <div className="dialog-actions">
+          <button type="button" className="secondary-button" onClick={onClose}>
+            取消
           </button>
-        </header>
-        <form onSubmit={(event) => void submit(event)}>
-          <label>
-            标题
-            <input
-              autoFocus
-              value={title}
-              onChange={(event) => setTitle(event.target.value)}
-              required
-            />
-          </label>
-          <label>
-            文件名
-            <input
-              value={slug}
-              onChange={(event) => setSlug(event.target.value)}
-              required
-              pattern="[a-z0-9][a-z0-9-]*"
-            />
-          </label>
-          <label>
-            描述
-            <input
-              value={description}
-              onChange={(event) => setDescription(event.target.value)}
-              required
-            />
-          </label>
-          <label>
-            标签
-            <input
-              value={tags}
-              onChange={(event) => setTags(event.target.value)}
-              placeholder="用逗号分隔"
-              required
-            />
-          </label>
-          <label>
-            领域
-            <select
-              value={domain}
-              onChange={(event) => setDomain(event.target.value as NoteSummary["domain"])}
-            >
-              {domains.slice(1).map((item) => (
-                <option key={item.value} value={item.value}>
-                  {item.label}
-                </option>
-              ))}
-            </select>
-          </label>
-          <fieldset>
-            <legend>可见性</legend>
-            <label>
-              <input
-                type="radio"
-                name="visibility"
-                value="public"
-                checked={visibility === "public"}
-                onChange={() => setVisibility("public")}
-              />
-              公开
-            </label>
-            <label>
-              <input
-                type="radio"
-                name="visibility"
-                value="private"
-                checked={visibility === "private"}
-                onChange={() => setVisibility("private")}
-              />
-              私密
-            </label>
-          </fieldset>
-          {error ? (
-            <p className="form-error" role="alert">
-              {error}
-            </p>
-          ) : null}
-          <div className="dialog-actions">
-            <button type="button" className="secondary-button" onClick={onClose}>
-              取消
-            </button>
-            <button
-              type="submit"
-              className="primary-button"
-              disabled={
-                busy || !title.trim() || !slug.trim() || !description.trim() || !tags.trim()
-              }
-            >
-              创建
-            </button>
-          </div>
-        </form>
-      </section>
-    </div>
+          <button
+            type="submit"
+            className="primary-button"
+            disabled={busy || !title.trim() || !slug.trim() || !description.trim() || !tags.trim()}
+          >
+            创建
+          </button>
+        </div>
+      </form>
+    </ModalShell>
   )
 }
 
@@ -192,7 +185,7 @@ export function NoteSidebar(props: NoteSidebarProps): React.JSX.Element {
 
   const closeCreate = (): void => {
     setCreating(false)
-    createButton.current?.focus()
+    queueMicrotask(() => createButton.current?.focus())
   }
 
   const filteredNotes = useMemo(() => {

@@ -441,6 +441,44 @@ button {
     monospace;
   white-space: pre-wrap;
 }
+.global-alert {
+  position: fixed;
+  z-index: 40;
+  top: 68px;
+  right: 18px;
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  max-width: min(430px, calc(100vw - 36px));
+  padding: 9px 11px;
+  border: 1px solid #754d3c;
+  border-radius: 7px;
+  color: #ffe1d3;
+  background: #3a241eea;
+  box-shadow: 0 12px 30px #0008;
+  font-size: 12px;
+}
+.editor-load-error {
+  display: flex;
+  min-height: 220px;
+  align-items: center;
+  justify-content: center;
+  flex-direction: column;
+  gap: 9px;
+  color: #aab4bf;
+  text-align: center;
+}
+.editor-load-error strong {
+  color: #f0f3f6;
+}
+.editor-load-error button {
+  margin-top: 5px;
+  padding: 7px 11px;
+  border: 1px solid #4b5663;
+  border-radius: 6px;
+  background: #20262e;
+  cursor: pointer;
+}
 .editor-gutter {
   position: absolute;
   top: 23px;
@@ -735,6 +773,30 @@ button {
   margin: 0;
   color: #f5a97f;
   font-size: 11px;
+}
+.visibility-confirm-dialog {
+  width: min(460px, 100%);
+}
+.visibility-confirm-copy {
+  display: grid;
+  gap: 8px;
+  padding: 4px 0 13px;
+}
+.visibility-confirm-copy p,
+.visibility-confirm-copy small {
+  margin: 0;
+}
+.visibility-confirm-copy p {
+  color: #f0f3f6;
+  font-size: 13px;
+}
+.visibility-confirm-copy small {
+  color: #99a3af;
+  font-size: 11px;
+  line-height: 1.5;
+}
+.warning-button {
+  background: #f5a97f;
 }
 
 @media (max-width: 1050px) {

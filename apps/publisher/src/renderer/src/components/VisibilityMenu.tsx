@@ -4,7 +4,7 @@ import type { Visibility } from "../../../shared/contracts"
 
 const options: readonly { value: Visibility; label: string; consequence: string }[] = [
   { value: "public", label: "公开", consequence: "发布后进入网站和 GitHub" },
-  { value: "private", label: "私密", consequence: "只保留在这台电脑上" },
+  { value: "private", label: "私密", consequence: "移入私密目录；已发布副本需发布后下架" },
 ]
 
 interface VisibilityMenuProps {

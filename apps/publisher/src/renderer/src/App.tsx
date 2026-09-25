@@ -1,5 +1,5 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from "react"
-import { BookOpen, Check, Eye, GitBranch, LoaderCircle } from "lucide-react"
+import { BookOpen, Check, Eye, GitBranch, LoaderCircle, TriangleAlert } from "lucide-react"
 import type {
   AppError,
   GardenApi,
@@ -11,6 +11,7 @@ import type {
   Visibility,
 } from "../../shared/contracts"
 import { NoteSidebar } from "./components/NoteSidebar"
+import { ModalShell } from "./components/ModalShell"
 import { PreviewPane } from "./components/PreviewPane"
 import { VisibilityMenu } from "./components/VisibilityMenu"
 import "./app.css"
@@ -80,6 +81,8 @@ function PublisherApp({ api }: { readonly api: GardenApi }): React.JSX.Element {
   const [notes, setNotes] = useState<readonly NoteSummary[]>([])
   const [selectedPath, setSelectedPath] = useState<string>()
   const [document, setDocument] = useState<NoteDocument>()
+  const [documentError, setDocumentError] = useState<string>()
+  const [documentRetry, setDocumentRetry] = useState(0)
   const [notesState, setNotesState] = useState<LoadState>("loading")
   const [notesMessage, setNotesMessage] = useState("正在读取花园…")
   const [preview, setPreview] = useState<PreviewStatus>(stoppedPreview)
@@ -87,12 +90,22 @@ function PublisherApp({ api }: { readonly api: GardenApi }): React.JSX.Element {
   const [publishMessage, setPublishMessage] = useState("正在检查可发布变化…")
   const [publishProgress, setPublishProgress] = useState<PublishProgress>()
   const [visibilityBusy, setVisibilityBusy] = useState(false)
+  const [visibilityError, setVisibilityError] = useState<{
+    path: string
+    title: string
+    message: string
+  }>()
+  const [pendingVisibility, setPendingVisibility] = useState<{
+    note: NoteSummary
+    visibility: Visibility
+  }>()
   const [visibilityNotice, setVisibilityNotice] = useState<{
     path: string
     messages: readonly string[]
   }>()
   const [paneSizes, setPaneSizes] = useState({ sidebar: 240, editor: 520 })
   const [customPaneSizes, setCustomPaneSizes] = useState(false)
+  const confirmationCancel = useRef<HTMLButtonElement>(null)
 
   const selectedNote = useMemo(
     () => notes.find((note) => note.path === selectedPath),
@@ -155,19 +168,27 @@ function PublisherApp({ api }: { readonly api: GardenApi }): React.JSX.Element {
   useEffect(() => {
     if (!selectedPath) {
       setDocument(undefined)
+      setDocumentError(undefined)
       return
     }
     let active = true
     setDocument(undefined)
-    void api.notes.read({ path: selectedPath }).then((result) => {
-      if (!active) return
-      if (result.ok) setDocument(result.value)
-      else setNotesMessage(result.error.message)
-    })
+    setDocumentError(undefined)
+    void api.notes
+      .read({ path: selectedPath })
+      .then((result) => {
+        if (!active) return
+        if (result.ok) setDocument(result.value)
+        else setDocumentError(result.error.message)
+      })
+      .catch((error: unknown) => {
+        if (!active) return
+        setDocumentError(error instanceof Error ? error.message : "无法读取这篇笔记")
+      })
     return () => {
       active = false
     }
-  }, [api, selectedPath])
+  }, [api, documentRetry, selectedPath])
 
   const createNote = async (request: NoteCreateRequest): Promise<string | undefined> => {
     const result = await api.notes.create(request)
@@ -194,20 +215,25 @@ function PublisherApp({ api }: { readonly api: GardenApi }): React.JSX.Element {
     return undefined
   }
 
-  const changeVisibility = async (visibility: Visibility): Promise<void> => {
-    if (!selectedNote || visibility === selectedNote.visibility || visibilityBusy) return
+  const changeVisibility = async (note: NoteSummary, visibility: Visibility): Promise<void> => {
+    if (visibility === note.visibility || visibilityBusy) return
     setVisibilityBusy(true)
-    const result = await api.notes.changeVisibility({ path: selectedNote.path, visibility })
-    if (result.ok) {
-      const nextPath = movedPath(selectedNote, visibility)
+    setVisibilityError(undefined)
+    try {
+      const result = await api.notes.changeVisibility({ path: note.path, visibility })
+      if (!result.ok) {
+        setVisibilityError({ path: note.path, title: note.title, message: result.error.message })
+        return
+      }
+      const nextPath = movedPath(note, visibility)
       setNotes((current) =>
-        current.map((note) =>
-          note.path === selectedNote.path ? { ...note, visibility, path: nextPath } : note,
+        current.map((candidate) =>
+          candidate.path === note.path ? { ...candidate, visibility, path: nextPath } : candidate,
         ),
       )
-      setSelectedPath((current) => (current === selectedNote.path ? nextPath : current))
+      setSelectedPath((current) => (current === note.path ? nextPath : current))
       setDocument((current) =>
-        current?.path === selectedNote.path ? { ...current, path: nextPath } : current,
+        current?.path === note.path ? { ...current, path: nextPath } : current,
       )
       const consequenceMessages = [
         ...(result.value.pendingPublicDeletion ? ["仍在线，等待发布下架"] : []),
@@ -219,10 +245,25 @@ function PublisherApp({ api }: { readonly api: GardenApi }): React.JSX.Element {
           ? { path: nextPath, messages: consequenceMessages }
           : undefined,
       )
-    } else {
-      setNotesMessage(result.error.message)
+    } catch (error) {
+      setVisibilityError({
+        path: note.path,
+        title: note.title,
+        message: error instanceof Error ? error.message : "无法更改这篇笔记的可见性",
+      })
+    } finally {
+      setVisibilityBusy(false)
     }
-    setVisibilityBusy(false)
+  }
+
+  const requestVisibility = (note: NoteSummary, visibility: Visibility): void => {
+    if (visibility === note.visibility || visibilityBusy) return
+    setVisibilityError(undefined)
+    if (note.visibility === "public" && visibility === "private") {
+      setPendingVisibility({ note, visibility })
+      return
+    }
+    void changeVisibility(note, visibility)
   }
 
   const loadHistory = useCallback(async (): Promise<string> => {
@@ -261,6 +302,15 @@ function PublisherApp({ api }: { readonly api: GardenApi }): React.JSX.Element {
           {previewLabel[preview.state]}
         </div>
       </header>
+
+      {visibilityError ? (
+        <div className="global-alert" role="alert" data-note-path={visibilityError.path}>
+          <TriangleAlert size={16} aria-hidden="true" />
+          <span>
+            {visibilityError.title}：{visibilityError.message}
+          </span>
+        </div>
+      ) : null}
 
       <div
         className="workspace-grid"
@@ -320,23 +370,34 @@ function PublisherApp({ api }: { readonly api: GardenApi }): React.JSX.Element {
               <VisibilityMenu
                 value={selectedNote.visibility}
                 disabled={visibilityBusy}
-                onChange={(value) => void changeVisibility(value)}
+                onChange={(value) => requestVisibility(selectedNote, value)}
               />
             ) : null}
           </header>
           <div className="editor-placeholder" data-editor-document={document?.path ?? ""}>
             {selectedNote ? (
-              <>
-                <div className="editor-gutter" aria-hidden="true">
-                  1<br />2<br />3<br />4<br />5<br />6
+              documentError ? (
+                <div className="editor-load-error" role="alert">
+                  <TriangleAlert size={24} aria-hidden="true" />
+                  <strong>无法读取当前笔记</strong>
+                  <span>{documentError}</span>
+                  <button type="button" onClick={() => setDocumentRetry((current) => current + 1)}>
+                    重试读取
+                  </button>
                 </div>
-                <pre aria-label="Markdown 源文档预览">
-                  {document?.markdown ?? "正在载入 Markdown…"}
-                </pre>
-                <p className="editor-notice">
-                  编辑器接口已就绪；Markdown 编辑、自动保存与 Wiki 补全将在下一阶段接入。
-                </p>
-              </>
+              ) : (
+                <>
+                  <div className="editor-gutter" aria-hidden="true">
+                    1<br />2<br />3<br />4<br />5<br />6
+                  </div>
+                  <pre aria-label="Markdown 源文档预览">
+                    {document?.markdown ?? "正在载入 Markdown…"}
+                  </pre>
+                  <p className="editor-notice">
+                    编辑器接口已就绪；Markdown 编辑、自动保存与 Wiki 补全将在下一阶段接入。
+                  </p>
+                </>
+              )
             ) : (
               <div className="empty-state">
                 <BookOpen size={28} />
@@ -372,6 +433,45 @@ function PublisherApp({ api }: { readonly api: GardenApi }): React.JSX.Element {
           检查并发布
         </button>
       </footer>
+
+      {pendingVisibility ? (
+        <ModalShell
+          labelId="private-confirm-title"
+          className="new-note-dialog visibility-confirm-dialog"
+          initialFocus={confirmationCancel}
+          onClose={() => setPendingVisibility(undefined)}
+        >
+          <header>
+            <h2 id="private-confirm-title">确认设为私密</h2>
+          </header>
+          <div className="visibility-confirm-copy">
+            <p>当前在线副本要等发布下架</p>
+            <p>Git 历史可能仍可见</p>
+            <small>如果这篇笔记从未发布，上述在线与历史提醒可能不适用。</small>
+          </div>
+          <div className="dialog-actions">
+            <button
+              ref={confirmationCancel}
+              type="button"
+              className="secondary-button"
+              onClick={() => setPendingVisibility(undefined)}
+            >
+              取消
+            </button>
+            <button
+              type="button"
+              className="primary-button warning-button"
+              onClick={() => {
+                const pending = pendingVisibility
+                setPendingVisibility(undefined)
+                void changeVisibility(pending.note, pending.visibility)
+              }}
+            >
+              确认设为私密
+            </button>
+          </div>
+        </ModalShell>
+      ) : null}
     </main>
   )
 }

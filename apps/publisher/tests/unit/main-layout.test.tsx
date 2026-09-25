@@ -200,15 +200,33 @@ describe("publisher main layout", () => {
     expect(await screen.findByText("private/life/new-note.md")).toBeVisible()
   })
 
-  it("closes the new-note dialog with Escape and restores trigger focus", async () => {
+  it("traps focus in the inert new-note modal and restores trigger focus", async () => {
     const user = userEvent.setup()
     render(<App />)
 
     const trigger = await screen.findByRole("button", { name: "新建笔记" })
     await user.click(trigger)
-    expect(screen.getByRole("dialog", { name: "新建笔记" })).toBeVisible()
+    const dialog = screen.getByRole("dialog", { name: "新建笔记" })
+    const shell = document.querySelector(".app-shell")
+    expect(dialog).toBeVisible()
+    expect(within(dialog).getByRole("textbox", { name: "标题" })).toHaveFocus()
+    expect(shell).toHaveAttribute("inert")
+    expect(shell).toHaveAttribute("aria-hidden", "true")
+
+    const close = within(dialog).getByRole("button", { name: "关闭" })
+    const cancel = within(dialog).getByRole("button", { name: "取消" })
+    close.focus()
+    await user.tab({ shift: true })
+    expect(cancel).toHaveFocus()
+    await user.tab()
+    expect(close).toHaveFocus()
+
+    fireEvent.pointerDown(document.querySelector(".dialog-backdrop")!)
+    expect(dialog).toBeVisible()
     await user.keyboard("{Escape}")
     expect(screen.queryByRole("dialog", { name: "新建笔记" })).not.toBeInTheDocument()
+    expect(shell).not.toHaveAttribute("inert")
+    expect(shell).not.toHaveAttribute("aria-hidden")
     expect(trigger).toHaveFocus()
   })
 
@@ -220,11 +238,24 @@ describe("publisher main layout", () => {
     expect(visibility).toHaveAttribute("aria-haspopup", "menu")
     await user.click(visibility)
     expect(screen.getByText("发布后进入网站和 GitHub")).toBeVisible()
-    expect(screen.getByText("只保留在这台电脑上")).toBeVisible()
+    expect(screen.getByText("移入私密目录；已发布副本需发布后下架")).toBeVisible()
+    expect(screen.queryByText("只保留在这台电脑上")).not.toBeInTheDocument()
 
     const privateOption = screen.getByRole("menuitemradio", { name: /私密/ })
     privateOption.focus()
     await user.keyboard("{Enter}")
+
+    const confirm = screen.getByRole("dialog", { name: "确认设为私密" })
+    expect(within(confirm).getByText("当前在线副本要等发布下架")).toBeVisible()
+    expect(within(confirm).getByText("Git 历史可能仍可见")).toBeVisible()
+    expect(garden.notes.changeVisibility).not.toHaveBeenCalled()
+    await user.click(within(confirm).getByRole("button", { name: "取消" }))
+    expect(visibility).toHaveFocus()
+
+    await user.click(visibility)
+    await user.click(screen.getByRole("menuitemradio", { name: /私密/ }))
+    const confirmed = screen.getByRole("dialog", { name: "确认设为私密" })
+    await user.click(within(confirmed).getByRole("button", { name: "确认设为私密" }))
 
     await waitFor(() => {
       expect(garden.notes.changeVisibility).toHaveBeenCalledWith({
@@ -255,6 +286,11 @@ describe("publisher main layout", () => {
 
     await user.click(visibility)
     await user.click(screen.getByRole("menuitemradio", { name: /私密/ }))
+    await user.click(
+      within(screen.getByRole("dialog", { name: "确认设为私密" })).getByRole("button", {
+        name: "确认设为私密",
+      }),
+    )
     expect(await screen.findByText("仍在线，等待发布下架")).toBeVisible()
     expect(screen.getByText("Git 历史仍可能保留公开内容")).toBeVisible()
   })
@@ -281,6 +317,66 @@ describe("publisher main layout", () => {
     expect(await screen.findByText("# 私密阅读札记", { exact: false })).toBeVisible()
   })
 
+  it("shows note-read failures in the editor and supports retry", async () => {
+    const user = userEvent.setup()
+    vi.mocked(garden.notes.read)
+      .mockResolvedValueOnce(unavailable<NoteDocument>("无法读取这篇笔记"))
+      .mockResolvedValueOnce(ok(documents.get(notes[0].path)!))
+    render(<App />)
+
+    const editor = screen.getByRole("region", { name: "Markdown 编辑器" })
+    expect(await within(editor).findByRole("alert")).toHaveTextContent("无法读取这篇笔记")
+    expect(within(editor).queryByText("正在载入 Markdown…")).not.toBeInTheDocument()
+    await user.click(within(editor).getByRole("button", { name: "重试读取" }))
+    expect(await within(editor).findByText("# CSS Grid 布局", { exact: false })).toBeVisible()
+  })
+
+  it("keeps the public selection and announces a visibility failure", async () => {
+    const user = userEvent.setup()
+    vi.mocked(garden.notes.changeVisibility).mockResolvedValueOnce(
+      unavailable<NoteTransactionReceipt>("无法移动这篇笔记"),
+    )
+    render(<App />)
+
+    await user.click(await screen.findByRole("button", { name: "可见性：公开" }))
+    await user.click(screen.getByRole("menuitemradio", { name: /私密/ }))
+    const confirm = screen.getByRole("dialog", { name: "确认设为私密" })
+    await user.click(within(confirm).getByRole("button", { name: "确认设为私密" }))
+
+    const editor = screen.getByRole("region", { name: "Markdown 编辑器" })
+    expect(await screen.findByRole("alert")).toHaveTextContent("无法移动这篇笔记")
+    expect(within(editor).queryByRole("alert")).not.toBeInTheDocument()
+    expect(screen.getByRole("button", { name: "可见性：公开" })).toBeVisible()
+    expect(screen.getByText("content/technology/css-grid.md")).toBeVisible()
+  })
+
+  it("attributes a late visibility failure to its original note", async () => {
+    const user = userEvent.setup()
+    let resolveVisibility: ((value: IpcResult<NoteTransactionReceipt>) => void) | undefined
+    vi.mocked(garden.notes.changeVisibility).mockImplementation(
+      () =>
+        new Promise((resolve) => {
+          resolveVisibility = resolve
+        }),
+    )
+    render(<App />)
+
+    await user.click(await screen.findByRole("button", { name: "可见性：公开" }))
+    await user.click(screen.getByRole("menuitemradio", { name: /私密/ }))
+    await user.click(
+      within(screen.getByRole("dialog", { name: "确认设为私密" })).getByRole("button", {
+        name: "确认设为私密",
+      }),
+    )
+    await user.click(screen.getByRole("button", { name: /私密阅读札记/ }))
+
+    await act(async () => {
+      resolveVisibility?.(unavailable<NoteTransactionReceipt>("无法移动这篇笔记"))
+    })
+    expect(screen.getByRole("alert")).toHaveTextContent("CSS Grid 布局：无法移动这篇笔记")
+    expect(screen.getByText("private/reading/private-notes.md")).toBeVisible()
+  })
+
   it("does not steal selection when an earlier visibility request finishes late", async () => {
     const user = userEvent.setup()
     let resolveVisibility: ((value: IpcResult<NoteTransactionReceipt>) => void) | undefined
@@ -294,6 +390,11 @@ describe("publisher main layout", () => {
 
     await user.click(await screen.findByRole("button", { name: "可见性：公开" }))
     await user.click(screen.getByRole("menuitemradio", { name: /私密/ }))
+    await user.click(
+      within(screen.getByRole("dialog", { name: "确认设为私密" })).getByRole("button", {
+        name: "确认设为私密",
+      }),
+    )
     await user.click(screen.getByRole("button", { name: /私密阅读札记/ }))
     expect(await screen.findByText("private/reading/private-notes.md")).toBeVisible()
 
