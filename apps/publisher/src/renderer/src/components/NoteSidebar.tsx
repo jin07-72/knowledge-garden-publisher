@@ -1,4 +1,4 @@
-import { useMemo, useRef, useState } from "react"
+import { useEffect, useMemo, useRef, useState } from "react"
 import { FilePlus2, Search, X } from "lucide-react"
 import type { NoteCreateRequest, NoteSummary, Visibility } from "../../../shared/contracts"
 import { ModalShell } from "./ModalShell"
@@ -27,7 +27,20 @@ interface NoteSidebarProps {
   readonly selectedPath?: string
   readonly onSelect: (path: string) => void
   readonly onCreate: (request: NoteCreateRequest) => Promise<string | undefined>
+  readonly onRetry: () => void
   readonly separator?: React.ReactNode
+}
+
+export function shanghaiCalendarDate(date = new Date()): string {
+  const parts = new Intl.DateTimeFormat("en", {
+    timeZone: "Asia/Shanghai",
+    year: "numeric",
+    month: "2-digit",
+    day: "2-digit",
+  }).formatToParts(date)
+  const value = (type: Intl.DateTimeFormatPartTypes): string =>
+    parts.find((part) => part.type === type)?.value ?? ""
+  return `${value("year")}-${value("month")}-${value("day")}`
 }
 
 function NewNoteDialog({
@@ -46,9 +59,18 @@ function NewNoteDialog({
   const [error, setError] = useState("")
   const [busy, setBusy] = useState(false)
   const titleInput = useRef<HTMLInputElement>(null)
+  const mounted = useRef(true)
+
+  useEffect(
+    () => () => {
+      mounted.current = false
+    },
+    [],
+  )
 
   const submit = async (event: React.FormEvent<HTMLFormElement>): Promise<void> => {
     event.preventDefault()
+    if (busy) return
     if (!title.trim() || !slug.trim()) return
     setBusy(true)
     const result = await onCreate({
@@ -56,7 +78,7 @@ function NewNoteDialog({
       slug: slug.trim(),
       domain,
       visibility,
-      date: new Date().toISOString().slice(0, 10),
+      date: shanghaiCalendarDate(),
       description: description.trim(),
       tags: tags
         .split(/[,，]/)
@@ -64,6 +86,7 @@ function NewNoteDialog({
         .filter(Boolean),
       body: `# ${title.trim()}\n`,
     })
+    if (!mounted.current) return
     setBusy(false)
     if (result) setError(result)
     else onClose()
@@ -74,11 +97,20 @@ function NewNoteDialog({
       labelId="new-note-title"
       className="new-note-dialog"
       initialFocus={titleInput}
-      onClose={onClose}
+      closeDisabled={busy}
+      onClose={() => {
+        if (!busy) onClose()
+      }}
     >
       <header>
         <h2 id="new-note-title">新建笔记</h2>
-        <button type="button" className="icon-button" aria-label="关闭" onClick={onClose}>
+        <button
+          type="button"
+          className="icon-button"
+          aria-label="关闭"
+          onClick={onClose}
+          disabled={busy}
+        >
           <X size={18} />
         </button>
       </header>
@@ -160,7 +192,7 @@ function NewNoteDialog({
           </p>
         ) : null}
         <div className="dialog-actions">
-          <button type="button" className="secondary-button" onClick={onClose}>
+          <button type="button" className="secondary-button" onClick={onClose} disabled={busy}>
             取消
           </button>
           <button
@@ -221,6 +253,14 @@ export function NoteSidebar(props: NoteSidebarProps): React.JSX.Element {
           新建笔记
         </button>
       </div>
+      {props.loadState === "error" ? (
+        <div className="list-error" role="alert" aria-live="assertive">
+          <span>{props.message || "无法读取笔记列表"}</span>
+          <button type="button" onClick={props.onRetry}>
+            重试
+          </button>
+        </div>
+      ) : null}
       <label className="search-field">
         <span className="sr-only">搜索笔记</span>
         <Search size={15} aria-hidden="true" />
@@ -289,7 +329,7 @@ export function NoteSidebar(props: NoteSidebarProps): React.JSX.Element {
           </li>
         ))}
         {props.loadState === "loading" ? <li className="list-message">正在读取笔记…</li> : null}
-        {props.loadState !== "loading" && filteredNotes.length === 0 ? (
+        {props.loadState === "ready" && filteredNotes.length === 0 ? (
           <li className="list-message">{props.message || "没有符合筛选条件的笔记"}</li>
         ) : null}
       </ul>

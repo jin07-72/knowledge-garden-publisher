@@ -19,6 +19,41 @@ import "./app.css"
 type LoadState = "loading" | "ready" | "error"
 
 const stoppedPreview: PreviewStatus = { state: "stopped", generation: 0 }
+const PANE_STORAGE_KEY = "garden-publisher:pane-sizes"
+const DEFAULT_PANE_SIZES = { sidebar: 240, editor: 520 }
+const MIN_SIDEBAR = 190
+const MAX_SIDEBAR = 420
+const MIN_EDITOR = 360
+const MAX_EDITOR = 900
+const MIN_PREVIEW = 360
+
+function storedPaneSizes(): { sidebar: number; editor: number } | undefined {
+  try {
+    const value = JSON.parse(localStorage.getItem(PANE_STORAGE_KEY) ?? "null") as unknown
+    if (
+      !value ||
+      typeof value !== "object" ||
+      !("sidebar" in value) ||
+      !("editor" in value) ||
+      typeof value.sidebar !== "number" ||
+      typeof value.editor !== "number" ||
+      !Number.isFinite(value.sidebar) ||
+      !Number.isFinite(value.editor) ||
+      value.sidebar < MIN_SIDEBAR ||
+      value.sidebar > MAX_SIDEBAR ||
+      value.editor < MIN_EDITOR ||
+      value.editor > MAX_EDITOR
+    ) {
+      return undefined
+    }
+    const width = window.innerWidth || 1440
+    const sidebar = Math.min(value.sidebar, Math.max(MIN_SIDEBAR, width - MIN_EDITOR - MIN_PREVIEW))
+    const editor = Math.min(value.editor, Math.max(MIN_EDITOR, width - sidebar - MIN_PREVIEW))
+    return { sidebar, editor }
+  } catch {
+    return undefined
+  }
+}
 
 function messageFor(error: AppError, fallback: string): string {
   return error.code === "SERVICE_UNAVAILABLE" ? fallback : error.message
@@ -73,6 +108,9 @@ function PaneSeparator({
       onPointerCancel={() => {
         drag.current = undefined
       }}
+      onLostPointerCapture={() => {
+        drag.current = undefined
+      }}
     />
   )
 }
@@ -103,17 +141,43 @@ function PublisherApp({ api }: { readonly api: GardenApi }): React.JSX.Element {
     path: string
     messages: readonly string[]
   }>()
-  const [paneSizes, setPaneSizes] = useState({ sidebar: 240, editor: 520 })
-  const [customPaneSizes, setCustomPaneSizes] = useState(false)
+  const initialPaneSizes = useRef(storedPaneSizes())
+  const [paneSizes, setPaneSizes] = useState(initialPaneSizes.current ?? DEFAULT_PANE_SIZES)
+  const [customPaneSizes, setCustomPaneSizes] = useState(Boolean(initialPaneSizes.current))
   const confirmationCancel = useRef<HTMLButtonElement>(null)
+  const appMounted = useRef(true)
+  const workspace = useRef<HTMLDivElement>(null)
+  const notesRequest = useRef(0)
+  const previewRequest = useRef(0)
+  const changesRequest = useRef(0)
+  const previewStart = useRef<ReturnType<GardenApi["preview"]["start"]> | undefined>(undefined)
 
   const selectedNote = useMemo(
     () => notes.find((note) => note.path === selectedPath),
     [notes, selectedPath],
   )
 
+  useEffect(() => {
+    appMounted.current = true
+    return () => {
+      appMounted.current = false
+    }
+  }, [])
+
   const loadNotes = useCallback(async () => {
-    const result = await api.notes.list()
+    const request = ++notesRequest.current
+    setNotesState("loading")
+    setNotesMessage("正在读取花园…")
+    let result: Awaited<ReturnType<GardenApi["notes"]["list"]>>
+    try {
+      result = await api.notes.list()
+    } catch (error) {
+      if (request !== notesRequest.current) return
+      setNotesState("error")
+      setNotesMessage(error instanceof Error ? error.message : "无法读取笔记列表")
+      return
+    }
+    if (request !== notesRequest.current) return
     if (!result.ok) {
       setNotesState("error")
       setNotesMessage(result.error.message)
@@ -129,41 +193,116 @@ function PublisherApp({ api }: { readonly api: GardenApi }): React.JSX.Element {
     )
   }, [api])
 
+  const applyPreview = useCallback((next: PreviewStatus): void => {
+    setPreview((current) => {
+      if (next.generation < current.generation) return current
+      if (next.state === "error" && !next.lastSuccessfulUrl && current.lastSuccessfulUrl) {
+        return { ...next, lastSuccessfulUrl: current.lastSuccessfulUrl }
+      }
+      return next
+    })
+  }, [])
+
+  const startPreview = useCallback(() => {
+    if (!previewStart.current) {
+      previewStart.current = api.preview.start().finally(() => {
+        previewStart.current = undefined
+      })
+    }
+    return previewStart.current
+  }, [api])
+
   useEffect(() => {
     void loadNotes()
-    void api.preview.status().then(async (result) => {
-      if (!result.ok) {
-        setPreview({ state: "error", generation: 0, error: result.error })
-        return
-      }
-      setPreview(result.value)
-      if (result.value.state === "stopped") {
-        const started = await api.preview.start()
-        setPreview(
-          started.ok
-            ? started.value
-            : { state: "error", generation: result.value.generation, error: started.error },
-        )
-      }
-    })
-    void api.changes.list().then((result) => {
-      if (result.ok) {
-        setChangeCount(result.value.length)
-        setPublishMessage(
-          result.value.length === 0 ? "当前没有可发布变化" : "可查看并选择要发布的变化",
-        )
-      } else {
+    const currentPreviewRequest = ++previewRequest.current
+    void api.preview
+      .status()
+      .then(async (result) => {
+        if (currentPreviewRequest !== previewRequest.current) return
+        if (!result.ok) {
+          applyPreview({ state: "error", generation: 0, error: result.error })
+          return
+        }
+        applyPreview(result.value)
+        if (result.value.state === "stopped") {
+          const started = await startPreview()
+          if (currentPreviewRequest !== previewRequest.current) return
+          applyPreview(
+            started.ok
+              ? started.value
+              : { state: "error", generation: result.value.generation, error: started.error },
+          )
+        }
+      })
+      .catch((error: unknown) => {
+        if (currentPreviewRequest !== previewRequest.current) return
+        setPreview((current) => ({
+          state: "error",
+          generation: current.generation,
+          lastSuccessfulUrl: current.lastSuccessfulUrl ?? current.url,
+          error: {
+            code: "INTERNAL_ERROR",
+            message: error instanceof Error ? error.message : "无法读取预览状态",
+          },
+        }))
+      })
+    const currentChangesRequest = ++changesRequest.current
+    void api.changes
+      .list()
+      .then((result) => {
+        if (currentChangesRequest !== changesRequest.current) return
+        if (result.ok) {
+          setChangeCount(result.value.length)
+          setPublishMessage(
+            result.value.length === 0 ? "当前没有可发布变化" : "可查看并选择要发布的变化",
+          )
+        } else {
+          setChangeCount(undefined)
+          setPublishMessage(messageFor(result.error, "发布检查暂不可用；后续版本会接入。"))
+        }
+      })
+      .catch((error: unknown) => {
+        if (currentChangesRequest !== changesRequest.current) return
         setChangeCount(undefined)
-        setPublishMessage(messageFor(result.error, "发布检查暂不可用；后续版本会接入。"))
-      }
-    })
-    const unsubscribePreview = api.preview.onProgress(setPreview)
+        setPublishMessage(error instanceof Error ? error.message : "无法检查可发布变化")
+      })
+    const unsubscribePreview = api.preview.onProgress(applyPreview)
     const unsubscribePublish = api.publish.onProgress(setPublishProgress)
     return () => {
       unsubscribePreview()
       unsubscribePublish()
+      notesRequest.current += 1
+      previewRequest.current += 1
+      changesRequest.current += 1
     }
-  }, [api, loadNotes])
+  }, [api, applyPreview, loadNotes, startPreview])
+
+  useEffect(() => {
+    if (!customPaneSizes) return
+    localStorage.setItem(PANE_STORAGE_KEY, JSON.stringify(paneSizes))
+  }, [customPaneSizes, paneSizes])
+
+  const availableWidth = (): number => workspace.current?.clientWidth || 1440
+  const resizeSidebar = (sidebar: number): void => {
+    setCustomPaneSizes(true)
+    setPaneSizes((current) => ({
+      ...current,
+      sidebar: Math.min(
+        MAX_SIDEBAR,
+        Math.max(MIN_SIDEBAR, Math.min(sidebar, availableWidth() - current.editor - MIN_PREVIEW)),
+      ),
+    }))
+  }
+  const resizeEditor = (editor: number): void => {
+    setCustomPaneSizes(true)
+    setPaneSizes((current) => ({
+      ...current,
+      editor: Math.min(
+        MAX_EDITOR,
+        Math.max(MIN_EDITOR, Math.min(editor, availableWidth() - current.sidebar - MIN_PREVIEW)),
+      ),
+    }))
+  }
 
   useEffect(() => {
     if (!selectedPath) {
@@ -192,6 +331,7 @@ function PublisherApp({ api }: { readonly api: GardenApi }): React.JSX.Element {
 
   const createNote = async (request: NoteCreateRequest): Promise<string | undefined> => {
     const result = await api.notes.create(request)
+    if (!appMounted.current) return undefined
     if (!result.ok) return result.error.message
     const created: NoteSummary = {
       path: result.value.path,
@@ -313,6 +453,7 @@ function PublisherApp({ api }: { readonly api: GardenApi }): React.JSX.Element {
       ) : null}
 
       <div
+        ref={workspace}
         className="workspace-grid"
         style={
           customPaneSizes
@@ -329,16 +470,17 @@ function PublisherApp({ api }: { readonly api: GardenApi }): React.JSX.Element {
           selectedPath={selectedPath}
           onSelect={setSelectedPath}
           onCreate={createNote}
+          onRetry={() => void loadNotes()}
           separator={
             <PaneSeparator
               label="调整笔记栏宽度"
               value={paneSizes.sidebar}
-              minimum={190}
-              maximum={420}
-              onResize={(sidebar) => {
-                setCustomPaneSizes(true)
-                setPaneSizes((current) => ({ ...current, sidebar }))
-              }}
+              minimum={MIN_SIDEBAR}
+              maximum={Math.max(
+                MIN_SIDEBAR,
+                Math.min(MAX_SIDEBAR, availableWidth() - paneSizes.editor - MIN_PREVIEW),
+              )}
+              onResize={resizeSidebar}
             />
           }
         />
@@ -347,12 +489,12 @@ function PublisherApp({ api }: { readonly api: GardenApi }): React.JSX.Element {
           <PaneSeparator
             label="调整编辑器宽度"
             value={paneSizes.editor}
-            minimum={360}
-            maximum={900}
-            onResize={(editor) => {
-              setCustomPaneSizes(true)
-              setPaneSizes((current) => ({ ...current, editor }))
-            }}
+            minimum={MIN_EDITOR}
+            maximum={Math.max(
+              MIN_EDITOR,
+              Math.min(MAX_EDITOR, availableWidth() - paneSizes.sidebar - MIN_PREVIEW),
+            )}
+            onResize={resizeEditor}
           />
           <header className="editor-header">
             <div className="path-heading">
@@ -411,27 +553,37 @@ function PublisherApp({ api }: { readonly api: GardenApi }): React.JSX.Element {
         <PreviewPane note={selectedNote} preview={preview} onLoadHistory={loadHistory} />
       </div>
 
-      <footer className="statusbar" role="status" aria-label="发布状态">
-        <div className="status-item">
-          <Check size={14} aria-hidden="true" />
-          <span>已保存</span>
+      <footer className="statusbar" aria-label="发布状态">
+        <div className="status-live" role="status" aria-live="polite" aria-label="发布状态">
+          <div className="status-item">
+            <Check size={14} aria-hidden="true" />
+            <span>已保存</span>
+          </div>
+          <div className="status-item">
+            {preview.state === "starting" || preview.state === "building" ? (
+              <LoaderCircle className="spin" size={14} aria-hidden="true" />
+            ) : (
+              <Eye size={14} aria-hidden="true" />
+            )}
+            <span>{previewLabel[preview.state]}</span>
+          </div>
+          <div className="status-item publish-summary" title={publishMessage}>
+            <GitBranch size={14} aria-hidden="true" />
+            <span>可发布变化：{changeCount === undefined ? "暂不可用" : changeCount}</span>
+            <small>{publishProgress?.message ?? publishMessage}</small>
+          </div>
         </div>
-        <div className="status-item">
-          {preview.state === "starting" || preview.state === "building" ? (
-            <LoaderCircle className="spin" size={14} aria-hidden="true" />
-          ) : (
-            <Eye size={14} aria-hidden="true" />
-          )}
-          <span>{previewLabel[preview.state]}</span>
-        </div>
-        <div className="status-item publish-summary" title={publishMessage}>
-          <GitBranch size={14} aria-hidden="true" />
-          <span>可发布变化：{changeCount === undefined ? "暂不可用" : changeCount}</span>
-          <small>{publishProgress?.message ?? publishMessage}</small>
-        </div>
-        <button className="publish-button" type="button" disabled={changeCount === undefined}>
+        <button
+          className="publish-button"
+          type="button"
+          disabled
+          aria-describedby="publish-review-unavailable"
+        >
           检查并发布
         </button>
+        <span id="publish-review-unavailable" className="sr-only">
+          发布审查功能尚未启用，将在后续任务接入。
+        </span>
       </footer>
 
       {pendingVisibility ? (
@@ -445,7 +597,7 @@ function PublisherApp({ api }: { readonly api: GardenApi }): React.JSX.Element {
             <h2 id="private-confirm-title">确认设为私密</h2>
           </header>
           <div className="visibility-confirm-copy">
-            <p>当前在线副本要等发布下架</p>
+            <p>若已上线，当前在线副本要等发布下架</p>
             <p>Git 历史可能仍可见</p>
             <small>如果这篇笔记从未发布，上述在线与历史提醒可能不适用。</small>
           </div>

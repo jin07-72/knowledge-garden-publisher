@@ -94,7 +94,11 @@ export function PreviewPane({ note, preview, onLoadHistory }: PreviewPaneProps):
           </div>
         ) : null}
         {tab === "note" && exactUrl && note ? (
-          <iframe title={`${note.title}的 Quartz 精确预览`} src={exactUrl} />
+          <iframe
+            title={`${note.title}的 Quartz 精确预览`}
+            src={exactUrl}
+            sandbox="allow-same-origin allow-scripts"
+          />
         ) : null}
         {tab === "note" && (!exactUrl || !note) ? (
           <div className="empty-state">
@@ -109,7 +113,13 @@ export function PreviewPane({ note, preview, onLoadHistory }: PreviewPaneProps):
             </span>
           </div>
         ) : null}
-        {tab === "site" && baseUrl ? <iframe title="Quartz 本地全站预览" src={baseUrl} /> : null}
+        {tab === "site" && baseUrl ? (
+          <iframe
+            title="Quartz 本地全站预览"
+            src={baseUrl}
+            sandbox="allow-same-origin allow-scripts"
+          />
+        ) : null}
         {tab === "site" && !baseUrl ? (
           <div className="empty-state">
             <strong>本地全站尚未就绪</strong>

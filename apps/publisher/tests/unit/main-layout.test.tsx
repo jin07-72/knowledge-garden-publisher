@@ -1,7 +1,9 @@
 import { act, cleanup, fireEvent, render, screen, waitFor, within } from "@testing-library/react"
 import userEvent from "@testing-library/user-event"
+import { StrictMode } from "react"
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest"
 import { App } from "../../src/renderer/src/App"
+import { shanghaiCalendarDate } from "../../src/renderer/src/components/NoteSidebar"
 import type {
   ChangeGroup,
   DeploymentRun,
@@ -69,6 +71,14 @@ function unavailable<T>(message: string): IpcResult<T> {
   return { ok: false, error: { code: "SERVICE_UNAVAILABLE", message } }
 }
 
+function deferred<T>(): {
+  promise: Promise<T>
+  resolve: (value: T) => void
+} {
+  let resolve!: (value: T) => void
+  return { promise: new Promise<T>((done) => (resolve = done)), resolve }
+}
+
 function createGardenMock(): GardenApi {
   const ready: PreviewStatus = {
     state: "ready",
@@ -134,6 +144,8 @@ describe("publisher main layout", () => {
   let garden: GardenApi
 
   beforeEach(() => {
+    localStorage.clear()
+    Object.defineProperty(window, "innerWidth", { configurable: true, value: 1440 })
     garden = createGardenMock()
     Object.defineProperty(window, "garden", { configurable: true, value: garden })
   })
@@ -141,6 +153,134 @@ describe("publisher main layout", () => {
   afterEach(() => {
     cleanup()
     vi.restoreAllMocks()
+  })
+
+  it("keeps modal isolation and focus stable under StrictMode effect replay", async () => {
+    const user = userEvent.setup()
+    render(
+      <StrictMode>
+        <App />
+      </StrictMode>,
+    )
+
+    await user.click(await screen.findByRole("button", { name: "新建笔记" }))
+    const dialog = screen.getByRole("dialog", { name: "新建笔记" })
+    await act(async () => Promise.resolve())
+    expect(document.querySelector(".app-shell")).toHaveAttribute("inert")
+    expect(within(dialog).getByRole("textbox", { name: "标题" })).toHaveFocus()
+  })
+
+  it("closes the visibility menu on Tab, outside pointer, and focus leaving", async () => {
+    const user = userEvent.setup()
+    render(<App />)
+    const trigger = await screen.findByRole("button", { name: "可见性：公开" })
+
+    await user.click(trigger)
+    within(screen.getByRole("menu", { name: "选择可见性" }))
+      .getByRole("menuitemradio", { name: /私密/ })
+      .focus()
+    await user.tab()
+    expect(screen.queryByRole("menu", { name: "选择可见性" })).not.toBeInTheDocument()
+
+    await user.click(trigger)
+    fireEvent.pointerDown(document.body)
+    expect(screen.queryByRole("menu", { name: "选择可见性" })).not.toBeInTheDocument()
+  })
+
+  it("ignores stale preview events while retaining the last successful preview on errors", async () => {
+    let progress: ((status: PreviewStatus) => void) | undefined
+    vi.mocked(garden.preview.onProgress).mockImplementation((listener) => {
+      progress = listener
+      return () => undefined
+    })
+    render(<App />)
+    const preview = await screen.findByRole("region", { name: "本地预览" })
+
+    act(() => {
+      progress?.({
+        state: "ready",
+        generation: 5,
+        url: "http://127.0.0.1:9000/",
+        lastSuccessfulUrl: "http://127.0.0.1:9000/",
+      })
+      progress?.({
+        state: "error",
+        generation: 4,
+        error: { code: "PREVIEW_BUILD_FAILED", message: "旧错误" },
+      })
+    })
+    expect(within(preview).queryByText("旧错误")).not.toBeInTheDocument()
+    expect(await within(preview).findByTitle("CSS Grid 布局的 Quartz 精确预览")).toHaveAttribute(
+      "src",
+      "http://127.0.0.1:9000/technology/css-grid",
+    )
+
+    act(() => {
+      progress?.({
+        state: "error",
+        generation: 5,
+        error: { code: "PREVIEW_BUILD_FAILED", message: "新错误" },
+      })
+    })
+    expect(within(preview).getByText("新错误")).toBeVisible()
+    expect(within(preview).getByTitle("CSS Grid 布局的 Quartz 精确预览")).toHaveAttribute(
+      "src",
+      "http://127.0.0.1:9000/technology/css-grid",
+    )
+  })
+
+  it("reports a rejected preview status request without an unhandled bootstrap failure", async () => {
+    vi.mocked(garden.preview.status).mockRejectedValueOnce(new Error("状态通道断开"))
+    render(<App />)
+
+    const preview = await screen.findByRole("region", { name: "本地预览" })
+    expect(await within(preview).findByRole("alert")).toHaveTextContent("状态通道断开")
+  })
+
+  it("reports a rejected change-list request without an unhandled bootstrap failure", async () => {
+    vi.mocked(garden.changes.list).mockRejectedValueOnce(new Error("变化通道断开"))
+    render(<App />)
+
+    const status = await screen.findByRole("status", { name: "发布状态" })
+    expect(within(status).getByText("变化通道断开")).toBeVisible()
+    expect(screen.getByRole("button", { name: "检查并发布" })).toBeDisabled()
+  })
+
+  it("ignores stale StrictMode bootstrap results and starts preview at most once", async () => {
+    const firstList = deferred<IpcResult<readonly NoteSummary[]>>()
+    const secondList = deferred<IpcResult<readonly NoteSummary[]>>()
+    const firstStatus = deferred<IpcResult<PreviewStatus>>()
+    const secondStatus = deferred<IpcResult<PreviewStatus>>()
+    const firstChanges = deferred<IpcResult<readonly ChangeGroup[]>>()
+    const secondChanges = deferred<IpcResult<readonly ChangeGroup[]>>()
+    const lists = [firstList, secondList]
+    const statuses = [firstStatus, secondStatus]
+    const changes = [firstChanges, secondChanges]
+    vi.mocked(garden.notes.list).mockImplementation(() => lists.shift()!.promise)
+    vi.mocked(garden.preview.status).mockImplementation(() => statuses.shift()!.promise)
+    vi.mocked(garden.changes.list).mockImplementation(() => changes.shift()!.promise)
+    render(
+      <StrictMode>
+        <App />
+      </StrictMode>,
+    )
+    await waitFor(() => expect(garden.notes.list).toHaveBeenCalledTimes(2))
+
+    secondList.resolve(ok([notes[1]]))
+    secondStatus.resolve(ok({ state: "stopped", generation: 2 }))
+    secondChanges.resolve(ok([]))
+    await waitFor(() => expect(garden.preview.start).toHaveBeenCalledTimes(1))
+    firstList.resolve(ok([notes[0]]))
+    firstStatus.resolve(ok({ state: "ready", generation: 99, url: "http://stale/" }))
+    firstChanges.resolve(ok([{ id: "stale", label: "旧变化", paths: ["content/a.md"] }]))
+
+    expect(await screen.findByText("private/reading/private-notes.md")).toBeVisible()
+    expect(screen.getByText("可发布变化：0")).toBeVisible()
+    expect(screen.getByRole("button", { name: "检查并发布" })).toBeDisabled()
+  })
+
+  it("uses the Shanghai calendar date for new notes", () => {
+    expect(shanghaiCalendarDate(new Date("2026-01-01T16:30:00.000Z"))).toBe("2026-01-02")
   })
 
   it("shows the approved panes, filters notes, and exposes the selected path", async () => {
@@ -200,6 +340,39 @@ describe("publisher main layout", () => {
     expect(await screen.findByText("private/life/new-note.md")).toBeVisible()
   })
 
+  it("keeps a busy create dialog modal and avoids updates after it unmounts", async () => {
+    const user = userEvent.setup()
+    const creation = deferred<Awaited<ReturnType<GardenApi["notes"]["create"]>>>()
+    vi.mocked(garden.notes.create).mockReturnValueOnce(creation.promise)
+    const view = render(<App />)
+
+    await user.click(await screen.findByRole("button", { name: "新建笔记" }))
+    const dialog = screen.getByRole("dialog", { name: "新建笔记" })
+    await user.type(within(dialog).getByRole("textbox", { name: "标题" }), "等待创建")
+    await user.type(within(dialog).getByRole("textbox", { name: "描述" }), "描述")
+    await user.type(within(dialog).getByRole("textbox", { name: "标签" }), "标签")
+    await user.click(within(dialog).getByRole("button", { name: "创建" }))
+
+    expect(within(dialog).getByRole("button", { name: "关闭" })).toBeDisabled()
+    expect(within(dialog).getByRole("button", { name: "取消" })).toBeDisabled()
+    await user.keyboard("{Escape}")
+    expect(dialog).toBeVisible()
+    fireEvent.submit(dialog.querySelector("form")!)
+    expect(garden.notes.create).toHaveBeenCalledTimes(1)
+    view.unmount()
+    await act(async () => {
+      creation.resolve(
+        ok({
+          path: "content/technology/new-note.md",
+          updatedAt: "2026-09-25T00:00:00.000Z",
+          mtimeMs: 4,
+          contentHash: "late",
+        }),
+      )
+      await Promise.resolve()
+    })
+  })
+
   it("traps focus in the inert new-note modal and restores trigger focus", async () => {
     const user = userEvent.setup()
     render(<App />)
@@ -246,7 +419,7 @@ describe("publisher main layout", () => {
     await user.keyboard("{Enter}")
 
     const confirm = screen.getByRole("dialog", { name: "确认设为私密" })
-    expect(within(confirm).getByText("当前在线副本要等发布下架")).toBeVisible()
+    expect(within(confirm).getByText("若已上线，当前在线副本要等发布下架")).toBeVisible()
     expect(within(confirm).getByText("Git 历史可能仍可见")).toBeVisible()
     expect(garden.notes.changeVisibility).not.toHaveBeenCalled()
     await user.click(within(confirm).getByRole("button", { name: "取消" }))
@@ -448,8 +621,56 @@ describe("publisher main layout", () => {
     expect(within(status).getByText("已保存")).toBeVisible()
     expect(within(status).getByText("预览就绪")).toBeVisible()
     expect(within(status).getByText("可发布变化：暂不可用")).toBeVisible()
-    expect(within(status).getByRole("button", { name: "检查并发布" })).toBeDisabled()
+    expect(screen.getByRole("button", { name: "检查并发布" })).toBeDisabled()
     expect(within(status).getByText(/发布检查暂不可用/)).toBeVisible()
+  })
+
+  it("announces note-list failures and retries without hiding the error", async () => {
+    const user = userEvent.setup()
+    vi.mocked(garden.notes.list)
+      .mockResolvedValueOnce(unavailable<readonly NoteSummary[]>("读取列表失败"))
+      .mockResolvedValueOnce(ok(notes))
+    render(<App />)
+
+    const navigation = screen.getByRole("navigation", { name: "笔记" })
+    const alert = await within(navigation).findByRole("alert")
+    expect(alert).toHaveTextContent("读取列表失败")
+    await user.click(within(alert).getByRole("button", { name: "重试" }))
+    expect(await within(navigation).findByRole("button", { name: /CSS Grid 布局/ })).toBeVisible()
+    expect(within(navigation).queryByRole("alert")).not.toBeInTheDocument()
+  })
+
+  it("keeps publish review disabled for both empty and non-empty successful change checks", async () => {
+    vi.mocked(garden.changes.list).mockResolvedValueOnce(
+      ok([{ id: "change-1", label: "一项变化", paths: ["content/a.md"] }]),
+    )
+    render(<App />)
+
+    expect(await screen.findByText("可发布变化：1")).toBeVisible()
+    const publish = screen.getByRole("button", { name: "检查并发布" })
+    expect(publish).toBeDisabled()
+    expect(publish).toHaveAccessibleDescription(/发布审查功能尚未启用/)
+    expect(garden.publish.start).not.toHaveBeenCalled()
+  })
+
+  it("ignores pending bootstrap results after unmount without console errors", async () => {
+    const list = deferred<IpcResult<readonly NoteSummary[]>>()
+    const status = deferred<IpcResult<PreviewStatus>>()
+    const changes = deferred<IpcResult<readonly ChangeGroup[]>>()
+    vi.mocked(garden.notes.list).mockReturnValueOnce(list.promise)
+    vi.mocked(garden.preview.status).mockReturnValueOnce(status.promise)
+    vi.mocked(garden.changes.list).mockReturnValueOnce(changes.promise)
+    const consoleError = vi.spyOn(console, "error").mockImplementation(() => undefined)
+    const view = render(<App />)
+    view.unmount()
+
+    await act(async () => {
+      list.resolve(ok(notes))
+      status.resolve(ok({ state: "ready", generation: 8, url: "http://late/" }))
+      changes.resolve(ok([]))
+      await Promise.resolve()
+    })
+    expect(consoleError).not.toHaveBeenCalled()
   })
 
   it("resizes pane separators with keyboard and pointer input", async () => {
@@ -472,5 +693,43 @@ describe("publisher main layout", () => {
     fireEvent.pointerCancel(sidebarSeparator)
     fireEvent.pointerMove(sidebarSeparator, { clientX: 300 })
     expect(workspace).toHaveStyle({ gridTemplateColumns: "292px 520px minmax(360px, 1fr)" })
+  })
+
+  it("jointly bounds both separators, stops on lost capture, and persists safe sizes", () => {
+    const view = render(<App />)
+    const sidebar = screen.getByRole("separator", { name: "调整笔记栏宽度" })
+    const editor = screen.getByRole("separator", { name: "调整编辑器宽度" })
+    const workspace = sidebar.closest(".workspace-grid")!
+    Object.defineProperty(workspace, "clientWidth", { configurable: true, value: 1440 })
+    Object.assign(sidebar, { setPointerCapture: vi.fn(), releasePointerCapture: vi.fn() })
+    Object.assign(editor, { setPointerCapture: vi.fn(), releasePointerCapture: vi.fn() })
+
+    fireEvent.pointerDown(sidebar, { pointerId: 1, clientX: 0 })
+    fireEvent.pointerMove(sidebar, { pointerId: 1, clientX: 1000 })
+    expect(workspace).toHaveStyle({ gridTemplateColumns: "420px 520px minmax(360px, 1fr)" })
+    fireEvent.lostPointerCapture(sidebar, { pointerId: 1 })
+    fireEvent.pointerMove(sidebar, { pointerId: 1, clientX: 0 })
+    expect(workspace).toHaveStyle({ gridTemplateColumns: "420px 520px minmax(360px, 1fr)" })
+
+    fireEvent.pointerDown(editor, { pointerId: 2, clientX: 0 })
+    fireEvent.pointerMove(editor, { pointerId: 2, clientX: 1000 })
+    fireEvent.pointerUp(editor, { pointerId: 2, clientX: 1000 })
+    expect(workspace).toHaveStyle({ gridTemplateColumns: "420px 660px minmax(360px, 1fr)" })
+    expect(JSON.parse(localStorage.getItem("garden-publisher:pane-sizes")!)).toEqual({
+      sidebar: 420,
+      editor: 660,
+    })
+
+    view.unmount()
+    render(<App />)
+    expect(document.querySelector(".workspace-grid")).toHaveStyle({
+      gridTemplateColumns: "420px 660px minmax(360px, 1fr)",
+    })
+  })
+
+  it("falls back from malformed persisted pane sizes", () => {
+    localStorage.setItem("garden-publisher:pane-sizes", '{"sidebar":"huge","editor":99999}')
+    render(<App />)
+    expect(document.querySelector(".workspace-grid")).not.toHaveAttribute("style")
   })
 })

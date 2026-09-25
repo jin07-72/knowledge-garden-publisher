@@ -332,6 +332,28 @@ button {
   line-height: 1.6;
   text-align: center;
 }
+.list-error {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+  margin: 10px 0;
+  padding: 9px;
+  border: 1px solid #7a4f43;
+  border-radius: 7px;
+  color: #ffd8c8;
+  background: #2b1c1a;
+  font-size: 11px;
+}
+.list-error button {
+  flex: none;
+  border: 1px solid #b97865;
+  border-radius: 5px;
+  padding: 4px 7px;
+  color: #fff1ea;
+  background: transparent;
+  cursor: pointer;
+}
 
 .editor-pane,
 .preview-pane {
@@ -634,6 +656,13 @@ button {
   background: #14181e;
   font-size: 11px;
 }
+.status-live {
+  display: flex;
+  min-width: 0;
+  flex: 1;
+  align-items: center;
+  gap: 18px;
+}
 .status-item {
   display: flex;
   align-items: center;
@@ -650,7 +679,7 @@ button {
 .publish-summary small {
   overflow: hidden;
   max-width: 230px;
-  color: #747f8b;
+  color: #9aa5b1;
   text-overflow: ellipsis;
   white-space: nowrap;
 }
@@ -660,7 +689,7 @@ button {
   font-size: 11px;
 }
 .publish-button:disabled {
-  color: #78828d;
+  color: #b5bec8;
   background: #293039;
   cursor: not-allowed;
 }

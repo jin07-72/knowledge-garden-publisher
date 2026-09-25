@@ -19,12 +19,22 @@ export function VisibilityMenu({
   onChange,
 }: VisibilityMenuProps): React.JSX.Element {
   const [open, setOpen] = useState(false)
+  const control = useRef<HTMLDivElement>(null)
   const menu = useRef<HTMLDivElement>(null)
   const trigger = useRef<HTMLButtonElement>(null)
   const selected = options.find((option) => option.value === value) ?? options[0]
 
   useEffect(() => {
     if (open) menu.current?.querySelector<HTMLButtonElement>("[role='menuitemradio']")?.focus()
+  }, [open])
+
+  useEffect(() => {
+    if (!open) return
+    const closeOutside = (event: PointerEvent): void => {
+      if (!control.current?.contains(event.target as Node)) setOpen(false)
+    }
+    document.addEventListener("pointerdown", closeOutside, true)
+    return () => document.removeEventListener("pointerdown", closeOutside, true)
   }, [open])
 
   const choose = (next: Visibility): void => {
@@ -34,7 +44,13 @@ export function VisibilityMenu({
   }
 
   return (
-    <div className="visibility-control">
+    <div
+      ref={control}
+      className="visibility-control"
+      onBlur={(event) => {
+        if (!event.currentTarget.contains(event.relatedTarget as Node | null)) setOpen(false)
+      }}
+    >
       <button
         ref={trigger}
         type="button"
