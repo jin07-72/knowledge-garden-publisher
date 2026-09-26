@@ -2,6 +2,7 @@ import { z } from "zod"
 import {
   IPC_CHANNELS,
   type ChangeGroup,
+  type CloseAckRequest,
   type DeploymentRun,
   type GitCommit,
   type HistoryRequest,
@@ -31,6 +32,7 @@ import {
 import {
   IPC_SUCCESS_SCHEMAS,
   appErrorSchema,
+  markdownSchema,
   previewProgressSchema,
   publishProgressSchema,
 } from "../shared/ipcSchemas"
@@ -91,6 +93,7 @@ export interface RegisterPublisherIpcOptions {
   readonly services: PublisherIpcServices
   readonly isTrustedSender: (event: unknown) => boolean
   readonly eventTargets: () => readonly IpcEventTarget[]
+  readonly acknowledgeClose?: (request: CloseAckRequest) => void
 }
 
 function bestEffortCleanup(actions: readonly (() => void)[]): void {
@@ -121,7 +124,7 @@ const hashSchema = z.string().regex(/^[a-f0-9]{64}$/)
 const noteSaveSchema = z
   .object({
     path: notePathSchema,
-    markdown: z.string().max(16 * 1024 * 1024),
+    markdown: markdownSchema,
     expectedMtimeMs: z.number().finite().nonnegative(),
     expectedContentHash: hashSchema,
   })
@@ -129,7 +132,7 @@ const noteSaveSchema = z
 const noteRecoveryWriteSchema = z
   .object({
     path: notePathSchema,
-    markdown: z.string().max(16 * 1024 * 1024),
+    markdown: markdownSchema,
     baseMtimeMs: z.number().finite().nonnegative(),
     baseContentHash: hashSchema,
   })
@@ -146,10 +149,7 @@ const noteCreateSchema = z
     date: z.string().regex(/^\d{4}-\d{2}-\d{2}$/),
     description: z.string().trim().min(1).max(2_000),
     tags: z.array(z.string().trim().min(1).max(128)).min(1).max(100),
-    body: z
-      .string()
-      .max(16 * 1024 * 1024)
-      .optional(),
+    body: markdownSchema.optional(),
   })
   .strict()
 const noteRenameSchema = z
@@ -185,6 +185,7 @@ const historySchema = z
   .strict()
   .optional()
   .transform((request) => request ?? {})
+const closeAckSchema = z.object({ requestId: z.string().uuid(), success: z.boolean() }).strict()
 
 function invalidInput(): IpcResult<never> {
   return { ok: false, error: { code: "INVALID_INPUT", message: "The request is invalid." } }
@@ -256,6 +257,15 @@ function secureHandler<Input, Output>(
 export function registerPublisherIpc(options: RegisterPublisherIpcOptions): () => void {
   const { ipcMain, services, isTrustedSender, eventTargets } = options
   const handlers: ReadonlyArray<readonly [string, RequestHandler]> = [
+    [
+      IPC_CHANNELS.requests.lifecycleCloseAck,
+      secureHandler(
+        IPC_CHANNELS.requests.lifecycleCloseAck,
+        closeAckSchema,
+        isTrustedSender,
+        (request) => options.acknowledgeClose?.(request),
+      ),
+    ],
     [
       IPC_CHANNELS.requests.workspaceInspect,
       secureHandler(IPC_CHANNELS.requests.workspaceInspect, noRequestSchema, isTrustedSender, () =>

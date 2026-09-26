@@ -2516,6 +2516,7 @@ export async function saveNote(
 ): Promise<NoteWriteResult> {
   if (
     typeof input.markdown !== "string" ||
+    Buffer.byteLength(input.markdown, "utf8") > 16 * 1024 * 1024 ||
     !Number.isFinite(input.expectedMtimeMs) ||
     typeof input.expectedContentHash !== "string" ||
     !/^[a-f0-9]{64}$/i.test(input.expectedContentHash) ||

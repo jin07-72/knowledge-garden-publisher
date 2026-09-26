@@ -111,13 +111,15 @@ function setup() {
       sent.push([channel, payload])
     },
   }
+  const acknowledgeClose = vi.fn()
   const dispose = registerPublisherIpc({
     ipcMain: ipc,
     services: servicePorts,
     isTrustedSender: (event) => event === trustedEvent,
     eventTargets: () => [target],
+    acknowledgeClose,
   })
-  return { ipc, servicePorts, sent, dispose }
+  return { ipc, servicePorts, sent, dispose, acknowledgeClose }
 }
 
 describe("secure publisher IPC", () => {
@@ -184,6 +186,35 @@ describe("secure publisher IPC", () => {
       expect(result).toMatchObject({ ok: false, error: { code: "INVALID_INPUT" } })
       expect(servicePorts.calls[call]).not.toHaveBeenCalled()
     }
+  })
+
+  it("enforces the Markdown limit in UTF-8 bytes rather than UTF-16 code units", async () => {
+    const { ipc, servicePorts } = setup()
+    const markdown = "界".repeat(Math.floor((16 * 1024 * 1024) / 3) + 1)
+    const result = await ipc.invoke(IPC_CHANNELS.requests.notesSave, trustedEvent, {
+      path: "content/life/a.md",
+      markdown,
+      expectedMtimeMs: 1,
+      expectedContentHash: "a".repeat(64),
+    })
+    expect(result).toMatchObject({ ok: false, error: { code: "INVALID_INPUT" } })
+    expect(servicePorts.calls.notesSave).not.toHaveBeenCalled()
+  })
+
+  it("accepts only a trusted, strictly validated close acknowledgement", async () => {
+    const { ipc, acknowledgeClose } = setup()
+    const request = { requestId: "11111111-1111-4111-8111-111111111111", success: false }
+    await expect(
+      ipc.invoke(IPC_CHANNELS.requests.lifecycleCloseAck, trustedEvent, request),
+    ).resolves.toEqual({ ok: true, value: undefined })
+    expect(acknowledgeClose).toHaveBeenCalledWith(request)
+    await expect(
+      ipc.invoke(IPC_CHANNELS.requests.lifecycleCloseAck, trustedEvent, {
+        ...request,
+        force: true,
+      }),
+    ).resolves.toMatchObject({ ok: false, error: { code: "INVALID_INPUT" } })
+    expect(acknowledgeClose).toHaveBeenCalledOnce()
   })
 
   it("accepts only normalized managed note paths", async () => {
@@ -525,7 +556,7 @@ describe("preload garden API", () => {
     expect(api).not.toHaveProperty("shell")
     expect(api).not.toHaveProperty("exec")
     expect(Object.keys(api).sort()).toEqual(
-      ["changes", "history", "notes", "preview", "publish", "workspace"].sort(),
+      ["changes", "history", "lifecycle", "notes", "preview", "publish", "workspace"].sort(),
     )
   })
 
@@ -572,6 +603,10 @@ describe("preload garden API", () => {
     await api.publish.cancel({ operationId: "publish-1" })
     await api.history.git({ limit: 20 })
     await api.history.deployments({ limit: 20 })
+    await api.lifecycle.acknowledgeClose({
+      requestId: "11111111-1111-4111-8111-111111111111",
+      success: true,
+    })
 
     expect(ipc.invokes.map(([channel]) => channel)).toEqual(Object.values(IPC_CHANNELS.requests))
   })
@@ -632,5 +667,25 @@ describe("preload garden API", () => {
     ipc.emit(IPC_CHANNELS.events.previewProgress, { state: "ready", generation: 1 })
     expect(first).toHaveBeenCalledTimes(1)
     expect(second).toHaveBeenCalledTimes(2)
+  })
+
+  it("validates lifecycle events and removes their wrapped listeners", () => {
+    const ipc = new FakeIpcRenderer()
+    const api = createGardenApi(ipc)
+    const beforeClose = vi.fn()
+    const blocked = vi.fn()
+    const unsubscribe = api.lifecycle.onBeforeClose(beforeClose)
+    api.lifecycle.onCloseBlocked(blocked)
+    ipc.emit(IPC_CHANNELS.events.beforeClose, { requestId: "not-a-uuid" })
+    ipc.emit(IPC_CHANNELS.events.beforeClose, {
+      requestId: "11111111-1111-4111-8111-111111111111",
+    })
+    ipc.emit(IPC_CHANNELS.events.closeBlocked, { message: "保存失败" })
+    unsubscribe()
+    ipc.emit(IPC_CHANNELS.events.beforeClose, {
+      requestId: "22222222-2222-4222-8222-222222222222",
+    })
+    expect(beforeClose).toHaveBeenCalledOnce()
+    expect(blocked).toHaveBeenCalledWith("保存失败")
   })
 })

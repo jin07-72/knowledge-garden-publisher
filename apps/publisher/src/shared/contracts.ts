@@ -221,10 +221,13 @@ export const IPC_CHANNELS = {
     publishCancel: "garden:publish:cancel",
     historyGit: "garden:history:git",
     historyDeployments: "garden:history:deployments",
+    lifecycleCloseAck: "garden:lifecycle:close-ack",
   },
   events: {
     previewProgress: "garden:event:preview-progress",
     publishProgress: "garden:event:publish-progress",
+    beforeClose: "garden:event:before-close",
+    closeBlocked: "garden:event:close-blocked",
   },
 } as const
 
@@ -264,6 +267,14 @@ export interface NoteRecoveryReceipt {
 
 export interface NoteRecoveryDiscardRequest extends NotePathRequest {
   readonly contentHash: string
+}
+
+export interface BeforeCloseRequest {
+  readonly requestId: string
+}
+
+export interface CloseAckRequest extends BeforeCloseRequest {
+  readonly success: boolean
 }
 
 export interface NoteCreateRequest {
@@ -337,6 +348,11 @@ export interface GitCommit {
 export type Unsubscribe = () => void
 
 export interface GardenApi {
+  readonly lifecycle: {
+    acknowledgeClose(request: CloseAckRequest): Promise<IpcResult<void>>
+    onBeforeClose(listener: (request: BeforeCloseRequest) => void): Unsubscribe
+    onCloseBlocked(listener: (message: string) => void): Unsubscribe
+  }
   readonly workspace: {
     inspect(): Promise<IpcResult<WorkspaceInspection>>
   }

@@ -3,6 +3,7 @@ import { tmpdir } from "node:os"
 import { join } from "node:path"
 import { afterEach, describe, expect, it, vi } from "vitest"
 import {
+  createPublisherCloseCoordinator,
   createPublisherQuitCoordinator,
   createPublisherServices,
   disposePublisherRuntime,
@@ -171,5 +172,141 @@ describe("publisher service wiring", () => {
     expect(allowQuit).toHaveBeenCalledOnce()
     expect(firstGesture.preventDefault).toHaveBeenCalledOnce()
     expect(secondGesture.preventDefault).toHaveBeenCalledOnce()
+  })
+
+  it("coalesces close and quit until the renderer confirms a durable save, then cleans up", async () => {
+    let resolveFlush!: (saved: boolean) => void
+    const pendingFlush = new Promise<boolean>((resolve) => {
+      resolveFlush = resolve
+    })
+    const order: string[] = []
+    const coordinator = createPublisherCloseCoordinator({
+      requestRendererFlush: vi.fn(() => pendingFlush),
+      cleanup: vi.fn(async () => {
+        order.push("cleanup")
+      }),
+      allowClose: vi.fn(() => order.push("close")),
+      allowQuit: vi.fn(() => order.push("quit")),
+      reportFailure: vi.fn(),
+    })
+    const closeEvent = { preventDefault: vi.fn() }
+    const quitEvent = { preventDefault: vi.fn() }
+    const close = coordinator.beforeWindowClose(closeEvent)
+    const quit = coordinator.beforeQuit(quitEvent)
+    expect(closeEvent.preventDefault).toHaveBeenCalledOnce()
+    expect(quitEvent.preventDefault).toHaveBeenCalledOnce()
+    expect(order).toEqual([])
+    resolveFlush(true)
+    await Promise.all([close, quit])
+    expect(order).toEqual(["close", "cleanup", "quit"])
+  })
+
+  it("keeps the app operable after a failed save and permits an explicit retry", async () => {
+    const requestRendererFlush = vi
+      .fn<() => Promise<boolean>>()
+      .mockResolvedValueOnce(false)
+      .mockResolvedValueOnce(true)
+    const cleanup = vi.fn(async () => undefined)
+    const allowClose = vi.fn()
+    const reportFailure = vi.fn()
+    const coordinator = createPublisherCloseCoordinator({
+      requestRendererFlush,
+      cleanup,
+      allowClose,
+      allowQuit: vi.fn(),
+      reportFailure,
+    })
+    await coordinator.beforeWindowClose({ preventDefault: vi.fn() })
+    expect(cleanup).not.toHaveBeenCalled()
+    expect(allowClose).not.toHaveBeenCalled()
+    expect(reportFailure).toHaveBeenCalledWith("保存失败，窗口仍保持打开。")
+    await coordinator.beforeWindowClose({ preventDefault: vi.fn() })
+    expect(allowClose).toHaveBeenCalledOnce()
+    await coordinator.beforeQuit({ preventDefault: vi.fn() })
+    expect(cleanup).toHaveBeenCalledOnce()
+  })
+
+  it("fails closed when the renderer is destroyed or does not acknowledge before timeout", async () => {
+    vi.useFakeTimers()
+    const reportFailure = vi.fn()
+    const cleanup = vi.fn()
+    const allowQuit = vi.fn()
+    const coordinator = createPublisherCloseCoordinator({
+      requestRendererFlush: () => new Promise<boolean>(() => undefined),
+      cleanup,
+      allowClose: vi.fn(),
+      allowQuit,
+      reportFailure,
+      timeoutMs: 50,
+    })
+    const quit = coordinator.beforeQuit({ preventDefault: vi.fn() })
+    await vi.advanceTimersByTimeAsync(50)
+    await quit
+    expect(cleanup).not.toHaveBeenCalled()
+    expect(allowQuit).not.toHaveBeenCalled()
+    expect(reportFailure).toHaveBeenCalledWith("保存失败，窗口仍保持打开。")
+    vi.useRealTimers()
+  })
+
+  it("allows the window close event emitted synchronously by an approved app quit", async () => {
+    const closeEvent = { preventDefault: vi.fn() }
+    let coordinator!: ReturnType<typeof createPublisherCloseCoordinator>
+    coordinator = createPublisherCloseCoordinator({
+      requestRendererFlush: vi.fn(async () => true),
+      cleanup: vi.fn(async () => undefined),
+      allowClose: vi.fn(),
+      allowQuit: vi.fn(() => {
+        void coordinator.beforeWindowClose(closeEvent)
+      }),
+      reportFailure: vi.fn(),
+    })
+
+    await coordinator.beforeQuit({ preventDefault: vi.fn() })
+
+    expect(closeEvent.preventDefault).not.toHaveBeenCalled()
+  })
+
+  it("requires a fresh renderer flush after close preparation fails", async () => {
+    const requestRendererFlush = vi.fn(async () => true)
+    const cleanup = vi
+      .fn<() => Promise<void>>()
+      .mockRejectedValueOnce(new Error("cleanup failed"))
+      .mockResolvedValueOnce(undefined)
+    const allowQuit = vi.fn()
+    const coordinator = createPublisherCloseCoordinator({
+      requestRendererFlush,
+      cleanup,
+      allowClose: vi.fn(),
+      allowQuit,
+      reportFailure: vi.fn(),
+    })
+
+    await coordinator.beforeQuit({ preventDefault: vi.fn() })
+    await coordinator.beforeQuit({ preventDefault: vi.fn() })
+
+    expect(requestRendererFlush).toHaveBeenCalledTimes(2)
+    expect(allowQuit).toHaveBeenCalledOnce()
+  })
+
+  it("re-arms the close barrier when cleanup fails after an allowed close", async () => {
+    const requestRendererFlush = vi.fn(async () => true)
+    const coordinator = createPublisherCloseCoordinator({
+      requestRendererFlush,
+      cleanup: vi.fn(async () => {
+        throw new Error("cleanup failed")
+      }),
+      allowClose: vi.fn(),
+      allowQuit: vi.fn(),
+      reportFailure: vi.fn(),
+    })
+
+    const close = coordinator.beforeWindowClose({ preventDefault: vi.fn() })
+    const quit = coordinator.beforeQuit({ preventDefault: vi.fn() })
+    await Promise.all([close, quit])
+    const retriedClose = { preventDefault: vi.fn() }
+    await coordinator.beforeWindowClose(retriedClose)
+
+    expect(retriedClose.preventDefault).toHaveBeenCalledOnce()
+    expect(requestRendererFlush).toHaveBeenCalledTimes(2)
   })
 })

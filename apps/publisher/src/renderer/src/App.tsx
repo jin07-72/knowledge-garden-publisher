@@ -206,10 +206,33 @@ function PublisherApp({ api }: { readonly api: GardenApi }): React.JSX.Element {
 
   useEffect(() => {
     appMounted.current = true
+    const unsubscribeBeforeClose = api.lifecycle.onBeforeClose(({ requestId }) => {
+      setSaveStateLabel("正在安全保存并关闭…")
+      void Promise.resolve()
+        .then(() => markdownEditor.current?.flush() ?? true)
+        .then(
+          async (success) => {
+            if (!success && appMounted.current) setSaveStateLabel("保存失败，窗口仍保持打开")
+            await api.lifecycle.acknowledgeClose({ requestId, success })
+          },
+          async () => {
+            if (appMounted.current) setSaveStateLabel("保存失败，窗口仍保持打开")
+            await api.lifecycle.acknowledgeClose({ requestId, success: false })
+          },
+        )
+        .catch(() => {
+          if (appMounted.current) setSaveStateLabel("关闭确认失败，窗口仍保持打开")
+        })
+    })
+    const unsubscribeCloseBlocked = api.lifecycle.onCloseBlocked((message) => {
+      if (appMounted.current) setSaveStateLabel(message)
+    })
     return () => {
       appMounted.current = false
+      unsubscribeBeforeClose()
+      unsubscribeCloseBlocked()
     }
-  }, [])
+  }, [api])
 
   useEffect(() => {
     const updateWidth = (width: number): void => {

@@ -2,6 +2,8 @@ import {
   IPC_CHANNELS,
   type GardenApi,
   type ChangeGroup,
+  type BeforeCloseRequest,
+  type CloseAckRequest,
   type DeploymentRun,
   type GitCommit,
   type HistoryRequest,
@@ -30,6 +32,8 @@ import {
 } from "../shared/contracts"
 import {
   IPC_SUCCESS_SCHEMAS,
+  beforeCloseSchema,
+  closeBlockedSchema,
   ipcResultSchema,
   previewProgressSchema,
   publishProgressSchema,
@@ -97,6 +101,16 @@ function subscription<T>(
 
 /** Builds the only renderer-facing capability object. No Electron primitive escapes this closure. */
 export function createGardenApi(ipc: IpcRendererPort): GardenApi {
+  const lifecycle = Object.freeze({
+    acknowledgeClose: (request: CloseAckRequest) =>
+      invoke<void>(ipc, IPC_CHANNELS.requests.lifecycleCloseAck, request),
+    onBeforeClose: (listener: (request: BeforeCloseRequest) => void) =>
+      subscription(ipc, IPC_CHANNELS.events.beforeClose, beforeCloseSchema, listener),
+    onCloseBlocked: (listener: (message: string) => void) =>
+      subscription(ipc, IPC_CHANNELS.events.closeBlocked, closeBlockedSchema, ({ message }) =>
+        listener(message),
+      ),
+  })
   const workspace = Object.freeze({
     inspect: () => invoke<WorkspaceInspection>(ipc, IPC_CHANNELS.requests.workspaceInspect),
   })
@@ -148,5 +162,5 @@ export function createGardenApi(ipc: IpcRendererPort): GardenApi {
     deployments: (request?: HistoryRequest) =>
       invoke<readonly DeploymentRun[]>(ipc, IPC_CHANNELS.requests.historyDeployments, request),
   })
-  return Object.freeze({ workspace, notes, preview, changes, publish, history })
+  return Object.freeze({ lifecycle, workspace, notes, preview, changes, publish, history })
 }

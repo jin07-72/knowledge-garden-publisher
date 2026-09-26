@@ -1,6 +1,7 @@
 import { act, cleanup, fireEvent, render, screen, waitFor, within } from "@testing-library/react"
 import userEvent from "@testing-library/user-event"
 import { EditorView } from "@codemirror/view"
+import { createHash } from "node:crypto"
 import { StrictMode } from "react"
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest"
 import { App } from "../../src/renderer/src/App"
@@ -69,6 +70,10 @@ function ok<T>(value: T): IpcResult<T> {
   return { ok: true, value }
 }
 
+function markdownHash(value: string): string {
+  return createHash("sha256").update(value).digest("hex")
+}
+
 function unavailable<T>(message: string): IpcResult<T> {
   return { ok: false, error: { code: "SERVICE_UNAVAILABLE", message } }
 }
@@ -100,6 +105,11 @@ function createGardenMock(): GardenApi {
   }
 
   return {
+    lifecycle: {
+      acknowledgeClose: vi.fn(async () => ok(undefined)),
+      onBeforeClose: vi.fn(() => () => undefined),
+      onCloseBlocked: vi.fn(() => () => undefined),
+    },
     workspace: {
       inspect: vi.fn(async () =>
         ok<WorkspaceInspection>({
@@ -194,6 +204,42 @@ describe("publisher main layout", () => {
     expect(within(dialog).getByRole("textbox", { name: "标题" })).toHaveFocus()
   })
 
+  it("acknowledges close only after an edit younger than 750ms and its recovery are durable", async () => {
+    let beforeClose: ((request: { requestId: string }) => void) | undefined
+    vi.mocked(garden.lifecycle.onBeforeClose).mockImplementation((listener) => {
+      beforeClose = listener
+      return () => undefined
+    })
+    const recoveryWrite = deferred<Awaited<ReturnType<GardenApi["notes"]["recovery"]["write"]>>>()
+    vi.mocked(garden.notes.recovery.write).mockReturnValue(recoveryWrite.promise)
+    vi.mocked(garden.notes.save).mockImplementation(async (request) =>
+      ok({
+        path: request.path,
+        updatedAt: "2026-09-26T00:00:00.000Z",
+        mtimeMs: 4,
+        contentHash: createHash("sha256").update(request.markdown).digest("hex"),
+      }),
+    )
+    render(<App />)
+    await screen.findByRole("region", { name: "Markdown 编辑器" })
+    const view = await waitFor(() =>
+      EditorView.findFromDOM(document.querySelector(".cm-content") as HTMLElement),
+    )
+    act(() => {
+      view!.dispatch({ changes: { from: view!.state.doc.length, insert: "\nclose now" } })
+      beforeClose?.({ requestId: "11111111-1111-4111-8111-111111111111" })
+    })
+    expect(garden.lifecycle.acknowledgeClose).not.toHaveBeenCalled()
+    recoveryWrite.resolve(ok({ contentHash: "c".repeat(64) }))
+    await waitFor(() => expect(garden.notes.save).toHaveBeenCalledOnce())
+    await waitFor(() =>
+      expect(garden.lifecycle.acknowledgeClose).toHaveBeenCalledWith({
+        requestId: "11111111-1111-4111-8111-111111111111",
+        success: true,
+      }),
+    )
+  })
+
   it("closes the visibility menu on Tab, outside pointer, and focus leaving", async () => {
     const user = userEvent.setup()
     render(<App />)
@@ -247,7 +293,7 @@ describe("publisher main layout", () => {
       })
     })
     expect(within(preview).getByText("新错误")).toBeVisible()
-    expect(within(preview).getByTitle("CSS Grid 布局的 Quartz 精确预览")).toHaveAttribute(
+    expect(await within(preview).findByTitle("CSS Grid 布局的 Quartz 精确预览")).toHaveAttribute(
       "src",
       "http://127.0.0.1:9000/technology/css-grid",
     )
@@ -573,7 +619,7 @@ describe("publisher main layout", () => {
         path: notes[0].path,
         updatedAt: "2026-09-25T01:00:00.000Z",
         mtimeMs: 3,
-        contentHash: "c".repeat(64),
+        contentHash: markdownHash("# CSS Grid 布局\n\n正文\nchanged"),
       }),
     )
     render(<App />)
@@ -662,7 +708,7 @@ describe("publisher main layout", () => {
         path: notes[0].path,
         updatedAt: "2026-09-25T01:00:00.000Z",
         mtimeMs: 3,
-        contentHash: "c".repeat(64),
+        contentHash: markdownHash("# CSS Grid 布局\n\n正文\nv1"),
       }),
     )
     await waitFor(() => expect(garden.notes.save).toHaveBeenCalledTimes(2))
@@ -672,7 +718,7 @@ describe("publisher main layout", () => {
         path: notes[0].path,
         markdown: expect.stringContaining("v2"),
         expectedMtimeMs: 3,
-        expectedContentHash: "c".repeat(64),
+        expectedContentHash: markdownHash("# CSS Grid 布局\n\n正文\nv1"),
       }),
     )
 
@@ -681,7 +727,7 @@ describe("publisher main layout", () => {
         path: notes[0].path,
         updatedAt: "2026-09-25T01:01:00.000Z",
         mtimeMs: 4,
-        contentHash: "f".repeat(64),
+        contentHash: markdownHash("# CSS Grid 布局\n\n正文\nv1\nv2"),
       }),
     )
     await waitFor(() => expect(garden.notes.changeVisibility).toHaveBeenCalledTimes(1))
@@ -720,7 +766,7 @@ describe("publisher main layout", () => {
         path: notes[0].path,
         updatedAt: "2026-09-25T01:00:00.000Z",
         mtimeMs: 3,
-        contentHash: "c".repeat(64),
+        contentHash: markdownHash("# CSS Grid 布局\n\n正文\nv1"),
       }),
     )
     await waitFor(() => expect(garden.notes.save).toHaveBeenCalledTimes(2))

@@ -16,7 +16,15 @@ export interface AutosaveController {
   readonly error?: AppError
   change(markdown: string): void
   flush(): Promise<boolean>
-  reset(document: NoteDocument): void
+  reset(document: NoteDocument): Promise<boolean>
+}
+
+async function sha256(markdown: string): Promise<string> {
+  const digest = await globalThis.crypto.subtle.digest(
+    "SHA-256",
+    new TextEncoder().encode(markdown),
+  )
+  return Array.from(new Uint8Array(digest), (byte) => byte.toString(16).padStart(2, "0")).join("")
 }
 
 export function useAutosave(options: {
@@ -139,6 +147,16 @@ export function useAutosave(options: {
             }
             return false
           }
+          if (
+            result.value.path !== latest.current.document.path ||
+            result.value.contentHash !== (await sha256(markdown))
+          ) {
+            if (mounted.current) {
+              setError({ code: "INTERNAL_ERROR", message: "保存结果无效，未更新编辑版本。" })
+              setState("failed")
+            }
+            return false
+          }
           persisted.current = markdown
           persistedGeneration.current = savingGeneration
           revision.current = {
@@ -190,17 +208,30 @@ export function useAutosave(options: {
     [persistRecovery, runSave],
   )
 
-  const reset = useCallback((next: NoteDocument): void => {
+  const reset = useCallback(async (next: NoteDocument): Promise<boolean> => {
+    if (timer.current) clearTimeout(timer.current)
+    timer.current = undefined
+    await recoveryChain.current.catch(() => undefined)
+    const pendingRecovery = latestRecovery.current
+    if (pendingRecovery) {
+      const discarded = await latest.current.discardRecovery(pendingRecovery.contentHash)
+      if (!discarded.ok) {
+        if (mounted.current) {
+          setError(discarded.error)
+          setState("failed")
+        }
+        return false
+      }
+    }
     current.current = next.markdown
     persisted.current = next.markdown
     revision.current = { mtimeMs: next.mtimeMs, contentHash: next.contentHash }
     generation.current += 1
     persistedGeneration.current = generation.current
     latestRecovery.current = undefined
-    if (timer.current) clearTimeout(timer.current)
-    timer.current = undefined
     setState("saved")
     setError(undefined)
+    return true
   }, [])
 
   return { state, error, change, flush, reset }

@@ -1,6 +1,27 @@
 import { z } from "zod"
 import { APP_ERROR_CODES, IPC_CHANNELS, type AppError, type IpcResult } from "./contracts"
 
+export const MAX_MARKDOWN_UTF8_BYTES = 16 * 1024 * 1024
+export function utf8ByteLength(value: string): number {
+  let bytes = 0
+  for (let index = 0; index < value.length; index += 1) {
+    const unit = value.charCodeAt(index)
+    if (unit <= 0x7f) bytes += 1
+    else if (unit <= 0x7ff) bytes += 2
+    else if (unit >= 0xd800 && unit <= 0xdbff) {
+      const next = value.charCodeAt(index + 1)
+      if (next >= 0xdc00 && next <= 0xdfff) {
+        bytes += 4
+        index += 1
+      } else bytes += 3
+    } else bytes += 3
+  }
+  return bytes
+}
+export const markdownSchema = z
+  .string()
+  .refine((value) => utf8ByteLength(value) <= MAX_MARKDOWN_UTF8_BYTES)
+
 export const appErrorSchema = z
   .object({
     code: z.enum(APP_ERROR_CODES),
@@ -67,7 +88,7 @@ const noteSummarySchema = z
 const noteDocumentSchema = z
   .object({
     path: pathSchema,
-    markdown: z.string().max(16 * 1024 * 1024),
+    markdown: markdownSchema,
     mtimeMs: z.number().finite().nonnegative(),
     contentHash: hashSchema,
   })
@@ -84,7 +105,7 @@ const noteWriteReceiptSchema = z
 const noteRecoverySchema = z
   .object({
     path: pathSchema,
-    markdown: z.string().max(16 * 1024 * 1024),
+    markdown: markdownSchema,
     baseMtimeMs: z.number().finite().nonnegative(),
     baseContentHash: hashSchema,
     createdAt: z.string().datetime(),
@@ -160,6 +181,8 @@ export const publishProgressSchema = z
   .strip()
 
 export const previewProgressSchema = previewStatusSchema
+export const beforeCloseSchema = z.object({ requestId: z.string().uuid() }).strict()
+export const closeBlockedSchema = z.object({ message: z.string().min(1).max(1_000) }).strict()
 
 type RequestChannel = (typeof IPC_CHANNELS.requests)[keyof typeof IPC_CHANNELS.requests]
 
@@ -183,6 +206,7 @@ export const IPC_SUCCESS_SCHEMAS = {
   [IPC_CHANNELS.requests.publishCancel]: z.undefined(),
   [IPC_CHANNELS.requests.historyGit]: z.array(gitCommitSchema).max(500),
   [IPC_CHANNELS.requests.historyDeployments]: z.array(deploymentRunSchema).max(500),
+  [IPC_CHANNELS.requests.lifecycleCloseAck]: z.undefined(),
 } satisfies Record<RequestChannel, z.ZodType>
 
 export function ipcResultSchema<T>(success: z.ZodType<T>): z.ZodType<IpcResult<T>> {

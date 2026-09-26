@@ -1,6 +1,6 @@
 import { describe, expect, it } from "vitest"
 import { IPC_CHANNELS } from "../../src/shared/contracts"
-import { IPC_SUCCESS_SCHEMAS } from "../../src/shared/ipcSchemas"
+import { IPC_SUCCESS_SCHEMAS, utf8ByteLength } from "../../src/shared/ipcSchemas"
 
 const privateField = { privateSource: "must-not-cross" }
 const capabilities = { files: true, preview: true, git: false, publish: false }
@@ -92,9 +92,25 @@ const validByChannel: Record<string, unknown> = {
       ...privateField,
     },
   ],
+  [IPC_CHANNELS.requests.lifecycleCloseAck]: undefined,
 }
 
 describe("IPC success schemas", () => {
+  it("matches Node UTF-8 byte length for BMP, surrogate pairs, and isolated surrogates", () => {
+    const samples = ["", "ASCII", "中文", "😀", "\ud800", "\udc00", "a\ud800b", "\ud83d\ude00"]
+    let seed = 0x5eed1234
+    for (let sample = 0; sample < 200; sample += 1) {
+      let value = ""
+      for (let length = 0; length < 64; length += 1) {
+        seed = (seed * 1664525 + 1013904223) >>> 0
+        value += String.fromCharCode(seed & 0xffff)
+      }
+      samples.push(value)
+    }
+    for (const value of samples)
+      expect(utf8ByteLength(value)).toBe(Buffer.byteLength(value, "utf8"))
+  })
+
   it("covers every request channel with valid, stripping schemas", () => {
     expect(Object.keys(IPC_SUCCESS_SCHEMAS).sort()).toEqual(
       Object.values(IPC_CHANNELS.requests).sort(),
@@ -126,5 +142,27 @@ describe("IPC success schemas", () => {
     expect(
       schema.safeParse({ ok: false, root: "C:/garden", capabilities, issues: [] }).success,
     ).toBe(true)
+  })
+
+  it("rejects note and recovery output whose Markdown exceeds 16 MiB in UTF-8", () => {
+    const markdown = "界".repeat(Math.floor((16 * 1024 * 1024) / 3) + 1)
+    expect(
+      IPC_SUCCESS_SCHEMAS[IPC_CHANNELS.requests.notesRead].safeParse({
+        path: "content/life/daily.md",
+        markdown,
+        mtimeMs: 1,
+        contentHash: "a".repeat(64),
+      }).success,
+    ).toBe(false)
+    expect(
+      IPC_SUCCESS_SCHEMAS[IPC_CHANNELS.requests.notesRecoveryGet].safeParse({
+        path: "content/life/daily.md",
+        markdown,
+        baseMtimeMs: 1,
+        baseContentHash: "a".repeat(64),
+        createdAt: "2026-09-24T00:00:00.000Z",
+        contentHash: "b".repeat(64),
+      }).success,
+    ).toBe(false)
   })
 })

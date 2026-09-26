@@ -1,6 +1,7 @@
 import { act, cleanup, fireEvent, render, screen, waitFor, within } from "@testing-library/react"
 import userEvent from "@testing-library/user-event"
 import { EditorView } from "@codemirror/view"
+import { createHash } from "node:crypto"
 import { StrictMode, createRef } from "react"
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest"
 import {
@@ -64,7 +65,7 @@ function receipt(markdown: string): NoteWriteReceipt {
     path: publicNote.path,
     updatedAt: "2026-09-25T01:00:00.000Z",
     mtimeMs: 11,
-    contentHash: markdown.length.toString(16).padStart(64, "0"),
+    contentHash: createHash("sha256").update(markdown).digest("hex"),
   }
 }
 
@@ -74,10 +75,12 @@ function setup(
     read?: () => Promise<IpcResult<NoteDocument>>
     recovery?: NoteRecovery
     discardRecovery?: () => Promise<IpcResult<void>>
+    document?: NoteDocument
   } = {},
 ) {
+  const selectedDocument = options.document ?? document
   const save = vi.fn(options.save ?? (async (markdown: string) => ok(receipt(markdown))))
-  const read = vi.fn(options.read ?? (async () => ok(document)))
+  const read = vi.fn(options.read ?? (async () => ok(selectedDocument)))
   const getRecovery = vi.fn(async () => ok(options.recovery))
   const writeRecovery = vi.fn(async () => ok({ contentHash: "c".repeat(64) }))
   const discardRecovery = vi.fn(options.discardRecovery ?? (async () => ok(undefined)))
@@ -85,7 +88,7 @@ function setup(
   const view = render(
     <MarkdownEditor
       ref={ref}
-      document={document}
+      document={selectedDocument}
       notes={[publicNote, privateNote]}
       save={async (request) => save(request.markdown)}
       read={read}
@@ -127,9 +130,16 @@ beforeEach(() => {
 })
 
 describe("MarkdownEditor", () => {
+  it("returns immediately for a clean close barrier without writing or saving", async () => {
+    const { ref, save, writeRecovery } = setup()
+    await expect(ref.current!.flush()).resolves.toBe(true)
+    expect(save).not.toHaveBeenCalled()
+    expect(writeRecovery).not.toHaveBeenCalled()
+  })
+
   it("preserves raw frontmatter bytes and coalesces changes into one save after 750ms", async () => {
     vi.useFakeTimers()
-    const { save, writeRecovery } = setup()
+    const { ref, save, writeRecovery } = setup()
     const changed = `${original}first\r\nsecond\r\n`
     replaceDoc(`${original}first\r\n`)
     replaceDoc(changed)
@@ -141,9 +151,27 @@ describe("MarkdownEditor", () => {
     expect(save).not.toHaveBeenCalled()
     await act(async () => vi.advanceTimersByTimeAsync(1))
 
+    await act(async () => {
+      await expect(ref.current!.flush()).resolves.toBe(true)
+    })
+
     expect(save).toHaveBeenCalledTimes(1)
     expect(save).toHaveBeenCalledWith(changed)
     expect(screen.getByRole("status", { name: "保存状态" })).toHaveTextContent("已保存")
+  })
+
+  it("keeps existing mixed CRLF/LF text and saves the editor's exact current buffer", async () => {
+    const mixed = "first\r\nsecond\nthird"
+    const mixedDocument = {
+      ...document,
+      markdown: mixed,
+      contentHash: createHash("sha256").update(mixed).digest("hex"),
+    }
+    const { ref, save } = setup({ document: mixedDocument })
+    const view = editorView()
+    act(() => view.dispatch({ changes: { from: view.state.doc.length, insert: "\nfourth" } }))
+    await act(async () => void (await ref.current!.flush()))
+    expect(save).toHaveBeenCalledWith("first\r\nsecond\nthird\nfourth")
   })
 
   it("keeps one flush pending until edits made during save1 are durably saved by save2", async () => {
@@ -231,6 +259,20 @@ describe("MarkdownEditor", () => {
     expect(discardRecovery).toHaveBeenCalledTimes(2)
   })
 
+  it("rejects a mismatched save receipt without advancing revision or clearing recovery", async () => {
+    const { ref, save, discardRecovery } = setup({
+      save: async (markdown) =>
+        ok({ ...receipt(markdown), path: "private/life/journal.md", contentHash: "f".repeat(64) }),
+    })
+    replaceDoc(`${original}receipt mismatch`)
+    await act(async () => {
+      await expect(ref.current!.flush()).resolves.toBe(false)
+    })
+    expect(save).toHaveBeenCalledOnce()
+    expect(discardRecovery).not.toHaveBeenCalled()
+    expect(screen.getByRole("alert", { name: "保存状态" })).toHaveTextContent("保存失败")
+  })
+
   it("automatically cleans an immediate recovery when the buffer returns to disk content", async () => {
     const { ref, save, writeRecovery, discardRecovery } = setup()
     replaceDoc(`${original}temporary edit`)
@@ -243,6 +285,25 @@ describe("MarkdownEditor", () => {
     expect(discardRecovery).toHaveBeenCalledWith(
       expect.objectContaining({ contentHash: "c".repeat(64) }),
     )
+  })
+
+  it("safely discards a loaded recovery whose content already matches the disk", async () => {
+    const matching: NoteRecovery = {
+      path: publicNote.path,
+      markdown: document.markdown,
+      baseMtimeMs: document.mtimeMs,
+      baseContentHash: document.contentHash,
+      createdAt: "2026-09-25T00:30:00.000Z",
+      contentHash: createHash("sha256").update(document.markdown).digest("hex"),
+    }
+    const { discardRecovery } = setup({ recovery: matching })
+    await waitFor(() =>
+      expect(discardRecovery).toHaveBeenCalledWith({
+        path: publicNote.path,
+        contentHash: matching.contentHash,
+      }),
+    )
+    expect(screen.queryByRole("dialog")).not.toBeInTheDocument()
   })
 
   it("flushes before a switch and retains the buffer when a failed flush blocks it", async () => {
@@ -292,6 +353,28 @@ describe("MarkdownEditor", () => {
     await waitFor(() => expect(editorView().state.doc.toString()).toContain("external"))
   })
 
+  it("reloads with a programmatic transaction and does not create a replacement recovery draft", async () => {
+    const external: NoteDocument = {
+      ...document,
+      markdown: `${original}external reload`,
+      mtimeMs: 12,
+      contentHash: createHash("sha256").update(`${original}external reload`).digest("hex"),
+    }
+    const { ref, writeRecovery } = setup({
+      save: async () => ({
+        ok: false,
+        error: { code: "EXTERNAL_EDIT", message: "changed elsewhere" },
+      }),
+      read: async () => ok(external),
+    })
+    replaceDoc(`${original}local buffer`)
+    await act(async () => void (await ref.current!.flush()))
+    writeRecovery.mockClear()
+    await userEvent.click(screen.getByRole("button", { name: "重新加载" }))
+    await waitFor(() => expect(editorView().state.sliceDoc()).toBe(external.markdown))
+    expect(writeRecovery).not.toHaveBeenCalled()
+  })
+
   it("prompts for disk recovery without replacing the buffer until confirmed", async () => {
     const recovery: NoteRecovery = {
       path: publicNote.path,
@@ -310,9 +393,66 @@ describe("MarkdownEditor", () => {
     cleanup()
     const secondSetup = setup({ recovery })
     const second = await screen.findByRole("dialog", { name: "恢复未保存内容" })
-    await userEvent.click(within(second).getByRole("button", { name: "丢弃" }))
+    await userEvent.click(within(second).getByRole("button", { name: "永久删除恢复稿" }))
     expect(discardRecovery).not.toHaveBeenCalled()
     expect(secondSetup.discardRecovery).toHaveBeenCalledTimes(1)
+  })
+
+  it("treats a recovery based on an older disk revision as a conflict requiring confirmation", async () => {
+    const recovery: NoteRecovery = {
+      path: publicNote.path,
+      markdown: `${original}old recovered buffer`,
+      createdAt: "2026-09-25T00:30:00.000Z",
+      baseMtimeMs: 1,
+      baseContentHash: "b".repeat(64),
+      contentHash: "c".repeat(64),
+    }
+    const { save } = setup({ recovery })
+    const prompt = await screen.findByRole("dialog", { name: "旧恢复稿与磁盘版本冲突" })
+    expect(editorView().state.sliceDoc()).toBe(original)
+    expect(save).not.toHaveBeenCalled()
+    await userEvent.click(within(prompt).getByRole("button", { name: "比较版本" }))
+    expect(within(prompt).getByLabelText("磁盘当前内容")).toHaveTextContent("# Grid")
+    expect(within(prompt).getByLabelText("旧恢复稿内容")).toHaveTextContent("old recovered buffer")
+    await userEvent.click(within(prompt).getByRole("button", { name: "仍使用恢复稿" }))
+    const confirmation = await screen.findByRole("dialog", { name: "确认使用旧恢复稿" })
+    expect(screen.getAllByRole("dialog")).toHaveLength(1)
+    expect(editorView().state.sliceDoc()).toBe(original)
+    await userEvent.click(within(confirmation).getByRole("button", { name: "确认覆盖当前版本" }))
+    expect(editorView().state.sliceDoc()).toContain("old recovered buffer")
+  })
+
+  it("bounds recovery comparison DOM and announces truncation", async () => {
+    const recovery: NoteRecovery = {
+      path: publicNote.path,
+      markdown: Array.from({ length: 700 }, (_, index) => `private line ${index}`).join("\n"),
+      createdAt: "2026-09-25T00:30:00.000Z",
+      baseMtimeMs: 1,
+      baseContentHash: "b".repeat(64),
+      contentHash: "c".repeat(64),
+    }
+    setup({ recovery })
+    const prompt = await screen.findByRole("dialog", { name: "旧恢复稿与磁盘版本冲突" })
+    await userEvent.click(within(prompt).getByRole("button", { name: "比较版本" }))
+    expect(within(prompt).getByRole("status")).toHaveTextContent("仅显示前 500 行或 64 KiB")
+    expect(within(prompt).getAllByText(/private line/)).toHaveLength(500)
+  })
+
+  it("shows a safe read error when Reload or Compare cannot read the disk version", async () => {
+    const { ref } = setup({
+      save: async () => ({
+        ok: false,
+        error: { code: "EXTERNAL_EDIT", message: "changed elsewhere" },
+      }),
+      read: async () => ({
+        ok: false,
+        error: { code: "NOTE_FILE_ACCESS_FAILED", message: "无法读取最新磁盘内容" },
+      }),
+    })
+    replaceDoc(`${original}local buffer`)
+    await act(async () => void (await ref.current!.flush()))
+    await userEvent.click(screen.getByRole("button", { name: "比较" }))
+    expect(await screen.findByText("无法读取最新磁盘内容")).toHaveAttribute("role", "alert")
   })
 
   it("supports search, undo, redo, and keyboard-selectable Wiki completion using metadata only", async () => {
@@ -352,6 +492,38 @@ describe("MarkdownEditor", () => {
     fireEvent.keyDown(content, { key: "ArrowDown", code: "ArrowDown" })
     fireEvent.keyDown(content, { key: "Enter", code: "Enter" })
     expect(editorView().state.doc.toString()).toMatch(/^\[\[(?:CSS Grid|Journal)\]\]$/)
+  })
+
+  it("reconfigures Wiki completion metadata without recreating the editor instance", async () => {
+    const mounted = setup()
+    const firstView = editorView()
+    const renamed = { ...publicNote, title: "Grid Layout Renamed" }
+    mounted.rerender(
+      <MarkdownEditor
+        ref={mounted.ref}
+        document={document}
+        notes={[renamed, privateNote]}
+        save={async (request) => mounted.save(request.markdown)}
+        read={mounted.read}
+        recovery={{
+          get: mounted.getRecovery,
+          write: mounted.writeRecovery,
+          discard: mounted.discardRecovery,
+        }}
+      />,
+    )
+    expect(editorView()).toBe(firstView)
+    act(() => {
+      firstView.dispatch({
+        changes: { from: 0, to: firstView.state.doc.length, insert: "[[Grid" },
+        selection: { anchor: 6 },
+        userEvent: "input.type",
+      })
+    })
+    await act(async () => new Promise((resolve) => setTimeout(resolve, 40)))
+    const completion = await screen.findByRole("listbox")
+    expect(completion).toHaveTextContent("Grid Layout Renamed")
+    expect(completion).not.toHaveTextContent("CSS Grid")
   })
 
   it("handles rejected promises, unmount races, and StrictMode without act warnings", async () => {

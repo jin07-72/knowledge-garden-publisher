@@ -1,10 +1,11 @@
 import { app, BrowserWindow, ipcMain, shell } from "electron"
 import { join } from "node:path"
-import { DEFAULT_GARDEN_PATH } from "../shared/contracts"
+import { randomUUID } from "node:crypto"
+import { DEFAULT_GARDEN_PATH, IPC_CHANNELS } from "../shared/contracts"
 import { systemCommandRunner } from "./lib/commandRunner"
 import { registerPublisherIpc } from "./ipc"
 import {
-  createPublisherQuitCoordinator,
+  createPublisherCloseCoordinator,
   createPublisherServices,
   disposePublisherRuntime,
 } from "./publisherServices"
@@ -23,7 +24,44 @@ let mainWindowTrust: RendererTrustPolicy | undefined
 let unregisterIpc: (() => void) | undefined
 let previewManager: PreviewManager | undefined
 
-const quitCoordinator = createPublisherQuitCoordinator({
+let pendingClose:
+  | {
+      readonly requestId: string
+      readonly promise: Promise<boolean>
+      readonly finish: (success: boolean) => void
+    }
+  | undefined
+
+function requestRendererFlush(): Promise<boolean> {
+  if (pendingClose) return pendingClose.promise
+  const window = mainWindow
+  const trust = mainWindowTrust
+  if (
+    !window ||
+    !trust ||
+    window.isDestroyed() ||
+    window.webContents.isDestroyed() ||
+    !trust.isTrustedUrl(window.webContents.getURL())
+  )
+    return Promise.resolve(false)
+  const requestId = randomUUID()
+  let finish!: (success: boolean) => void
+  const promise = new Promise<boolean>((resolve) => {
+    const timer = setTimeout(() => resolve(false), 10_000)
+    finish = (success) => {
+      clearTimeout(timer)
+      resolve(success)
+    }
+  }).finally(() => {
+    if (pendingClose?.requestId === requestId) pendingClose = undefined
+  })
+  pendingClose = { requestId, promise, finish }
+  window.webContents.send(IPC_CHANNELS.events.beforeClose, { requestId })
+  return promise
+}
+
+const closeCoordinator = createPublisherCloseCoordinator({
+  requestRendererFlush,
   cleanup: async () => {
     const manager = previewManager
     const unregister = unregisterIpc
@@ -37,11 +75,19 @@ const quitCoordinator = createPublisherQuitCoordinator({
     previewManager = undefined
   },
   allowQuit: () => app.quit(),
-  logFailure: (message) => {
+  allowClose: () => mainWindow?.close(),
+  reportFailure: (message) => {
     console.error(message)
-  },
-  restoreOperable: () => {
-    if (app.isReady() && BrowserWindow.getAllWindows().length === 0) createWindow()
+    let window = mainWindow
+    if ((!window || window.isDestroyed() || window.webContents.isDestroyed()) && app.isReady())
+      window = createWindow()
+    if (!window || window.isDestroyed() || window.webContents.isDestroyed()) return
+    if (window.webContents.isLoading()) {
+      window.webContents.once("did-finish-load", () => {
+        if (!window?.isDestroyed())
+          window?.webContents.send(IPC_CHANNELS.events.closeBlocked, { message })
+      })
+    } else window.webContents.send(IPC_CHANNELS.events.closeBlocked, { message })
   },
 })
 
@@ -76,6 +122,9 @@ function createWindow(): BrowserWindow {
   mainWindowTrust = trust
 
   configureTrustedRendererNavigation(window.webContents, trust)
+  window.on("close", (event) => {
+    void closeCoordinator.beforeWindowClose(event)
+  })
   window.once("closed", () => {
     if (mainWindow === window) {
       mainWindow = undefined
@@ -121,6 +170,9 @@ app.whenReady().then(() => {
         ? []
         : [window.webContents]
     },
+    acknowledgeClose: ({ requestId, success }) => {
+      if (pendingClose?.requestId === requestId) pendingClose.finish(success)
+    },
   })
   createWindow()
 
@@ -132,7 +184,7 @@ app.whenReady().then(() => {
 })
 
 app.on("before-quit", (event) => {
-  void quitCoordinator.beforeQuit(event)
+  void closeCoordinator.beforeQuit(event)
 })
 
 app.on("window-all-closed", () => {

@@ -100,6 +100,103 @@ export interface PublisherQuitCoordinator {
   beforeQuit(event: { preventDefault(): void }): Promise<void>
 }
 
+export interface PublisherCloseCoordinator {
+  beforeWindowClose(event: { preventDefault(): void }): Promise<void>
+  beforeQuit(event: { preventDefault(): void }): Promise<void>
+}
+
+/** Fail-closed close barrier. Cleanup cannot begin until the renderer confirms durable state. */
+export function createPublisherCloseCoordinator(options: {
+  readonly requestRendererFlush: () => Promise<boolean>
+  readonly cleanup: () => Promise<void>
+  readonly allowClose: () => void
+  readonly allowQuit: () => void
+  readonly reportFailure: (message: string) => void
+  readonly timeoutMs?: number
+}): PublisherCloseCoordinator {
+  let flushed = false
+  let closeAllowed = false
+  let quitAllowed = false
+  let closeRequested = false
+  let quitRequested = false
+  let flight: Promise<void> | undefined
+  const requestFlush = async (): Promise<boolean> => {
+    let timer: ReturnType<typeof setTimeout> | undefined
+    try {
+      return await Promise.race([
+        options.requestRendererFlush(),
+        new Promise<boolean>((resolve) => {
+          timer = setTimeout(() => resolve(false), options.timeoutMs ?? 10_000)
+        }),
+      ])
+    } finally {
+      if (timer) clearTimeout(timer)
+    }
+  }
+
+  const run = (): Promise<void> => {
+    if (flight) return flight
+    const operation = (async () => {
+      try {
+        if (!flushed) {
+          if (!(await requestFlush())) {
+            closeRequested = false
+            quitRequested = false
+            options.reportFailure("保存失败，窗口仍保持打开。")
+            return
+          }
+          flushed = true
+        }
+        if (closeRequested && !closeAllowed) {
+          closeAllowed = true
+          try {
+            options.allowClose()
+          } catch (error) {
+            closeAllowed = false
+            throw error
+          }
+        }
+        if (quitRequested && !quitAllowed) {
+          await options.cleanup()
+          quitAllowed = true
+          try {
+            options.allowQuit()
+          } catch (error) {
+            quitAllowed = false
+            throw error
+          }
+        }
+      } catch {
+        flushed = false
+        closeAllowed = false
+        closeRequested = false
+        quitRequested = false
+        options.reportFailure("保存或关闭准备失败，窗口仍保持打开。")
+      }
+    })()
+    flight = operation.finally(() => {
+      if (flight === tracked) flight = undefined
+    })
+    const tracked = flight
+    return flight
+  }
+
+  return {
+    beforeWindowClose(event) {
+      if (closeAllowed || quitAllowed) return Promise.resolve()
+      event.preventDefault()
+      closeRequested = true
+      return run()
+    },
+    beforeQuit(event) {
+      if (quitAllowed) return Promise.resolve()
+      event.preventDefault()
+      quitRequested = true
+      return run()
+    },
+  }
+}
+
 export function createPublisherQuitCoordinator(options: {
   readonly cleanup: () => Promise<void>
   readonly allowQuit: () => void
