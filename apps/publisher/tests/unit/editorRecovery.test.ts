@@ -6,13 +6,14 @@ import {
   readFile,
   readdir,
   rm,
+  stat,
   symlink,
   unlink,
   writeFile,
 } from "node:fs/promises"
 import { tmpdir } from "node:os"
 import { join } from "node:path"
-import { afterEach, describe, expect, it } from "vitest"
+import { afterEach, describe, expect, it, vi } from "vitest"
 import {
   discardEditorRecovery,
   getEditorRecovery,
@@ -75,6 +76,28 @@ describe("editor recovery", () => {
     await expect(listRecoveries(workspace)).resolves.toEqual([])
     const files = await readdir(join(workspace, ".garden-publisher", "editor-recovery"))
     expect(files.filter((name) => name.endsWith(".json"))).toHaveLength(1)
+  })
+
+  it("allocates recovery reads from the verified file size instead of the global limit", async () => {
+    const workspace = await garden()
+    await writeEditorRecovery(workspace, {
+      path,
+      markdown: "small authenticated draft",
+      baseMtimeMs: 1,
+      baseContentHash: "a".repeat(64),
+    })
+    const file = join(workspace, ".garden-publisher", "editor-recovery", `${hash(path)}.json`)
+    const size = (await stat(file)).size
+    const allocation = vi.spyOn(Buffer, "alloc")
+
+    await expect(getEditorRecovery(workspace, { path })).resolves.toMatchObject({
+      markdown: "small authenticated draft",
+    })
+
+    expect(allocation).toHaveBeenCalledWith(size + 1)
+    expect(Math.max(...allocation.mock.calls.map(([bytes]) => bytes))).toBeLessThanOrEqual(
+      16 * 1024 * 1024 + 1,
+    )
   })
 
   it("does not let an old save discard a newer crash-recovery buffer", async () => {

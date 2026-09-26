@@ -4,6 +4,7 @@ import { EditorView } from "@codemirror/view"
 import { createHash } from "node:crypto"
 import { StrictMode } from "react"
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest"
+import { createPublisherCloseCoordinator } from "../../src/main/publisherServices"
 import { App } from "../../src/renderer/src/App"
 import { shanghaiCalendarDate } from "../../src/renderer/src/components/NoteSidebar"
 import type {
@@ -211,6 +212,11 @@ describe("publisher main layout", () => {
       return () => undefined
     })
     const recoveryWrite = deferred<Awaited<ReturnType<GardenApi["notes"]["recovery"]["write"]>>>()
+    const rendererAck = deferred<boolean>()
+    vi.mocked(garden.lifecycle.acknowledgeClose).mockImplementation(async ({ success }) => {
+      rendererAck.resolve(success)
+      return ok(undefined)
+    })
     vi.mocked(garden.notes.recovery.write).mockReturnValue(recoveryWrite.promise)
     vi.mocked(garden.notes.save).mockImplementation(async (request) =>
       ok({
@@ -225,10 +231,25 @@ describe("publisher main layout", () => {
     const view = await waitFor(() =>
       EditorView.findFromDOM(document.querySelector(".cm-content") as HTMLElement),
     )
+    await waitFor(() => expect(view!.contentDOM).toHaveAttribute("contenteditable", "true"))
     act(() => {
       view!.dispatch({ changes: { from: view!.state.doc.length, insert: "\nclose now" } })
-      beforeClose?.({ requestId: "11111111-1111-4111-8111-111111111111" })
     })
+    const allowClose = vi.fn()
+    const coordinator = createPublisherCloseCoordinator({
+      requestRendererFlush: () => {
+        beforeClose?.({ requestId: "11111111-1111-4111-8111-111111111111" })
+        return rendererAck.promise
+      },
+      cleanup: vi.fn(async () => undefined),
+      allowClose,
+      allowQuit: vi.fn(),
+      reportFailure: vi.fn(),
+    })
+    const closeEvent = { preventDefault: vi.fn() }
+    const close = coordinator.beforeWindowClose(closeEvent)
+    expect(closeEvent.preventDefault).toHaveBeenCalledOnce()
+    expect(allowClose).not.toHaveBeenCalled()
     expect(garden.lifecycle.acknowledgeClose).not.toHaveBeenCalled()
     recoveryWrite.resolve(ok({ contentHash: "c".repeat(64) }))
     await waitFor(() => expect(garden.notes.save).toHaveBeenCalledOnce())
@@ -238,6 +259,8 @@ describe("publisher main layout", () => {
         success: true,
       }),
     )
+    await close
+    expect(allowClose).toHaveBeenCalledOnce()
   })
 
   it("closes the visibility menu on Tab, outside pointer, and focus leaving", async () => {

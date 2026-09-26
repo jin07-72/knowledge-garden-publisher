@@ -144,15 +144,16 @@ async function target(workspace: string, path: string): Promise<{ root: DraftRoo
   return { root, file: resolve(root.path, draftName(path)) }
 }
 
-async function boundedRead(handle: FileHandle): Promise<Buffer> {
-  const buffer = Buffer.alloc(maximumStoredBytes + 1)
+async function boundedRead(handle: FileHandle, expectedSize: bigint): Promise<Buffer> {
+  const expectedBytes = Number(expectedSize)
+  const buffer = Buffer.alloc(expectedBytes + 1)
   let offset = 0
   while (offset < buffer.length) {
     const { bytesRead } = await handle.read(buffer, offset, buffer.length - offset, offset)
     if (bytesRead === 0) break
     offset += bytesRead
   }
-  if (offset > maximumStoredBytes) throw failure("RECOVERY_INVALID", "Recovery data is invalid.")
+  if (offset !== expectedBytes) throw failure("RECOVERY_INVALID", "Recovery data is invalid.")
   return buffer.subarray(0, offset)
 }
 
@@ -182,11 +183,12 @@ async function readStored(
     const opened = await handle.stat({ bigint: true })
     if (!opened.isFile() || identity(opened) !== identity(before))
       throw failure("RECOVERY_INVALID", "Recovery data is invalid.")
-    const bytes = await boundedRead(handle)
+    const bytes = await boundedRead(handle, opened.size)
     const after = await lstat(file, { bigint: true })
     if (
       after.isSymbolicLink() ||
       identity(after) !== identity(opened) ||
+      after.size !== opened.size ||
       !inside(root.path, await realpath(file))
     )
       throw failure("RECOVERY_INVALID", "Recovery data is invalid.")

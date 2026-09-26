@@ -29,17 +29,23 @@ const programmaticReplace = Annotation.define<boolean>()
 const compareMaximumBytes = 64 * 1024
 const compareMaximumLines = 500
 
-function boundedLines(markdown: string): { lines: readonly string[]; truncated: boolean } {
-  const source = markdown.split(/\r?\n/)
+export function boundedLines(markdown: string): { lines: readonly string[]; truncated: boolean } {
   const lines: string[] = []
   let bytes = 0
-  for (const line of source) {
+  let start = 0
+  while (start <= markdown.length) {
+    const newline = markdown.indexOf("\n", start)
+    const end = newline === -1 ? markdown.length : newline
+    const contentEnd = end > start && markdown.charCodeAt(end - 1) === 13 ? end - 1 : end
+    const line = markdown.slice(start, contentEnd)
     const lineBytes = new TextEncoder().encode(`${line}\n`).byteLength
     if (lines.length >= compareMaximumLines || bytes + lineBytes > compareMaximumBytes) {
       return { lines, truncated: true }
     }
     lines.push(line)
     bytes += lineBytes
+    if (newline === -1) return { lines, truncated: false }
+    start = newline + 1
   }
   return { lines, truncated: false }
 }
@@ -117,8 +123,18 @@ export const MarkdownEditor = forwardRef<
   const host = useRef<HTMLDivElement>(null)
   const editor = useRef<EditorView | undefined>(undefined)
   const completion = useRef(new Compartment())
+  const editing = useRef(new Compartment())
   const mounted = useRef(true)
+  const recoveryReady = useRef(false)
+  const recoveryWritesEnabled = useRef(false)
+  const reloadPending = useRef(false)
+  const refreshWritable = useRef<() => void>(() => undefined)
+  const retryRecoveryLoad = useRef<() => void>(() => undefined)
   const [recoveryPrompt, setRecoveryPrompt] = useState<NoteRecovery>()
+  const [recoveryLoadError, setRecoveryLoadError] = useState<string>()
+  const [unknownRecoveryWarning, setUnknownRecoveryWarning] = useState(false)
+  const [maintenanceRecovery, setMaintenanceRecovery] = useState<NoteRecovery>()
+  const [maintenanceWarning, setMaintenanceWarning] = useState<string>()
   const [external, setExternal] = useState<NoteDocument>()
   const [comparisonOpen, setComparisonOpen] = useState(false)
   const [recoveryComparisonOpen, setRecoveryComparisonOpen] = useState(false)
@@ -128,7 +144,16 @@ export const MarkdownEditor = forwardRef<
   const autosave = useAutosave({
     document,
     save,
-    writeRecovery: recovery.write,
+    writeRecovery: (request) =>
+      recoveryWritesEnabled.current
+        ? recovery.write(request)
+        : Promise.resolve({
+            ok: false,
+            error: {
+              code: "RECOVERY_INVALID" as const,
+              message: "Recovery state is not ready.",
+            },
+          }),
     discardRecovery: (contentHash) => recovery.discard({ path: document.path, contentHash }),
     onSaved,
   })
@@ -157,6 +182,14 @@ export const MarkdownEditor = forwardRef<
               activateOnTyping: true,
             }),
           ),
+          editing.current.of([EditorState.readOnly.of(true), EditorView.editable.of(false)]),
+          EditorState.transactionFilter.of((transaction) =>
+            transaction.docChanged &&
+            (!recoveryReady.current || reloadPending.current) &&
+            !transaction.annotation(programmaticReplace)
+              ? []
+              : transaction,
+          ),
           EditorView.lineWrapping,
           EditorView.updateListener.of((update) => {
             if (!update.docChanged) return
@@ -176,21 +209,64 @@ export const MarkdownEditor = forwardRef<
       }),
     })
     editor.current = view
-    void recovery
-      .get()
-      .then((result) => {
-        if (!mounted.current || !result.ok || result.value === undefined) return
-        if (result.value.markdown === document.markdown) {
-          void recovery
-            .discard({ path: document.path, contentHash: result.value.contentHash })
-            .catch(() => undefined)
-          return
-        }
-        setRecoveryPrompt(result.value)
+    let active = true
+    const updateWritable = (): void => {
+      if (!active) return
+      const writable = recoveryReady.current && !reloadPending.current
+      view.dispatch({
+        effects: editing.current.reconfigure([
+          EditorState.readOnly.of(!writable),
+          EditorView.editable.of(writable),
+        ]),
       })
-      .catch(() => undefined)
+    }
+    refreshWritable.current = updateWritable
+    const loadRecovery = async (): Promise<void> => {
+      recoveryReady.current = false
+      recoveryWritesEnabled.current = false
+      setRecoveryLoadError(undefined)
+      setUnknownRecoveryWarning(false)
+      updateWritable()
+      let result: IpcResult<NoteRecovery | undefined>
+      try {
+        result = await recovery.get()
+      } catch {
+        if (active) setRecoveryLoadError("无法检查本地恢复稿。请重试或明确选择继续。")
+        return
+      }
+      if (!active) return
+      if (!result.ok) {
+        setRecoveryLoadError(result.error.message || "无法检查本地恢复稿。")
+        return
+      }
+      if (result.value?.markdown === document.markdown) {
+        setMaintenanceRecovery(result.value)
+        try {
+          const discarded = await recovery.discard({
+            path: document.path,
+            contentHash: result.value.contentHash,
+          })
+          if (!active) return
+          if (discarded.ok) {
+            setMaintenanceRecovery(undefined)
+            setMaintenanceWarning(undefined)
+          } else setMaintenanceWarning(`恢复稿清理失败：${discarded.error.message}`)
+        } catch {
+          if (!active) return
+          setMaintenanceWarning("恢复稿清理失败，请重试。")
+        }
+      } else if (result.value !== undefined) setRecoveryPrompt(result.value)
+      recoveryWritesEnabled.current = true
+      recoveryReady.current = true
+      updateWritable()
+    }
+    retryRecoveryLoad.current = () => void loadRecovery()
+    void loadRecovery()
     return () => {
+      active = false
       mounted.current = false
+      recoveryReady.current = false
+      reloadPending.current = false
       editor.current = undefined
       view.destroy()
     }
@@ -243,9 +319,42 @@ export const MarkdownEditor = forwardRef<
   }
 
   const reloadExternal = async (): Promise<void> => {
-    const next = await readExternal()
-    if (!next) return
-    await replaceFromDisk(next)
+    if (reloadPending.current) return
+    reloadPending.current = true
+    refreshWritable.current()
+    try {
+      const next = await readExternal()
+      if (!next) return
+      await replaceFromDisk(next)
+    } finally {
+      reloadPending.current = false
+      refreshWritable.current()
+    }
+  }
+
+  const continueWithoutRecovery = (): void => {
+    recoveryWritesEnabled.current = false
+    recoveryReady.current = true
+    setRecoveryLoadError(undefined)
+    setUnknownRecoveryWarning(true)
+    refreshWritable.current()
+  }
+
+  const retryMaintenanceCleanup = async (): Promise<void> => {
+    if (!maintenanceRecovery) return
+    try {
+      const result = await recovery.discard({
+        path: document.path,
+        contentHash: maintenanceRecovery.contentHash,
+      })
+      if (!mounted.current) return
+      if (result.ok) {
+        setMaintenanceRecovery(undefined)
+        setMaintenanceWarning(undefined)
+      } else setMaintenanceWarning(`恢复稿清理失败：${result.error.message}`)
+    } catch {
+      if (mounted.current) setMaintenanceWarning("恢复稿清理失败，请重试。")
+    }
   }
 
   const statusLabel = {
@@ -313,105 +422,131 @@ export const MarkdownEditor = forwardRef<
         </p>
       ) : null}
 
-      {recoveryPrompt && !confirmStaleRecovery ? (
-        <ModalShell
-          labelId="recovery-title"
-          className="editor-dialog"
-          onClose={() => undefined}
-          closeDisabled
-        >
-          <h2 id="recovery-title">
-            {recoveryPrompt.baseMtimeMs === document.mtimeMs &&
-            recoveryPrompt.baseContentHash === document.contentHash
-              ? "恢复未保存内容"
-              : "旧恢复稿与磁盘版本冲突"}
-          </h2>
-          <p>
-            {recoveryPrompt.baseMtimeMs === document.mtimeMs &&
-            recoveryPrompt.baseContentHash === document.contentHash
-              ? "检测到这篇笔记的本地恢复副本。确认前不会替换当前编辑内容。"
-              : "磁盘版本已在恢复稿之后改变。旧稿不会自动保存；请先比较并明确确认。"}
-          </p>
-          <p className="recovery-delete-warning">
-            丢弃操作会永久删除本机恢复稿，无法从回收站找回。
-          </p>
-          {recoveryActionError ? <p role="alert">{recoveryActionError}</p> : null}
-          {recoveryComparisonOpen ? (
-            <Comparison
-              left={document.markdown}
-              right={recoveryPrompt.markdown}
-              leftLabel="磁盘当前内容"
-              rightLabel="旧恢复稿内容"
-            />
-          ) : null}
-          <div className="dialog-actions">
-            {recoveryPrompt.baseMtimeMs === document.mtimeMs &&
-            recoveryPrompt.baseContentHash === document.contentHash ? (
-              <button
-                type="button"
-                onClick={() => {
-                  replace(recoveryPrompt)
-                  setRecoveryPrompt(undefined)
-                }}
-              >
-                恢复
-              </button>
-            ) : (
-              <>
-                <button type="button" onClick={() => setRecoveryComparisonOpen(true)}>
-                  比较版本
-                </button>
-                <button type="button" onClick={() => setConfirmStaleRecovery(true)}>
-                  仍使用恢复稿
-                </button>
-              </>
-            )}
-            <button
-              type="button"
-              onClick={() =>
-                void recovery
-                  .discard({ path: document.path, contentHash: recoveryPrompt.contentHash })
-                  .then((result) => {
-                    if (!mounted.current) return
-                    if (result.ok) {
-                      setRecoveryPrompt(undefined)
-                      setRecoveryActionError(undefined)
-                    } else setRecoveryActionError(result.error.message)
-                  })
-                  .catch(() => {
-                    if (mounted.current) setRecoveryActionError("无法永久删除恢复稿。")
-                  })
-              }
-            >
-              永久删除恢复稿
-            </button>
-          </div>
-        </ModalShell>
+      {recoveryLoadError ? (
+        <div className="editor-recovery-warning" role="alert">
+          <span>{recoveryLoadError}</span>
+          <button type="button" onClick={() => retryRecoveryLoad.current()}>
+            重试检查
+          </button>
+          <button type="button" onClick={continueWithoutRecovery}>
+            不加载恢复稿继续
+          </button>
+        </div>
+      ) : null}
+      {unknownRecoveryWarning ? (
+        <div className="editor-recovery-warning" role="status">
+          <span>恢复稿状态未知；继续编辑不会覆盖状态未知的恢复稿。</span>
+          <button type="button" onClick={() => retryRecoveryLoad.current()}>
+            重新检查
+          </button>
+        </div>
+      ) : null}
+      {maintenanceWarning ? (
+        <div className="editor-recovery-warning" role="status">
+          <span>{maintenanceWarning}</span>
+          <button type="button" onClick={() => void retryMaintenanceCleanup()}>
+            重试清理
+          </button>
+        </div>
       ) : null}
 
-      {confirmStaleRecovery && recoveryPrompt ? (
+      {recoveryPrompt ? (
         <ModalShell
-          labelId="stale-recovery-confirm-title"
+          labelId={confirmStaleRecovery ? "stale-recovery-confirm-title" : "recovery-title"}
           className="editor-dialog"
           onClose={() => setConfirmStaleRecovery(false)}
+          closeDisabled={!confirmStaleRecovery}
         >
-          <h2 id="stale-recovery-confirm-title">确认使用旧恢复稿</h2>
-          <p>这会用旧恢复稿替换编辑器内容，并以当前磁盘版本作为下一次保存基线。</p>
-          <div className="dialog-actions">
-            <button type="button" onClick={() => setConfirmStaleRecovery(false)}>
-              取消
-            </button>
-            <button
-              type="button"
-              onClick={() => {
-                replace(recoveryPrompt)
-                setConfirmStaleRecovery(false)
-                setRecoveryPrompt(undefined)
-              }}
-            >
-              确认覆盖当前版本
-            </button>
-          </div>
+          {confirmStaleRecovery ? (
+            <>
+              <h2 id="stale-recovery-confirm-title">确认使用旧恢复稿</h2>
+              <p>这会用旧恢复稿替换编辑器内容，并以当前磁盘版本作为下一次保存基线。</p>
+              <div className="dialog-actions">
+                <button type="button" onClick={() => setConfirmStaleRecovery(false)}>
+                  取消
+                </button>
+                <button
+                  type="button"
+                  onClick={() => {
+                    replace(recoveryPrompt)
+                    setConfirmStaleRecovery(false)
+                    setRecoveryPrompt(undefined)
+                  }}
+                >
+                  确认覆盖当前版本
+                </button>
+              </div>
+            </>
+          ) : (
+            <>
+              <h2 id="recovery-title">
+                {recoveryPrompt.baseMtimeMs === document.mtimeMs &&
+                recoveryPrompt.baseContentHash === document.contentHash
+                  ? "恢复未保存内容"
+                  : "旧恢复稿与磁盘版本冲突"}
+              </h2>
+              <p>
+                {recoveryPrompt.baseMtimeMs === document.mtimeMs &&
+                recoveryPrompt.baseContentHash === document.contentHash
+                  ? "检测到这篇笔记的本地恢复副本。确认前不会替换当前编辑内容。"
+                  : "磁盘版本已在恢复稿之后改变。旧稿不会自动保存；请先比较并明确确认。"}
+              </p>
+              <p className="recovery-delete-warning">
+                丢弃操作会永久删除本机恢复稿，无法从回收站找回。
+              </p>
+              {recoveryActionError ? <p role="alert">{recoveryActionError}</p> : null}
+              {recoveryComparisonOpen ? (
+                <Comparison
+                  left={document.markdown}
+                  right={recoveryPrompt.markdown}
+                  leftLabel="磁盘当前内容"
+                  rightLabel="旧恢复稿内容"
+                />
+              ) : null}
+              <div className="dialog-actions">
+                {recoveryPrompt.baseMtimeMs === document.mtimeMs &&
+                recoveryPrompt.baseContentHash === document.contentHash ? (
+                  <button
+                    type="button"
+                    onClick={() => {
+                      replace(recoveryPrompt)
+                      setRecoveryPrompt(undefined)
+                    }}
+                  >
+                    恢复
+                  </button>
+                ) : (
+                  <>
+                    <button type="button" onClick={() => setRecoveryComparisonOpen(true)}>
+                      比较版本
+                    </button>
+                    <button type="button" onClick={() => setConfirmStaleRecovery(true)}>
+                      仍使用恢复稿
+                    </button>
+                  </>
+                )}
+                <button
+                  type="button"
+                  onClick={() =>
+                    void recovery
+                      .discard({ path: document.path, contentHash: recoveryPrompt.contentHash })
+                      .then((result) => {
+                        if (!mounted.current) return
+                        if (result.ok) {
+                          setRecoveryPrompt(undefined)
+                          setRecoveryActionError(undefined)
+                        } else setRecoveryActionError(result.error.message)
+                      })
+                      .catch(() => {
+                        if (mounted.current) setRecoveryActionError("无法永久删除恢复稿。")
+                      })
+                  }
+                >
+                  永久删除恢复稿
+                </button>
+              </div>
+            </>
+          )}
         </ModalShell>
       ) : null}
 

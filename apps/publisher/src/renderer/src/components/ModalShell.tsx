@@ -72,7 +72,7 @@ export function ModalShell({
         if (snapshot.previouslyFocused?.isConnected) snapshot.previouslyFocused.focus()
       })
     }
-  }, [initialFocus])
+  }, [initialFocus, labelId])
 
   return createPortal(
     <div
