@@ -1,7 +1,7 @@
 import {
   IPC_CHANNELS,
   type GardenApi,
-  type ChangeGroup,
+  type ChangeReview,
   type BeforeCloseRequest,
   type CloseAckRequest,
   type DeploymentRun,
@@ -146,7 +146,7 @@ export function createGardenApi(ipc: IpcRendererPort): GardenApi {
       subscription(ipc, IPC_CHANNELS.events.previewProgress, previewProgressSchema, listener),
   })
   const changes = Object.freeze({
-    list: () => invoke<readonly ChangeGroup[]>(ipc, IPC_CHANNELS.requests.changesList),
+    list: () => invoke<ChangeReview>(ipc, IPC_CHANNELS.requests.changesList),
   })
   const publish = Object.freeze({
     start: (request: PublishRequest) =>

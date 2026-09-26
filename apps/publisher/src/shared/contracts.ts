@@ -159,10 +159,27 @@ export interface NoteSummary {
   readonly tags: readonly string[]
 }
 
+export type ChangeKind = "added" | "modified" | "unpublish" | "attachment" | "private" | "config"
+export type ChangeSelection = "default" | "optional" | "locked"
+
+export interface ChangeAttachment {
+  readonly path: string
+  readonly label: string
+}
+
 export interface ChangeGroup {
   readonly id: string
   readonly label: string
+  readonly kind: ChangeKind
+  readonly selection: ChangeSelection
+  readonly description: string
   readonly paths: readonly string[]
+  readonly attachments: readonly ChangeAttachment[]
+}
+
+export interface ChangeReview {
+  readonly groups: readonly ChangeGroup[]
+  readonly blockedReason?: string
 }
 
 export interface PublishRequest {
@@ -377,7 +394,7 @@ export interface GardenApi {
     onProgress(listener: (status: PreviewStatus) => void): Unsubscribe
   }
   readonly changes: {
-    list(): Promise<IpcResult<readonly ChangeGroup[]>>
+    list(): Promise<IpcResult<ChangeReview>>
   }
   readonly publish: {
     start(request: PublishRequest): Promise<IpcResult<PublishStartReceipt>>

@@ -957,6 +957,171 @@ button {
   background: #f5a97f;
 }
 
+.publish-review-dialog {
+  display: grid;
+  width: min(720px, 100%);
+  max-height: min(760px, calc(100vh - 48px));
+  grid-template-rows: auto minmax(0, 1fr) auto;
+  overflow: hidden;
+  border: 1px solid #46515e;
+  border-radius: 12px;
+  background: #171c22;
+  box-shadow: 0 24px 70px #000c;
+}
+.publish-review-header,
+.publish-review-footer {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 18px;
+  padding: 15px 17px;
+}
+.publish-review-header {
+  border-bottom: 1px solid #303640;
+}
+.publish-review-header h2 {
+  margin: 0;
+  font-size: 17px;
+}
+.publish-review-body {
+  min-height: 240px;
+  overflow: auto;
+  padding: 12px;
+}
+.change-groups {
+  display: grid;
+  gap: 8px;
+}
+.advanced-heading {
+  margin: 8px 2px 0;
+  color: #aeb7c2;
+  font-size: 11px;
+  letter-spacing: 0.06em;
+  text-transform: uppercase;
+}
+.change-group {
+  padding: 11px 12px;
+  border: 1px solid #313943;
+  border-radius: 8px;
+  background: #1c222a;
+}
+.change-group > label {
+  display: flex;
+  align-items: flex-start;
+  gap: 10px;
+  cursor: pointer;
+}
+.change-group > label > input {
+  flex: none;
+  margin-top: 3px;
+  accent-color: #8bd5ca;
+}
+.change-group > label > svg {
+  flex: none;
+  margin-left: auto;
+  color: #f5a97f;
+}
+.change-copy {
+  min-width: 0;
+  display: grid;
+  gap: 3px;
+}
+.change-copy strong {
+  color: #eef1f4;
+  font-size: 13px;
+}
+.change-copy small {
+  color: #9da8b4;
+  font-size: 11px;
+}
+.change-copy code {
+  overflow: hidden;
+  color: #7f8b98;
+  font:
+    10px/1.5 "Cascadia Code",
+    Consolas,
+    monospace;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.change-kind {
+  color: #8bd5ca;
+}
+.change-unpublish .change-kind,
+.change-private .change-kind {
+  color: #f5a97f;
+}
+.change-config .change-kind {
+  color: #eed49f;
+}
+.change-private {
+  opacity: 0.82;
+}
+.attachment-tree {
+  display: grid;
+  gap: 4px;
+  margin: 8px 0 0 28px;
+  padding: 0;
+  color: #9ba6b1;
+  font-size: 11px;
+  list-style: none;
+}
+.attachment-tree li::before {
+  margin-right: 7px;
+  color: #596571;
+  content: "└─";
+}
+.review-state {
+  display: flex;
+  min-height: 210px;
+  align-items: center;
+  justify-content: center;
+  flex-direction: column;
+  gap: 9px;
+  margin: 0;
+  color: #98a3af;
+  text-align: center;
+}
+.review-state strong {
+  color: #eef1f4;
+}
+.review-state .secondary-button,
+.review-error .secondary-button {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  margin-top: 5px;
+}
+.review-error span {
+  color: #f5a97f;
+}
+.review-blocked {
+  margin-bottom: 10px;
+  padding: 9px 11px;
+  border: 1px solid #765644;
+  border-radius: 7px;
+  color: #ffe0c7;
+  background: #35251e;
+  font-size: 12px;
+}
+.publish-review-footer {
+  border-top: 1px solid #303640;
+  background: #14191f;
+}
+.publish-review-footer > div {
+  min-width: 0;
+  display: grid;
+  gap: 3px;
+}
+.publish-review-footer strong {
+  font-size: 12px;
+}
+.publish-review-footer small {
+  color: #8f9aa6;
+  font-size: 10px;
+  line-height: 1.4;
+}
+
 @media (max-width: 1050px) {
   .workspace-grid {
     grid-template-columns: var(--sidebar-width, minmax(190px, 0.42fr)) minmax(360px, 1fr) !important;

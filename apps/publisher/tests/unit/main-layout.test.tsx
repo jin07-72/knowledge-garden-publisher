@@ -8,7 +8,7 @@ import { createPublisherCloseCoordinator } from "../../src/main/publisherService
 import { App } from "../../src/renderer/src/App"
 import { shanghaiCalendarDate } from "../../src/renderer/src/components/NoteSidebar"
 import type {
-  ChangeGroup,
+  ChangeReview,
   DeploymentRun,
   GardenApi,
   GitCommit,
@@ -151,7 +151,7 @@ function createGardenMock(): GardenApi {
       onProgress: vi.fn(() => () => undefined),
     },
     changes: {
-      list: vi.fn(async () => unavailable<readonly ChangeGroup[]>("变更服务将在后续任务中提供。")),
+      list: vi.fn(async () => unavailable<ChangeReview>("变更服务暂不可用。")),
     },
     publish: {
       start: vi.fn(),
@@ -331,12 +331,17 @@ describe("publisher main layout", () => {
   })
 
   it("reports a rejected change-list request without an unhandled bootstrap failure", async () => {
+    const user = userEvent.setup()
     vi.mocked(garden.changes.list).mockRejectedValueOnce(new Error("变化通道断开"))
     render(<App />)
 
     const status = await screen.findByRole("status", { name: "发布状态" })
     expect(within(status).getByText("变化通道断开")).toBeVisible()
-    expect(screen.getByRole("button", { name: "检查并发布" })).toBeDisabled()
+    const review = screen.getByRole("button", { name: "检查并发布" })
+    expect(review).toBeEnabled()
+    await user.click(review)
+    expect(await screen.findByRole("dialog", { name: "检查并发布" })).toBeVisible()
+    expect(screen.getByRole("alert")).toHaveTextContent("发布检查暂不可用")
   })
 
   it("ignores stale StrictMode bootstrap results and starts preview at most once", async () => {
@@ -344,8 +349,8 @@ describe("publisher main layout", () => {
     const secondList = deferred<IpcResult<readonly NoteSummary[]>>()
     const firstStatus = deferred<IpcResult<PreviewStatus>>()
     const secondStatus = deferred<IpcResult<PreviewStatus>>()
-    const firstChanges = deferred<IpcResult<readonly ChangeGroup[]>>()
-    const secondChanges = deferred<IpcResult<readonly ChangeGroup[]>>()
+    const firstChanges = deferred<IpcResult<ChangeReview>>()
+    const secondChanges = deferred<IpcResult<ChangeReview>>()
     const lists = [firstList, secondList]
     const statuses = [firstStatus, secondStatus]
     const changes = [firstChanges, secondChanges]
@@ -361,15 +366,29 @@ describe("publisher main layout", () => {
 
     secondList.resolve(ok([notes[1]]))
     secondStatus.resolve(ok({ state: "stopped", generation: 2 }))
-    secondChanges.resolve(ok([]))
+    secondChanges.resolve(ok({ groups: [] }))
     await waitFor(() => expect(garden.preview.start).toHaveBeenCalledTimes(1))
     firstList.resolve(ok([notes[0]]))
     firstStatus.resolve(ok({ state: "ready", generation: 99, url: "http://stale/" }))
-    firstChanges.resolve(ok([{ id: "stale", label: "旧变化", paths: ["content/a.md"] }]))
+    firstChanges.resolve(
+      ok({
+        groups: [
+          {
+            id: "stale",
+            label: "旧变化",
+            kind: "modified",
+            selection: "default",
+            description: "旧变化",
+            paths: ["content/a.md"],
+            attachments: [],
+          },
+        ],
+      }),
+    )
 
     expect(await screen.findByText("private/reading/private-notes.md")).toBeVisible()
     expect(screen.getByText("可发布变化：0")).toBeVisible()
-    expect(screen.getByRole("button", { name: "检查并发布" })).toBeDisabled()
+    expect(screen.getByRole("button", { name: "检查并发布" })).toBeEnabled()
   })
 
   it("uses the Shanghai calendar date for new notes", () => {
@@ -935,7 +954,7 @@ describe("publisher main layout", () => {
     render(<App />)
 
     const preview = await screen.findByRole("region", { name: "本地预览" })
-    expect(within(preview).getByTitle("CSS Grid 布局的 Quartz 精确预览")).toHaveAttribute(
+    expect(await within(preview).findByTitle("CSS Grid 布局的 Quartz 精确预览")).toHaveAttribute(
       "src",
       "http://127.0.0.1:8080/technology/css-grid",
     )
@@ -978,7 +997,7 @@ describe("publisher main layout", () => {
     expect(within(status).getByText("已保存")).toBeVisible()
     expect(within(status).getByText("预览就绪")).toBeVisible()
     expect(within(status).getByText("可发布变化：暂不可用")).toBeVisible()
-    expect(screen.getByRole("button", { name: "检查并发布" })).toBeDisabled()
+    expect(screen.getByRole("button", { name: "检查并发布" })).toBeEnabled()
     expect(within(status).getByText(/发布检查暂不可用/)).toBeVisible()
   })
 
@@ -997,23 +1016,38 @@ describe("publisher main layout", () => {
     expect(within(navigation).queryByRole("alert")).not.toBeInTheDocument()
   })
 
-  it("keeps publish review disabled for both empty and non-empty successful change checks", async () => {
+  it("opens publish review for a successful change check without starting publication", async () => {
+    const user = userEvent.setup()
     vi.mocked(garden.changes.list).mockResolvedValueOnce(
-      ok([{ id: "change-1", label: "一项变化", paths: ["content/a.md"] }]),
+      ok({
+        groups: [
+          {
+            id: "change-1",
+            label: "一项变化",
+            kind: "modified",
+            selection: "default",
+            description: "公开文章已修改",
+            paths: ["content/technology/a.md"],
+            attachments: [],
+          },
+        ],
+      }),
     )
     render(<App />)
 
     expect(await screen.findByText("可发布变化：1")).toBeVisible()
     const publish = screen.getByRole("button", { name: "检查并发布" })
-    expect(publish).toBeDisabled()
-    expect(publish).toHaveAccessibleDescription(/发布审查功能尚未启用/)
+    expect(publish).toBeEnabled()
+    await user.click(publish)
+    expect(screen.getByRole("dialog", { name: "检查并发布" })).toBeVisible()
+    expect(screen.getByRole("button", { name: "验证并发布" })).toBeDisabled()
     expect(garden.publish.start).not.toHaveBeenCalled()
   })
 
   it("ignores pending bootstrap results after unmount without console errors", async () => {
     const list = deferred<IpcResult<readonly NoteSummary[]>>()
     const status = deferred<IpcResult<PreviewStatus>>()
-    const changes = deferred<IpcResult<readonly ChangeGroup[]>>()
+    const changes = deferred<IpcResult<ChangeReview>>()
     vi.mocked(garden.notes.list).mockReturnValueOnce(list.promise)
     vi.mocked(garden.preview.status).mockReturnValueOnce(status.promise)
     vi.mocked(garden.changes.list).mockReturnValueOnce(changes.promise)
@@ -1024,7 +1058,7 @@ describe("publisher main layout", () => {
     await act(async () => {
       list.resolve(ok(notes))
       status.resolve(ok({ state: "ready", generation: 8, url: "http://late/" }))
-      changes.resolve(ok([]))
+      changes.resolve(ok({ groups: [] }))
       await Promise.resolve()
     })
     expect(consoleError).not.toHaveBeenCalled()

@@ -17,6 +17,7 @@ import {
 } from "./services/editorRecovery"
 import { scanNotes } from "./services/noteIndex"
 import { inspectWorkspace } from "./services/workspace"
+import { listChanges } from "./services/changes"
 
 export interface PreviewServicePort {
   start(request: {
@@ -39,7 +40,7 @@ function unavailable(name: string): AppError {
   return { code: "SERVICE_UNAVAILABLE", message: `${name} is not available yet.` }
 }
 
-/** Wires only implemented Task 3-7 capabilities; later services fail explicitly. */
+/** Wires implemented capabilities; publishing remains unavailable until Task 11. */
 export function createPublisherServices(
   dependencies: PublisherServiceDependencies,
 ): PublisherIpcServices {
@@ -75,7 +76,7 @@ export function createPublisherServices(
       status: () => preview.getStatus(),
       subscribe: (listener) => preview.subscribe(listener),
     },
-    changes: { list: () => reject("Change review") },
+    changes: { list: () => listChanges({ workspace }) },
     publish: {
       start: () => reject("Publishing"),
       cancel: () => reject("Publishing"),

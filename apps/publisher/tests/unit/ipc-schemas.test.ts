@@ -71,9 +71,21 @@ const validByChannel: Record<string, unknown> = {
   [IPC_CHANNELS.requests.previewStart]: preview,
   [IPC_CHANNELS.requests.previewStop]: preview,
   [IPC_CHANNELS.requests.previewStatus]: preview,
-  [IPC_CHANNELS.requests.changesList]: [
-    { id: "note:daily", label: "Daily", paths: ["content/life/daily.md"], ...privateField },
-  ],
+  [IPC_CHANNELS.requests.changesList]: {
+    groups: [
+      {
+        id: "note:daily",
+        label: "Daily",
+        kind: "modified",
+        selection: "default",
+        description: "公开文章已修改",
+        paths: ["content/life/daily.md"],
+        attachments: [],
+        ...privateField,
+      },
+    ],
+    ...privateField,
+  },
   [IPC_CHANNELS.requests.publishStart]: { operationId: "publish-1", ...privateField },
   [IPC_CHANNELS.requests.publishCancel]: undefined,
   [IPC_CHANNELS.requests.historyGit]: [

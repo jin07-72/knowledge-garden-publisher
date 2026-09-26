@@ -9,6 +9,7 @@ import {
   disposePublisherRuntime,
 } from "../../src/main/publisherServices"
 import type { PreviewStatus } from "../../src/shared/contracts"
+import { git } from "../helpers/git"
 
 const temporaryDirectories: string[] = []
 
@@ -25,6 +26,9 @@ async function garden(): Promise<string> {
     join(root, "content", "life", "daily.md"),
     "---\ntitle: Daily\ndate: 2026-09-24\ndescription: Daily note\ntags: [life]\n---\n\n# Daily",
   )
+  await git(root, ["init", "--initial-branch=main", "--object-format=sha1"])
+  await git(root, ["config", "user.name", "Garden Test"])
+  await git(root, ["config", "user.email", "garden-test@example.invalid"])
   return root
 }
 
@@ -64,7 +68,7 @@ describe("publisher service wiring", () => {
     expect(manager.subscribe).toHaveBeenCalledWith(listener)
   })
 
-  it("keeps post-Task-7 services explicitly unavailable", async () => {
+  it("wires change review while keeping post-Task-10 services explicitly unavailable", async () => {
     const workspace = await garden()
     const services = createPublisherServices({
       workspace,
@@ -72,7 +76,9 @@ describe("publisher service wiring", () => {
       isTracked: async () => false,
       preview: preview(),
     })
-    await expect(services.changes.list()).rejects.toMatchObject({ code: "SERVICE_UNAVAILABLE" })
+    await expect(services.changes.list()).resolves.toMatchObject({
+      groups: [expect.objectContaining({ kind: "added", selection: "default" })],
+    })
     await expect(services.publish.start({ changeGroupIds: ["note:a"] })).rejects.toMatchObject({
       code: "SERVICE_UNAVAILABLE",
     })

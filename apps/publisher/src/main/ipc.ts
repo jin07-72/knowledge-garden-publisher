@@ -1,7 +1,7 @@
 import { z } from "zod"
 import {
   IPC_CHANNELS,
-  type ChangeGroup,
+  type ChangeReview,
   type CloseAckRequest,
   type DeploymentRun,
   type GitCommit,
@@ -75,7 +75,7 @@ export interface PublisherIpcServices {
     subscribe(listener: (status: PreviewStatus) => void): () => void
   }
   readonly changes: {
-    list(): Promise<readonly ChangeGroup[]>
+    list(): Promise<ChangeReview>
   }
   readonly publish: {
     start(request: PublishRequest): Promise<PublishStartReceipt>

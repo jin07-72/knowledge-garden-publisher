@@ -149,7 +149,19 @@ const changeGroupSchema = z
   .object({
     id: z.string().min(1).max(128),
     label: z.string().min(1).max(512),
+    kind: z.enum(["added", "modified", "unpublish", "attachment", "private", "config"]),
+    selection: z.enum(["default", "optional", "locked"]),
+    description: z.string().min(1).max(1_000),
     paths: z.array(pathSchema).max(10_000),
+    attachments: z
+      .array(z.object({ path: pathSchema, label: z.string().min(1).max(512) }).strip())
+      .max(10_000),
+  })
+  .strip()
+const changeReviewSchema = z
+  .object({
+    groups: z.array(changeGroupSchema).max(10_000),
+    blockedReason: z.string().min(1).max(1_000).optional(),
   })
   .strip()
 const publishStartReceiptSchema = z.object({ operationId: z.string().min(1).max(128) }).strip()
@@ -201,7 +213,7 @@ export const IPC_SUCCESS_SCHEMAS = {
   [IPC_CHANNELS.requests.previewStart]: previewStatusSchema,
   [IPC_CHANNELS.requests.previewStop]: previewStatusSchema,
   [IPC_CHANNELS.requests.previewStatus]: previewStatusSchema,
-  [IPC_CHANNELS.requests.changesList]: z.array(changeGroupSchema).max(10_000),
+  [IPC_CHANNELS.requests.changesList]: changeReviewSchema,
   [IPC_CHANNELS.requests.publishStart]: publishStartReceiptSchema,
   [IPC_CHANNELS.requests.publishCancel]: z.undefined(),
   [IPC_CHANNELS.requests.historyGit]: z.array(gitCommitSchema).max(500),

@@ -2,6 +2,7 @@ import { useCallback, useEffect, useMemo, useRef, useState } from "react"
 import { BookOpen, Check, Eye, GitBranch, LoaderCircle, TriangleAlert } from "lucide-react"
 import type {
   AppError,
+  ChangeReview,
   GardenApi,
   NoteCreateRequest,
   NoteDocument,
@@ -15,6 +16,7 @@ import { ModalShell } from "./components/ModalShell"
 import { MarkdownEditor, type MarkdownEditorHandle } from "./components/MarkdownEditor"
 import { PreviewPane } from "./components/PreviewPane"
 import { VisibilityMenu } from "./components/VisibilityMenu"
+import { PublishReview } from "./components/PublishReview"
 import "./app.css"
 
 type LoadState = "loading" | "ready" | "error"
@@ -152,6 +154,9 @@ function PublisherApp({ api }: { readonly api: GardenApi }): React.JSX.Element {
   const [notesMessage, setNotesMessage] = useState("正在读取花园…")
   const [preview, setPreview] = useState<PreviewStatus>(stoppedPreview)
   const [changeCount, setChangeCount] = useState<number>()
+  const [changeReview, setChangeReview] = useState<ChangeReview>()
+  const [changeReviewState, setChangeReviewState] = useState<LoadState>("loading")
+  const [changeReviewOpen, setChangeReviewOpen] = useState(false)
   const [publishMessage, setPublishMessage] = useState("正在检查可发布变化…")
   const [publishProgress, setPublishProgress] = useState<PublishProgress>()
   const [saveStateLabel, setSaveStateLabel] = useState("已保存")
@@ -304,6 +309,38 @@ function PublisherApp({ api }: { readonly api: GardenApi }): React.JSX.Element {
     return previewStart.current
   }, [api])
 
+  const loadChanges = useCallback(async (): Promise<void> => {
+    const request = ++changesRequest.current
+    setChangeReviewState("loading")
+    let result: Awaited<ReturnType<GardenApi["changes"]["list"]>>
+    try {
+      result = await api.changes.list()
+    } catch (error) {
+      if (request !== changesRequest.current) return
+      setChangeReview(undefined)
+      setChangeCount(undefined)
+      setChangeReviewState("error")
+      setPublishMessage(error instanceof Error ? error.message : "无法检查可发布变化")
+      return
+    }
+    if (request !== changesRequest.current) return
+    if (!result.ok) {
+      setChangeReview(undefined)
+      setChangeCount(undefined)
+      setChangeReviewState("error")
+      setPublishMessage(messageFor(result.error, "发布检查暂不可用。"))
+      return
+    }
+    setChangeReview(result.value)
+    setChangeReviewState("ready")
+    const publishable = result.value.groups.filter((group) => group.selection === "default").length
+    setChangeCount(publishable)
+    setPublishMessage(
+      result.value.blockedReason ??
+        (result.value.groups.length === 0 ? "当前没有可发布变化" : "可查看并选择要发布的变化"),
+    )
+  }, [api])
+
   useEffect(() => {
     void loadNotes()
     const currentPreviewRequest = ++previewRequest.current
@@ -338,26 +375,7 @@ function PublisherApp({ api }: { readonly api: GardenApi }): React.JSX.Element {
           },
         }))
       })
-    const currentChangesRequest = ++changesRequest.current
-    void api.changes
-      .list()
-      .then((result) => {
-        if (currentChangesRequest !== changesRequest.current) return
-        if (result.ok) {
-          setChangeCount(result.value.length)
-          setPublishMessage(
-            result.value.length === 0 ? "当前没有可发布变化" : "可查看并选择要发布的变化",
-          )
-        } else {
-          setChangeCount(undefined)
-          setPublishMessage(messageFor(result.error, "发布检查暂不可用；后续版本会接入。"))
-        }
-      })
-      .catch((error: unknown) => {
-        if (currentChangesRequest !== changesRequest.current) return
-        setChangeCount(undefined)
-        setPublishMessage(error instanceof Error ? error.message : "无法检查可发布变化")
-      })
+    void loadChanges()
     const unsubscribePreview = api.preview.onProgress(applyPreview)
     const unsubscribePublish = api.publish.onProgress(setPublishProgress)
     return () => {
@@ -367,7 +385,7 @@ function PublisherApp({ api }: { readonly api: GardenApi }): React.JSX.Element {
       previewRequest.current += 1
       changesRequest.current += 1
     }
-  }, [api, applyPreview, loadNotes, startPreview])
+  }, [api, applyPreview, loadChanges, loadNotes, startPreview])
 
   useEffect(() => {
     if (!customPaneSizes) return
@@ -721,15 +739,30 @@ function PublisherApp({ api }: { readonly api: GardenApi }): React.JSX.Element {
         <button
           className="publish-button"
           type="button"
-          disabled
-          aria-describedby="publish-review-unavailable"
+          aria-describedby={
+            changeReviewState === "error" ? "publish-review-unavailable" : undefined
+          }
+          onClick={() => {
+            setChangeReviewOpen(true)
+            void loadChanges()
+          }}
         >
           检查并发布
         </button>
         <span id="publish-review-unavailable" className="sr-only">
-          发布审查功能尚未启用，将在后续任务接入。
+          {changeReviewState === "error" ? publishMessage : "发布检查可用。"}
         </span>
       </footer>
+
+      {changeReviewOpen ? (
+        <PublishReview
+          state={changeReviewState}
+          review={changeReview}
+          error={changeReviewState === "error" ? publishMessage : undefined}
+          onClose={() => setChangeReviewOpen(false)}
+          onRefresh={() => void loadChanges()}
+        />
+      ) : null}
 
       {pendingVisibility ? (
         <ModalShell
