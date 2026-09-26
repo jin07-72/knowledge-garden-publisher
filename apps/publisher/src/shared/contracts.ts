@@ -31,6 +31,10 @@ export const APP_ERROR_CODES = [
   "GIT_ORIGIN_MISSING",
   "GIT_ORIGIN_FAILED",
   "GIT_STATUS_FAILED",
+  "CHANGE_SCAN_INVALID",
+  "CHANGE_SCAN_LIMIT",
+  "CHANGE_SCAN_CANCELLED",
+  "CHANGE_SCAN_FAILED",
   "COMMAND_FAILED",
   "COMMAND_CANCELLED",
   "NOTE_INDEX_INVALID",
@@ -119,9 +123,11 @@ type BridgeError = Extract<
   { readonly code: "IPC_UNAUTHORIZED" | "SERVICE_UNAVAILABLE" | "INTERNAL_ERROR" }
 >
 
+type ChangeScanError = Extract<AppError, { readonly code: `CHANGE_SCAN_${string}` }>
+
 export type WorkspaceIssue = Exclude<
   AppError,
-  NoteIndexError | NoteFileError | PreviewError | BridgeError
+  NoteIndexError | NoteFileError | PreviewError | BridgeError | ChangeScanError
 > & {
   readonly path?: string
 }
@@ -158,6 +164,12 @@ export interface NoteSummary {
   readonly updatedAt: string
   readonly tags: readonly string[]
 }
+
+export const NOTE_DOMAINS = ["technology", "reading", "language", "life"] as const
+export const KEBAB_SLUG_SOURCE = "[a-z0-9]+(?:-[a-z0-9]+)*"
+export const MANAGED_NOTE_PATH_PATTERN = new RegExp(
+  `^(content|private)/(${NOTE_DOMAINS.join("|")})/(${KEBAB_SLUG_SOURCE})\\.md$`,
+)
 
 export type ChangeKind = "added" | "modified" | "unpublish" | "attachment" | "private" | "config"
 export type ChangeSelection = "default" | "optional" | "locked"
@@ -234,6 +246,7 @@ export const IPC_CHANNELS = {
     previewStop: "garden:preview:stop",
     previewStatus: "garden:preview:status",
     changesList: "garden:changes:list",
+    changesCancel: "garden:changes:cancel",
     publishStart: "garden:publish:start",
     publishCancel: "garden:publish:cancel",
     historyGit: "garden:history:git",
@@ -395,6 +408,7 @@ export interface GardenApi {
   }
   readonly changes: {
     list(): Promise<IpcResult<ChangeReview>>
+    cancel(): Promise<IpcResult<void>>
   }
   readonly publish: {
     start(request: PublishRequest): Promise<IpcResult<PublishStartReceipt>>

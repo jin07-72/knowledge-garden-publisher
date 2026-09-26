@@ -384,6 +384,7 @@ function PublisherApp({ api }: { readonly api: GardenApi }): React.JSX.Element {
       notesRequest.current += 1
       previewRequest.current += 1
       changesRequest.current += 1
+      void api.changes.cancel()
     }
   }, [api, applyPreview, loadChanges, loadNotes, startPreview])
 
@@ -759,7 +760,11 @@ function PublisherApp({ api }: { readonly api: GardenApi }): React.JSX.Element {
           state={changeReviewState}
           review={changeReview}
           error={changeReviewState === "error" ? publishMessage : undefined}
-          onClose={() => setChangeReviewOpen(false)}
+          onClose={() => {
+            changesRequest.current += 1
+            void api.changes.cancel()
+            setChangeReviewOpen(false)
+          }}
           onRefresh={() => void loadChanges()}
         />
       ) : null}

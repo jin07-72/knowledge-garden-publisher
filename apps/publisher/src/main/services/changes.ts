@@ -1,14 +1,59 @@
+import { spawn } from "node:child_process"
 import { createHash } from "node:crypto"
 import { lstat, realpath } from "node:fs/promises"
 import { basename, isAbsolute, relative, resolve, sep } from "node:path"
-import type {
-  ChangeAttachment,
-  ChangeGroup,
-  ChangeKind,
-  ChangeReview,
-  ChangeSelection,
+import {
+  KEBAB_SLUG_SOURCE,
+  MANAGED_NOTE_PATH_PATTERN,
+  NOTE_DOMAINS,
+  type ChangeAttachment,
+  type ChangeGroup,
+  type ChangeKind,
+  type ChangeReview,
+  type ChangeSelection,
 } from "../../shared/contracts"
-import { type CommandRunner, systemCommandRunner } from "../lib/commandRunner"
+
+export const MAX_CHANGE_STATUS_BYTES = 2 * 1024 * 1024
+export const MAX_CHANGE_STDERR_BYTES = 64 * 1024
+export const MAX_CHANGE_RECORDS = 1_000
+export const MAX_CHANGE_PATHS = 500
+export const MAX_CHANGE_REVIEW_BYTES = 512 * 1024
+const CHANGE_SCAN_DEADLINE_MS = 15_000
+
+type ChangeScanCode =
+  "CHANGE_SCAN_INVALID" | "CHANGE_SCAN_LIMIT" | "CHANGE_SCAN_CANCELLED" | "CHANGE_SCAN_FAILED"
+
+class ChangeScanError extends Error {
+  readonly name = "ChangeScanError"
+
+  constructor(
+    readonly code: ChangeScanCode,
+    message: string,
+  ) {
+    super(message)
+  }
+}
+
+export interface ChangeCommandRequest {
+  readonly executable: "git"
+  readonly args: readonly string[]
+  readonly cwd: string
+  readonly env: Readonly<Record<string, string | undefined>>
+  readonly signal?: AbortSignal
+  readonly deadlineMs: number
+  readonly maxStdoutBytes: number
+  readonly maxStderrBytes: number
+}
+
+export interface ChangeCommandResult {
+  readonly exitCode: number
+  readonly stdout: Buffer
+  readonly stderr: Buffer
+}
+
+export interface ChangeCommandRunner {
+  run(request: ChangeCommandRequest): Promise<ChangeCommandResult>
+}
 
 export type PorcelainEntry = {
   readonly recordType: "ordinary" | "rename" | "unmerged" | "untracked" | "ignored"
@@ -16,13 +61,20 @@ export type PorcelainEntry = {
   readonly originalPath?: string
   readonly index: string
   readonly worktree: string
+  readonly submodule: string
 }
 
 export interface ListChangesOptions {
   readonly workspace: string
-  readonly runner?: CommandRunner
+  readonly runner?: ChangeCommandRunner
+  readonly signal?: AbortSignal
   /** Test seam for exact porcelain fixtures. Production always invokes Git itself. */
-  readonly statusOutput?: string
+  readonly statusOutput?: Buffer
+}
+
+export interface ChangeScanner {
+  list(): Promise<ChangeReview>
+  cancel(): Promise<void>
 }
 
 type MutableGroup = {
@@ -35,78 +87,298 @@ type MutableGroup = {
   attachments: ChangeAttachment[]
 }
 
+const ordinaryStatusPattern = /^[.MTAD]{2}$/
+const renameStatusPattern = /^[RC][.MTAD]$/
+const unmergedStatusPattern = /^(?:DD|AU|UD|UA|DU|AA|UU)$/
+const submodulePattern = /^(?:N\.\.\.|S[.C][.M][.U])$/
+const modePattern = /^(?:000000|100644|100755|120000|160000)$/
+const oidPattern = /^(?:[0-9a-f]{40}|[0-9a-f]{64})$/
+const scorePattern = /^[RC](?:100|[1-9]?[0-9])$/
+const slugPattern = new RegExp(`^${KEBAB_SLUG_SOURCE}$`)
+const publicNote = new RegExp(`^content\/(${NOTE_DOMAINS.join("|")})\/(${KEBAB_SLUG_SOURCE})\\.md$`)
+const privateNote = new RegExp(
+  `^private\/(${NOTE_DOMAINS.join("|")})\/(${KEBAB_SLUG_SOURCE})\\.md$`,
+)
+const publicAttachment = new RegExp(`^content\/_assets\/(${KEBAB_SLUG_SOURCE})\/(.+)$`)
+const privateAttachment = new RegExp(`^private\/_assets\/(${KEBAB_SLUG_SOURCE})\/(.+)$`)
+
+function scanError(code: ChangeScanCode, message: string): ChangeScanError {
+  return new ChangeScanError(code, message)
+}
+
+function invalid(message = "Git returned invalid publication status data."): ChangeScanError {
+  return scanError("CHANGE_SCAN_INVALID", message)
+}
+
+function ensureBufferLimit(buffer: Buffer): void {
+  if (buffer.byteLength > MAX_CHANGE_STATUS_BYTES) {
+    throw scanError("CHANGE_SCAN_LIMIT", "Publication status exceeded the safe size limit.")
+  }
+}
+
+function decodeStatus(output: Buffer): string {
+  ensureBufferLimit(output)
+  try {
+    return new TextDecoder("utf-8", { fatal: true, ignoreBOM: true }).decode(output)
+  } catch {
+    throw invalid()
+  }
+}
+
 function parseHeader(record: string, tokenCount: number): { tokens: string[]; path: string } {
   const tokens: string[] = []
   let offset = 0
   for (let index = 0; index < tokenCount; index += 1) {
     const separator = record.indexOf(" ", offset)
-    if (separator < 0) throw new Error("Malformed porcelain-v2 record.")
-    tokens.push(record.slice(offset, separator))
+    if (separator < 0) throw invalid()
+    const token = record.slice(offset, separator)
+    if (!token) throw invalid()
+    tokens.push(token)
     offset = separator + 1
   }
   const path = record.slice(offset)
-  if (!path) throw new Error("Malformed porcelain-v2 path.")
+  if (!path) throw invalid()
   return { tokens, path }
 }
 
-export function parsePorcelainV2(output: string): readonly PorcelainEntry[] {
-  const fields = output.split("\0")
-  if (fields.at(-1) === "") fields.pop()
+function validateCommon(tokens: string[], type: "1" | "2" | "u"): readonly string[] {
+  const status = tokens[1] ?? ""
+  if (tokens[0] !== type) throw invalid()
+  if (
+    type === "u"
+      ? !unmergedStatusPattern.test(status)
+      : type === "2"
+        ? !renameStatusPattern.test(status)
+        : !ordinaryStatusPattern.test(status) || status === ".."
+  ) {
+    throw invalid()
+  }
+  if (type === "1" && unmergedStatusPattern.test(status)) throw invalid()
+  if (!submodulePattern.test(tokens[2] ?? "")) throw invalid()
+  const modeCount = type === "u" ? 4 : 3
+  const oidCount = type === "u" ? 3 : 2
+  const modeStart = 3
+  const oidStart = modeStart + modeCount
+  if (!tokens.slice(modeStart, oidStart).every((token) => modePattern.test(token))) throw invalid()
+  const oids = tokens.slice(oidStart, oidStart + oidCount)
+  if (!oids.every((token) => oidPattern.test(token))) {
+    throw invalid()
+  }
+  if (type === "2") {
+    const score = tokens[8] ?? ""
+    const kind = status.includes("R") ? "R" : "C"
+    if (!scorePattern.test(score) || score[0] !== kind) throw invalid()
+  }
+  return oids
+}
+
+function parsePorcelainBuffer(
+  output: Buffer,
+  expectedOidWidth?: number,
+): { readonly entries: readonly PorcelainEntry[]; readonly oidWidth?: number } {
+  if (output.byteLength === 0) return { entries: [], oidWidth: expectedOidWidth }
+  const decoded = decodeStatus(output)
+  if (!decoded.endsWith("\0")) throw invalid("Git status output was not NUL terminated.")
+  const fields = decoded.slice(0, -1).split("\0")
+  if (fields.some((field) => field.length === 0)) throw invalid()
   const entries: PorcelainEntry[] = []
-  const paths = new Set<string>()
+  let oidWidth = expectedOidWidth
+  const currentPaths = new Set<string>()
   const renameOrigins = new Set<string>()
+
   for (let cursor = 0; cursor < fields.length; cursor += 1) {
+    if (entries.length >= MAX_CHANGE_RECORDS) {
+      throw scanError("CHANGE_SCAN_LIMIT", "Publication status contained too many records.")
+    }
     const record = fields[cursor]!
-    if (!record) throw new Error("Malformed empty porcelain-v2 record.")
     let entry: PorcelainEntry
     if (record.startsWith("1 ")) {
       const { tokens, path } = parseHeader(record, 8)
-      const status = tokens[1]
-      if (!status || status.length !== 2) throw new Error("Malformed porcelain-v2 status.")
-      entry = { recordType: "ordinary", path, index: status[0]!, worktree: status[1]! }
+      const oids = validateCommon(tokens, "1")
+      oidWidth ??= oids[0]?.length
+      if (oids.some((oid) => oid.length !== oidWidth)) throw invalid()
+      entry = {
+        recordType: "ordinary",
+        path,
+        index: tokens[1]![0]!,
+        worktree: tokens[1]![1]!,
+        submodule: tokens[2]!,
+      }
     } else if (record.startsWith("2 ")) {
       const { tokens, path } = parseHeader(record, 9)
+      const oids = validateCommon(tokens, "2")
+      oidWidth ??= oids[0]?.length
+      if (oids.some((oid) => oid.length !== oidWidth)) throw invalid()
       const originalPath = fields[++cursor]
-      if (!originalPath) throw new Error("Malformed porcelain-v2 rename record.")
-      const status = tokens[1]
-      if (!status || status.length !== 2) throw new Error("Malformed porcelain-v2 rename status.")
+      if (!originalPath) throw invalid("Malformed porcelain-v2 rename record.")
       entry = {
         recordType: "rename",
         path,
         originalPath,
-        index: status[0]!,
-        worktree: status[1]!,
+        index: tokens[1]![0]!,
+        worktree: tokens[1]![1]!,
+        submodule: tokens[2]!,
       }
     } else if (record.startsWith("u ")) {
       const { tokens, path } = parseHeader(record, 10)
-      const status = tokens[1]
+      const oids = validateCommon(tokens, "u")
+      oidWidth ??= oids[0]?.length
+      if (oids.some((oid) => oid.length !== oidWidth)) throw invalid()
       entry = {
         recordType: "unmerged",
         path,
-        index: status?.[0] ?? "U",
-        worktree: status?.[1] ?? "U",
+        index: tokens[1]![0]!,
+        worktree: tokens[1]![1]!,
+        submodule: tokens[2]!,
       }
     } else if (record.startsWith("? ") || record.startsWith("! ")) {
+      const path = record.slice(2)
+      if (!path) throw invalid()
       entry = {
         recordType: record[0] === "?" ? "untracked" : "ignored",
-        path: record.slice(2),
+        path,
         index: record[0]!,
         worktree: record[0]!,
+        submodule: "N...",
       }
     } else {
-      throw new Error("Unsupported porcelain-v2 record.")
+      throw invalid()
     }
-    if (paths.has(entry.path)) throw new Error(`Duplicate path in change status: ${entry.path}`)
-    paths.add(entry.path)
+    if (currentPaths.has(entry.path)) throw invalid("Duplicate path in change status.")
+    currentPaths.add(entry.path)
     if (entry.originalPath) {
-      if (renameOrigins.has(entry.originalPath))
-        throw new Error(`Duplicate rename origin in change status: ${entry.originalPath}`)
+      if (renameOrigins.has(entry.originalPath)) throw invalid("Duplicate rename origin in status.")
       renameOrigins.add(entry.originalPath)
     }
     entries.push(entry)
   }
-  return entries
+  if (currentPaths.size + renameOrigins.size > MAX_CHANGE_PATHS) {
+    throw scanError("CHANGE_SCAN_LIMIT", "Publication status contained too many paths.")
+  }
+  return { entries, oidWidth }
 }
+
+export function parsePorcelainV2(output: Buffer): readonly PorcelainEntry[] {
+  return parsePorcelainBuffer(output).entries
+}
+
+function createSystemChangeCommandRunner(): ChangeCommandRunner {
+  return {
+    run(request) {
+      if (request.signal?.aborted) {
+        return Promise.reject(scanError("CHANGE_SCAN_CANCELLED", "Change scan was cancelled."))
+      }
+      return new Promise<ChangeCommandResult>((resolvePromise, rejectPromise) => {
+        let settled = false
+        let timedOut = false
+        let cancelled = false
+        let pendingError: ChangeScanError | undefined
+        let stdoutBytes = 0
+        let stderrBytes = 0
+        const stdout: Buffer[] = []
+        const stderr: Buffer[] = []
+        let child: ReturnType<typeof spawn>
+        try {
+          child = spawn(request.executable, request.args, {
+            cwd: request.cwd,
+            env: { ...process.env, ...request.env },
+            shell: false,
+            windowsHide: true,
+          })
+        } catch {
+          rejectPromise(scanError("CHANGE_SCAN_FAILED", "Could not start the publication scan."))
+          return
+        }
+        const finish = (error?: ChangeScanError, result?: ChangeCommandResult): void => {
+          if (settled) return
+          settled = true
+          clearTimeout(timer)
+          request.signal?.removeEventListener("abort", abort)
+          if (error) rejectPromise(error)
+          else resolvePromise(result!)
+        }
+        const stop = (): void => {
+          try {
+            child.kill()
+          } catch {
+            pendingError ??= scanError("CHANGE_SCAN_FAILED", "Could not stop the publication scan.")
+          }
+        }
+        const abort = (): void => {
+          cancelled = true
+          stop()
+        }
+        const timer = setTimeout(() => {
+          timedOut = true
+          stop()
+        }, request.deadlineMs)
+        request.signal?.addEventListener("abort", abort, { once: true })
+        if (request.signal?.aborted) abort()
+        child.on("error", () => {
+          pendingError ??= scanError(
+            "CHANGE_SCAN_FAILED",
+            "Could not start or stop the publication scan.",
+          )
+        })
+        child.on("close", (code) => {
+          if (cancelled) {
+            finish(scanError("CHANGE_SCAN_CANCELLED", "Change scan was cancelled."))
+          } else if (timedOut) {
+            finish(scanError("CHANGE_SCAN_FAILED", "Publication scan timed out."))
+          } else if (pendingError) {
+            finish(pendingError)
+          } else if (code === null) {
+            finish(scanError("CHANGE_SCAN_FAILED", "Publication scan did not finish safely."))
+          } else {
+            finish(undefined, {
+              exitCode: code,
+              stdout: Buffer.concat(stdout, stdoutBytes),
+              stderr: Buffer.concat(stderr, stderrBytes),
+            })
+          }
+        })
+        const childStdout = child.stdout
+        const childStderr = child.stderr
+        if (!childStdout || !childStderr) {
+          pendingError = scanError(
+            "CHANGE_SCAN_FAILED",
+            "Publication scan streams were unavailable.",
+          )
+          stop()
+          return
+        }
+        childStdout.on("data", (chunk: Buffer | string) => {
+          const bytes = Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk)
+          stdoutBytes += bytes.byteLength
+          if (stdoutBytes > request.maxStdoutBytes) {
+            pendingError = scanError(
+              "CHANGE_SCAN_LIMIT",
+              "Publication status exceeded the safe size limit.",
+            )
+            stop()
+            return
+          }
+          stdout.push(bytes)
+        })
+        childStderr.on("data", (chunk: Buffer | string) => {
+          const bytes = Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk)
+          stderrBytes += bytes.byteLength
+          if (stderrBytes > request.maxStderrBytes) {
+            pendingError = scanError(
+              "CHANGE_SCAN_LIMIT",
+              "Git diagnostics exceeded the safe size limit.",
+            )
+            stop()
+            return
+          }
+          stderr.push(bytes)
+        })
+      })
+    },
+  }
+}
+
+const systemChangeCommandRunner = createSystemChangeCommandRunner()
 
 function assertRelativePath(path: string): void {
   const normalized = path.endsWith("/") ? path.slice(0, -1) : path
@@ -117,7 +389,10 @@ function assertRelativePath(path: string): void {
     normalized.includes("\\") ||
     normalized.split("/").some((segment) => segment === "" || segment === "." || segment === "..")
   ) {
-    throw new Error("Git returned a path that is not a safe workspace path.")
+    throw invalid("Git returned a path that is not a safe workspace path.")
+  }
+  if (Buffer.byteLength(path, "utf8") > 512) {
+    throw scanError("CHANGE_SCAN_LIMIT", "A publication path exceeded the safe size limit.")
   }
 }
 
@@ -126,21 +401,44 @@ function isContained(root: string, candidate: string): boolean {
   return result === "" || (!result.startsWith(`..${sep}`) && result !== ".." && !isAbsolute(result))
 }
 
-async function assertManagedPathBoundary(workspace: string, path: string): Promise<void> {
-  if (!path.startsWith("content/") && !path.startsWith("private/")) return
+type AwaitGuard = <T>(operation: Promise<T>) => Promise<T>
+
+async function assertManagedPathBoundary(
+  workspace: string,
+  path: string,
+  guard: AwaitGuard,
+): Promise<void> {
+  if (!/^(?:content|private)\//.test(path)) return
   let current = workspace
   for (const part of path.replace(/\/$/, "").split("/")) {
     current = resolve(current, part)
-    if (!isContained(workspace, current)) throw new Error("Managed path escaped the workspace.")
+    if (!isContained(workspace, current)) throw invalid("Managed path escaped the workspace.")
     try {
-      const info = await lstat(current)
-      if (info.isSymbolicLink())
-        throw new Error("Managed content crosses a symbolic link boundary.")
+      const info = await guard(lstat(current))
+      if (info.isSymbolicLink()) {
+        throw invalid("Managed content crosses a symbolic link boundary.")
+      }
     } catch (error) {
       if ((error as NodeJS.ErrnoException).code === "ENOENT") return
       throw error
     }
   }
+}
+
+function hasUnsafeManagedAlias(path: string): boolean {
+  const segments = path.split("/")
+  const root = segments[0] ?? ""
+  if (/^(?:content|private)$/i.test(root) && root !== root.toLowerCase()) return true
+  if (root !== "content" && root !== "private") return false
+  const domain = segments[1] ?? ""
+  const canonicalDomain = NOTE_DOMAINS.find((item) => item.toLowerCase() === domain.toLowerCase())
+  if (canonicalDomain && domain !== canonicalDomain) return true
+  if (domain.toLowerCase() === "_assets" && domain !== "_assets") return true
+  if (canonicalDomain && segments.length === 3 && path.toLowerCase().endsWith(".md")) {
+    return !MANAGED_NOTE_PATH_PATTERN.test(path)
+  }
+  if (domain === "_assets" && segments.length >= 3) return !slugPattern.test(segments[2] ?? "")
+  return false
 }
 
 function idFor(kind: ChangeKind, key: string): string {
@@ -156,11 +454,6 @@ function makeGroup(
 ): MutableGroup {
   return { id: idFor(kind, key), label, kind, selection, description, paths: [], attachments: [] }
 }
-
-const publicNote = /^content\/(?:technology|reading|language|life)\/([^/]+)\.md$/
-const privateNote = /^private\/(?:technology|reading|language|life)\/([^/]+)\.md$/
-const publicAttachment = /^content\/_assets\/([^/]+)\/(.+)$/
-const privateAttachment = /^private\/_assets\/([^/]+)\/(.+)$/
 
 function isDeletion(entry: PorcelainEntry): boolean {
   return entry.index === "D" || entry.worktree === "D"
@@ -182,174 +475,354 @@ function addUnique(target: string[], path: string): void {
 }
 
 function immutableGroup(group: MutableGroup): ChangeGroup {
+  return { ...group, paths: [...group.paths], attachments: [...group.attachments] }
+}
+
+type AttachmentDelta = { slug: string; path: string; label: string }
+
+async function existingPublicIdentities(
+  workspace: string,
+  slug: string,
+  guard: AwaitGuard,
+): Promise<string[]> {
+  const identities: string[] = []
+  for (const domain of NOTE_DOMAINS) {
+    try {
+      const info = await guard(lstat(resolve(workspace, "content", domain, `${slug}.md`)))
+      if (info.isFile()) identities.push(`${domain}/${slug}`)
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error
+    }
+  }
+  return identities
+}
+
+function commandRequest(
+  workspace: string,
+  args: readonly string[],
+  deadlineMs: number,
+  maxStdoutBytes: number,
+  maxStderrBytes: number,
+  signal?: AbortSignal,
+): ChangeCommandRequest {
   return {
-    ...group,
-    paths: [...group.paths],
-    attachments: [...group.attachments],
+    executable: "git",
+    args,
+    cwd: workspace,
+    env: { GIT_OPTIONAL_LOCKS: "0" },
+    signal,
+    deadlineMs,
+    maxStdoutBytes,
+    maxStderrBytes,
   }
 }
 
 export async function listChanges(options: ListChangesOptions): Promise<ChangeReview> {
-  const workspace = await realpath(resolve(options.workspace))
-  let output = options.statusOutput
-  let ignoredPrivateOutput = ""
-  if (output === undefined) {
-    const result = await (options.runner ?? systemCommandRunner).run({
-      executable: "git",
-      args: ["status", "--porcelain=v2", "-z", "--untracked-files=all"],
-      cwd: workspace,
-      env: { GIT_OPTIONAL_LOCKS: "0" },
-    })
-    if (result.exitCode !== 0) throw new Error("Could not inspect publication changes.")
-    output = result.stdout
-    const ignoredPrivate = await (options.runner ?? systemCommandRunner).run({
-      executable: "git",
-      args: [
-        "status",
-        "--porcelain=v2",
-        "-z",
-        "--untracked-files=all",
-        "--ignored=matching",
-        "--",
-        "private",
-      ],
-      cwd: workspace,
-      env: { GIT_OPTIONAL_LOCKS: "0" },
-    })
-    if (ignoredPrivate.exitCode !== 0) throw new Error("Could not inspect private local changes.")
-    ignoredPrivateOutput = ignoredPrivate.stdout
+  const deadlineAt = Date.now() + CHANGE_SCAN_DEADLINE_MS
+  const throwIfStopped = (): void => {
+    if (options.signal?.aborted) {
+      throw scanError("CHANGE_SCAN_CANCELLED", "Change scan was cancelled.")
+    }
+    if (Date.now() >= deadlineAt) {
+      throw scanError("CHANGE_SCAN_FAILED", "Publication scan timed out.")
+    }
   }
+  const remainingDeadline = (): number => {
+    throwIfStopped()
+    return Math.max(1, deadlineAt - Date.now())
+  }
+  const guard: AwaitGuard = async <T>(operation: Promise<T>): Promise<T> => {
+    throwIfStopped()
+    let timer: ReturnType<typeof setTimeout> | undefined
+    let abort: (() => void) | undefined
+    const stopped = new Promise<never>((_, reject) => {
+      timer = setTimeout(
+        () => reject(scanError("CHANGE_SCAN_FAILED", "Publication scan timed out.")),
+        remainingDeadline(),
+      )
+      abort = () => reject(scanError("CHANGE_SCAN_CANCELLED", "Change scan was cancelled."))
+      options.signal?.addEventListener("abort", abort, { once: true })
+      if (options.signal?.aborted) abort()
+    })
+    try {
+      return await Promise.race([operation, stopped])
+    } finally {
+      if (timer) clearTimeout(timer)
+      if (abort) options.signal?.removeEventListener("abort", abort)
+    }
+  }
+  throwIfStopped()
+  const workspace = await guard(realpath(resolve(options.workspace)))
+  throwIfStopped()
+  let output: Buffer | undefined = options.statusOutput
+  let ignoredPrivateOutput: Buffer = Buffer.alloc(0)
+  let totalStdoutBytes = output?.byteLength ?? 0
+  let totalStderrBytes = 0
+  if (output === undefined) {
+    const runner = options.runner ?? systemChangeCommandRunner
+    const result = await runner.run(
+      commandRequest(
+        workspace,
+        ["status", "--porcelain=v2", "-z", "--untracked-files=all", "--ignore-submodules=none"],
+        remainingDeadline(),
+        MAX_CHANGE_STATUS_BYTES,
+        MAX_CHANGE_STDERR_BYTES,
+        options.signal,
+      ),
+    )
+    if (result.exitCode !== 0) {
+      throw scanError("CHANGE_SCAN_FAILED", "Could not inspect publication changes.")
+    }
+    throwIfStopped()
+    output = result.stdout
+    totalStdoutBytes += result.stdout.byteLength
+    totalStderrBytes += result.stderr.byteLength
+    const remainingStdoutBytes = MAX_CHANGE_STATUS_BYTES - totalStdoutBytes
+    const remainingStderrBytes = MAX_CHANGE_STDERR_BYTES - totalStderrBytes
+    if (remainingStdoutBytes <= 0 || remainingStderrBytes <= 0) {
+      throw scanError("CHANGE_SCAN_LIMIT", "Publication scan exceeded the safe output limit.")
+    }
+    const ignoredPrivate = await runner.run(
+      commandRequest(
+        workspace,
+        [
+          "status",
+          "--porcelain=v2",
+          "-z",
+          "--untracked-files=all",
+          "--ignore-submodules=none",
+          "--ignored=matching",
+          "--",
+          "private",
+        ],
+        remainingDeadline(),
+        remainingStdoutBytes,
+        remainingStderrBytes,
+        options.signal,
+      ),
+    )
+    if (ignoredPrivate.exitCode !== 0) {
+      throw scanError("CHANGE_SCAN_FAILED", "Could not inspect private local changes.")
+    }
+    throwIfStopped()
+    ignoredPrivateOutput = ignoredPrivate.stdout
+    totalStdoutBytes += ignoredPrivate.stdout.byteLength
+    totalStderrBytes += ignoredPrivate.stderr.byteLength
+  }
+  if (totalStdoutBytes > MAX_CHANGE_STATUS_BYTES || totalStderrBytes > MAX_CHANGE_STDERR_BYTES) {
+    throw scanError("CHANGE_SCAN_LIMIT", "Publication scan exceeded the safe output limit.")
+  }
+  ensureBufferLimit(output)
+  ensureBufferLimit(ignoredPrivateOutput)
+  const primaryStatus = parsePorcelainBuffer(output)
+  const ignoredStatus = parsePorcelainBuffer(ignoredPrivateOutput, primaryStatus.oidWidth)
   const entries = [
-    ...parsePorcelainV2(output),
-    ...parsePorcelainV2(ignoredPrivateOutput).filter(
-      (entry) => entry.recordType === "ignored" && entry.path.startsWith("private/"),
+    ...primaryStatus.entries,
+    ...ignoredStatus.entries.filter(
+      (entry) => entry.recordType === "ignored" && /^private\//i.test(entry.path),
     ),
   ]
+  if (entries.length > MAX_CHANGE_RECORDS) {
+    throw scanError("CHANGE_SCAN_LIMIT", "Publication status contained too many records.")
+  }
+  const pathCount = entries.reduce((count, entry) => count + 1 + (entry.originalPath ? 1 : 0), 0)
+  if (pathCount > MAX_CHANGE_PATHS) {
+    throw scanError("CHANGE_SCAN_LIMIT", "Publication status contained too many paths.")
+  }
   for (const entry of entries) {
+    throwIfStopped()
     for (const path of [entry.path, entry.originalPath]) {
       if (!path) continue
       assertRelativePath(path)
-      await assertManagedPathBoundary(workspace, path)
+      await assertManagedPathBoundary(workspace, path, guard)
     }
   }
 
   if (entries.some((entry) => entry.recordType === "unmerged")) {
     return { groups: [], blockedReason: "检测到内容冲突，请先解决后再检查发布。" }
   }
+  if (entries.some((entry) => entry.submodule.startsWith("S"))) {
+    return { groups: [], blockedReason: "检测到子模块变化，无法安全确定发布内容。" }
+  }
+  if (
+    entries.some(
+      (entry) =>
+        hasUnsafeManagedAlias(entry.path) ||
+        Boolean(entry.originalPath && hasUnsafeManagedAlias(entry.originalPath)),
+    )
+  ) {
+    return { groups: [], blockedReason: "检测到大小写不规范或无效的内容路径，请先修正。" }
+  }
 
   const staged = entries.some(
     (entry) =>
       (entry.recordType === "ordinary" || entry.recordType === "rename") && entry.index !== ".",
   )
-  const noteGroups = new Map<string, MutableGroup>()
-  const unattached: { slug: string; path: string; label: string; entry: PorcelainEntry }[] = []
+  const publicGroups = new Map<string, MutableGroup>()
   const privateGroups = new Map<string, MutableGroup>()
+  const attachments: AttachmentDelta[] = []
   const config = makeGroup("config", "repository", "配置修改", "optional", "高级选项，默认不发布")
 
-  for (const entry of entries) {
-    if (entry.recordType === "ignored" && !entry.path.startsWith("private/")) continue
-    const publicMatch = publicNote.exec(entry.path)
-    const privateMatch = privateNote.exec(entry.path)
-    const attachmentMatch = publicAttachment.exec(entry.path)
-    const privateAssetMatch = privateAttachment.exec(entry.path)
-    const originalPublicMatch = entry.originalPath ? publicNote.exec(entry.originalPath) : null
-    const originalAttachmentMatch = entry.originalPath
-      ? publicAttachment.exec(entry.originalPath)
-      : null
-    if (originalPublicMatch && !publicMatch) {
-      const slug = originalPublicMatch[1]!
-      const group = makeGroup(
-        "unpublish",
-        entry.originalPath!,
-        slug,
-        "default",
-        publicDescription("unpublish"),
+  const addPrivate = (path: string): void => {
+    const note = privateNote.exec(path)
+    const asset = privateAttachment.exec(path)
+    const identity = note ? `${note[1]}/${note[2]}` : asset ? `asset/${asset[1]}` : path
+    const label = note?.[2] ?? asset?.[1] ?? basename(path).replace(/\.[^.]*$/, "")
+    if (!privateGroups.has(identity)) {
+      privateGroups.set(
+        identity,
+        makeGroup("private", identity, label!, "locked", "只保留在本机，不会发布"),
       )
-      group.paths.push(entry.originalPath!)
-      noteGroups.set(entry.originalPath!, group)
     }
-    if (originalAttachmentMatch && !attachmentMatch) {
-      unattached.push({
-        slug: originalAttachmentMatch[1]!,
-        path: entry.originalPath!,
-        label: originalAttachmentMatch[2]!,
-        entry: {
-          ...entry,
-          path: entry.originalPath!,
-          originalPath: undefined,
-          index: "D",
-          worktree: ".",
-        },
-      })
+  }
+  const addPublicNote = (
+    path: string,
+    entry: PorcelainEntry,
+    forcedUnpublish = false,
+  ): MutableGroup => {
+    const match = publicNote.exec(path)!
+    const identity = `${match[1]}/${match[2]}`
+    const kind: ChangeKind =
+      forcedUnpublish || isDeletion(entry) ? "unpublish" : isAddition(entry) ? "added" : "modified"
+    let group = publicGroups.get(identity)
+    if (!group) {
+      group = makeGroup(kind, identity, match[2]!, "default", publicDescription(kind))
+      publicGroups.set(identity, group)
     }
-    if (publicMatch) {
-      const slug = publicMatch[1]!
-      const kind: ChangeKind = isDeletion(entry)
-        ? "unpublish"
-        : isAddition(entry)
-          ? "added"
-          : "modified"
-      const group = makeGroup(kind, entry.path, slug, "default", publicDescription(kind))
-      addUnique(group.paths, entry.path)
-      if (entry.originalPath?.startsWith("content/")) addUnique(group.paths, entry.originalPath)
-      noteGroups.set(entry.path, group)
-    } else if (attachmentMatch) {
-      unattached.push({
-        slug: attachmentMatch[1]!,
-        path: entry.path,
-        label: attachmentMatch[2]!,
-        entry,
-      })
-    } else if (entry.path.startsWith("private/")) {
-      const key = (privateMatch ?? privateAssetMatch)?.[1] ?? entry.path
-      const label =
-        (privateMatch ?? privateAssetMatch)?.[1] ?? basename(entry.path).replace(/\.[^.]*$/, "")
-      if (!privateGroups.has(key)) {
-        privateGroups.set(
-          key,
-          makeGroup("private", entry.path, label, "locked", "只保留在本机，不会发布"),
-        )
+    addUnique(group.paths, path)
+    return group
+  }
+  const addDelta = (path: string, entry: PorcelainEntry, origin: boolean): void => {
+    if (publicNote.test(path)) {
+      addPublicNote(path, entry, origin)
+      return
+    }
+    const attachment = publicAttachment.exec(path)
+    if (attachment) {
+      attachments.push({ slug: attachment[1]!, path, label: attachment[2]! })
+      return
+    }
+    if (path.startsWith("private/")) {
+      addPrivate(path)
+      return
+    }
+    addUnique(config.paths, path)
+  }
+
+  for (const entry of entries) {
+    throwIfStopped()
+    if (entry.recordType === "ignored" && !entry.path.startsWith("private/")) continue
+    if (entry.recordType === "rename" && entry.originalPath) {
+      const currentNote = publicNote.exec(entry.path)
+      const originalNote = publicNote.exec(entry.originalPath)
+      if (currentNote && originalNote) {
+        const current = addPublicNote(entry.path, entry)
+        addUnique(current.paths, entry.originalPath)
+      } else {
+        addDelta(entry.path, entry, false)
+        addDelta(entry.originalPath, entry, true)
       }
     } else {
-      addUnique(config.paths, entry.path)
+      addDelta(entry.path, entry, false)
     }
   }
 
-  for (const item of unattached) {
-    const candidates = [...noteGroups.values()].filter(
-      (candidate) => candidate.kind !== "attachment" && candidate.label === item.slug,
+  for (const item of attachments) {
+    throwIfStopped()
+    const changedIdentities = [...publicGroups.keys()].filter((identity) =>
+      identity.endsWith(`/${item.slug}`),
     )
-    let group = candidates.length === 1 ? candidates[0] : noteGroups.get(`attachment:${item.slug}`)
+    const existingIdentities = await existingPublicIdentities(workspace, item.slug, guard)
+    const identities = [...new Set([...changedIdentities, ...existingIdentities])]
+    if (identities.length > 1) {
+      return { groups: [], blockedReason: "检测到附件归属不明确，请先确保文章 slug 唯一。" }
+    }
+    const identity = identities[0] ?? `attachment/${item.slug}`
+    let group = publicGroups.get(identity)
     if (!group) {
-      const kind: ChangeKind = "attachment"
-      group = makeGroup(kind, item.path, item.slug, "default", publicDescription(kind))
-      noteGroups.set(`attachment:${item.slug}`, group)
+      group = makeGroup(
+        "attachment",
+        identity,
+        item.slug,
+        "default",
+        publicDescription("attachment"),
+      )
+      publicGroups.set(identity, group)
     }
     addUnique(group.paths, item.path)
-    group.attachments.push({ path: item.path, label: item.label })
-    if (item.entry.originalPath?.startsWith("content/"))
-      addUnique(group.paths, item.entry.originalPath)
+    if (!group.attachments.some((attachment) => attachment.path === item.path)) {
+      group.attachments.push({ path: item.path, label: item.label })
+    }
   }
 
   const groups = [
-    ...noteGroups.values(),
+    ...publicGroups.values(),
     ...privateGroups.values(),
     ...(config.paths.length > 0 ? [config] : []),
   ]
-    .map(immutableGroup)
-    .sort((left, right) => {
-      const order: Record<ChangeKind, number> = {
-        added: 0,
-        modified: 1,
-        unpublish: 2,
-        attachment: 3,
-        private: 4,
-        config: 5,
+  const pathOwners = new Map<string, string>()
+  for (const group of groups) {
+    if (group.selection === "locked") continue
+    for (const path of group.paths) {
+      const owner = pathOwners.get(path)
+      if (owner && owner !== group.id) {
+        return {
+          groups: [],
+          blockedReason: "检测到同一路径同时属于多个发布选项，无法安全继续。",
+        }
       }
-      return order[left.kind] - order[right.kind] || left.label.localeCompare(right.label, "zh-CN")
-    })
-  return {
-    groups,
+      pathOwners.set(path, group.id)
+    }
+  }
+  const immutable = groups.map(immutableGroup).sort((left, right) => {
+    const order: Record<ChangeKind, number> = {
+      added: 0,
+      modified: 1,
+      unpublish: 2,
+      attachment: 3,
+      private: 4,
+      config: 5,
+    }
+    return order[left.kind] - order[right.kind] || left.label.localeCompare(right.label, "zh-CN")
+  })
+  const review: ChangeReview = {
+    groups: immutable,
     ...(staged ? { blockedReason: "检测到其他工具已准备中的发布内容，请先处理后再继续。" } : {}),
+  }
+  if (Buffer.byteLength(JSON.stringify(review), "utf8") > MAX_CHANGE_REVIEW_BYTES) {
+    throw scanError("CHANGE_SCAN_LIMIT", "Publication review exceeded the safe size limit.")
+  }
+  throwIfStopped()
+  return review
+}
+
+export function createChangeScanner(options: {
+  readonly workspace: string
+  readonly runner?: ChangeCommandRunner
+}): ChangeScanner {
+  let active: { readonly controller: AbortController; readonly settled: Promise<void> } | undefined
+  return {
+    list() {
+      const predecessor = active?.settled ?? Promise.resolve()
+      active?.controller.abort()
+      const controller = new AbortController()
+      const operation = predecessor.then(() =>
+        listChanges({ ...options, signal: controller.signal }),
+      )
+      const settled = operation.then(
+        () => undefined,
+        () => undefined,
+      )
+      active = { controller, settled }
+      void settled.then(() => {
+        if (active?.controller === controller) active = undefined
+      })
+      return operation
+    },
+    async cancel() {
+      const current = active
+      current?.controller.abort()
+      await current?.settled
+    },
   }
 }

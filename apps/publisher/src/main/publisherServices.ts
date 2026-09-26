@@ -17,7 +17,7 @@ import {
 } from "./services/editorRecovery"
 import { scanNotes } from "./services/noteIndex"
 import { inspectWorkspace } from "./services/workspace"
-import { listChanges } from "./services/changes"
+import { createChangeScanner } from "./services/changes"
 
 export interface PreviewServicePort {
   start(request: {
@@ -45,6 +45,7 @@ export function createPublisherServices(
   dependencies: PublisherServiceDependencies,
 ): PublisherIpcServices {
   const { workspace, trash, preview, isTracked } = dependencies
+  const changeScanner = createChangeScanner({ workspace })
   const reject = async <T>(name: string): Promise<T> => Promise.reject(unavailable(name))
   return {
     workspace: {
@@ -76,7 +77,10 @@ export function createPublisherServices(
       status: () => preview.getStatus(),
       subscribe: (listener) => preview.subscribe(listener),
     },
-    changes: { list: () => listChanges({ workspace }) },
+    changes: {
+      list: () => changeScanner.list(),
+      cancel: () => changeScanner.cancel(),
+    },
     publish: {
       start: () => reject("Publishing"),
       cancel: () => reject("Publishing"),

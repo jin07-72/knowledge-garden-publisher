@@ -38,7 +38,11 @@ export function PublishReview({
   useEffect(() => {
     setSelected(
       new Set(
-        review?.groups.filter((group) => group.selection === "default").map((group) => group.id),
+        review?.blockedReason
+          ? []
+          : review?.groups
+              .filter((group) => group.selection === "default")
+              .map((group) => group.id),
       ),
     )
   }, [review])
@@ -112,7 +116,7 @@ export function PublishReview({
         {state === "ready" && review && review.groups.length > 0 ? (
           <div className="change-groups" aria-label="可发布内容">
             {review.groups.map((group, index) => {
-              const locked = group.selection === "locked"
+              const locked = group.selection === "locked" || Boolean(review.blockedReason)
               const paths = visiblePaths(group)
               return (
                 <Fragment key={group.id}>

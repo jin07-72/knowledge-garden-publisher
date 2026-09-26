@@ -1,6 +1,7 @@
 import { z } from "zod"
 import {
   IPC_CHANNELS,
+  MANAGED_NOTE_PATH_PATTERN,
   type ChangeReview,
   type CloseAckRequest,
   type DeploymentRun,
@@ -76,6 +77,7 @@ export interface PublisherIpcServices {
   }
   readonly changes: {
     list(): Promise<ChangeReview>
+    cancel(): Promise<void>
   }
   readonly publish: {
     start(request: PublishRequest): Promise<PublishStartReceipt>
@@ -107,12 +109,7 @@ function bestEffortCleanup(actions: readonly (() => void)[]): void {
 }
 
 const noRequestSchema = z.undefined()
-const notePathSchema = z
-  .string()
-  .max(512)
-  .regex(
-    /^(?:content|private)\/(?:technology|reading|language|life)\/[a-z0-9]+(?:-[a-z0-9]+)*\.md$/,
-  )
+const notePathSchema = z.string().max(512).regex(MANAGED_NOTE_PATH_PATTERN)
 const notePathRequestSchema = z.object({ path: notePathSchema }).strict()
 const domainSchema = z.enum(["technology", "reading", "language", "life"])
 const slugSchema = z
@@ -381,6 +378,12 @@ export function registerPublisherIpc(options: RegisterPublisherIpcOptions): () =
       IPC_CHANNELS.requests.changesList,
       secureHandler(IPC_CHANNELS.requests.changesList, noRequestSchema, isTrustedSender, () =>
         services.changes.list(),
+      ),
+    ],
+    [
+      IPC_CHANNELS.requests.changesCancel,
+      secureHandler(IPC_CHANNELS.requests.changesCancel, noRequestSchema, isTrustedSender, () =>
+        services.changes.cancel(),
       ),
     ],
     [

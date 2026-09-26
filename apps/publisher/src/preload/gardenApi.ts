@@ -147,6 +147,7 @@ export function createGardenApi(ipc: IpcRendererPort): GardenApi {
   })
   const changes = Object.freeze({
     list: () => invoke<ChangeReview>(ipc, IPC_CHANNELS.requests.changesList),
+    cancel: () => invoke<void>(ipc, IPC_CHANNELS.requests.changesCancel),
   })
   const publish = Object.freeze({
     start: (request: PublishRequest) =>

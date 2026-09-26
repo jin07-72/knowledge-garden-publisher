@@ -152,6 +152,7 @@ function createGardenMock(): GardenApi {
     },
     changes: {
       list: vi.fn(async () => unavailable<ChangeReview>("变更服务暂不可用。")),
+      cancel: vi.fn(async () => ok(undefined)),
     },
     publish: {
       start: vi.fn(),

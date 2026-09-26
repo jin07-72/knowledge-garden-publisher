@@ -104,13 +104,16 @@ describe("PublishReview", () => {
     view.rerender(
       <PublishReview
         state="ready"
-        review={{ groups: [], blockedReason: "检测到内容冲突，请先解决后再发布。" }}
+        review={{ ...review, blockedReason: "检测到内容冲突，请先解决后再发布。" }}
         onClose={vi.fn()}
         onRefresh={refresh}
       />,
     )
     expect(screen.getByRole("alert")).toHaveTextContent("检测到内容冲突")
-    expect(screen.getByText("当前没有可发布变化")).toBeVisible()
+    for (const checkbox of screen.getAllByRole("checkbox")) {
+      expect(checkbox).toBeDisabled()
+      expect(checkbox).not.toBeChecked()
+    }
     expect(document.body).not.toHaveTextContent("porcelain")
   })
 })

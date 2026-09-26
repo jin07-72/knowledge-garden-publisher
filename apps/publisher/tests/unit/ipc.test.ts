@@ -77,7 +77,7 @@ function services(): PublisherIpcServices & {
         return () => previewListeners.delete(listener)
       },
     },
-    changes: { list: call("changesList") },
+    changes: { list: call("changesList"), cancel: call("changesCancel") },
     publish: {
       start: call("publishStart"),
       cancel: call("publishCancel"),
@@ -170,6 +170,7 @@ describe("secure publisher IPC", () => {
       [IPC_CHANNELS.requests.previewStop, null, "previewStop"],
       [IPC_CHANNELS.requests.previewStatus, {}, "previewStatus"],
       [IPC_CHANNELS.requests.changesList, [], "changesList"],
+      [IPC_CHANNELS.requests.changesCancel, {}, "changesCancel"],
       [IPC_CHANNELS.requests.publishStart, { changeGroupIds: ["../secret"] }, "publishStart"],
       [
         IPC_CHANNELS.requests.publishStart,
@@ -599,6 +600,7 @@ describe("preload garden API", () => {
     await api.preview.stop()
     await api.preview.status()
     await api.changes.list()
+    await api.changes.cancel()
     await api.publish.start({ changeGroupIds: ["note:a"], message: "Publish A" })
     await api.publish.cancel({ operationId: "publish-1" })
     await api.history.git({ limit: 20 })
