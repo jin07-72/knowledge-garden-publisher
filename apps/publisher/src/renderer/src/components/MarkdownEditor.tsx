@@ -33,19 +33,41 @@ export function boundedLines(markdown: string): { lines: readonly string[]; trun
   const lines: string[] = []
   let bytes = 0
   let start = 0
-  while (start <= markdown.length) {
-    const newline = markdown.indexOf("\n", start)
-    const end = newline === -1 ? markdown.length : newline
-    const contentEnd = end > start && markdown.charCodeAt(end - 1) === 13 ? end - 1 : end
-    const line = markdown.slice(start, contentEnd)
-    const lineBytes = new TextEncoder().encode(`${line}\n`).byteLength
-    if (lines.length >= compareMaximumLines || bytes + lineBytes > compareMaximumBytes) {
-      return { lines, truncated: true }
+  let index = 0
+  let lineBytes = 0
+  while (index <= markdown.length) {
+    if (lines.length >= compareMaximumLines) return { lines, truncated: true }
+    const atEnd = index === markdown.length
+    const unit = atEnd ? 10 : markdown.charCodeAt(index)
+    if (unit === 10) {
+      if (bytes + lineBytes + 1 > compareMaximumBytes) return { lines, truncated: true }
+      const contentEnd = index > start && markdown.charCodeAt(index - 1) === 13 ? index - 1 : index
+      lines.push(markdown.slice(start, contentEnd))
+      bytes += lineBytes + 1
+      if (atEnd) return { lines, truncated: false }
+      index += 1
+      start = index
+      lineBytes = 0
+      continue
     }
-    lines.push(line)
-    bytes += lineBytes
-    if (newline === -1) return { lines, truncated: false }
-    start = newline + 1
+    if (unit === 13 && markdown.charCodeAt(index + 1) === 10) {
+      index += 1
+      continue
+    }
+    let unitBytes: number
+    let width = 1
+    if (unit <= 0x7f) unitBytes = 1
+    else if (unit <= 0x7ff) unitBytes = 2
+    else if (unit >= 0xd800 && unit <= 0xdbff) {
+      const next = markdown.charCodeAt(index + 1)
+      if (next >= 0xdc00 && next <= 0xdfff) {
+        unitBytes = 4
+        width = 2
+      } else unitBytes = 3
+    } else unitBytes = 3
+    if (bytes + lineBytes + unitBytes + 1 > compareMaximumBytes) return { lines, truncated: true }
+    lineBytes += unitBytes
+    index += width
   }
   return { lines, truncated: false }
 }

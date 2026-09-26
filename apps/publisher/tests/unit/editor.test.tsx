@@ -522,6 +522,21 @@ describe("MarkdownEditor", () => {
     expect(split).not.toHaveBeenCalled()
   })
 
+  it("stops a 16 MiB single-line preview at the byte bound without whole-line work", () => {
+    const encode = vi.spyOn(TextEncoder.prototype, "encode")
+    const slice = vi.spyOn(String.prototype, "slice")
+    const preview = boundedLines("x".repeat(16 * 1024 * 1024))
+    expect(preview).toEqual({ lines: [], truncated: true })
+    expect(encode).not.toHaveBeenCalled()
+    expect(slice).not.toHaveBeenCalled()
+  })
+
+  it("counts surrogate pairs exactly at the bounded preview byte edge", () => {
+    const fitting = `${"😀".repeat(16_383)}abc`
+    expect(boundedLines(fitting)).toEqual({ lines: [fitting], truncated: false })
+    expect(boundedLines("😀".repeat(16_384))).toEqual({ lines: [], truncated: true })
+  })
+
   it("shows and retries a non-blocking warning when same-content recovery cleanup fails", async () => {
     const matching: NoteRecovery = {
       path: publicNote.path,

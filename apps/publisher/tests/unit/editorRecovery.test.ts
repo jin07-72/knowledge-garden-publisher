@@ -8,6 +8,7 @@ import {
   rm,
   stat,
   symlink,
+  truncate,
   unlink,
   writeFile,
 } from "node:fs/promises"
@@ -98,6 +99,62 @@ describe("editor recovery", () => {
     expect(Math.max(...allocation.mock.calls.map(([bytes]) => bytes))).toBeLessThanOrEqual(
       16 * 1024 * 1024 + 1,
     )
+  })
+
+  it("rejects same-inode growth after lstat before allocating from the opened size", async () => {
+    const workspace = await garden()
+    await writeEditorRecovery(workspace, {
+      path,
+      markdown: "small draft before in-place growth",
+      baseMtimeMs: 1,
+      baseContentHash: "a".repeat(64),
+    })
+    const file = join(workspace, ".garden-publisher", "editor-recovery", `${hash(path)}.json`)
+    const originalSize = (await stat(file)).size
+    const allocation = vi.spyOn(Buffer, "alloc")
+    const grownSize = originalSize + 1024 * 1024
+
+    await expect(
+      getEditorRecovery(
+        workspace,
+        { path },
+        {
+          afterLstat: async (target) => truncate(target, grownSize),
+        },
+      ),
+    ).rejects.toMatchObject({ code: "RECOVERY_INVALID" })
+
+    expect(allocation).not.toHaveBeenCalledWith(grownSize + 1)
+    expect(Math.max(...allocation.mock.calls.map(([bytes]) => bytes))).toBeLessThanOrEqual(
+      16 * 1024 * 1024 + 1,
+    )
+  })
+
+  it("bounds the read to the opened size when the same inode grows during reading", async () => {
+    const workspace = await garden()
+    await writeEditorRecovery(workspace, {
+      path,
+      markdown: "small draft before growth during read",
+      baseMtimeMs: 1,
+      baseContentHash: "a".repeat(64),
+    })
+    const file = join(workspace, ".garden-publisher", "editor-recovery", `${hash(path)}.json`)
+    const originalSize = (await stat(file)).size
+    const grownSize = originalSize + 1024 * 1024
+    const allocation = vi.spyOn(Buffer, "alloc")
+
+    await expect(
+      getEditorRecovery(
+        workspace,
+        { path },
+        {
+          afterOpen: async (target) => truncate(target, grownSize),
+        },
+      ),
+    ).rejects.toMatchObject({ code: "RECOVERY_INVALID" })
+
+    expect(allocation).toHaveBeenCalledWith(originalSize + 1)
+    expect(allocation).not.toHaveBeenCalledWith(grownSize + 1)
   })
 
   it("does not let an old save discard a newer crash-recovery buffer", async () => {

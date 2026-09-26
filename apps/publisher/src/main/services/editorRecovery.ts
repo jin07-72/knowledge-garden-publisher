@@ -29,6 +29,11 @@ interface DraftRoot {
   readonly workspace: string
 }
 
+export interface EditorRecoveryReadAdapter {
+  readonly afterLstat?: (file: string) => Promise<void>
+  readonly afterOpen?: (file: string) => Promise<void>
+}
+
 function failure(code: AppError["code"], message: string): AppError {
   return { code, message } as AppError
 }
@@ -144,8 +149,13 @@ async function target(workspace: string, path: string): Promise<{ root: DraftRoo
   return { root, file: resolve(root.path, draftName(path)) }
 }
 
-async function boundedRead(handle: FileHandle, expectedSize: bigint): Promise<Buffer> {
-  const expectedBytes = Number(expectedSize)
+function checkedStoredSize(size: bigint): number {
+  if (size < 0n || size > BigInt(maximumStoredBytes) || size > BigInt(Number.MAX_SAFE_INTEGER))
+    throw failure("RECOVERY_INVALID", "Recovery data is invalid.")
+  return Number(size)
+}
+
+async function boundedRead(handle: FileHandle, expectedBytes: number): Promise<Buffer> {
   const buffer = Buffer.alloc(expectedBytes + 1)
   let offset = 0
   while (offset < buffer.length) {
@@ -162,6 +172,7 @@ async function readStored(
   file: string,
   expectedPath: string,
   key: Buffer,
+  adapter: EditorRecoveryReadAdapter = {},
 ): Promise<{ draft: StoredDraft; identity: string } | undefined> {
   let before
   try {
@@ -170,10 +181,12 @@ async function readStored(
     if ((error as NodeJS.ErrnoException).code === "ENOENT") return undefined
     throw failure("RECOVERY_INVALID", "Recovery data is invalid.")
   }
-  if (before.isSymbolicLink() || !before.isFile() || before.size > BigInt(maximumStoredBytes))
+  if (before.isSymbolicLink() || !before.isFile())
     throw failure("RECOVERY_INVALID", "Recovery data is invalid.")
+  checkedStoredSize(before.size)
   if (!inside(root.path, await realpath(file)))
     throw failure("RECOVERY_INVALID", "Recovery data is invalid.")
+  await adapter.afterLstat?.(file)
   let handle: FileHandle | undefined
   try {
     handle = await open(
@@ -181,9 +194,11 @@ async function readStored(
       process.platform === "win32" ? "r" : constants.O_RDONLY | constants.O_NOFOLLOW,
     )
     const opened = await handle.stat({ bigint: true })
-    if (!opened.isFile() || identity(opened) !== identity(before))
+    if (!opened.isFile() || identity(opened) !== identity(before) || opened.size !== before.size)
       throw failure("RECOVERY_INVALID", "Recovery data is invalid.")
-    const bytes = await boundedRead(handle, opened.size)
+    const openedBytes = checkedStoredSize(opened.size)
+    await adapter.afterOpen?.(file)
+    const bytes = await boundedRead(handle, openedBytes)
     const after = await lstat(file, { bigint: true })
     if (
       after.isSymbolicLink() ||
@@ -283,6 +298,7 @@ export async function writeEditorRecovery(
 export async function getEditorRecovery(
   workspace: string,
   request: NotePathRequest,
+  adapter: EditorRecoveryReadAdapter = {},
 ): Promise<NoteRecovery | undefined> {
   const { root, file } = await target(workspace, request.path)
   try {
@@ -292,7 +308,7 @@ export async function getEditorRecovery(
     throw failure("RECOVERY_INVALID", "Recovery data is invalid.")
   }
   const key = await internalRecoveryKey(workspace, false)
-  const stored = await readStored(root, file, request.path, key)
+  const stored = await readStored(root, file, request.path, key, adapter)
   if (!stored) return undefined
   const { path, markdown, baseMtimeMs, baseContentHash, createdAt, contentHash } = stored.draft
   return { path, markdown, baseMtimeMs, baseContentHash, createdAt, contentHash }
