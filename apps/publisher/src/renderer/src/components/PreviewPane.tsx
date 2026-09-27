@@ -1,13 +1,15 @@
-import { useEffect, useMemo, useState } from "react"
+import { useMemo, useState } from "react"
 import { Monitor, TriangleAlert } from "lucide-react"
 import type { NoteSummary, PreviewStatus } from "../../../shared/contracts"
+import { HistoryView, type HistorySnapshot } from "./HistoryView"
 
 type PreviewTab = "note" | "site" | "public" | "history"
 
 interface PreviewPaneProps {
   readonly note?: NoteSummary
   readonly preview: PreviewStatus
-  readonly onLoadHistory: () => Promise<string>
+  readonly onLoadHistory: () => Promise<HistorySnapshot>
+  readonly onOpenHistoryLink: (url: string) => Promise<void>
 }
 
 function notePreviewUrl(
@@ -20,27 +22,15 @@ function notePreviewUrl(
   return base.toString().replace(/\/$/, "")
 }
 
-export function PreviewPane({ note, preview, onLoadHistory }: PreviewPaneProps): React.JSX.Element {
+export function PreviewPane({
+  note,
+  preview,
+  onLoadHistory,
+  onOpenHistoryLink,
+}: PreviewPaneProps): React.JSX.Element {
   const [tab, setTab] = useState<PreviewTab>("note")
-  const [historyMessage, setHistoryMessage] = useState("选择此标签页后读取历史记录。")
   const baseUrl = preview.lastSuccessfulUrl ?? preview.url
   const exactUrl = useMemo(() => notePreviewUrl(baseUrl, note), [baseUrl, note])
-
-  useEffect(() => {
-    if (tab !== "history") return
-    let active = true
-    setHistoryMessage("正在读取历史记录…")
-    void onLoadHistory()
-      .then((message) => {
-        if (active) setHistoryMessage(message)
-      })
-      .catch(() => {
-        if (active) setHistoryMessage("无法读取历史记录，请稍后重试。")
-      })
-    return () => {
-      active = false
-    }
-  }, [onLoadHistory, tab])
 
   const tabs: readonly { id: PreviewTab; label: string }[] = [
     { id: "note", label: "当前笔记" },
@@ -137,11 +127,7 @@ export function PreviewPane({ note, preview, onLoadHistory }: PreviewPaneProps):
           />
         ) : null}
         {tab === "history" ? (
-          <div className="destination-card">
-            <span className="destination-icon">↺</span>
-            <strong>发布历史</strong>
-            <p>{historyMessage}</p>
-          </div>
+          <HistoryView loadHistory={onLoadHistory} openExternal={onOpenHistoryLink} />
         ) : null}
       </div>
     </section>

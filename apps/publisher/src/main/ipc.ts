@@ -4,9 +4,10 @@ import {
   MANAGED_NOTE_PATH_PATTERN,
   type ChangeReview,
   type CloseAckRequest,
-  type DeploymentRun,
+  type DeploymentHistory,
   type GitCommit,
   type HistoryRequest,
+  type HistoryLinkRequest,
   type IpcResult,
   type NoteCreateRequest,
   type NoteDocument,
@@ -86,7 +87,8 @@ export interface PublisherIpcServices {
   }
   readonly history: {
     git(request: HistoryRequest): Promise<readonly GitCommit[]>
-    deployments(request: HistoryRequest): Promise<readonly DeploymentRun[]>
+    deployments(request: HistoryRequest): Promise<DeploymentHistory>
+    openLink(request: HistoryLinkRequest): Promise<void>
   }
 }
 
@@ -178,10 +180,11 @@ const publishRequestSchema = z
   .refine((request) => new Set(request.changeGroupIds).size === request.changeGroupIds.length)
 const publishCancelSchema = z.object({ operationId: opaqueIdSchema }).strict()
 const historySchema = z
-  .object({ limit: z.number().int().min(1).max(500).optional() })
+  .object({ limit: z.number().int().min(1).max(100).optional() })
   .strict()
   .optional()
   .transform((request) => request ?? {})
+const historyLinkSchema = z.object({ url: z.string().url().max(2_048) }).strict()
 const closeAckSchema = z.object({ requestId: z.string().uuid(), success: z.boolean() }).strict()
 
 function invalidInput(): IpcResult<never> {
@@ -417,6 +420,15 @@ export function registerPublisherIpc(options: RegisterPublisherIpcOptions): () =
         historySchema,
         isTrustedSender,
         (request) => services.history.deployments(request),
+      ),
+    ],
+    [
+      IPC_CHANNELS.requests.historyOpenLink,
+      secureHandler(
+        IPC_CHANNELS.requests.historyOpenLink,
+        historyLinkSchema,
+        isTrustedSender,
+        (request) => services.history.openLink(request),
       ),
     ],
   ]

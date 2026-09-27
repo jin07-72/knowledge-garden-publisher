@@ -26,7 +26,21 @@ const preview: PreviewStatus = {
 
 describe("renderer security", () => {
   it("sandboxes both local Quartz frames without navigation, popup, or download capabilities", async () => {
-    render(<PreviewPane note={note} preview={preview} onLoadHistory={async () => ""} />)
+    render(
+      <PreviewPane
+        note={note}
+        preview={preview}
+        onLoadHistory={async () => ({
+          commits: [],
+          deployments: {
+            runs: [],
+            actionsUrl: "https://github.com/octocat/garden/actions/workflows/deploy.yml",
+            liveSiteUrl: "https://octocat.github.io/garden/",
+          },
+        })}
+        onOpenHistoryLink={async () => undefined}
+      />,
+    )
     expect(screen.getByTitle("CSS Grid的 Quartz 精确预览")).toHaveAttribute(
       "sandbox",
       "allow-same-origin allow-scripts",

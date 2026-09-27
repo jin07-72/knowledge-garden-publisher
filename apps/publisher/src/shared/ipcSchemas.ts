@@ -177,11 +177,32 @@ const gitCommitSchema = z
 const deploymentRunSchema = z
   .object({
     id: z.string().min(1).max(128),
+    headSha: z.string().regex(/^[a-f0-9]{40,64}$/),
     startedAt: z.string().min(1).max(64),
     completedAt: z.string().min(1).max(64).optional(),
     status: z.enum(["pending", "running", "succeeded", "failed", "cancelled"]),
     url: z.string().url().max(2_048).optional(),
     error: appErrorSchema.optional(),
+  })
+  .strip()
+const githubUrlSchema = z
+  .string()
+  .url()
+  .max(2_048)
+  .refine(
+    (value) => new URL(value).protocol === "https:" && new URL(value).hostname === "github.com",
+  )
+const liveSiteUrlSchema = z
+  .string()
+  .url()
+  .max(2_048)
+  .refine((value) => new URL(value).protocol === "https:")
+const deploymentHistorySchema = z
+  .object({
+    runs: z.array(deploymentRunSchema).max(100),
+    actionsUrl: githubUrlSchema,
+    liveSiteUrl: liveSiteUrlSchema,
+    unavailableMessage: z.string().min(1).max(500).optional(),
   })
   .strip()
 
@@ -219,7 +240,8 @@ export const IPC_SUCCESS_SCHEMAS = {
   [IPC_CHANNELS.requests.publishStart]: publishStartReceiptSchema,
   [IPC_CHANNELS.requests.publishCancel]: z.undefined(),
   [IPC_CHANNELS.requests.historyGit]: z.array(gitCommitSchema).max(500),
-  [IPC_CHANNELS.requests.historyDeployments]: z.array(deploymentRunSchema).max(500),
+  [IPC_CHANNELS.requests.historyDeployments]: deploymentHistorySchema,
+  [IPC_CHANNELS.requests.historyOpenLink]: z.undefined(),
   [IPC_CHANNELS.requests.lifecycleCloseAck]: z.undefined(),
 } satisfies Record<RequestChannel, z.ZodType>
 

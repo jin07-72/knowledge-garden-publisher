@@ -29,6 +29,7 @@ async function garden(): Promise<string> {
   await git(root, ["init", "--initial-branch=main", "--object-format=sha1"])
   await git(root, ["config", "user.name", "Garden Test"])
   await git(root, ["config", "user.email", "garden-test@example.invalid"])
+  await git(root, ["commit", "--allow-empty", "-m", "initial"])
   return root
 }
 
@@ -68,7 +69,7 @@ describe("publisher service wiring", () => {
     expect(manager.subscribe).toHaveBeenCalledWith(listener)
   })
 
-  it("wires change review while keeping post-Task-10 services explicitly unavailable", async () => {
+  it("wires change review and history while keeping publishing explicitly unavailable", async () => {
     const workspace = await garden()
     const services = createPublisherServices({
       workspace,
@@ -82,7 +83,9 @@ describe("publisher service wiring", () => {
     await expect(services.publish.start({ changeGroupIds: ["note:a"] })).rejects.toMatchObject({
       code: "SERVICE_UNAVAILABLE",
     })
-    await expect(services.history.git({})).rejects.toMatchObject({ code: "SERVICE_UNAVAILABLE" })
+    await expect(services.history.git({})).resolves.toEqual([
+      expect.objectContaining({ subject: "initial" }),
+    ])
   })
 
   it("keeps IPC registered until preview disposal succeeds", async () => {

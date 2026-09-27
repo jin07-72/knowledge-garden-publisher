@@ -18,6 +18,10 @@ import {
 import { scanNotes } from "./services/noteIndex"
 import { inspectWorkspace } from "./services/workspace"
 import { createChangeScanner, type ChangeScanner } from "./services/changes"
+import {
+  createDeploymentHistoryService,
+  type DeploymentHistoryService,
+} from "./services/deployments"
 
 export interface PreviewServicePort {
   start(request: {
@@ -36,6 +40,8 @@ export interface PublisherServiceDependencies {
   readonly preview: PreviewServicePort
   readonly changeScanner?: Pick<ChangeScanner, "list" | "cancel"> &
     Partial<Pick<ChangeScanner, "dispose">>
+  readonly deploymentHistory?: DeploymentHistoryService
+  readonly openExternal?: (url: string) => Promise<void>
 }
 
 export type PublisherRuntimeServices = PublisherIpcServices & { dispose(): Promise<void> }
@@ -50,9 +56,17 @@ export function createPublisherServices(
 ): PublisherRuntimeServices {
   const { workspace, trash, preview, isTracked } = dependencies
   const changeScanner = dependencies.changeScanner ?? createChangeScanner({ workspace })
+  const deploymentHistory =
+    dependencies.deploymentHistory ??
+    createDeploymentHistoryService({ workspace, openExternal: dependencies.openExternal })
   const reject = async <T>(name: string): Promise<T> => Promise.reject(unavailable(name))
   return {
-    dispose: () => changeScanner.dispose?.() ?? changeScanner.cancel(),
+    dispose: async () => {
+      await Promise.all([
+        changeScanner.dispose?.() ?? changeScanner.cancel(),
+        deploymentHistory.dispose(),
+      ])
+    },
     workspace: {
       inspect: () => inspectWorkspace(workspace, { checkGit: true }),
     },
@@ -92,8 +106,9 @@ export function createPublisherServices(
       subscribe: () => () => undefined,
     },
     history: {
-      git: () => reject("Git history"),
-      deployments: () => reject("Deployment history"),
+      git: (request) => deploymentHistory.git(request),
+      deployments: (request) => deploymentHistory.deployments(request),
+      openLink: ({ url }) => deploymentHistory.openLink(url),
     },
   }
 }

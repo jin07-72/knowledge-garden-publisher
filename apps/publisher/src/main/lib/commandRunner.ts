@@ -6,6 +6,7 @@ export interface CommandRequest {
   readonly cwd: string
   readonly env?: Readonly<Record<string, string | undefined>>
   readonly signal?: AbortSignal
+  readonly maxOutputBytes?: number
 }
 
 export interface CommandResult {
@@ -34,7 +35,7 @@ export type CommandSpawner = (
     env: NodeJS.ProcessEnv
     shell: false
     windowsHide: boolean
-  }
+  },
 ) => CommandProcess
 
 export class CommandRunnerError extends Error {
@@ -43,7 +44,7 @@ export class CommandRunnerError extends Error {
   constructor(
     readonly code: "COMMAND_FAILED" | "COMMAND_CANCELLED",
     message: string,
-    readonly details?: Readonly<{ reason: "termination" }>
+    readonly details?: Readonly<{ reason: "termination" }>,
   ) {
     super(message)
   }
@@ -54,17 +55,15 @@ function cancelledError(): CommandRunnerError {
 }
 
 function terminationError(): CommandRunnerError {
-  return new CommandRunnerError(
-    "COMMAND_FAILED",
-    "Command termination was not confirmed.",
-    { reason: "termination" }
-  )
+  return new CommandRunnerError("COMMAND_FAILED", "Command termination was not confirmed.", {
+    reason: "termination",
+  })
 }
 
 function commandSpawner(
   executable: string,
   args: readonly string[],
-  options: Parameters<typeof spawn>[2]
+  options: Parameters<typeof spawn>[2],
 ): CommandProcess {
   return spawn(executable, args, options)
 }
@@ -87,7 +86,7 @@ export function createCommandRunner(spawner: CommandSpawner = commandSpawner): C
             cwd: request.cwd,
             env: { ...process.env, ...request.env },
             shell: false,
-            windowsHide: true
+            windowsHide: true,
           })
         } catch {
           reject(new CommandRunnerError("COMMAND_FAILED", "Could not start command."))
@@ -113,7 +112,6 @@ export function createCommandRunner(spawner: CommandSpawner = commandSpawner): C
             fail(terminationError())
           }
         }
-
         request.signal?.addEventListener("abort", cancel, { once: true })
         const childStdout = child.stdout
         const childStderr = child.stderr
@@ -130,7 +128,11 @@ export function createCommandRunner(spawner: CommandSpawner = commandSpawner): C
           stderr += chunk
         })
         child.on("error", () => {
-          fail(cancellationRequested ? terminationError() : new CommandRunnerError("COMMAND_FAILED", "Could not start command."))
+          fail(
+            cancellationRequested
+              ? terminationError()
+              : new CommandRunnerError("COMMAND_FAILED", "Could not start command."),
+          )
         })
         child.on("close", (code) => {
           if (settled) return
@@ -147,7 +149,7 @@ export function createCommandRunner(spawner: CommandSpawner = commandSpawner): C
           resolve({ exitCode: code, stdout, stderr })
         })
       })
-    }
+    },
   }
 }
 

@@ -96,14 +96,21 @@ const validByChannel: Record<string, unknown> = {
       ...privateField,
     },
   ],
-  [IPC_CHANNELS.requests.historyDeployments]: [
-    {
-      id: "deploy-1",
-      startedAt: "2026-09-24T00:00:00.000Z",
-      status: "succeeded",
-      ...privateField,
-    },
-  ],
+  [IPC_CHANNELS.requests.historyDeployments]: {
+    runs: [
+      {
+        id: "deploy-1",
+        headSha: "a".repeat(40),
+        startedAt: "2026-09-24T00:00:00.000Z",
+        status: "succeeded",
+        ...privateField,
+      },
+    ],
+    actionsUrl: "https://github.com/example/garden/actions/workflows/deploy.yml",
+    liveSiteUrl: "https://example.github.io/garden/",
+    ...privateField,
+  },
+  [IPC_CHANNELS.requests.historyOpenLink]: undefined,
   [IPC_CHANNELS.requests.lifecycleCloseAck]: undefined,
 }
 

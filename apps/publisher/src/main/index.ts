@@ -153,6 +153,7 @@ app.whenReady().then(() => {
     trash: { trashItem: (absolutePath) => shell.trashItem(absolutePath) },
     isTracked,
     preview: previewManager,
+    openExternal: (url) => shell.openExternal(url),
   })
   unregisterIpc = registerPublisherIpc({
     ipcMain,

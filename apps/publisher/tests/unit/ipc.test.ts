@@ -86,7 +86,11 @@ function services(): PublisherIpcServices & {
         return () => publishListeners.delete(listener)
       },
     },
-    history: { git: call("historyGit"), deployments: call("historyDeployments") },
+    history: {
+      git: call("historyGit"),
+      deployments: call("historyDeployments"),
+      openLink: call("historyOpenLink"),
+    },
     emitPreview(status) {
       for (const listener of previewListeners) listener(status)
     },
@@ -605,6 +609,9 @@ describe("preload garden API", () => {
     await api.publish.cancel({ operationId: "publish-1" })
     await api.history.git({ limit: 20 })
     await api.history.deployments({ limit: 20 })
+    await api.history.openLink({
+      url: "https://github.com/octocat/garden/actions/workflows/deploy.yml",
+    })
     await api.lifecycle.acknowledgeClose({
       requestId: "11111111-1111-4111-8111-111111111111",
       success: true,

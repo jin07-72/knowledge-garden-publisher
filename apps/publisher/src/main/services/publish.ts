@@ -349,6 +349,10 @@ export function createBoundedPublishCommandRunner(options: {
         let stopping = false
         let stdoutBytes = 0
         let stderrBytes = 0
+        const outputLimit = Math.min(
+          MAX_OUTPUT_BYTES,
+          Math.max(1, request.maxOutputBytes ?? MAX_OUTPUT_BYTES),
+        )
         const stdout: Buffer[] = []
         const stderr: Buffer[] = []
         let pending = new PublishCommandFailure("Publication command timed out.")
@@ -426,7 +430,7 @@ export function createBoundedPublishCommandRunner(options: {
           if (settled || stopping) return
           const bytes = Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk)
           stdoutBytes += bytes.byteLength
-          if (stdoutBytes > MAX_OUTPUT_BYTES) {
+          if (stdoutBytes + stderrBytes > outputLimit) {
             stop(new PublishCommandFailure("Publication command output exceeded its safe limit."))
           } else {
             stdout.push(bytes)
@@ -436,7 +440,7 @@ export function createBoundedPublishCommandRunner(options: {
           if (settled || stopping) return
           const bytes = Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk)
           stderrBytes += bytes.byteLength
-          if (stderrBytes > MAX_STDERR_BYTES) {
+          if (stderrBytes > MAX_STDERR_BYTES || stdoutBytes + stderrBytes > outputLimit) {
             stop(
               new PublishCommandFailure("Publication command diagnostics exceeded its safe limit."),
             )
@@ -449,12 +453,16 @@ export function createBoundedPublishCommandRunner(options: {
   }
 }
 
-const productionTerminator = createProductionProcessTreeTerminator()
-const systemPublishCommandRunner = createBoundedPublishCommandRunner({
-  spawner: (executable, args, options) =>
-    spawn(executable, [...args], options) as unknown as PublishCommandProcess,
-  terminate: (child) => productionTerminator(child),
-})
+export function createSystemBoundedCommandRunner(): CommandRunner {
+  const terminate = createProductionProcessTreeTerminator()
+  return createBoundedPublishCommandRunner({
+    spawner: (executable, args, options) =>
+      spawn(executable, [...args], options) as unknown as PublishCommandProcess,
+    terminate: (child) => terminate(child),
+  })
+}
+
+const systemPublishCommandRunner = createSystemBoundedCommandRunner()
 
 function isInside(root: string, candidate: string): boolean {
   const result = relative(root, candidate)

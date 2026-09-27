@@ -9,7 +9,7 @@ import { App } from "../../src/renderer/src/App"
 import { shanghaiCalendarDate } from "../../src/renderer/src/components/NoteSidebar"
 import type {
   ChangeReview,
-  DeploymentRun,
+  DeploymentHistory,
   GardenApi,
   GitCommit,
   IpcResult,
@@ -162,8 +162,9 @@ function createGardenMock(): GardenApi {
     history: {
       git: vi.fn(async () => unavailable<readonly GitCommit[]>("历史服务将在后续任务中提供。")),
       deployments: vi.fn(async () =>
-        unavailable<readonly DeploymentRun[]>("部署历史将在后续任务中提供。"),
+        unavailable<DeploymentHistory>("部署历史将在后续任务中提供。"),
       ),
+      openLink: vi.fn(async () => ok(undefined)),
     },
   }
 }
@@ -978,7 +979,7 @@ describe("publisher main layout", () => {
     expect(within(preview).queryByTitle(/私密阅读札记的 Quartz 精确预览/)).not.toBeInTheDocument()
 
     await user.click(within(preview).getByRole("tab", { name: "历史" }))
-    expect(await within(preview).findByText(/历史服务暂不可用/)).toBeVisible()
+    expect(await within(preview).findByText("无法读取发布历史")).toBeVisible()
   })
 
   it("shows a safe history error when history loading rejects", async () => {
@@ -988,7 +989,7 @@ describe("publisher main layout", () => {
 
     const preview = await screen.findByRole("region", { name: "本地预览" })
     await user.click(within(preview).getByRole("tab", { name: "历史" }))
-    expect(await within(preview).findByText("无法读取历史记录，请稍后重试。")).toBeVisible()
+    expect(await within(preview).findByText("无法读取发布历史")).toBeVisible()
   })
 
   it("reports unavailable future services honestly in the status bar", async () => {

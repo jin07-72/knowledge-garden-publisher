@@ -207,11 +207,23 @@ export interface PublishProgress {
 
 export interface DeploymentRun {
   readonly id: string
+  readonly headSha: string
   readonly startedAt: string
   readonly completedAt?: string
   readonly status: "pending" | "running" | "succeeded" | "failed" | "cancelled"
   readonly url?: string
   readonly error?: AppError
+}
+
+export interface DeploymentHistory {
+  readonly runs: readonly DeploymentRun[]
+  readonly actionsUrl: string
+  readonly liveSiteUrl: string
+  readonly unavailableMessage?: string
+}
+
+export interface HistoryLinkRequest {
+  readonly url: string
 }
 
 export interface TrashAdapter {
@@ -251,6 +263,7 @@ export const IPC_CHANNELS = {
     publishCancel: "garden:publish:cancel",
     historyGit: "garden:history:git",
     historyDeployments: "garden:history:deployments",
+    historyOpenLink: "garden:history:open-link",
     lifecycleCloseAck: "garden:lifecycle:close-ack",
   },
   events: {
@@ -417,7 +430,8 @@ export interface GardenApi {
   }
   readonly history: {
     git(request?: HistoryRequest): Promise<IpcResult<readonly GitCommit[]>>
-    deployments(request?: HistoryRequest): Promise<IpcResult<readonly DeploymentRun[]>>
+    deployments(request?: HistoryRequest): Promise<IpcResult<DeploymentHistory>>
+    openLink(request: HistoryLinkRequest): Promise<IpcResult<void>>
   }
 }
 

@@ -17,6 +17,7 @@ import { MarkdownEditor, type MarkdownEditorHandle } from "./components/Markdown
 import { PreviewPane } from "./components/PreviewPane"
 import { VisibilityMenu } from "./components/VisibilityMenu"
 import { PublishReview } from "./components/PublishReview"
+import type { HistorySnapshot } from "./components/HistoryView"
 import "./app.css"
 
 type LoadState = "loading" | "ready" | "error"
@@ -542,17 +543,22 @@ function PublisherApp({ api }: { readonly api: GardenApi }): React.JSX.Element {
     void changeVisibility(note, visibility)
   }
 
-  const loadHistory = useCallback(async (): Promise<string> => {
+  const loadHistory = useCallback(async (): Promise<HistorySnapshot> => {
     const [git, deployments] = await Promise.all([
       api.history.git({ limit: 20 }),
       api.history.deployments({ limit: 20 }),
     ])
-    if (!git.ok || !deployments.ok) {
-      return "历史服务暂不可用；后续版本会显示提交与部署记录。"
-    }
-    if (git.value.length === 0 && deployments.value.length === 0) return "还没有历史记录。"
-    return `本地提交 ${git.value.length} 条 · 部署记录 ${deployments.value.length} 条`
+    if (!git.ok) throw new Error(messageFor(git.error, "本地发布历史暂不可用。"))
+    if (!deployments.ok) throw new Error(messageFor(deployments.error, "部署历史暂不可用。"))
+    return { commits: git.value, deployments: deployments.value }
   }, [api])
+  const openHistoryLink = useCallback(
+    async (url: string): Promise<void> => {
+      const result = await api.history.openLink({ url })
+      if (!result.ok) throw new Error(messageFor(result.error, "无法打开链接。"))
+    },
+    [api],
+  )
 
   const previewLabel: Record<PreviewStatus["state"], string> = {
     stopped: "预览未启动",
@@ -714,7 +720,12 @@ function PublisherApp({ api }: { readonly api: GardenApi }): React.JSX.Element {
           </div>
         </section>
 
-        <PreviewPane note={selectedNote} preview={preview} onLoadHistory={loadHistory} />
+        <PreviewPane
+          note={selectedNote}
+          preview={preview}
+          onLoadHistory={loadHistory}
+          onOpenHistoryLink={openHistoryLink}
+        />
       </div>
 
       <footer className="statusbar" aria-label="发布状态">

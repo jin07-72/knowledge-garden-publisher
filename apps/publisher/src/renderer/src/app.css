@@ -775,6 +775,176 @@ button {
   text-decoration: none;
 }
 
+.history-view {
+  height: 100%;
+  overflow: auto;
+  padding: 14px;
+  color: #dce2e8;
+  background: #11151a;
+}
+.history-summary,
+.history-entry-heading,
+.history-links,
+.history-fallback-links,
+.history-notice {
+  display: flex;
+  align-items: center;
+}
+.history-summary {
+  justify-content: space-between;
+  gap: 12px;
+  padding: 2px 2px 12px;
+}
+.history-summary > div {
+  display: grid;
+  gap: 3px;
+}
+.history-summary strong {
+  font-size: 14px;
+}
+.history-summary span,
+.history-entry time,
+.history-empty span {
+  color: #8f9aa6;
+  font-size: 10px;
+}
+.history-summary button,
+.history-state button {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  gap: 6px;
+  min-height: 30px;
+  padding: 0 9px;
+  border: 1px solid #3d4753;
+  border-radius: 6px;
+  color: #d7dde4;
+  background: #20262e;
+  cursor: pointer;
+}
+.history-notice {
+  gap: 7px;
+  margin-bottom: 10px;
+  padding: 8px 10px;
+  border: 1px solid #765644;
+  border-radius: 7px;
+  color: #ffe0c7;
+  background: #35251e;
+  font-size: 11px;
+}
+.history-list {
+  display: grid;
+  gap: 9px;
+  margin: 0;
+  padding: 0;
+  list-style: none;
+}
+.history-entry {
+  padding: 12px;
+  border: 1px solid #303843;
+  border-radius: 8px;
+  background: #191f26;
+}
+.history-entry-heading {
+  justify-content: space-between;
+  gap: 12px;
+}
+.history-entry-heading strong {
+  min-width: 0;
+  overflow: hidden;
+  font-size: 12px;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.history-entry time {
+  flex: none;
+}
+.history-entry dl {
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  gap: 8px;
+  margin: 10px 0;
+}
+.history-entry dl > div {
+  display: grid;
+  gap: 3px;
+}
+.history-entry dt {
+  color: #7f8a97;
+  font-size: 9px;
+  letter-spacing: 0.06em;
+  text-transform: uppercase;
+}
+.history-entry dd {
+  margin: 0;
+  font-size: 11px;
+}
+.history-entry code {
+  color: #c7d0d9;
+  font-family: "Cascadia Code", Consolas, monospace;
+}
+.deployment-succeeded {
+  color: #8bd5ca;
+}
+.deployment-failed,
+.deployment-cancelled {
+  color: #f5a97f;
+}
+.deployment-running,
+.deployment-pending {
+  color: #eed49f;
+}
+.deployment-unknown {
+  color: #9aa5b1;
+}
+.history-links,
+.history-fallback-links {
+  flex-wrap: wrap;
+  gap: 8px 13px;
+}
+.history-links a,
+.history-fallback-links a {
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+  color: #8bd5ca;
+  font-size: 10px;
+  text-decoration: none;
+}
+.history-links a:hover,
+.history-fallback-links a:hover {
+  text-decoration: underline;
+}
+.history-fallback-links {
+  margin-top: 12px;
+  padding: 10px 2px 2px;
+  border-top: 1px solid #2a3039;
+}
+.history-empty,
+.history-state {
+  display: flex;
+  min-height: 220px;
+  align-items: center;
+  justify-content: center;
+  flex-direction: column;
+  gap: 8px;
+  color: #8f9aa6;
+  text-align: center;
+}
+.history-empty strong,
+.history-state strong {
+  color: #dce2e8;
+  font-size: 13px;
+}
+.history-state span,
+.history-empty span {
+  max-width: 320px;
+  line-height: 1.6;
+}
+.history-error svg {
+  color: #f5a97f;
+}
+
 .statusbar {
   display: flex;
   align-items: center;
