@@ -91,13 +91,29 @@ export interface DependencyLinkRequest {
   readonly type: "junction"
 }
 
-export interface PublishDependencies {
+interface PublishDependencies {
   readonly workspace: string
   readonly runtime: PublishRuntime
   readonly runner?: CommandRunner
   readonly validateDependencies?: (request: VerifySiteRequest) => Promise<boolean>
   readonly verifySite?: (request: VerifySiteRequest) => Promise<{ readonly exitCode: number }>
   readonly createDependencyLink?: (request: DependencyLinkRequest) => Promise<void>
+  readonly onProgress?: (progress: PublishProgressEvent) => void
+  readonly timeoutMs?: number
+  readonly criticalSectionTimeoutMs?: number
+  /** Test-only race seam. Production construction never supplies this hook. */
+  readonly beforeIndexLockAcquired?: () => Promise<void>
+}
+
+/** Explicitly unsafe construction seam used only by repository integration tests. */
+export type PublisherTestDependencies = PublishDependencies
+
+export interface ProductionPublisherOptions {
+  readonly workspace: string
+  readonly isPackaged: boolean
+  readonly resourcesPath: string
+  readonly appPath: string
+  readonly runner?: CommandRunner
   readonly onProgress?: (progress: PublishProgressEvent) => void
   readonly timeoutMs?: number
   readonly criticalSectionTimeoutMs?: number
@@ -136,6 +152,49 @@ const gitEnvironment = {
   GIT_ALTERNATE_OBJECT_DIRECTORIES: undefined,
   GIT_TERMINAL_PROMPT: "0",
 } as const
+
+const publisherConstructionKey = Symbol("publisher-construction-key")
+
+export function resolveProductionPublishRuntime(options: {
+  readonly workspace: string
+  readonly isPackaged: boolean
+  readonly resourcesPath: string
+  readonly appPath: string
+}): PublishRuntime {
+  const root = options.isPackaged
+    ? resolve(options.resourcesPath, "node")
+    : resolve(options.appPath, "vendor", "node")
+  return {
+    root,
+    nodeExecutable: resolve(root, "node.exe"),
+    npmCliPath: resolve(root, "node_modules", "npm", "bin", "npm-cli.js"),
+    nodeModules: resolve(options.workspace, "node_modules"),
+  }
+}
+
+export function createProductionPublisher(options: ProductionPublisherOptions): Publisher {
+  if ("runtime" in options) {
+    throw new TypeError("A production runtime cannot be supplied by the caller.")
+  }
+  const { workspace, isPackaged, resourcesPath, appPath, ...dependencies } = options
+  return new Publisher(
+    {
+      workspace,
+      runtime: resolveProductionPublishRuntime({
+        workspace,
+        isPackaged,
+        resourcesPath,
+        appPath,
+      }),
+      ...dependencies,
+    },
+    publisherConstructionKey,
+  )
+}
+
+export function createPublisherForTest(dependencies: PublisherTestDependencies): Publisher {
+  return new Publisher(dependencies, publisherConstructionKey)
+}
 
 function error(code: PublishErrorCode, message: string): PublishError {
   return new PublishError(code, message)
@@ -383,7 +442,13 @@ export class Publisher {
   #pendingPush: { readonly commit: string; readonly tree: string } | undefined
   #terminationUncertain = false
 
-  constructor(private readonly dependencies: PublishDependencies) {
+  constructor(
+    private readonly dependencies: PublishDependencies,
+    constructionKey?: symbol,
+  ) {
+    if (constructionKey !== publisherConstructionKey) {
+      throw new TypeError("Publisher must be created by a trusted construction factory.")
+    }
     this.#runner = dependencies.runner ?? systemPublishCommandRunner
   }
 
@@ -603,6 +668,8 @@ export class Publisher {
   }): Promise<void> {
     if (options.callerSignal.aborted) throw options.callerSignal.reason
     const paths = await this.#realIndexPaths(options.workspace, options.callerSignal)
+    await this.dependencies.beforeIndexLockAcquired?.()
+    if (options.callerSignal.aborted) throw options.callerSignal.reason
     let lock: Awaited<ReturnType<typeof open>>
     try {
       lock = await open(paths.lock, "wx", 0o600)
@@ -622,6 +689,30 @@ export class Publisher {
       Math.max(1, this.dependencies.criticalSectionTimeoutMs ?? 10_000),
     )
     try {
+      const branch = (
+        await this.#git(
+          options.workspace,
+          ["symbolic-ref", "--quiet", "--short", "HEAD"],
+          critical.signal,
+          "REF_CHANGED",
+          "The current branch changed during publication.",
+        )
+      ).stdout.trim()
+      if (branch !== "main") {
+        throw error("REF_CHANGED", "The current branch changed during publication.")
+      }
+      const head = (
+        await this.#git(
+          options.workspace,
+          ["rev-parse", "--verify", "HEAD"],
+          critical.signal,
+          "REF_CHANGED",
+          "The current publication version changed during publication.",
+        )
+      ).stdout.trim()
+      if (head !== options.oldHead) {
+        throw error("REF_CHANGED", "The current publication version changed during publication.")
+      }
       const staged = await this.#git(
         options.workspace,
         ["diff", "--cached", "--quiet", "--exit-code"],

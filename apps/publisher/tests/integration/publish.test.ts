@@ -11,7 +11,7 @@ import {
   writeFile,
 } from "node:fs/promises"
 import { EventEmitter } from "node:events"
-import { dirname, join } from "node:path"
+import { dirname, join, resolve } from "node:path"
 import { PassThrough } from "node:stream"
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest"
 import { runCommand, type CommandRequest } from "../../src/main/lib/commandRunner"
@@ -19,9 +19,12 @@ import {
   Publisher,
   PublishError,
   createBoundedPublishCommandRunner,
+  createProductionPublisher,
+  createPublisherForTest,
+  resolveProductionPublishRuntime,
   type PublishCommandProcess,
-  type PublishDependencies,
   type PublishPhase,
+  type PublisherTestDependencies,
 } from "../../src/main/services/publish"
 import { createTemporaryGitRepository, git, type TemporaryGitRepository } from "../helpers/git"
 
@@ -76,9 +79,9 @@ async function fixture(): Promise<TemporaryGitRepository> {
 
 function publisher(
   repository: TemporaryGitRepository,
-  overrides: Partial<PublishDependencies> = {},
+  overrides: Partial<PublisherTestDependencies> = {},
 ): Publisher {
-  return new Publisher({
+  return createPublisherForTest({
     workspace: repository.root,
     runtime: {
       root: join(repository.root, "apps/publisher/vendor/node"),
@@ -102,6 +105,145 @@ beforeEach(() => {
 afterEach(async () => {
   vi.restoreAllMocks()
   await Promise.all(repositories.splice(0).map((repository) => repository.cleanup()))
+})
+
+describe("production publication runtime", () => {
+  it("derives the packaged runtime only from resourcesPath and fixes workspace dependencies", () => {
+    const runtime = resolveProductionPublishRuntime({
+      workspace: String.raw`C:\Garden`,
+      isPackaged: true,
+      resourcesPath: String.raw`C:\Program Files\Garden Publisher\resources`,
+      appPath: String.raw`C:\ignored-dev-app`,
+    })
+
+    expect(runtime).toEqual({
+      root: resolve(String.raw`C:\Program Files\Garden Publisher\resources`, "node"),
+      nodeExecutable: resolve(
+        String.raw`C:\Program Files\Garden Publisher\resources`,
+        "node",
+        "node.exe",
+      ),
+      npmCliPath: resolve(
+        String.raw`C:\Program Files\Garden Publisher\resources`,
+        "node",
+        "node_modules",
+        "npm",
+        "bin",
+        "npm-cli.js",
+      ),
+      nodeModules: resolve(String.raw`C:\Garden`, "node_modules"),
+    })
+  })
+
+  it("derives the development runtime only from appPath/vendor/node", () => {
+    const runtime = resolveProductionPublishRuntime({
+      workspace: String.raw`C:\Garden`,
+      isPackaged: false,
+      resourcesPath: String.raw`C:\ignored-packaged-resources`,
+      appPath: String.raw`C:\src\apps\publisher`,
+    })
+
+    expect(runtime.root).toBe(resolve(String.raw`C:\src\apps\publisher`, "vendor", "node"))
+    expect(runtime.nodeExecutable).toBe(
+      resolve(String.raw`C:\src\apps\publisher`, "vendor", "node", "node.exe"),
+    )
+    expect(runtime.npmCliPath).toBe(
+      resolve(
+        String.raw`C:\src\apps\publisher`,
+        "vendor",
+        "node",
+        "node_modules",
+        "npm",
+        "bin",
+        "npm-cli.js",
+      ),
+    )
+  })
+
+  it("rejects an arbitrary declared runtime on the production construction path", () => {
+    expect(() =>
+      createProductionPublisher({
+        workspace: String.raw`C:\Garden`,
+        isPackaged: true,
+        resourcesPath: String.raw`C:\Program Files\Garden Publisher\resources`,
+        appPath: String.raw`C:\src\apps\publisher`,
+        runtime: {
+          root: String.raw`D:\attacker`,
+          nodeExecutable: String.raw`D:\attacker\node.exe`,
+          npmCliPath: String.raw`D:\attacker\npm-cli.js`,
+          nodeModules: String.raw`D:\attacker\node_modules`,
+        },
+      } as never),
+    ).toThrow(/runtime.*cannot be supplied/i)
+  })
+
+  it("uses the derived bundled runtime for default dependency and site verification commands", async () => {
+    const repository = await fixture()
+    await put(repository.root, "content/technology/css-grid.md", "production commands\n")
+    const runtimeRequests: CommandRequest[] = []
+    const service = createProductionPublisher({
+      workspace: repository.root,
+      isPackaged: false,
+      resourcesPath: join(repository.root, "ignored-resources"),
+      appPath: join(repository.root, "apps", "publisher"),
+      runner: {
+        run: async (request) => {
+          if (request.executable.toLowerCase().endsWith("node.exe")) {
+            runtimeRequests.push(request)
+            return { exitCode: 0, stdout: "", stderr: "" }
+          }
+          return runCommand(request)
+        },
+      },
+    })
+
+    await service.publish({ paths: ["content/technology/css-grid.md"] })
+
+    const runtime = resolveProductionPublishRuntime({
+      workspace: repository.root,
+      isPackaged: false,
+      resourcesPath: join(repository.root, "ignored-resources"),
+      appPath: join(repository.root, "apps", "publisher"),
+    })
+    expect(runtimeRequests).toHaveLength(2)
+    expect(runtimeRequests[0]).toMatchObject({
+      executable: runtime.nodeExecutable,
+      args: [runtime.npmCliPath, "ls", "--all", "--json", "--ignore-scripts"],
+      cwd: repository.root,
+    })
+    expect(runtimeRequests[1]).toMatchObject({
+      executable: runtime.nodeExecutable,
+      args: [runtime.npmCliPath, "run", "verify:site"],
+    })
+    expect(runtimeRequests[1]?.cwd).toMatch(/[\\/]\.garden-publisher[\\/]publish[\\/]/)
+  })
+
+  it("fails before staging when the default bundled dependency check is unsuccessful", async () => {
+    const repository = await fixture()
+    await put(repository.root, "content/technology/css-grid.md", "invalid dependencies\n")
+    const service = createProductionPublisher({
+      workspace: repository.root,
+      isPackaged: false,
+      resourcesPath: join(repository.root, "ignored-resources"),
+      appPath: join(repository.root, "apps", "publisher"),
+      runner: {
+        run: async (request) =>
+          request.executable.toLowerCase().endsWith("node.exe")
+            ? { exitCode: 1, stdout: "", stderr: "dependency mismatch" }
+            : runCommand(request),
+      },
+    })
+
+    await expect(
+      service.publish({ paths: ["content/technology/css-grid.md"] }),
+    ).rejects.toMatchObject({ code: "DEPENDENCIES_INVALID" })
+    expect(await output(repository.root, ["rev-parse", "HEAD"])).toBe(
+      await output(repository.root, ["rev-parse", "refs/remotes/origin/main"]),
+    )
+    await expect(
+      readdir(join(repository.root, ".garden-publisher", "publish")),
+    ).rejects.toMatchObject({ code: "ENOENT" })
+  })
 })
 
 describe("exact-tree publication", () => {
@@ -185,16 +327,18 @@ describe("exact-tree publication", () => {
   it("creates the controlled dependency link and invokes the pinned runtime in the detached tree", async () => {
     const repository = await fixture()
     await put(repository.root, "content/technology/css-grid.md", "verify me\n")
-    const junction = vi.fn<NonNullable<PublishDependencies["createDependencyLink"]>>(
+    const junction = vi.fn<NonNullable<PublisherTestDependencies["createDependencyLink"]>>(
       async () => undefined,
     )
-    const verifySite = vi.fn<NonNullable<PublishDependencies["verifySite"]>>(async (request) => {
-      expect(await output(request.cwd, ["rev-parse", "--abbrev-ref", "HEAD"])).toBe("HEAD")
-      expect(await output(request.cwd, ["show", "HEAD:content/technology/css-grid.md"])).toBe(
-        "verify me",
-      )
-      return { exitCode: 0 }
-    })
+    const verifySite = vi.fn<NonNullable<PublisherTestDependencies["verifySite"]>>(
+      async (request) => {
+        expect(await output(request.cwd, ["rev-parse", "--abbrev-ref", "HEAD"])).toBe("HEAD")
+        expect(await output(request.cwd, ["show", "HEAD:content/technology/css-grid.md"])).toBe(
+          "verify me",
+        )
+        return { exitCode: 0 }
+      },
+    )
 
     await publisher(repository, { createDependencyLink: junction, verifySite }).publish({
       paths: ["content/technology/css-grid.md"],
@@ -386,6 +530,32 @@ describe("exact-tree publication", () => {
     expect(await output(repository.root, ["diff", "--cached", "--name-only"])).toBe("")
     expect(await readFile(join(repository.root, "content/life/weekly-review.md"), "utf8")).toBe(
       "concurrent intent\n",
+    )
+  })
+
+  it("rejects a branch switch in the window before index-lock acquisition without changing either branch or index", async () => {
+    const repository = await fixture()
+    const before = await output(repository.root, ["rev-parse", "refs/heads/main"])
+    await put(repository.root, "content/technology/css-grid.md", "branch race\n")
+    let switched = false
+    const service = publisher(repository, {
+      beforeIndexLockAcquired: async () => {
+        expect((await git(repository.root, ["switch", "-c", "attacker"])).exitCode).toBe(0)
+        switched = true
+      },
+    })
+
+    await expect(
+      service.publish({ paths: ["content/technology/css-grid.md"] }),
+    ).rejects.toMatchObject({ code: "REF_CHANGED" })
+
+    expect(switched).toBe(true)
+    expect(await output(repository.root, ["rev-parse", "refs/heads/main"])).toBe(before)
+    expect(await output(repository.root, ["rev-parse", "refs/heads/attacker"])).toBe(before)
+    expect(await output(repository.root, ["rev-parse", "--abbrev-ref", "HEAD"])).toBe("attacker")
+    expect(await output(repository.root, ["diff", "--cached", "--name-only"])).toBe("")
+    expect(await readFile(join(repository.root, "content/technology/css-grid.md"), "utf8")).toBe(
+      "branch race\n",
     )
   })
 
