@@ -11,7 +11,7 @@ import {
   writeFile,
 } from "node:fs/promises"
 import { EventEmitter } from "node:events"
-import { dirname, join, resolve } from "node:path"
+import { basename, dirname, join, resolve } from "node:path"
 import { PassThrough } from "node:stream"
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest"
 import { runCommand, type CommandRequest } from "../../src/main/lib/commandRunner"
@@ -174,20 +174,43 @@ describe("production publication runtime", () => {
           nodeModules: String.raw`D:\attacker\node_modules`,
         },
       } as never),
-    ).toThrow(/runtime.*cannot be supplied/i)
+    ).toThrow(/unsupported production publisher option/i)
+  })
+
+  it.each([
+    "runner",
+    "runtime",
+    "verifySite",
+    "validateDependencies",
+    "createDependencyLink",
+    "beforeIndexLockAcquired",
+  ])("rejects the production injection field %s at runtime", (field) => {
+    expect(() =>
+      createProductionPublisher({
+        workspace: String.raw`C:\Garden`,
+        isPackaged: false,
+        resourcesPath: String.raw`C:\resources`,
+        appPath: String.raw`C:\app`,
+        [field]: field === "runner" ? { run: vi.fn() } : vi.fn(),
+      } as never),
+    ).toThrow(/unsupported production publisher option/i)
   })
 
   it("uses the derived bundled runtime for default dependency and site verification commands", async () => {
     const repository = await fixture()
     await put(repository.root, "content/technology/css-grid.md", "production commands\n")
     const runtimeRequests: CommandRequest[] = []
-    const service = createProductionPublisher({
+    const runtime = resolveProductionPublishRuntime({
       workspace: repository.root,
       isPackaged: false,
       resourcesPath: join(repository.root, "ignored-resources"),
       appPath: join(repository.root, "apps", "publisher"),
+    })
+    const service = createPublisherForTest({
+      workspace: repository.root,
+      runtime,
       runner: {
-        run: async (request) => {
+        run: async (request: CommandRequest) => {
           if (request.executable.toLowerCase().endsWith("node.exe")) {
             runtimeRequests.push(request)
             return { exitCode: 0, stdout: "", stderr: "" }
@@ -199,12 +222,6 @@ describe("production publication runtime", () => {
 
     await service.publish({ paths: ["content/technology/css-grid.md"] })
 
-    const runtime = resolveProductionPublishRuntime({
-      workspace: repository.root,
-      isPackaged: false,
-      resourcesPath: join(repository.root, "ignored-resources"),
-      appPath: join(repository.root, "apps", "publisher"),
-    })
     expect(runtimeRequests).toHaveLength(2)
     expect(runtimeRequests[0]).toMatchObject({
       executable: runtime.nodeExecutable,
@@ -221,13 +238,17 @@ describe("production publication runtime", () => {
   it("fails before staging when the default bundled dependency check is unsuccessful", async () => {
     const repository = await fixture()
     await put(repository.root, "content/technology/css-grid.md", "invalid dependencies\n")
-    const service = createProductionPublisher({
+    const runtime = resolveProductionPublishRuntime({
       workspace: repository.root,
       isPackaged: false,
       resourcesPath: join(repository.root, "ignored-resources"),
       appPath: join(repository.root, "apps", "publisher"),
+    })
+    const service = createPublisherForTest({
+      workspace: repository.root,
+      runtime,
       runner: {
-        run: async (request) =>
+        run: async (request: CommandRequest) =>
           request.executable.toLowerCase().endsWith("node.exe")
             ? { exitCode: 1, stdout: "", stderr: "dependency mismatch" }
             : runCommand(request),
@@ -367,6 +388,8 @@ describe("exact-tree publication", () => {
   it("does not update the real branch when site validation fails and removes its operation directory", async () => {
     const repository = await fixture()
     const before = await output(repository.root, ["rev-parse", "HEAD"])
+    const beforeIndex = await output(repository.root, ["write-tree"])
+    const beforeRemote = await output(repository.root, ["rev-parse", "refs/remotes/origin/main"])
     await put(repository.root, "content/technology/css-grid.md", "invalid site\n")
 
     await expect(
@@ -376,8 +399,86 @@ describe("exact-tree publication", () => {
     ).rejects.toMatchObject({ code: "VERIFY_FAILED" })
 
     expect(await output(repository.root, ["rev-parse", "HEAD"])).toBe(before)
+    expect(await output(repository.root, ["write-tree"])).toBe(beforeIndex)
+    expect(await output(repository.root, ["rev-parse", "refs/remotes/origin/main"])).toBe(
+      beforeRemote,
+    )
     const publishRoot = join(repository.root, ".garden-publisher", "publish")
     expect(await readdir(publishRoot).catch(() => [])).toEqual([])
+  })
+
+  it("regenerates the install index after verification corrupts the staging index", async () => {
+    const repository = await fixture()
+    await put(repository.root, "content/technology/css-grid.md", "verified selection\n")
+    await put(repository.root, "content/life/weekly-review.md", "unselected change\n")
+
+    await publisher(repository, {
+      verifySite: async ({ cwd }) => {
+        await writeFile(join(dirname(cwd), "temporary.index"), "attacker controlled bytes")
+        return { exitCode: 0 }
+      },
+    }).publish({ paths: ["content/technology/css-grid.md"] })
+
+    expect(await output(repository.root, ["show", "HEAD:content/technology/css-grid.md"])).toBe(
+      "verified selection",
+    )
+    expect(await output(repository.root, ["show", "HEAD:content/life/weekly-review.md"])).toBe(
+      "original weekly",
+    )
+    expect(await output(repository.root, ["diff", "--cached", "--name-only"])).toBe("")
+  })
+
+  it("never installs a different valid index substituted by verification", async () => {
+    const repository = await fixture()
+    await put(repository.root, "content/technology/css-grid.md", "verified selection\n")
+    await put(repository.root, "private/life/journal.md", "private secret\n")
+
+    await publisher(repository, {
+      verifySite: async ({ cwd }) => {
+        const operationRoot = dirname(cwd)
+        const maliciousIndex = join(operationRoot, "malicious.index")
+        const env = { GIT_INDEX_FILE: maliciousIndex }
+        expect((await git(repository.root, ["read-tree", "HEAD"], env)).exitCode).toBe(0)
+        expect(
+          (await git(repository.root, ["add", "-f", "--", "private/life/journal.md"], env))
+            .exitCode,
+        ).toBe(0)
+        await rm(join(operationRoot, "temporary.index"), { force: true })
+        await rename(maliciousIndex, join(operationRoot, "temporary.index"))
+        return { exitCode: 0 }
+      },
+    }).publish({ paths: ["content/technology/css-grid.md"] })
+
+    const names = await output(repository.root, ["ls-tree", "-r", "--name-only", "HEAD"])
+    expect(names).not.toContain("private/life/journal.md")
+    expect(await output(repository.root, ["diff", "--cached", "--name-only"])).toBe("")
+  })
+
+  it("never follows a staging-index symlink substituted by verification", async ({ skip }) => {
+    const repository = await fixture()
+    await put(repository.root, "content/technology/css-grid.md", "verified selection\n")
+
+    await publisher(repository, {
+      verifySite: async ({ cwd }) => {
+        const operationRoot = dirname(cwd)
+        const temporaryIndex = join(operationRoot, "temporary.index")
+        const attackerIndex = join(operationRoot, "attacker.index")
+        await writeFile(attackerIndex, "attacker controlled bytes")
+        await rm(temporaryIndex, { force: true })
+        try {
+          await symlink(attackerIndex, temporaryIndex, "file")
+        } catch (error) {
+          if ((error as NodeJS.ErrnoException).code === "EPERM") skip()
+          throw error
+        }
+        return { exitCode: 0 }
+      },
+    }).publish({ paths: ["content/technology/css-grid.md"] })
+
+    expect(await output(repository.root, ["show", "HEAD:content/technology/css-grid.md"])).toBe(
+      "verified selection",
+    )
+    expect(await output(repository.root, ["diff", "--cached", "--name-only"])).toBe("")
   })
 
   it("pushes the verified commit instead of a concurrently switched HEAD and confirms its remote tree", async () => {
@@ -932,6 +1033,92 @@ describe("exact-tree publication", () => {
     expect(await readFile(join(outside, "marker.txt"), "utf8")).toBe("keep")
   })
 
+  it("fails cleanup closed if verification replaces the publication root", async ({ skip }) => {
+    const repository = await fixture()
+    await put(repository.root, "content/technology/css-grid.md", "cleanup race\n")
+    let outsideSentinel = ""
+    const service = publisher(repository, {
+      verifySite: async ({ cwd }) => {
+        const operationRoot = dirname(cwd)
+        const publishRoot = dirname(operationRoot)
+        const parkedRoot = join(dirname(publishRoot), "publish-parked")
+        const outside = join(dirname(repository.root), "outside-cleanup-target")
+        const fakeOperation = join(outside, basename(operationRoot))
+        outsideSentinel = join(fakeOperation, "sentinel.txt")
+        await mkdir(fakeOperation, { recursive: true })
+        await writeFile(outsideSentinel, "keep")
+        try {
+          await rename(publishRoot, parkedRoot)
+          await symlink(outside, publishRoot, process.platform === "win32" ? "junction" : "dir")
+        } catch (error) {
+          if ((error as NodeJS.ErrnoException).code === "EPERM") skip()
+          throw error
+        }
+        return { exitCode: 1 }
+      },
+    })
+
+    await expect(
+      service.publish({ paths: ["content/technology/css-grid.md"] }),
+    ).rejects.toMatchObject({ code: "VERIFY_FAILED" })
+    expect(await readFile(outsideSentinel, "utf8")).toBe("keep")
+    await expect(
+      service.publish({ paths: ["content/technology/css-grid.md"] }),
+    ).rejects.toMatchObject({ code: "CLEANUP_FAILED" })
+  })
+
+  it("does not recursively remove a substituted operation after cleanup validation", async ({
+    skip,
+  }) => {
+    const repository = await fixture()
+    await put(repository.root, "content/technology/css-grid.md", "cleanup late race\n")
+    let outsideSentinel = ""
+    let replaced = false
+    const runner = {
+      run: async (request: CommandRequest) => {
+        const result = await runCommand(request)
+        if (
+          !replaced &&
+          request.executable === "git" &&
+          request.args[0] === "worktree" &&
+          request.args[1] === "remove"
+        ) {
+          const verify = request.args.at(-1)!
+          const operationRoot = dirname(verify)
+          const publishRoot = dirname(operationRoot)
+          const parkedRoot = join(dirname(publishRoot), "publish-late-parked")
+          const outside = join(dirname(repository.root), "outside-late-cleanup-target")
+          const fakeOperation = join(outside, basename(operationRoot))
+          outsideSentinel = join(fakeOperation, "sentinel.txt")
+          await mkdir(fakeOperation, { recursive: true })
+          await writeFile(outsideSentinel, "keep")
+          try {
+            await rename(publishRoot, parkedRoot)
+            await symlink(outside, publishRoot, process.platform === "win32" ? "junction" : "dir")
+          } catch (error) {
+            if ((error as NodeJS.ErrnoException).code === "EPERM") skip()
+            throw error
+          }
+          replaced = true
+        }
+        return result
+      },
+    }
+    const service = publisher(repository, {
+      runner,
+      verifySite: async () => ({ exitCode: 1 }),
+    })
+
+    await expect(
+      service.publish({ paths: ["content/technology/css-grid.md"] }),
+    ).rejects.toMatchObject({ code: "VERIFY_FAILED" })
+    expect(replaced).toBe(true)
+    expect(await readFile(outsideSentinel, "utf8")).toBe("keep")
+    await expect(
+      service.publish({ paths: ["content/technology/css-grid.md"] }),
+    ).rejects.toMatchObject({ code: "CLEANUP_FAILED" })
+  })
+
   it("is single-flight and supports explicit cancellation", async () => {
     const repository = await fixture()
     await put(repository.root, "content/technology/css-grid.md", "cancel\n")
@@ -1001,6 +1188,84 @@ describe("exact-tree publication", () => {
 })
 
 describe("bounded publication commands", () => {
+  it("uses command-specific allowlisted environments and excludes inherited secrets and overrides", async () => {
+    for (const [key, value] of Object.entries({
+      PATH: "safe-path",
+      TEMP: "safe-temp",
+      USERPROFILE: "safe-profile",
+      SSH_AUTH_SOCK: "safe-agent",
+      GH_TOKEN: "secret-gh",
+      GITHUB_TOKEN: "secret-github",
+      NPM_TOKEN: "secret-npm",
+      NODE_OPTIONS: "--require attacker.js",
+      npm_config_registry: "https://attacker.invalid",
+      GIT_DIR: "attacker-git-dir",
+      GIT_WORK_TREE: "attacker-work-tree",
+      GIT_INDEX_FILE: "attacker-index",
+      GIT_OBJECT_DIRECTORY: "attacker-objects",
+      GIT_ALTERNATE_OBJECT_DIRECTORIES: "attacker-alternate-objects",
+    }))
+      vi.stubEnv(key, value)
+    const captured: Array<{ executable: string; env: NodeJS.ProcessEnv }> = []
+    const spawner = (
+      executable: string,
+      _args: readonly string[],
+      options: { env: NodeJS.ProcessEnv },
+    ) => {
+      captured.push({ executable, env: options.env })
+      const child = Object.assign(new EventEmitter(), {
+        pid: 4242,
+        stdout: new PassThrough(),
+        stderr: new PassThrough(),
+        kill: () => true,
+      }) as EventEmitter & PublishCommandProcess
+      queueMicrotask(() => child.emit("close", 0))
+      return child
+    }
+    const runner = createBoundedPublishCommandRunner({
+      spawner: spawner as never,
+      terminate: async () => true,
+    })
+    try {
+      await runner.run({
+        executable: "git",
+        args: ["status"],
+        cwd: process.cwd(),
+        env: { GIT_INDEX_FILE: "controlled-index", GIT_TERMINAL_PROMPT: "0" },
+      })
+      await runner.run({ executable: "node.exe", args: ["verify.js"], cwd: process.cwd() })
+    } finally {
+      vi.unstubAllEnvs()
+    }
+
+    expect(captured[0]?.env).toMatchObject({
+      PATH: "safe-path",
+      TEMP: "safe-temp",
+      USERPROFILE: "safe-profile",
+      SSH_AUTH_SOCK: "safe-agent",
+      GIT_INDEX_FILE: "controlled-index",
+      GIT_TERMINAL_PROMPT: "0",
+    })
+    expect(captured[1]?.env).toMatchObject({
+      PATH: "safe-path",
+      TEMP: "safe-temp",
+      USERPROFILE: "safe-profile",
+    })
+    for (const capturedCommand of captured) {
+      expect(capturedCommand.env).not.toHaveProperty("GH_TOKEN")
+      expect(capturedCommand.env).not.toHaveProperty("GITHUB_TOKEN")
+      expect(capturedCommand.env).not.toHaveProperty("NPM_TOKEN")
+      expect(capturedCommand.env).not.toHaveProperty("NODE_OPTIONS")
+      expect(capturedCommand.env).not.toHaveProperty("npm_config_registry")
+      expect(capturedCommand.env).not.toHaveProperty("GIT_DIR")
+      expect(capturedCommand.env).not.toHaveProperty("GIT_WORK_TREE")
+      expect(capturedCommand.env).not.toHaveProperty("GIT_OBJECT_DIRECTORY")
+      expect(capturedCommand.env).not.toHaveProperty("GIT_ALTERNATE_OBJECT_DIRECTORIES")
+    }
+    expect(captured[1]?.env).not.toHaveProperty("GIT_INDEX_FILE")
+    expect(captured[1]?.env).not.toHaveProperty("SSH_AUTH_SOCK")
+  })
+
   it("settles fail-closed when cancellation cannot confirm process-tree termination", async () => {
     const child = Object.assign(new EventEmitter(), {
       pid: 4242,

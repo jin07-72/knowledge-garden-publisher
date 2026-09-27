@@ -1,18 +1,17 @@
 import { spawn } from "node:child_process"
+import { randomUUID } from "node:crypto"
 import {
   lstat,
   mkdir,
   mkdtemp,
   open,
-  readFile,
   realpath,
   rename,
   rm,
-  stat,
   symlink,
   unlink,
 } from "node:fs/promises"
-import { dirname, isAbsolute, join, relative, resolve, sep } from "node:path"
+import { basename, dirname, isAbsolute, join, relative, resolve, sep } from "node:path"
 import { type CommandRequest, type CommandResult, type CommandRunner } from "../lib/commandRunner"
 import type { PreviewProcess } from "./preview"
 import { createProductionProcessTreeTerminator } from "./previewRuntime"
@@ -113,7 +112,6 @@ export interface ProductionPublisherOptions {
   readonly isPackaged: boolean
   readonly resourcesPath: string
   readonly appPath: string
-  readonly runner?: CommandRunner
   readonly onProgress?: (progress: PublishProgressEvent) => void
   readonly timeoutMs?: number
   readonly criticalSectionTimeoutMs?: number
@@ -132,10 +130,20 @@ export interface PublishResult {
 }
 
 interface OperationPaths {
+  readonly publishRoot: string
+  readonly publishRootIdentity: FileIdentity
   readonly root: string
+  readonly rootIdentity: FileIdentity
   readonly index: string
+  readonly installIndex: string
   readonly verify: string
   readonly dependencyLink: string
+}
+
+interface FileIdentity {
+  readonly dev: number
+  readonly ino: number
+  readonly birthtimeMs: number
 }
 
 const MAX_PATHS = 500
@@ -173,10 +181,19 @@ export function resolveProductionPublishRuntime(options: {
 }
 
 export function createProductionPublisher(options: ProductionPublisherOptions): Publisher {
-  if ("runtime" in options) {
-    throw new TypeError("A production runtime cannot be supplied by the caller.")
+  const allowed = new Set([
+    "workspace",
+    "isPackaged",
+    "resourcesPath",
+    "appPath",
+    "onProgress",
+    "timeoutMs",
+    "criticalSectionTimeoutMs",
+  ])
+  if (Object.keys(options).some((key) => !allowed.has(key))) {
+    throw new TypeError("Unsupported production publisher option.")
   }
-  const { workspace, isPackaged, resourcesPath, appPath, ...dependencies } = options
+  const { workspace, isPackaged, resourcesPath, appPath } = options
   return new Publisher(
     {
       workspace,
@@ -186,7 +203,9 @@ export function createProductionPublisher(options: ProductionPublisherOptions): 
         resourcesPath,
         appPath,
       }),
-      ...dependencies,
+      onProgress: options.onProgress,
+      timeoutMs: options.timeoutMs,
+      criticalSectionTimeoutMs: options.criticalSectionTimeoutMs,
     },
     publisherConstructionKey,
   )
@@ -225,6 +244,65 @@ class PublishCommandFailure extends Error {
   }
 }
 
+const commonInheritedEnvironmentKeys = [
+  "SystemRoot",
+  "SYSTEMROOT",
+  "WINDIR",
+  "windir",
+  "PATH",
+  "Path",
+  "TEMP",
+  "TMP",
+  "USERPROFILE",
+  "APPDATA",
+  "LOCALAPPDATA",
+  "HOME",
+  "HOMEDRIVE",
+  "HOMEPATH",
+  "COMSPEC",
+  "PATHEXT",
+] as const
+
+const gitCredentialEnvironmentKeys = [
+  "SSH_AUTH_SOCK",
+  "SSH_AGENT_PID",
+  "GCM_INTERACTIVE",
+  "GCM_PROVIDER",
+  "GCM_AUTHORITY",
+  "GCM_HTTP_TIMEOUT",
+] as const
+
+const internalGitEnvironmentKeys = new Set([
+  "GIT_DIR",
+  "GIT_WORK_TREE",
+  "GIT_INDEX_FILE",
+  "GIT_OBJECT_DIRECTORY",
+  "GIT_ALTERNATE_OBJECT_DIRECTORIES",
+  "GIT_TERMINAL_PROMPT",
+])
+
+function publishCommandEnvironment(
+  executable: string,
+  requested: Readonly<Record<string, string | undefined>> | undefined,
+): NodeJS.ProcessEnv {
+  const environment: NodeJS.ProcessEnv = {}
+  for (const key of commonInheritedEnvironmentKeys) {
+    const value = process.env[key]
+    if (value !== undefined) environment[key] = value
+  }
+  const git = ["git", "git.exe"].includes(basename(executable).toLowerCase())
+  if (git) {
+    for (const key of gitCredentialEnvironmentKeys) {
+      const value = process.env[key]
+      if (value !== undefined) environment[key] = value
+    }
+    for (const [key, value] of Object.entries(requested ?? {})) {
+      if (internalGitEnvironmentKeys.has(key) && value !== undefined) environment[key] = value
+    }
+  }
+  return environment
+}
+
 export function createBoundedPublishCommandRunner(options: {
   readonly spawner: PublishCommandSpawner
   readonly terminate: (child: PublishCommandProcess) => Promise<boolean>
@@ -241,7 +319,7 @@ export function createBoundedPublishCommandRunner(options: {
         try {
           child = options.spawner(request.executable, request.args, {
             cwd: request.cwd,
-            env: { ...process.env, ...request.env },
+            env: publishCommandEnvironment(request.executable, request.env),
             shell: false,
             windowsHide: true,
             detached: true,
@@ -419,6 +497,21 @@ function safeMessage(message: string | undefined): string {
 
 function pathsEqual(left: string, right: string): boolean {
   return process.platform === "win32" ? left.toLowerCase() === right.toLowerCase() : left === right
+}
+
+function fileIdentity(details: {
+  readonly dev: number
+  readonly ino: number
+  readonly birthtimeMs: number
+}): FileIdentity {
+  return { dev: details.dev, ino: details.ino, birthtimeMs: details.birthtimeMs }
+}
+
+function sameIdentity(
+  left: FileIdentity,
+  right: { readonly dev: number; readonly ino: number; readonly birthtimeMs: number },
+): boolean {
+  return left.dev === right.dev && left.ino === right.ino && left.birthtimeMs === right.birthtimeMs
 }
 
 function progressMessage(phase: PublishPhase): string {
@@ -660,7 +753,7 @@ export class Publisher {
 
   async #installVerifiedRefAndIndex(options: {
     readonly workspace: string
-    readonly temporaryIndex: string
+    readonly operationPaths: OperationPaths
     readonly oldHead: string
     readonly commit: string
     readonly tree: string
@@ -724,6 +817,96 @@ export class Publisher {
       if (staged.exitCode !== 0) {
         throw error("STAGED_CHANGES", "Other prepared changes appeared during publication.")
       }
+
+      if (!(await this.#operationPathsAreCurrent(options.operationPaths))) {
+        throw error("CLEANUP_FAILED", "The publication operation folder changed unexpectedly.")
+      }
+      try {
+        await lstat(options.operationPaths.installIndex)
+        throw error("REF_UPDATE_FAILED", "The controlled installation index already exists.")
+      } catch (caught) {
+        if (caught instanceof PublishError) throw caught
+        if ((caught as NodeJS.ErrnoException).code !== "ENOENT") {
+          throw error("REF_UPDATE_FAILED", "The controlled installation index is unavailable.")
+        }
+      }
+      const installEnvironment = {
+        ...gitEnvironment,
+        GIT_INDEX_FILE: options.operationPaths.installIndex,
+      }
+      await this.#git(
+        options.workspace,
+        ["read-tree", options.tree],
+        critical.signal,
+        "REF_UPDATE_FAILED",
+        "The verified publication index could not be regenerated.",
+        { env: installEnvironment },
+      )
+      const installDetails = await lstat(options.operationPaths.installIndex).catch(() => undefined)
+      const installCanonical = await realpath(options.operationPaths.installIndex).catch(
+        () => undefined,
+      )
+      if (
+        !installDetails?.isFile() ||
+        installDetails.isSymbolicLink() ||
+        !installCanonical ||
+        !pathsEqual(installCanonical, resolve(options.operationPaths.installIndex)) ||
+        !isInside(options.operationPaths.root, installCanonical)
+      ) {
+        throw error("REF_UPDATE_FAILED", "The regenerated publication index is unsafe.")
+      }
+      const installTree = (
+        await this.#git(
+          options.workspace,
+          ["write-tree"],
+          critical.signal,
+          "REF_UPDATE_FAILED",
+          "The regenerated publication index could not be verified.",
+          { env: installEnvironment },
+        )
+      ).stdout.trim()
+      if (installTree !== options.tree) {
+        throw error("TREE_INVALID", "The regenerated publication index differs from verification.")
+      }
+      const checkedDetails = await lstat(options.operationPaths.installIndex).catch(() => undefined)
+      const checkedCanonical = await realpath(options.operationPaths.installIndex).catch(
+        () => undefined,
+      )
+      if (
+        !checkedDetails?.isFile() ||
+        checkedDetails.isSymbolicLink() ||
+        !checkedCanonical ||
+        !pathsEqual(checkedCanonical, resolve(options.operationPaths.installIndex)) ||
+        !isInside(options.operationPaths.root, checkedCanonical)
+      ) {
+        throw error("REF_UPDATE_FAILED", "The regenerated publication index changed unexpectedly.")
+      }
+      const installIdentity = fileIdentity(checkedDetails)
+      const installHandle = await open(options.operationPaths.installIndex, "r")
+      let verifiedIndex: Buffer
+      try {
+        const openedDetails = await installHandle.stat()
+        if (
+          !openedDetails.isFile() ||
+          !sameIdentity(installIdentity, openedDetails) ||
+          openedDetails.size <= 0 ||
+          openedDetails.size > MAX_GIT_INDEX_BYTES
+        ) {
+          throw error("REF_UPDATE_FAILED", "The regenerated publication index is invalid.")
+        }
+        verifiedIndex = await installHandle.readFile()
+        const finalDetails = await installHandle.stat()
+        if (
+          !sameIdentity(installIdentity, finalDetails) ||
+          finalDetails.size !== verifiedIndex.byteLength
+        ) {
+          throw error("REF_UPDATE_FAILED", "The regenerated publication index changed while read.")
+        }
+      } finally {
+        await installHandle.close()
+      }
+      if (critical.signal.aborted) throw critical.signal.reason
+
       refMayHaveAdvanced = true
       await this.#git(
         options.workspace,
@@ -734,23 +917,27 @@ export class Publisher {
       )
       this.#pendingPush = { commit: options.commit, tree: options.tree }
 
-      const indexDetails = await stat(options.temporaryIndex)
-      if (
-        !indexDetails.isFile() ||
-        indexDetails.size <= 0 ||
-        indexDetails.size > MAX_GIT_INDEX_BYTES
-      ) {
-        throw error("REF_UPDATE_FAILED", "The verified temporary index is invalid.")
-      }
-      const verifiedIndex = await readFile(options.temporaryIndex)
-      if (critical.signal.aborted) throw critical.signal.reason
       await lock.writeFile(verifiedIndex)
+      // Persist the complete verified index before the atomic lock-file replacement.
       await lock.sync()
       await lock.close()
       lockOpen = false
       await rename(paths.lock, paths.index)
       ownsLock = false
 
+      const installedIndexTree = (
+        await this.#git(
+          options.workspace,
+          ["write-tree"],
+          critical.signal,
+          "REF_UPDATE_FAILED",
+          "The installed publication index could not be confirmed.",
+        )
+      ).stdout.trim()
+      if (installedIndexTree !== options.tree) {
+        this.#terminationUncertain = true
+        throw error("TREE_INVALID", "The installed index differs from the verified tree.")
+      }
       const installedTree = (
         await this.#git(
           options.workspace,
@@ -958,12 +1145,55 @@ export class Publisher {
     if (!isInside(publishRoot, canonical) || canonical === publishRoot) {
       throw error("UNSAFE_STATE_PATH", "The publication operation folder is unsafe.")
     }
+    const publishRootDetails = await lstat(publishRoot)
+    const rootDetails = await lstat(canonical)
+    if (
+      publishRootDetails.isSymbolicLink() ||
+      !publishRootDetails.isDirectory() ||
+      rootDetails.isSymbolicLink() ||
+      !rootDetails.isDirectory()
+    ) {
+      throw error("UNSAFE_STATE_PATH", "The publication operation folder is unsafe.")
+    }
     const verify = join(canonical, "verify")
     return {
+      publishRoot,
+      publishRootIdentity: fileIdentity(publishRootDetails),
       root: canonical,
+      rootIdentity: fileIdentity(rootDetails),
       index: join(canonical, "temporary.index"),
+      installIndex: join(canonical, `install-${randomUUID()}.index`),
       verify,
       dependencyLink: join(verify, "node_modules"),
+    }
+  }
+
+  async #operationPathsAreCurrent(paths: OperationPaths): Promise<boolean> {
+    try {
+      const expectedPublishRoot = resolve(paths.publishRoot)
+      const expectedRoot = resolve(paths.root)
+      const publishRootDetails = await lstat(expectedPublishRoot)
+      const rootDetails = await lstat(expectedRoot)
+      if (
+        publishRootDetails.isSymbolicLink() ||
+        !publishRootDetails.isDirectory() ||
+        rootDetails.isSymbolicLink() ||
+        !rootDetails.isDirectory() ||
+        !sameIdentity(paths.publishRootIdentity, publishRootDetails) ||
+        !sameIdentity(paths.rootIdentity, rootDetails)
+      ) {
+        return false
+      }
+      const canonicalPublishRoot = await realpath(expectedPublishRoot)
+      const canonicalRoot = await realpath(expectedRoot)
+      return (
+        pathsEqual(canonicalPublishRoot, expectedPublishRoot) &&
+        pathsEqual(canonicalRoot, expectedRoot) &&
+        isInside(canonicalPublishRoot, canonicalRoot) &&
+        !pathsEqual(canonicalPublishRoot, canonicalRoot)
+      )
+    } catch {
+      return false
     }
   }
 
@@ -974,6 +1204,9 @@ export class Publisher {
     signal: AbortSignal,
   ): Promise<void> {
     if (!paths) return
+    if (!(await this.#operationPathsAreCurrent(paths))) {
+      throw error("CLEANUP_FAILED", "The publication operation folder changed unexpectedly.")
+    }
     let cleanupFailure = false
     try {
       await unlink(paths.dependencyLink)
@@ -1007,7 +1240,9 @@ export class Publisher {
       if (
         details.isSymbolicLink() ||
         !details.isDirectory() ||
-        !isInside(publishRoot, canonical) ||
+        !pathsEqual(publishRoot, paths.publishRoot) ||
+        !sameIdentity(paths.rootIdentity, details) ||
+        !isInside(paths.publishRoot, canonical) ||
         canonical === publishRoot
       ) {
         cleanupFailure = true
@@ -1258,7 +1493,7 @@ export class Publisher {
         throw error("REF_CHANGED", "The current branch changed during publication.")
       await this.#installVerifiedRefAndIndex({
         workspace,
-        temporaryIndex: operationPaths.index,
+        operationPaths,
         oldHead,
         commit,
         tree,
