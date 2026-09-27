@@ -1,5 +1,4 @@
 import type {
-  DeploymentHistoryRequest,
   DeploymentHistory,
   DeploymentRun,
   GitCommit,
@@ -31,7 +30,7 @@ type Wait = (milliseconds: number, signal: AbortSignal) => Promise<void>
 
 export interface DeploymentHistoryService {
   git(request?: HistoryRequest): Promise<readonly GitCommit[]>
-  deployments(request?: DeploymentHistoryRequest): Promise<DeploymentHistory>
+  deployments(request?: HistoryRequest): Promise<DeploymentHistory>
   cancel(request: HistoryCancelRequest): Promise<void>
   openLink(url: string): Promise<void>
   dispose(): Promise<void>
@@ -61,6 +60,11 @@ interface ResolvedRepository {
 interface DeploymentFlight {
   readonly controller: AbortController
   readonly promise: Promise<DeploymentHistory>
+}
+
+interface GitRequestState {
+  readonly controllers: Set<AbortController>
+  readonly flights: Set<Promise<void>>
 }
 
 const anonymousFlight = Symbol("anonymous-deployment-history-flight")
@@ -290,6 +294,7 @@ class DeploymentHistoryServiceImpl implements DeploymentHistoryService {
   #currentRepository?: GitHubRepository
   #resolutionGeneration = 0
   readonly #flights = new Map<string | symbol, DeploymentFlight>()
+  readonly #gitRequests = new Map<string, GitRequestState>()
 
   constructor(dependencies: DeploymentHistoryDependencies) {
     this.#workspace = dependencies.workspace
@@ -304,6 +309,14 @@ class DeploymentHistoryServiceImpl implements DeploymentHistoryService {
     if (this.#disposed) gitFailure("发布历史服务已停止。")
     const controller = new AbortController()
     this.#controllers.add(controller)
+    const requestId = request?.requestId
+    const requestState = requestId
+      ? (this.#gitRequests.get(requestId) ?? { controllers: new Set(), flights: new Set() })
+      : undefined
+    if (requestId && requestState) {
+      requestState.controllers.add(controller)
+      this.#gitRequests.set(requestId, requestState)
+    }
     const timer = setTimeout(() => controller.abort(), this.#timeoutMs)
     const limit = normalizedLimit(request)
     let settled: Promise<void> | undefined
@@ -326,6 +339,7 @@ class DeploymentHistoryServiceImpl implements DeploymentHistoryService {
         () => undefined,
       )
       this.#gitFlights.add(settled)
+      requestState?.flights.add(settled)
       const result = await execution
       if (result.exitCode !== 0) gitFailure("无法读取本地发布历史。")
       return parseGitLog(result.stdout, limit)
@@ -335,11 +349,17 @@ class DeploymentHistoryServiceImpl implements DeploymentHistoryService {
       clearTimeout(timer)
       this.#controllers.delete(controller)
       if (settled) this.#gitFlights.delete(settled)
+      if (requestState) {
+        requestState.controllers.delete(controller)
+        if (settled) requestState.flights.delete(settled)
+        if (requestId && requestState.controllers.size === 0 && requestState.flights.size === 0)
+          this.#gitRequests.delete(requestId)
+      }
     }
     throw new Error("unreachable")
   }
 
-  deployments(request?: DeploymentHistoryRequest): Promise<DeploymentHistory> {
+  deployments(request?: HistoryRequest): Promise<DeploymentHistory> {
     const key = request?.requestId ?? anonymousFlight
     const existing = this.#flights.get(key)
     if (existing) return existing.promise
@@ -385,9 +405,13 @@ class DeploymentHistoryServiceImpl implements DeploymentHistoryService {
 
   async cancel(request: HistoryCancelRequest): Promise<void> {
     const flight = this.#flights.get(request.requestId)
-    if (!flight) return
-    flight.controller.abort()
-    await flight.promise.catch(() => undefined)
+    const gitRequest = this.#gitRequests.get(request.requestId)
+    flight?.controller.abort()
+    for (const controller of gitRequest?.controllers ?? []) controller.abort()
+    await Promise.all([
+      flight?.promise.catch(() => undefined),
+      ...[...(gitRequest?.flights ?? [])].map((gitFlight) => gitFlight.catch(() => undefined)),
+    ])
   }
 
   async openLink(url: string): Promise<void> {

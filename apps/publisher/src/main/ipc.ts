@@ -5,7 +5,6 @@ import {
   type ChangeReview,
   type CloseAckRequest,
   type DeploymentHistory,
-  type DeploymentHistoryRequest,
   type GitCommit,
   type HistoryCancelRequest,
   type HistoryRequest,
@@ -89,7 +88,7 @@ export interface PublisherIpcServices {
   }
   readonly history: {
     git(request: HistoryRequest): Promise<readonly GitCommit[]>
-    deployments(request: DeploymentHistoryRequest): Promise<DeploymentHistory>
+    deployments(request: HistoryRequest): Promise<DeploymentHistory>
     cancel(request: HistoryCancelRequest): Promise<void>
     openLink(request: HistoryLinkRequest): Promise<void>
   }
@@ -183,11 +182,6 @@ const publishRequestSchema = z
   .refine((request) => new Set(request.changeGroupIds).size === request.changeGroupIds.length)
 const publishCancelSchema = z.object({ operationId: opaqueIdSchema }).strict()
 const historySchema = z
-  .object({ limit: z.number().int().min(1).max(100).optional() })
-  .strict()
-  .optional()
-  .transform((request) => request ?? {})
-const deploymentHistorySchema = z
   .object({
     limit: z.number().int().min(1).max(100).optional(),
     requestId: opaqueIdSchema.optional(),
@@ -429,7 +423,7 @@ export function registerPublisherIpc(options: RegisterPublisherIpcOptions): () =
       IPC_CHANNELS.requests.historyDeployments,
       secureHandler(
         IPC_CHANNELS.requests.historyDeployments,
-        deploymentHistorySchema,
+        historySchema,
         isTrustedSender,
         (request) => services.history.deployments(request),
       ),

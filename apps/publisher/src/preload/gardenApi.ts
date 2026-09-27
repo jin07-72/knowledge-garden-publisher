@@ -5,7 +5,6 @@ import {
   type BeforeCloseRequest,
   type CloseAckRequest,
   type DeploymentHistory,
-  type DeploymentHistoryRequest,
   type GitCommit,
   type HistoryCancelRequest,
   type HistoryRequest,
@@ -163,7 +162,7 @@ export function createGardenApi(ipc: IpcRendererPort): GardenApi {
   const history = Object.freeze({
     git: (request?: HistoryRequest) =>
       invoke<readonly GitCommit[]>(ipc, IPC_CHANNELS.requests.historyGit, request),
-    deployments: (request?: DeploymentHistoryRequest) =>
+    deployments: (request?: HistoryRequest) =>
       invoke<DeploymentHistory>(ipc, IPC_CHANNELS.requests.historyDeployments, request),
     cancel: (request: HistoryCancelRequest) =>
       invoke<void>(ipc, IPC_CHANNELS.requests.historyCancel, request),

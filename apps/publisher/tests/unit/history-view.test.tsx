@@ -103,6 +103,82 @@ describe("HistoryView", () => {
     expect(await screen.findByRole("alert")).toHaveTextContent("无法打开链接，请稍后重试。")
   })
 
+  it("clears a stale link error when a new open or history refresh recovers", async () => {
+    let resolveSecondOpen!: () => void
+    const openExternal = vi
+      .fn<(url: string) => Promise<void>>()
+      .mockRejectedValueOnce(new Error("shell failed"))
+      .mockImplementationOnce(
+        () =>
+          new Promise<void>((resolve) => {
+            resolveSecondOpen = resolve
+          }),
+      )
+      .mockRejectedValueOnce(new Error("shell failed again"))
+    const snapshot = {
+      commits: [],
+      deployments: {
+        runs: [],
+        actionsUrl: "https://github.com/octocat/garden/actions/workflows/deploy.yml",
+        liveSiteUrl: "https://octocat.github.io/garden/",
+      },
+    }
+    render(
+      <HistoryView
+        loadHistory={vi.fn(async (_requestId: string) => snapshot)}
+        cancelHistory={vi.fn(async () => undefined)}
+        openExternal={openExternal}
+      />,
+    )
+
+    await userEvent.click(await screen.findByRole("link", { name: "打开 GitHub Actions" }))
+    expect(await screen.findByRole("alert")).toHaveTextContent("无法打开链接，请稍后重试。")
+
+    await userEvent.click(screen.getByRole("link", { name: "打开线上网站" }))
+    expect(screen.queryByRole("alert")).not.toBeInTheDocument()
+    resolveSecondOpen()
+
+    await userEvent.click(screen.getByRole("link", { name: "打开 GitHub Actions" }))
+    expect(await screen.findByRole("alert")).toHaveTextContent("无法打开链接，请稍后重试。")
+    await userEvent.click(screen.getByRole("button", { name: "重新读取" }))
+    await screen.findByRole("link", { name: "打开 GitHub Actions" })
+    expect(screen.queryByRole("alert")).not.toBeInTheDocument()
+  })
+
+  it("does not restore an old link error after a newer open succeeds", async () => {
+    let rejectFirst!: (error: Error) => void
+    const openExternal = vi
+      .fn<(url: string) => Promise<void>>()
+      .mockImplementationOnce(
+        () =>
+          new Promise<void>((_resolve, reject) => {
+            rejectFirst = reject
+          }),
+      )
+      .mockResolvedValueOnce(undefined)
+    render(
+      <HistoryView
+        loadHistory={vi.fn(async (_requestId: string) => ({
+          commits: [],
+          deployments: {
+            runs: [],
+            actionsUrl: "https://github.com/octocat/garden/actions/workflows/deploy.yml",
+            liveSiteUrl: "https://octocat.github.io/garden/",
+          },
+        }))}
+        cancelHistory={vi.fn(async () => undefined)}
+        openExternal={openExternal}
+      />,
+    )
+
+    await userEvent.click(await screen.findByRole("link", { name: "打开 GitHub Actions" }))
+    await userEvent.click(screen.getByRole("link", { name: "打开线上网站" }))
+    rejectFirst(new Error("late failure"))
+
+    await waitFor(() => expect(openExternal).toHaveBeenCalledTimes(2))
+    expect(screen.queryByRole("alert")).not.toBeInTheDocument()
+  })
+
   it("cancels its own deployment request when unmounted", async () => {
     const loadHistory = vi.fn((_requestId: string) => new Promise<never>(() => undefined))
     const cancelHistory = vi.fn(async () => undefined)
@@ -120,5 +196,40 @@ describe("HistoryView", () => {
 
     expect(requestId).toMatch(/^history-/)
     expect(cancelHistory).toHaveBeenCalledWith(requestId)
+  })
+
+  it("cancels each request id across a rapid refresh and unmount", async () => {
+    const snapshot = {
+      commits: [],
+      deployments: {
+        runs: [],
+        actionsUrl: "https://github.com/octocat/garden/actions/workflows/deploy.yml",
+        liveSiteUrl: "https://octocat.github.io/garden/",
+      },
+    }
+    const loadHistory = vi
+      .fn<(requestId: string) => Promise<typeof snapshot>>()
+      .mockResolvedValueOnce(snapshot)
+      .mockImplementationOnce(() => new Promise(() => undefined))
+    const cancelHistory = vi.fn(async () => undefined)
+    const view = render(
+      <HistoryView
+        loadHistory={loadHistory}
+        cancelHistory={cancelHistory}
+        openExternal={vi.fn(async () => undefined)}
+      />,
+    )
+    await screen.findByRole("button", { name: "重新读取" })
+    const firstRequestId = loadHistory.mock.calls[0]?.[0]
+
+    await userEvent.click(screen.getByRole("button", { name: "重新读取" }))
+    await waitFor(() => expect(loadHistory).toHaveBeenCalledTimes(2))
+    const secondRequestId = loadHistory.mock.calls[1]?.[0]
+    expect(cancelHistory).toHaveBeenCalledWith(firstRequestId)
+
+    view.unmount()
+
+    expect(secondRequestId).not.toBe(firstRequestId)
+    expect(cancelHistory).toHaveBeenCalledWith(secondRequestId)
   })
 })

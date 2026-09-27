@@ -184,6 +184,7 @@ describe("secure publisher IPC", () => {
       ],
       [IPC_CHANNELS.requests.publishCancel, { operationId: "../bad" }, "publishCancel"],
       [IPC_CHANNELS.requests.historyGit, { limit: 0 }, "historyGit"],
+      [IPC_CHANNELS.requests.historyGit, { requestId: "../bad" }, "historyGit"],
       [IPC_CHANNELS.requests.historyDeployments, { limit: 101 }, "historyDeployments"],
       [IPC_CHANNELS.requests.historyCancel, { requestId: "../bad" }, "historyCancel"],
     ]
@@ -609,7 +610,7 @@ describe("preload garden API", () => {
     await api.changes.cancel()
     await api.publish.start({ changeGroupIds: ["note:a"], message: "Publish A" })
     await api.publish.cancel({ operationId: "publish-1" })
-    await api.history.git({ limit: 20 })
+    await api.history.git({ limit: 20, requestId: "history-1" })
     await api.history.deployments({ limit: 20, requestId: "history-1" })
     await api.history.cancel({ requestId: "history-1" })
     await api.history.openLink({

@@ -981,6 +981,10 @@ describe("publisher main layout", () => {
 
     await user.click(within(preview).getByRole("tab", { name: "历史" }))
     expect(await within(preview).findByText("无法读取发布历史")).toBeVisible()
+    const gitRequest = vi.mocked(garden.history.git).mock.calls.at(-1)?.[0]
+    const deploymentRequest = vi.mocked(garden.history.deployments).mock.calls.at(-1)?.[0]
+    expect(gitRequest?.requestId).toMatch(/^history-/)
+    expect(deploymentRequest?.requestId).toBe(gitRequest?.requestId)
   })
 
   it("shows a safe history error when history loading rejects", async () => {

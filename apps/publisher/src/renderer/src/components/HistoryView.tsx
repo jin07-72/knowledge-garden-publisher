@@ -1,4 +1,4 @@
-import { useCallback, useEffect, useState } from "react"
+import { useCallback, useEffect, useRef, useState } from "react"
 import { CircleAlert, ExternalLink, LoaderCircle, RefreshCw } from "lucide-react"
 import type { DeploymentHistory, DeploymentRun, GitCommit } from "../../../shared/contracts"
 
@@ -50,12 +50,10 @@ function SafeLink({
   href,
   children,
   openExternal,
-  onOpenError,
 }: {
   readonly href: string
   readonly children: React.ReactNode
   readonly openExternal: (url: string) => Promise<void>
-  readonly onOpenError: () => void
 }) {
   return (
     <a
@@ -64,11 +62,7 @@ function SafeLink({
       rel="noreferrer"
       onClick={(event) => {
         event.preventDefault()
-        try {
-          void openExternal(href).catch(() => onOpenError())
-        } catch {
-          onOpenError()
-        }
+        void openExternal(href)
       }}
     >
       {children}
@@ -85,18 +79,39 @@ export function HistoryView({
   const [state, setState] = useState<ViewState>({ kind: "loading" })
   const [attempt, setAttempt] = useState(0)
   const [linkError, setLinkError] = useState(false)
+  const openAttempt = useRef(0)
   const retry = useCallback(() => {
+    openAttempt.current += 1
+    setLinkError(false)
     setState({ kind: "loading" })
     setAttempt((current) => current + 1)
   }, [])
+  const openLink = useCallback(
+    async (url: string): Promise<void> => {
+      const currentAttempt = ++openAttempt.current
+      setLinkError(false)
+      try {
+        await openExternal(url)
+        if (openAttempt.current === currentAttempt) setLinkError(false)
+      } catch {
+        if (openAttempt.current === currentAttempt) setLinkError(true)
+      }
+    },
+    [openExternal],
+  )
 
   useEffect(() => {
     let active = true
     const requestId = nextRequestId()
+    openAttempt.current += 1
+    setLinkError(false)
     setState({ kind: "loading" })
     void loadHistory(requestId).then(
       (snapshot) => {
-        if (active) setState({ kind: "ready", snapshot })
+        if (active) {
+          setLinkError(false)
+          setState({ kind: "ready", snapshot })
+        }
       },
       () => {
         if (active) setState({ kind: "error" })
@@ -104,6 +119,7 @@ export function HistoryView({
     )
     return () => {
       active = false
+      openAttempt.current += 1
       try {
         void cancelHistory(requestId).catch(() => undefined)
       } catch {
@@ -191,24 +207,21 @@ export function HistoryView({
                 <div className="history-links">
                   <SafeLink
                     href={deployments.liveSiteUrl}
-                    openExternal={openExternal}
-                    onOpenError={() => setLinkError(true)}
+                    openExternal={openLink}
                   >
                     查看网站
                   </SafeLink>
                   {deployment?.url ? (
                     <SafeLink
                       href={deployment.url}
-                      openExternal={openExternal}
-                      onOpenError={() => setLinkError(true)}
+                      openExternal={openLink}
                     >
                       查看部署详情
                     </SafeLink>
                   ) : (
                     <SafeLink
                       href={deployments.actionsUrl}
-                      openExternal={openExternal}
-                      onOpenError={() => setLinkError(true)}
+                      openExternal={openLink}
                     >
                       打开 GitHub Actions
                     </SafeLink>
@@ -228,15 +241,13 @@ export function HistoryView({
       <footer className="history-fallback-links">
         <SafeLink
           href={deployments.actionsUrl}
-          openExternal={openExternal}
-          onOpenError={() => setLinkError(true)}
+          openExternal={openLink}
         >
           打开 GitHub Actions
         </SafeLink>
         <SafeLink
           href={deployments.liveSiteUrl}
-          openExternal={openExternal}
-          onOpenError={() => setLinkError(true)}
+          openExternal={openLink}
         >
           打开线上网站
         </SafeLink>

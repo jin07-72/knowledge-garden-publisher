@@ -374,4 +374,33 @@ describe("deployment history", () => {
     await service.cancel({ requestId: "history-second" })
     await expect(second).resolves.toMatchObject({ unavailableMessage: expect.any(String) })
   })
+
+  it("cancels only the local git request with the matching history request id", async () => {
+    const requests: CommandRequest[] = []
+    const runner: CommandRunner = {
+      run: vi.fn(
+        (request: CommandRequest) =>
+          new Promise<CommandResult>((_resolve, reject) => {
+            requests.push(request)
+            request.signal?.addEventListener("abort", () => reject(new Error("aborted")), {
+              once: true,
+            })
+          }),
+      ),
+    }
+    const service = createDeploymentHistoryService({ workspace: "C:\\garden", runner })
+    const first = service.git({ limit: 20, requestId: "history-first" }).catch((error) => error)
+    const second = service.git({ limit: 20, requestId: "history-second" }).catch((error) => error)
+    await vi.waitFor(() => expect(requests).toHaveLength(2))
+
+    await service.cancel({ requestId: "history-first" })
+
+    expect(requests[0]?.signal?.aborted).toBe(true)
+    expect(requests[1]?.signal?.aborted).toBe(false)
+    await expect(first).resolves.toMatchObject({ code: "GIT_STATUS_FAILED" })
+
+    await service.cancel({ requestId: "history-second" })
+    expect(requests[1]?.signal?.aborted).toBe(true)
+    await expect(second).resolves.toMatchObject({ code: "GIT_STATUS_FAILED" })
+  })
 })

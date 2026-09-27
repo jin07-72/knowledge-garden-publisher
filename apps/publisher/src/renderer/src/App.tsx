@@ -545,7 +545,7 @@ function PublisherApp({ api }: { readonly api: GardenApi }): React.JSX.Element {
 
   const loadHistory = useCallback(async (requestId: string): Promise<HistorySnapshot> => {
     const [git, deployments] = await Promise.all([
-      api.history.git({ limit: 20 }),
+      api.history.git({ limit: 20, requestId }),
       api.history.deployments({ limit: 20, requestId }),
     ])
     if (!git.ok) throw new Error(messageFor(git.error, "本地发布历史暂不可用。"))

@@ -380,9 +380,6 @@ export interface PublishStartReceipt {
 
 export interface HistoryRequest {
   readonly limit?: number
-}
-
-export interface DeploymentHistoryRequest extends HistoryRequest {
   readonly requestId?: string
 }
 
@@ -439,7 +436,7 @@ export interface GardenApi {
   }
   readonly history: {
     git(request?: HistoryRequest): Promise<IpcResult<readonly GitCommit[]>>
-    deployments(request?: DeploymentHistoryRequest): Promise<IpcResult<DeploymentHistory>>
+    deployments(request?: HistoryRequest): Promise<IpcResult<DeploymentHistory>>
     cancel(request: HistoryCancelRequest): Promise<IpcResult<void>>
     openLink(request: HistoryLinkRequest): Promise<IpcResult<void>>
   }
