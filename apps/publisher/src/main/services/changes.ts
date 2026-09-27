@@ -291,7 +291,6 @@ function terminationFailure(): ChangeScanError {
 export function createBoundedChangeCommandRunner(options: {
   readonly spawner: ChangeCommandSpawner
   readonly terminate: (child: ChangeCommandProcess) => Promise<boolean>
-  readonly terminationGraceMs?: number
   readonly terminationDeadlineMs?: number
 }): ChangeCommandRunner {
   return {
@@ -303,7 +302,6 @@ export function createBoundedChangeCommandRunner(options: {
         let settled = false
         let stopping = false
         let pendingError: ChangeScanError | undefined
-        let escalationTimer: ReturnType<typeof setTimeout> | undefined
         let stdoutBytes = 0
         let stderrBytes = 0
         const stdout: Buffer[] = []
@@ -325,12 +323,11 @@ export function createBoundedChangeCommandRunner(options: {
           if (settled) return
           settled = true
           clearTimeout(timer)
-          if (escalationTimer) clearTimeout(escalationTimer)
           request.signal?.removeEventListener("abort", abort)
           if (error) rejectPromise(error)
           else resolvePromise(result!)
         }
-        const escalate = async (): Promise<void> => {
+        const terminateAndFinish = async (): Promise<void> => {
           if (settled) return
           let deadline: ReturnType<typeof setTimeout> | undefined
           try {
@@ -361,18 +358,7 @@ export function createBoundedChangeCommandRunner(options: {
           if (settled || stopping) return
           stopping = true
           pendingError = error
-          let accepted = false
-          try {
-            accepted = child.kill()
-          } catch {
-            accepted = false
-          }
-          if (settled) return
-          if (accepted) {
-            escalationTimer = setTimeout(() => void escalate(), options.terminationGraceMs ?? 100)
-          } else {
-            void escalate()
-          }
+          void terminateAndFinish()
         }
         const abort = (): void =>
           stop(scanError("CHANGE_SCAN_CANCELLED", "Change scan was cancelled."))
@@ -386,9 +372,8 @@ export function createBoundedChangeCommandRunner(options: {
           stop(scanError("CHANGE_SCAN_FAILED", "Could not start or stop the publication scan."))
         })
         child.on("close", (code) => {
-          if (stopping && pendingError) {
-            finish(pendingError)
-          } else if (code === null) {
+          if (stopping) return
+          if (code === null) {
             finish(scanError("CHANGE_SCAN_FAILED", "Publication scan did not finish safely."))
           } else {
             finish(undefined, {
@@ -866,6 +851,7 @@ export function createChangeScanner(options: {
 }): ChangeScanner {
   let active: { readonly controller: AbortController; readonly settled: Promise<void> } | undefined
   let blocked: ChangeScanError | undefined
+  let disposed = false
   const cancel = async (): Promise<void> => {
     const current = active
     current?.controller.abort()
@@ -874,6 +860,11 @@ export function createChangeScanner(options: {
   }
   return {
     list() {
+      if (disposed) {
+        return Promise.reject(
+          scanError("CHANGE_SCAN_FAILED", "Publication scanning has been shut down."),
+        )
+      }
       if (blocked) return Promise.reject(blocked)
       const predecessor = active?.settled ?? Promise.resolve()
       active?.controller.abort()
@@ -895,6 +886,9 @@ export function createChangeScanner(options: {
       return operation
     },
     cancel,
-    dispose: cancel,
+    async dispose() {
+      disposed = true
+      await cancel()
+    },
   }
 }

@@ -211,17 +211,44 @@ describe("bounded change command runner", () => {
   it("bounds timeout teardown even when direct kill succeeds but close never arrives", async () => {
     const { process } = child(() => true)
     const terminate = vi.fn(async () => true)
-    const runner = createBoundedChangeCommandRunner({
-      spawner: () => process,
-      terminate,
-      terminationGraceMs: 1,
-    })
+    const runner = createBoundedChangeCommandRunner({ spawner: () => process, terminate })
 
     await expect(runner.run(request(new AbortController().signal, 1))).rejects.toMatchObject({
       code: "CHANGE_SCAN_FAILED",
       message: expect.stringMatching(/timed out/i),
     })
     expect(terminate).toHaveBeenCalledWith(process)
+  })
+
+  it("does not let an immediate child close bypass process-tree confirmation", async () => {
+    const { process } = child(() => true)
+    let confirmTermination!: (confirmed: boolean) => void
+    const terminate = vi.fn(
+      () =>
+        new Promise<boolean>((resolve) => {
+          confirmTermination = resolve
+        }),
+    )
+    const runner = createBoundedChangeCommandRunner({ spawner: () => process, terminate })
+    const controller = new AbortController()
+    const command = runner.run(request(controller.signal))
+    let settled = false
+    void command.then(
+      () => {
+        settled = true
+      },
+      () => {
+        settled = true
+      },
+    )
+
+    controller.abort()
+    process.emit("close", null)
+    await vi.waitFor(() => expect(terminate).toHaveBeenCalledWith(process))
+    expect(settled).toBe(false)
+
+    confirmTermination(true)
+    await expect(command).rejects.toMatchObject({ code: "CHANGE_SCAN_CANCELLED" })
   })
 })
 
@@ -655,5 +682,37 @@ describe("listChanges", () => {
     await expect(stale).rejects.toMatchObject({ code: "CHANGE_SCAN_CANCELLED" })
     await expect(current).resolves.toEqual({ groups: [] })
     expect(calls).toBe(3)
+  })
+
+  it("makes disposal terminal before awaiting active scan teardown", async () => {
+    const fixture = await repository()
+    let calls = 0
+    let release: (() => void) | undefined
+    const run: ChangeCommandRunner["run"] = (request) => {
+      calls += 1
+      return new Promise((_, reject) => {
+        request.signal?.addEventListener(
+          "abort",
+          () => {
+            release = () => reject({ code: "CHANGE_SCAN_CANCELLED", message: "cancelled" })
+          },
+          { once: true },
+        )
+      })
+    }
+    const scanner = createChangeScanner({ workspace: fixture.root, runner: { run } })
+    const active = scanner.list()
+    await vi.waitFor(() => expect(calls).toBe(1))
+
+    const disposal = scanner.dispose()
+    await expect(scanner.list()).rejects.toMatchObject({ code: "CHANGE_SCAN_FAILED" })
+    expect(calls).toBe(1)
+    await vi.waitFor(() => expect(release).toBeTypeOf("function"))
+    release?.()
+
+    await expect(active).rejects.toMatchObject({ code: "CHANGE_SCAN_CANCELLED" })
+    await expect(disposal).resolves.toBeUndefined()
+    await expect(scanner.list()).rejects.toMatchObject({ code: "CHANGE_SCAN_FAILED" })
+    expect(calls).toBe(1)
   })
 })
