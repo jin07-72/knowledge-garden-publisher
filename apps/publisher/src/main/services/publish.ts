@@ -102,6 +102,8 @@ interface PublishDependencies {
   readonly criticalSectionTimeoutMs?: number
   /** Test-only race seam. Production construction never supplies this hook. */
   readonly beforeIndexLockAcquired?: () => Promise<void>
+  /** Test-only cleanup race seam. Production construction never supplies this hook. */
+  readonly beforeDependencyLinkUnlink?: (request: DependencyLinkRequest) => Promise<void>
 }
 
 /** Explicitly unsafe construction seam used only by repository integration tests. */
@@ -137,13 +139,17 @@ interface OperationPaths {
   readonly index: string
   readonly installIndex: string
   readonly verify: string
+  verifyIdentity?: FileIdentity
   readonly dependencyLink: string
+  readonly dependencyTarget: string
+  readonly dependencyTargetIdentity: FileIdentity
+  dependencyLinkIdentity?: FileIdentity
 }
 
 interface FileIdentity {
-  readonly dev: number
-  readonly ino: number
-  readonly birthtimeMs: number
+  readonly dev: bigint
+  readonly ino: bigint
+  readonly birthtimeNs: bigint
 }
 
 const MAX_PATHS = 500
@@ -272,6 +278,17 @@ const gitCredentialEnvironmentKeys = [
   "GCM_HTTP_TIMEOUT",
 ] as const
 
+const gitProxyEnvironmentKeys = [
+  "HTTP_PROXY",
+  "HTTPS_PROXY",
+  "ALL_PROXY",
+  "NO_PROXY",
+  "http_proxy",
+  "https_proxy",
+  "all_proxy",
+  "no_proxy",
+] as const
+
 const internalGitEnvironmentKeys = new Set([
   "GIT_DIR",
   "GIT_WORK_TREE",
@@ -292,7 +309,7 @@ function publishCommandEnvironment(
   }
   const git = ["git", "git.exe"].includes(basename(executable).toLowerCase())
   if (git) {
-    for (const key of gitCredentialEnvironmentKeys) {
+    for (const key of [...gitCredentialEnvironmentKeys, ...gitProxyEnvironmentKeys]) {
       const value = process.env[key]
       if (value !== undefined) environment[key] = value
     }
@@ -500,18 +517,18 @@ function pathsEqual(left: string, right: string): boolean {
 }
 
 function fileIdentity(details: {
-  readonly dev: number
-  readonly ino: number
-  readonly birthtimeMs: number
+  readonly dev: bigint
+  readonly ino: bigint
+  readonly birthtimeNs: bigint
 }): FileIdentity {
-  return { dev: details.dev, ino: details.ino, birthtimeMs: details.birthtimeMs }
+  return { dev: details.dev, ino: details.ino, birthtimeNs: details.birthtimeNs }
 }
 
 function sameIdentity(
   left: FileIdentity,
-  right: { readonly dev: number; readonly ino: number; readonly birthtimeMs: number },
+  right: { readonly dev: bigint; readonly ino: bigint; readonly birthtimeNs: bigint },
 ): boolean {
-  return left.dev === right.dev && left.ino === right.ino && left.birthtimeMs === right.birthtimeMs
+  return left.dev === right.dev && left.ino === right.ino && left.birthtimeNs === right.birthtimeNs
 }
 
 function progressMessage(phase: PublishPhase): string {
@@ -868,7 +885,9 @@ export class Publisher {
       if (installTree !== options.tree) {
         throw error("TREE_INVALID", "The regenerated publication index differs from verification.")
       }
-      const checkedDetails = await lstat(options.operationPaths.installIndex).catch(() => undefined)
+      const checkedDetails = await lstat(options.operationPaths.installIndex, {
+        bigint: true,
+      }).catch(() => undefined)
       const checkedCanonical = await realpath(options.operationPaths.installIndex).catch(
         () => undefined,
       )
@@ -885,20 +904,20 @@ export class Publisher {
       const installHandle = await open(options.operationPaths.installIndex, "r")
       let verifiedIndex: Buffer
       try {
-        const openedDetails = await installHandle.stat()
+        const openedDetails = await installHandle.stat({ bigint: true })
         if (
           !openedDetails.isFile() ||
           !sameIdentity(installIdentity, openedDetails) ||
-          openedDetails.size <= 0 ||
-          openedDetails.size > MAX_GIT_INDEX_BYTES
+          openedDetails.size <= 0n ||
+          openedDetails.size > BigInt(MAX_GIT_INDEX_BYTES)
         ) {
           throw error("REF_UPDATE_FAILED", "The regenerated publication index is invalid.")
         }
         verifiedIndex = await installHandle.readFile()
-        const finalDetails = await installHandle.stat()
+        const finalDetails = await installHandle.stat({ bigint: true })
         if (
           !sameIdentity(installIdentity, finalDetails) ||
-          finalDetails.size !== verifiedIndex.byteLength
+          finalDetails.size !== BigInt(verifiedIndex.byteLength)
         ) {
           throw error("REF_UPDATE_FAILED", "The regenerated publication index changed while read.")
         }
@@ -1145,8 +1164,10 @@ export class Publisher {
     if (!isInside(publishRoot, canonical) || canonical === publishRoot) {
       throw error("UNSAFE_STATE_PATH", "The publication operation folder is unsafe.")
     }
-    const publishRootDetails = await lstat(publishRoot)
-    const rootDetails = await lstat(canonical)
+    const publishRootDetails = await lstat(publishRoot, { bigint: true })
+    const rootDetails = await lstat(canonical, { bigint: true })
+    const dependencyTarget = await realpath(this.dependencies.runtime.nodeModules)
+    const dependencyTargetDetails = await lstat(dependencyTarget, { bigint: true })
     if (
       publishRootDetails.isSymbolicLink() ||
       !publishRootDetails.isDirectory() ||
@@ -1165,6 +1186,8 @@ export class Publisher {
       installIndex: join(canonical, `install-${randomUUID()}.index`),
       verify,
       dependencyLink: join(verify, "node_modules"),
+      dependencyTarget,
+      dependencyTargetIdentity: fileIdentity(dependencyTargetDetails),
     }
   }
 
@@ -1172,25 +1195,79 @@ export class Publisher {
     try {
       const expectedPublishRoot = resolve(paths.publishRoot)
       const expectedRoot = resolve(paths.root)
-      const publishRootDetails = await lstat(expectedPublishRoot)
-      const rootDetails = await lstat(expectedRoot)
+      const rootDetails = await lstat(expectedRoot, { bigint: true })
       if (
-        publishRootDetails.isSymbolicLink() ||
-        !publishRootDetails.isDirectory() ||
         rootDetails.isSymbolicLink() ||
         !rootDetails.isDirectory() ||
-        !sameIdentity(paths.publishRootIdentity, publishRootDetails) ||
-        !sameIdentity(paths.rootIdentity, rootDetails)
+        !sameIdentity(paths.rootIdentity, rootDetails) ||
+        !(await this.#publishRootIsCurrent(paths))
       ) {
         return false
       }
-      const canonicalPublishRoot = await realpath(expectedPublishRoot)
       const canonicalRoot = await realpath(expectedRoot)
       return (
-        pathsEqual(canonicalPublishRoot, expectedPublishRoot) &&
         pathsEqual(canonicalRoot, expectedRoot) &&
-        isInside(canonicalPublishRoot, canonicalRoot) &&
-        !pathsEqual(canonicalPublishRoot, canonicalRoot)
+        isInside(expectedPublishRoot, canonicalRoot) &&
+        !pathsEqual(expectedPublishRoot, canonicalRoot)
+      )
+    } catch {
+      return false
+    }
+  }
+
+  async #publishRootIsCurrent(paths: OperationPaths): Promise<boolean> {
+    try {
+      const expected = resolve(paths.publishRoot)
+      const details = await lstat(expected, { bigint: true })
+      const canonical = await realpath(expected)
+      return (
+        details.isDirectory() &&
+        !details.isSymbolicLink() &&
+        sameIdentity(paths.publishRootIdentity, details) &&
+        pathsEqual(canonical, expected)
+      )
+    } catch {
+      return false
+    }
+  }
+
+  async #dependencyLinkIsCurrent(paths: OperationPaths): Promise<boolean> {
+    try {
+      const details = await lstat(paths.dependencyLink, { bigint: true })
+      if (
+        !paths.dependencyLinkIdentity ||
+        !details.isSymbolicLink() ||
+        !sameIdentity(paths.dependencyLinkIdentity, details)
+      ) {
+        return false
+      }
+      const target = await realpath(paths.dependencyLink)
+      const targetDetails = await lstat(target, { bigint: true })
+      return (
+        pathsEqual(target, paths.dependencyTarget) &&
+        targetDetails.isDirectory() &&
+        !targetDetails.isSymbolicLink() &&
+        sameIdentity(paths.dependencyTargetIdentity, targetDetails)
+      )
+    } catch (caught) {
+      return (
+        paths.dependencyLinkIdentity === undefined &&
+        (caught as NodeJS.ErrnoException).code === "ENOENT"
+      )
+    }
+  }
+
+  async #verifyPathIsCurrent(paths: OperationPaths): Promise<boolean> {
+    if (!paths.verifyIdentity || !(await this.#operationPathsAreCurrent(paths))) return false
+    try {
+      const details = await lstat(paths.verify, { bigint: true })
+      const canonical = await realpath(paths.verify)
+      return (
+        details.isDirectory() &&
+        !details.isSymbolicLink() &&
+        sameIdentity(paths.verifyIdentity, details) &&
+        pathsEqual(canonical, resolve(paths.verify)) &&
+        isInside(paths.root, canonical)
       )
     } catch {
       return false
@@ -1208,12 +1285,37 @@ export class Publisher {
       throw error("CLEANUP_FAILED", "The publication operation folder changed unexpectedly.")
     }
     let cleanupFailure = false
-    try {
-      await unlink(paths.dependencyLink)
-    } catch (caught) {
-      if ((caught as NodeJS.ErrnoException).code !== "ENOENT") cleanupFailure = true
+    await this.dependencies.beforeDependencyLinkUnlink?.({
+      target: paths.dependencyTarget,
+      link: paths.dependencyLink,
+      type: "junction",
+    })
+    if (
+      !(await this.#operationPathsAreCurrent(paths)) ||
+      !(await this.#dependencyLinkIsCurrent(paths))
+    ) {
+      throw error("CLEANUP_FAILED", "The publication dependency link changed unexpectedly.")
+    }
+    if (paths.dependencyLinkIdentity) {
+      try {
+        await unlink(paths.dependencyLink)
+      } catch {
+        throw error("CLEANUP_FAILED", "The publication dependency link could not be removed.")
+      }
+      if (
+        !(await this.#operationPathsAreCurrent(paths)) ||
+        (await lstat(paths.dependencyLink).then(
+          () => true,
+          (caught: NodeJS.ErrnoException) => caught.code !== "ENOENT",
+        ))
+      ) {
+        throw error("CLEANUP_FAILED", "The publication dependency link was not removed safely.")
+      }
     }
     if (worktreeAdded) {
+      if (!(await this.#verifyPathIsCurrent(paths))) {
+        throw error("CLEANUP_FAILED", "The verification worktree changed unexpectedly.")
+      }
       try {
         const cleanupController = new AbortController()
         const timer = setTimeout(() => cleanupController.abort(), 10_000)
@@ -1232,25 +1334,57 @@ export class Publisher {
       } catch {
         cleanupFailure = true
       }
+      if (!(await this.#operationPathsAreCurrent(paths))) cleanupFailure = true
+      const verifyStillExists = await lstat(paths.verify).then(
+        () => true,
+        (caught: NodeJS.ErrnoException) => caught.code !== "ENOENT",
+      )
+      if (verifyStillExists) cleanupFailure = true
     }
+    if (cleanupFailure) {
+      throw error("CLEANUP_FAILED", "Temporary publication files could not be removed safely.")
+    }
+    if (!(await this.#operationPathsAreCurrent(paths))) {
+      throw error("CLEANUP_FAILED", "The publication operation folder changed unexpectedly.")
+    }
+    const cleanupRoot = join(paths.publishRoot, `.cleanup-${randomUUID()}`)
     try {
-      const publishRoot = await realpath(join(workspace, ".garden-publisher", "publish"))
-      const details = await lstat(paths.root)
-      const canonical = await realpath(paths.root)
-      if (
-        details.isSymbolicLink() ||
-        !details.isDirectory() ||
-        !pathsEqual(publishRoot, paths.publishRoot) ||
-        !sameIdentity(paths.rootIdentity, details) ||
-        !isInside(paths.publishRoot, canonical) ||
-        canonical === publishRoot
-      ) {
-        cleanupFailure = true
-      } else {
-        await rm(canonical, { force: true, recursive: true })
-      }
+      await lstat(cleanupRoot)
+      cleanupFailure = true
     } catch (caught) {
       if ((caught as NodeJS.ErrnoException).code !== "ENOENT") cleanupFailure = true
+    }
+    if (!cleanupFailure) {
+      try {
+        if (!(await this.#operationPathsAreCurrent(paths))) {
+          throw new Error("operation changed")
+        }
+        await rename(paths.root, cleanupRoot)
+        const details = await lstat(cleanupRoot, { bigint: true })
+        const canonical = await realpath(cleanupRoot)
+        if (
+          details.isSymbolicLink() ||
+          !details.isDirectory() ||
+          !sameIdentity(paths.rootIdentity, details) ||
+          !pathsEqual(canonical, cleanupRoot) ||
+          !isInside(paths.publishRoot, canonical) ||
+          !(await this.#publishRootIsCurrent(paths))
+        ) {
+          throw new Error("quarantine changed")
+        }
+        await rm(cleanupRoot, { force: true, recursive: true })
+        if (
+          !(await this.#publishRootIsCurrent(paths)) ||
+          (await lstat(cleanupRoot).then(
+            () => true,
+            (caught: NodeJS.ErrnoException) => caught.code !== "ENOENT",
+          ))
+        ) {
+          throw new Error("quarantine cleanup uncertain")
+        }
+      } catch {
+        cleanupFailure = true
+      }
     }
     if (cleanupFailure) {
       throw error("CLEANUP_FAILED", "Temporary publication files could not be removed safely.")
@@ -1422,6 +1556,20 @@ export class Publisher {
         "The isolated verification folder could not be created.",
       )
       worktreeAdded = true
+      const verifyDetails = await lstat(operationPaths.verify, { bigint: true }).catch(
+        () => undefined,
+      )
+      const verifyCanonical = await realpath(operationPaths.verify).catch(() => undefined)
+      if (
+        !verifyDetails?.isDirectory() ||
+        verifyDetails.isSymbolicLink() ||
+        !verifyCanonical ||
+        !pathsEqual(verifyCanonical, resolve(operationPaths.verify)) ||
+        !isInside(operationPaths.root, verifyCanonical)
+      ) {
+        throw error("VERIFY_FAILED", "The isolated verification folder is unsafe.")
+      }
+      operationPaths.verifyIdentity = fileIdentity(verifyDetails)
       const createLink =
         this.dependencies.createDependencyLink ??
         ((request: DependencyLinkRequest) => symlink(request.target, request.link, request.type))
@@ -1433,6 +1581,20 @@ export class Publisher {
         }),
         signal,
       )
+      const dependencyLinkDetails = await lstat(operationPaths.dependencyLink, {
+        bigint: true,
+      }).catch(() => undefined)
+      if (dependencyLinkDetails) {
+        if (!dependencyLinkDetails.isSymbolicLink()) {
+          throw error("VERIFY_FAILED", "The verification dependency link is unsafe.")
+        }
+        operationPaths.dependencyLinkIdentity = fileIdentity(dependencyLinkDetails)
+        if (!(await this.#dependencyLinkIsCurrent(operationPaths))) {
+          throw error("VERIFY_FAILED", "The verification dependency link is unsafe.")
+        }
+      } else if (!this.dependencies.createDependencyLink) {
+        throw error("VERIFY_FAILED", "The verification dependency link is unavailable.")
+      }
       const verifyRequest: VerifySiteRequest = {
         executable: this.dependencies.runtime.nodeExecutable,
         args: [this.dependencies.runtime.npmCliPath, "run", "verify:site"],

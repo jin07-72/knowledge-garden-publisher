@@ -184,6 +184,7 @@ describe("production publication runtime", () => {
     "validateDependencies",
     "createDependencyLink",
     "beforeIndexLockAcquired",
+    "beforeDependencyLinkUnlink",
   ])("rejects the production injection field %s at runtime", (field) => {
     expect(() =>
       createProductionPublisher({
@@ -264,6 +265,52 @@ describe("production publication runtime", () => {
     await expect(
       readdir(join(repository.root, ".garden-publisher", "publish")),
     ).rejects.toMatchObject({ code: "ENOENT" })
+  })
+
+  it("keeps HEAD, index, remote, and operation state unchanged when default verification exits nonzero", async () => {
+    const repository = await fixture()
+    await put(repository.root, "content/technology/css-grid.md", "invalid production site\n")
+    const beforeHead = await output(repository.root, ["rev-parse", "HEAD"])
+    const beforeIndex = await output(repository.root, ["write-tree"])
+    const beforeRemote = await output(repository.root, ["rev-parse", "refs/remotes/origin/main"])
+    const runtime = resolveProductionPublishRuntime({
+      workspace: repository.root,
+      isPackaged: false,
+      resourcesPath: join(repository.root, "ignored-resources"),
+      appPath: join(repository.root, "apps", "publisher"),
+    })
+    const runtimeRequests: CommandRequest[] = []
+    const service = createPublisherForTest({
+      workspace: repository.root,
+      runtime,
+      runner: {
+        run: async (request: CommandRequest) => {
+          if (!request.executable.toLowerCase().endsWith("node.exe")) return runCommand(request)
+          runtimeRequests.push(request)
+          return {
+            exitCode: request.args.includes("verify:site") ? 1 : 0,
+            stdout: "",
+            stderr: "verification failed",
+          }
+        },
+      },
+    })
+
+    await expect(
+      service.publish({ paths: ["content/technology/css-grid.md"] }),
+    ).rejects.toMatchObject({ code: "VERIFY_FAILED" })
+    expect(runtimeRequests.map((request) => request.args)).toEqual([
+      [runtime.npmCliPath, "ls", "--all", "--json", "--ignore-scripts"],
+      [runtime.npmCliPath, "run", "verify:site"],
+    ])
+    expect(await output(repository.root, ["rev-parse", "HEAD"])).toBe(beforeHead)
+    expect(await output(repository.root, ["write-tree"])).toBe(beforeIndex)
+    expect(await output(repository.root, ["rev-parse", "refs/remotes/origin/main"])).toBe(
+      beforeRemote,
+    )
+    expect(
+      await readdir(join(repository.root, ".garden-publisher", "publish")).catch(() => []),
+    ).toEqual([])
   })
 })
 
@@ -1067,6 +1114,41 @@ describe("exact-tree publication", () => {
     ).rejects.toMatchObject({ code: "CLEANUP_FAILED" })
   })
 
+  it("does not unlink a dependency link replaced immediately before cleanup", async ({ skip }) => {
+    const repository = await fixture()
+    await put(repository.root, "content/technology/css-grid.md", "dependency cleanup race\n")
+    const outside = join(dirname(repository.root), "outside-dependency-target")
+    const sentinel = join(outside, "sentinel.txt")
+    await mkdir(outside)
+    await writeFile(sentinel, "keep")
+    let attackedLink = ""
+    let hookCalled = false
+    const service = publisher(repository, {
+      verifySite: async () => ({ exitCode: 1 }),
+      beforeDependencyLinkUnlink: async ({ link }) => {
+        hookCalled = true
+        attackedLink = link
+        await unlink(link)
+        try {
+          await symlink(outside, link, process.platform === "win32" ? "junction" : "dir")
+        } catch (error) {
+          if ((error as NodeJS.ErrnoException).code === "EPERM") skip()
+          throw error
+        }
+      },
+    })
+
+    await expect(
+      service.publish({ paths: ["content/technology/css-grid.md"] }),
+    ).rejects.toMatchObject({ code: "VERIFY_FAILED" })
+    expect(hookCalled).toBe(true)
+    expect(await readFile(sentinel, "utf8")).toBe("keep")
+    expect((await lstat(attackedLink)).isSymbolicLink()).toBe(true)
+    await expect(
+      service.publish({ paths: ["content/technology/css-grid.md"] }),
+    ).rejects.toMatchObject({ code: "CLEANUP_FAILED" })
+  })
+
   it("does not recursively remove a substituted operation after cleanup validation", async ({
     skip,
   }) => {
@@ -1076,7 +1158,6 @@ describe("exact-tree publication", () => {
     let replaced = false
     const runner = {
       run: async (request: CommandRequest) => {
-        const result = await runCommand(request)
         if (
           !replaced &&
           request.executable === "git" &&
@@ -1089,8 +1170,9 @@ describe("exact-tree publication", () => {
           const parkedRoot = join(dirname(publishRoot), "publish-late-parked")
           const outside = join(dirname(repository.root), "outside-late-cleanup-target")
           const fakeOperation = join(outside, basename(operationRoot))
-          outsideSentinel = join(fakeOperation, "sentinel.txt")
-          await mkdir(fakeOperation, { recursive: true })
+          const fakeVerify = join(fakeOperation, "verify")
+          outsideSentinel = join(fakeVerify, "sentinel.txt")
+          await mkdir(fakeVerify, { recursive: true })
           await writeFile(outsideSentinel, "keep")
           try {
             await rename(publishRoot, parkedRoot)
@@ -1101,7 +1183,7 @@ describe("exact-tree publication", () => {
           }
           replaced = true
         }
-        return result
+        return runCommand(request)
       },
     }
     const service = publisher(repository, {
@@ -1194,6 +1276,14 @@ describe("bounded publication commands", () => {
       TEMP: "safe-temp",
       USERPROFILE: "safe-profile",
       SSH_AUTH_SOCK: "safe-agent",
+      HTTP_PROXY: "http://proxy.invalid:8080",
+      HTTPS_PROXY: "http://secure-proxy.invalid:8080",
+      ALL_PROXY: "socks5://proxy.invalid:1080",
+      NO_PROXY: "localhost,127.0.0.1",
+      http_proxy: "http://proxy.invalid:8080",
+      https_proxy: "http://secure-proxy.invalid:8080",
+      all_proxy: "socks5://proxy.invalid:1080",
+      no_proxy: "localhost,127.0.0.1",
       GH_TOKEN: "secret-gh",
       GITHUB_TOKEN: "secret-github",
       NPM_TOKEN: "secret-npm",
@@ -1243,6 +1333,14 @@ describe("bounded publication commands", () => {
       TEMP: "safe-temp",
       USERPROFILE: "safe-profile",
       SSH_AUTH_SOCK: "safe-agent",
+      HTTP_PROXY: "http://proxy.invalid:8080",
+      HTTPS_PROXY: "http://secure-proxy.invalid:8080",
+      ALL_PROXY: "socks5://proxy.invalid:1080",
+      NO_PROXY: "localhost,127.0.0.1",
+      http_proxy: "http://proxy.invalid:8080",
+      https_proxy: "http://secure-proxy.invalid:8080",
+      all_proxy: "socks5://proxy.invalid:1080",
+      no_proxy: "localhost,127.0.0.1",
       GIT_INDEX_FILE: "controlled-index",
       GIT_TERMINAL_PROMPT: "0",
     })
@@ -1264,6 +1362,18 @@ describe("bounded publication commands", () => {
     }
     expect(captured[1]?.env).not.toHaveProperty("GIT_INDEX_FILE")
     expect(captured[1]?.env).not.toHaveProperty("SSH_AUTH_SOCK")
+    for (const proxy of [
+      "HTTP_PROXY",
+      "HTTPS_PROXY",
+      "ALL_PROXY",
+      "NO_PROXY",
+      "http_proxy",
+      "https_proxy",
+      "all_proxy",
+      "no_proxy",
+    ]) {
+      expect(captured[1]?.env).not.toHaveProperty(proxy)
+    }
   })
 
   it("settles fail-closed when cancellation cannot confirm process-tree termination", async () => {
