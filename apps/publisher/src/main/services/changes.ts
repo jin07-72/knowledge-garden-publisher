@@ -870,7 +870,13 @@ export function createChangeScanner(options: {
       active?.controller.abort()
       const controller = new AbortController()
       const operation = predecessor
-        .then(() => listChanges({ ...options, signal: controller.signal }))
+        .then(() => {
+          if (disposed) {
+            throw scanError("CHANGE_SCAN_FAILED", "Publication scanning has been shut down.")
+          }
+          if (blocked) throw blocked
+          return listChanges({ ...options, signal: controller.signal })
+        })
         .catch((error: unknown) => {
           if (error instanceof ChangeScanError && error.terminationUncertain) blocked = error
           throw error

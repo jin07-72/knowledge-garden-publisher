@@ -715,4 +715,35 @@ describe("listChanges", () => {
     await expect(scanner.list()).rejects.toMatchObject({ code: "CHANGE_SCAN_FAILED" })
     expect(calls).toBe(1)
   })
+
+  it("does not start a queued scan after predecessor termination becomes uncertain", async () => {
+    const fixture = await repository()
+    let spawnCalls = 0
+    const commandRunner = createBoundedChangeCommandRunner({
+      spawner: () => {
+        spawnCalls += 1
+        const process = Object.assign(new EventEmitter(), {
+          pid: 4242,
+          stdout: new PassThrough(),
+          stderr: new PassThrough(),
+          kill: () => false,
+        }) as EventEmitter & ChangeCommandProcess
+        if (spawnCalls > 1) {
+          queueMicrotask(() => process.emit("close", 0))
+        }
+        return process
+      },
+      terminate: async () => false,
+      terminationDeadlineMs: 5,
+    })
+    const scanner = createChangeScanner({ workspace: fixture.root, runner: commandRunner })
+    const predecessor = scanner.list()
+    await vi.waitFor(() => expect(spawnCalls).toBe(1))
+
+    const queued = scanner.list()
+    await expect(predecessor).rejects.toMatchObject({ code: "CHANGE_SCAN_FAILED" })
+    await expect(queued).rejects.toMatchObject({ code: "CHANGE_SCAN_FAILED" })
+    await expect(scanner.list()).rejects.toMatchObject({ code: "CHANGE_SCAN_FAILED" })
+    expect(spawnCalls).toBe(1)
+  })
 })
