@@ -110,6 +110,7 @@ const validByChannel: Record<string, unknown> = {
     liveSiteUrl: "https://example.github.io/garden/",
     ...privateField,
   },
+  [IPC_CHANNELS.requests.historyCancel]: undefined,
   [IPC_CHANNELS.requests.historyOpenLink]: undefined,
   [IPC_CHANNELS.requests.lifecycleCloseAck]: undefined,
 }

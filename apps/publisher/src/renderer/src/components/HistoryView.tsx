@@ -8,7 +8,8 @@ export interface HistorySnapshot {
 }
 
 interface HistoryViewProps {
-  readonly loadHistory: () => Promise<HistorySnapshot>
+  readonly loadHistory: (requestId: string) => Promise<HistorySnapshot>
+  readonly cancelHistory: (requestId: string) => Promise<void>
   readonly openExternal: (url: string) => Promise<void>
 }
 
@@ -23,6 +24,13 @@ const stateLabel: Record<DeploymentRun["status"], string> = {
   succeeded: "已部署",
   failed: "部署失败",
   cancelled: "部署已取消",
+}
+
+let requestSequence = 0
+
+function nextRequestId(): string {
+  requestSequence += 1
+  return `history-${Date.now().toString(36)}-${requestSequence.toString(36)}`
 }
 
 function dateLabel(value: string): string {
@@ -42,10 +50,12 @@ function SafeLink({
   href,
   children,
   openExternal,
+  onOpenError,
 }: {
   readonly href: string
   readonly children: React.ReactNode
   readonly openExternal: (url: string) => Promise<void>
+  readonly onOpenError: () => void
 }) {
   return (
     <a
@@ -54,7 +64,11 @@ function SafeLink({
       rel="noreferrer"
       onClick={(event) => {
         event.preventDefault()
-        void openExternal(href)
+        try {
+          void openExternal(href).catch(() => onOpenError())
+        } catch {
+          onOpenError()
+        }
       }}
     >
       {children}
@@ -63,9 +77,14 @@ function SafeLink({
   )
 }
 
-export function HistoryView({ loadHistory, openExternal }: HistoryViewProps): React.JSX.Element {
+export function HistoryView({
+  loadHistory,
+  cancelHistory,
+  openExternal,
+}: HistoryViewProps): React.JSX.Element {
   const [state, setState] = useState<ViewState>({ kind: "loading" })
   const [attempt, setAttempt] = useState(0)
+  const [linkError, setLinkError] = useState(false)
   const retry = useCallback(() => {
     setState({ kind: "loading" })
     setAttempt((current) => current + 1)
@@ -73,8 +92,9 @@ export function HistoryView({ loadHistory, openExternal }: HistoryViewProps): Re
 
   useEffect(() => {
     let active = true
+    const requestId = nextRequestId()
     setState({ kind: "loading" })
-    void loadHistory().then(
+    void loadHistory(requestId).then(
       (snapshot) => {
         if (active) setState({ kind: "ready", snapshot })
       },
@@ -84,8 +104,13 @@ export function HistoryView({ loadHistory, openExternal }: HistoryViewProps): Re
     )
     return () => {
       active = false
+      try {
+        void cancelHistory(requestId).catch(() => undefined)
+      } catch {
+        // Unmount remains safe if cancellation transport is already unavailable.
+      }
     }
-  }, [attempt, loadHistory])
+  }, [attempt, cancelHistory, loadHistory])
 
   if (state.kind === "loading") {
     return (
@@ -133,6 +158,13 @@ export function HistoryView({ loadHistory, openExternal }: HistoryViewProps): Re
         </div>
       ) : null}
 
+      {linkError ? (
+        <div className="history-notice history-error" role="alert">
+          <CircleAlert size={15} aria-hidden="true" />
+          <span>无法打开链接，请稍后重试。</span>
+        </div>
+      ) : null}
+
       {commits.length > 0 ? (
         <ol className="history-list">
           {commits.map((commit) => {
@@ -157,15 +189,27 @@ export function HistoryView({ loadHistory, openExternal }: HistoryViewProps): Re
                   </div>
                 </dl>
                 <div className="history-links">
-                  <SafeLink href={deployments.liveSiteUrl} openExternal={openExternal}>
+                  <SafeLink
+                    href={deployments.liveSiteUrl}
+                    openExternal={openExternal}
+                    onOpenError={() => setLinkError(true)}
+                  >
                     查看网站
                   </SafeLink>
                   {deployment?.url ? (
-                    <SafeLink href={deployment.url} openExternal={openExternal}>
+                    <SafeLink
+                      href={deployment.url}
+                      openExternal={openExternal}
+                      onOpenError={() => setLinkError(true)}
+                    >
                       查看部署详情
                     </SafeLink>
                   ) : (
-                    <SafeLink href={deployments.actionsUrl} openExternal={openExternal}>
+                    <SafeLink
+                      href={deployments.actionsUrl}
+                      openExternal={openExternal}
+                      onOpenError={() => setLinkError(true)}
+                    >
                       打开 GitHub Actions
                     </SafeLink>
                   )}
@@ -182,10 +226,18 @@ export function HistoryView({ loadHistory, openExternal }: HistoryViewProps): Re
       )}
 
       <footer className="history-fallback-links">
-        <SafeLink href={deployments.actionsUrl} openExternal={openExternal}>
+        <SafeLink
+          href={deployments.actionsUrl}
+          openExternal={openExternal}
+          onOpenError={() => setLinkError(true)}
+        >
           打开 GitHub Actions
         </SafeLink>
-        <SafeLink href={deployments.liveSiteUrl} openExternal={openExternal}>
+        <SafeLink
+          href={deployments.liveSiteUrl}
+          openExternal={openExternal}
+          onOpenError={() => setLinkError(true)}
+        >
           打开线上网站
         </SafeLink>
       </footer>

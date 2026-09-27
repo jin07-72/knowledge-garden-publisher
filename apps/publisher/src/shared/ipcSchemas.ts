@@ -241,6 +241,7 @@ export const IPC_SUCCESS_SCHEMAS = {
   [IPC_CHANNELS.requests.publishCancel]: z.undefined(),
   [IPC_CHANNELS.requests.historyGit]: z.array(gitCommitSchema).max(500),
   [IPC_CHANNELS.requests.historyDeployments]: deploymentHistorySchema,
+  [IPC_CHANNELS.requests.historyCancel]: z.undefined(),
   [IPC_CHANNELS.requests.historyOpenLink]: z.undefined(),
   [IPC_CHANNELS.requests.lifecycleCloseAck]: z.undefined(),
 } satisfies Record<RequestChannel, z.ZodType>

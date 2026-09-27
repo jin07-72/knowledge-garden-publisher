@@ -89,6 +89,7 @@ function services(): PublisherIpcServices & {
     history: {
       git: call("historyGit"),
       deployments: call("historyDeployments"),
+      cancel: call("historyCancel"),
       openLink: call("historyOpenLink"),
     },
     emitPreview(status) {
@@ -183,7 +184,8 @@ describe("secure publisher IPC", () => {
       ],
       [IPC_CHANNELS.requests.publishCancel, { operationId: "../bad" }, "publishCancel"],
       [IPC_CHANNELS.requests.historyGit, { limit: 0 }, "historyGit"],
-      [IPC_CHANNELS.requests.historyDeployments, { limit: 501 }, "historyDeployments"],
+      [IPC_CHANNELS.requests.historyDeployments, { limit: 101 }, "historyDeployments"],
+      [IPC_CHANNELS.requests.historyCancel, { requestId: "../bad" }, "historyCancel"],
     ]
 
     for (const [channel, request, call] of invalidRequests) {
@@ -608,7 +610,8 @@ describe("preload garden API", () => {
     await api.publish.start({ changeGroupIds: ["note:a"], message: "Publish A" })
     await api.publish.cancel({ operationId: "publish-1" })
     await api.history.git({ limit: 20 })
-    await api.history.deployments({ limit: 20 })
+    await api.history.deployments({ limit: 20, requestId: "history-1" })
+    await api.history.cancel({ requestId: "history-1" })
     await api.history.openLink({
       url: "https://github.com/octocat/garden/actions/workflows/deploy.yml",
     })

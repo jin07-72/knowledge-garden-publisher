@@ -8,6 +8,7 @@ import {
 } from "../../src/main/lib/commandRunner"
 import {
   createBoundedPublishCommandRunner,
+  type BoundedCommandRequest,
   type PublishCommandProcess,
 } from "../../src/main/services/publish"
 import {
@@ -70,12 +71,13 @@ describe("deployment history", () => {
       spawner: () => child,
       terminate,
     })
-    const result = runner.run({
+    const request: BoundedCommandRequest = {
       executable: "git",
       args: ["log"],
       cwd: "C:\\garden",
       maxOutputBytes: 4,
-    })
+    }
+    const result = runner.run(request)
 
     stdout.write("12345")
     events.emit("close", 0)
@@ -96,28 +98,71 @@ describe("deployment history", () => {
     "https://user:secret@github.com/octocat/garden.git",
     "https://example.com/octocat/garden.git",
     "git@github.com:octocat/../../secret.git",
+    "git@github.com:../garden.git",
+    "git@github.com:octocat/...git",
   ])("rejects unsafe or credential-bearing remote %s", (remote) => {
     expect(() => parseGitHubRemote(remote)).toThrow()
   })
 
-  it("opens only allowlisted GitHub history and GitHub Pages links", async () => {
+  it("opens only exact links derived from the currently resolved repository", async () => {
     const openExternal = vi.fn(async () => undefined)
+    const runner = new FakeRunner(({ args }) => ({
+      exitCode: 0,
+      stdout:
+        args[0] === "remote" ? "https://github.com/octocat/garden.git\n" : `${"a".repeat(40)}\n`,
+      stderr: "",
+    }))
     const service = createDeploymentHistoryService({
       workspace: "C:\\garden",
-      runner: new FakeRunner(() => ({ exitCode: 0, stdout: "", stderr: "" })),
+      runner,
+      fetcher: vi.fn(async () => response(200, { workflow_runs: [githubRun()] })),
       openExternal,
     })
     const actions = "https://github.com/octocat/garden/actions/workflows/deploy.yml"
     const site = "https://octocat.github.io/garden/"
+    const run = "https://github.com/octocat/garden/actions/runs/42"
 
-    expect(isSafeHistoryUrl(actions)).toBe(true)
-    expect(isSafeHistoryUrl(site)).toBe(true)
+    await service.deployments()
+    expect(isSafeHistoryUrl(actions, { owner: "octocat", repo: "garden" })).toBe(true)
+    expect(isSafeHistoryUrl(site, { owner: "octocat", repo: "garden" })).toBe(true)
     await service.openLink(actions)
     await service.openLink(site)
-    await expect(service.openLink("https://example.com/steal")).rejects.toMatchObject({
-      code: "SERVICE_UNAVAILABLE",
+    await service.openLink(run)
+    for (const unsafe of [
+      "https://github.com/other/garden/actions/workflows/deploy.yml",
+      "https://other.github.io/garden/",
+      "https://github.com/octocat/other/actions/runs/42",
+      "https://github.com/octocat/garden/actions/runs/42/attempts/1",
+      "https://example.com/steal",
+    ]) {
+      await expect(service.openLink(unsafe)).rejects.toMatchObject({ code: "SERVICE_UNAVAILABLE" })
+    }
+    expect(openExternal.mock.calls).toEqual([[actions], [site], [run]])
+  })
+
+  it("fails closed instead of reusing repository links after origin becomes invalid", async () => {
+    let remote = "https://github.com/octocat/garden.git\n"
+    const runner = new FakeRunner(({ args }) => ({
+      exitCode: 0,
+      stdout: args[0] === "remote" ? remote : `${"a".repeat(40)}\n`,
+      stderr: "",
+    }))
+    const openExternal = vi.fn(async () => undefined)
+    const service = createDeploymentHistoryService({
+      workspace: "C:\\garden",
+      runner,
+      fetcher: vi.fn(async () => response(200, { workflow_runs: [githubRun()] })),
+      openExternal,
     })
-    expect(openExternal.mock.calls).toEqual([[actions], [site]])
+
+    await service.deployments()
+    remote = "https://example.com/octocat/garden.git\n"
+
+    await expect(service.deployments()).rejects.toMatchObject({ code: "GIT_STATUS_FAILED" })
+    await expect(
+      service.openLink("https://github.com/octocat/garden/actions/workflows/deploy.yml"),
+    ).rejects.toMatchObject({ code: "SERVICE_UNAVAILABLE" })
+    expect(openExternal).not.toHaveBeenCalled()
   })
 
   it("reads bounded Git history using a stable NUL-delimited format", async () => {
@@ -221,6 +266,31 @@ describe("deployment history", () => {
     expect(wait).toHaveBeenCalledWith(3_000, expect.any(AbortSignal))
   })
 
+  it("does not expose a deployment URL unless it is an exact numeric run URL", async () => {
+    const sha = "a".repeat(40)
+    const runner = new FakeRunner(({ args }) => ({
+      exitCode: 0,
+      stdout:
+        args[0] === "remote" ? "https://github.com/octocat/garden.git\n" : `${sha}\n`,
+      stderr: "",
+    }))
+    const service = createDeploymentHistoryService({
+      workspace: "C:\\garden",
+      runner,
+      fetcher: vi.fn(async () =>
+        response(200, {
+          workflow_runs: [
+            githubRun({ html_url: "https://github.com/octocat/garden/actions/runs/42/attempts/1" }),
+          ],
+        }),
+      ),
+    })
+
+    const result = await service.deployments()
+
+    expect(result.runs[0]).not.toHaveProperty("url")
+  })
+
   it.each([403, 429])("falls back to safe public links on HTTP %s", async (status) => {
     const runner = new FakeRunner(({ args }) => ({
       exitCode: 0,
@@ -271,5 +341,37 @@ describe("deployment history", () => {
     await service.dispose()
     await expect(first).resolves.toMatchObject({ unavailableMessage: "部署状态检查已停止。" })
     release()
+  })
+
+  it("cancels only the deployment request with the matching request id", async () => {
+    const runner = new FakeRunner(({ args }) => ({
+      exitCode: 0,
+      stdout:
+        args[0] === "remote" ? "https://github.com/octocat/garden.git\n" : `${"a".repeat(40)}\n`,
+      stderr: "",
+    }))
+    const wait = vi.fn(
+      (_milliseconds: number, signal: AbortSignal) =>
+        new Promise<void>((_resolve, reject) => {
+          signal.addEventListener("abort", () => reject(new DOMException("Aborted", "AbortError")))
+        }),
+    )
+    const service = createDeploymentHistoryService({
+      workspace: "C:\\garden",
+      runner,
+      fetcher: vi.fn(async () => response(200, { workflow_runs: [] })),
+      wait,
+    })
+    const first = service.deployments({ limit: 20, requestId: "history-first" })
+    const second = service.deployments({ limit: 20, requestId: "history-second" })
+    await vi.waitFor(() => expect(wait).toHaveBeenCalledTimes(2))
+
+    await service.cancel({ requestId: "history-first" })
+
+    expect(wait.mock.calls[0]?.[1].aborted).toBe(true)
+    expect(wait.mock.calls[1]?.[1].aborted).toBe(false)
+    await expect(first).resolves.toMatchObject({ unavailableMessage: expect.any(String) })
+    await service.cancel({ requestId: "history-second" })
+    await expect(second).resolves.toMatchObject({ unavailableMessage: expect.any(String) })
   })
 })

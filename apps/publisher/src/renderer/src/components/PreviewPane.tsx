@@ -8,7 +8,8 @@ type PreviewTab = "note" | "site" | "public" | "history"
 interface PreviewPaneProps {
   readonly note?: NoteSummary
   readonly preview: PreviewStatus
-  readonly onLoadHistory: () => Promise<HistorySnapshot>
+  readonly onLoadHistory: (requestId: string) => Promise<HistorySnapshot>
+  readonly onCancelHistory: (requestId: string) => Promise<void>
   readonly onOpenHistoryLink: (url: string) => Promise<void>
 }
 
@@ -26,6 +27,7 @@ export function PreviewPane({
   note,
   preview,
   onLoadHistory,
+  onCancelHistory,
   onOpenHistoryLink,
 }: PreviewPaneProps): React.JSX.Element {
   const [tab, setTab] = useState<PreviewTab>("note")
@@ -127,7 +129,11 @@ export function PreviewPane({
           />
         ) : null}
         {tab === "history" ? (
-          <HistoryView loadHistory={onLoadHistory} openExternal={onOpenHistoryLink} />
+          <HistoryView
+            loadHistory={onLoadHistory}
+            cancelHistory={onCancelHistory}
+            openExternal={onOpenHistoryLink}
+          />
         ) : null}
       </div>
     </section>

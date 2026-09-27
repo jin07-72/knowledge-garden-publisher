@@ -227,6 +227,14 @@ function error(code: PublishErrorCode, message: string): PublishError {
 
 export interface PublishCommandProcess extends PreviewProcess {}
 
+export interface BoundedCommandRequest extends CommandRequest {
+  readonly maxOutputBytes?: number
+}
+
+export interface BoundedCommandRunner extends CommandRunner {
+  run(request: BoundedCommandRequest): Promise<CommandResult>
+}
+
 export type PublishCommandSpawner = (
   executable: string,
   args: readonly string[],
@@ -325,7 +333,7 @@ export function createBoundedPublishCommandRunner(options: {
   readonly terminate: (child: PublishCommandProcess) => Promise<boolean>
   readonly commandDeadlineMs?: number
   readonly terminationDeadlineMs?: number
-}): CommandRunner {
+}): BoundedCommandRunner {
   return {
     run(request) {
       if (request.signal?.aborted) {
@@ -453,7 +461,7 @@ export function createBoundedPublishCommandRunner(options: {
   }
 }
 
-export function createSystemBoundedCommandRunner(): CommandRunner {
+export function createSystemBoundedCommandRunner(): BoundedCommandRunner {
   const terminate = createProductionProcessTreeTerminator()
   return createBoundedPublishCommandRunner({
     spawner: (executable, args, options) =>

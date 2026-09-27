@@ -1,4 +1,4 @@
-import { cleanup, render, screen } from "@testing-library/react"
+import { cleanup, render, screen, waitFor } from "@testing-library/react"
 import userEvent from "@testing-library/user-event"
 import { afterEach, describe, expect, it, vi } from "vitest"
 import { HistoryView } from "../../src/renderer/src/components/HistoryView"
@@ -11,7 +11,8 @@ describe("HistoryView", () => {
     render(
       <HistoryView
         openExternal={openExternal}
-        loadHistory={vi.fn(async () => ({
+        cancelHistory={vi.fn(async () => undefined)}
+        loadHistory={vi.fn(async (_requestId: string) => ({
           commits: [
             {
               id: "a".repeat(40),
@@ -67,11 +68,57 @@ describe("HistoryView", () => {
         },
       })
     const user = userEvent.setup()
-    render(<HistoryView loadHistory={loadHistory} openExternal={vi.fn(async () => undefined)} />)
+    render(
+      <HistoryView
+        loadHistory={loadHistory}
+        cancelHistory={vi.fn(async () => undefined)}
+        openExternal={vi.fn(async () => undefined)}
+      />,
+    )
 
     expect(await screen.findByRole("alert")).toHaveTextContent("无法读取发布历史")
     await user.click(screen.getByRole("button", { name: "重新读取" }))
     expect((await screen.findAllByText("还没有本地发布记录。")).length).toBeGreaterThan(0)
     expect(screen.getByRole("link", { name: "打开 GitHub Actions" })).toBeVisible()
+  })
+
+  it("shows a concise error when opening an external history link fails", async () => {
+    render(
+      <HistoryView
+        loadHistory={vi.fn(async (_requestId: string) => ({
+          commits: [],
+          deployments: {
+            runs: [],
+            actionsUrl: "https://github.com/octocat/garden/actions/workflows/deploy.yml",
+            liveSiteUrl: "https://octocat.github.io/garden/",
+          },
+        }))}
+        cancelHistory={vi.fn(async () => undefined)}
+        openExternal={vi.fn(async () => Promise.reject(new Error("shell failed")))}
+      />,
+    )
+
+    await userEvent.click(await screen.findByRole("link", { name: "打开 GitHub Actions" }))
+
+    expect(await screen.findByRole("alert")).toHaveTextContent("无法打开链接，请稍后重试。")
+  })
+
+  it("cancels its own deployment request when unmounted", async () => {
+    const loadHistory = vi.fn((_requestId: string) => new Promise<never>(() => undefined))
+    const cancelHistory = vi.fn(async () => undefined)
+    const view = render(
+      <HistoryView
+        loadHistory={loadHistory}
+        cancelHistory={cancelHistory}
+        openExternal={vi.fn(async () => undefined)}
+      />,
+    )
+    await waitFor(() => expect(loadHistory).toHaveBeenCalledOnce())
+    const requestId = loadHistory.mock.calls[0]?.[0]
+
+    view.unmount()
+
+    expect(requestId).toMatch(/^history-/)
+    expect(cancelHistory).toHaveBeenCalledWith(requestId)
   })
 })

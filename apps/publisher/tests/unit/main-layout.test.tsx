@@ -164,6 +164,7 @@ function createGardenMock(): GardenApi {
       deployments: vi.fn(async () =>
         unavailable<DeploymentHistory>("部署历史将在后续任务中提供。"),
       ),
+      cancel: vi.fn(async () => ok(undefined)),
       openLink: vi.fn(async () => ok(undefined)),
     },
   }

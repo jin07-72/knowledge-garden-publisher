@@ -108,6 +108,7 @@ export function createPublisherServices(
     history: {
       git: (request) => deploymentHistory.git(request),
       deployments: (request) => deploymentHistory.deployments(request),
+      cancel: (request) => deploymentHistory.cancel(request),
       openLink: ({ url }) => deploymentHistory.openLink(url),
     },
   }

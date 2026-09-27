@@ -6,7 +6,6 @@ export interface CommandRequest {
   readonly cwd: string
   readonly env?: Readonly<Record<string, string | undefined>>
   readonly signal?: AbortSignal
-  readonly maxOutputBytes?: number
 }
 
 export interface CommandResult {

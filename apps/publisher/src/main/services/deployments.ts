@@ -1,11 +1,15 @@
 import type {
+  DeploymentHistoryRequest,
   DeploymentHistory,
   DeploymentRun,
   GitCommit,
+  HistoryCancelRequest,
   HistoryRequest,
 } from "../../shared/contracts"
-import type { CommandRunner } from "../lib/commandRunner"
-import { createSystemBoundedCommandRunner } from "./publish"
+import {
+  createSystemBoundedCommandRunner,
+  type BoundedCommandRunner,
+} from "./publish"
 
 const DEFAULT_LIMIT = 20
 const MAX_LIMIT = 100
@@ -27,14 +31,15 @@ type Wait = (milliseconds: number, signal: AbortSignal) => Promise<void>
 
 export interface DeploymentHistoryService {
   git(request?: HistoryRequest): Promise<readonly GitCommit[]>
-  deployments(request?: HistoryRequest): Promise<DeploymentHistory>
+  deployments(request?: DeploymentHistoryRequest): Promise<DeploymentHistory>
+  cancel(request: HistoryCancelRequest): Promise<void>
   openLink(url: string): Promise<void>
   dispose(): Promise<void>
 }
 
 export interface DeploymentHistoryDependencies {
   readonly workspace: string
-  readonly runner?: CommandRunner
+  readonly runner?: BoundedCommandRunner
   readonly fetcher?: Fetcher
   readonly wait?: Wait
   readonly timeoutMs?: number
@@ -47,13 +52,33 @@ interface CachedRuns {
   readonly runs: readonly DeploymentRun[]
 }
 
+interface ResolvedRepository {
+  readonly repository: GitHubRepository
+  readonly repositoryKey: string
+  readonly links: Pick<DeploymentHistory, "actionsUrl" | "liveSiteUrl">
+}
+
+interface DeploymentFlight {
+  readonly controller: AbortController
+  readonly promise: Promise<DeploymentHistory>
+}
+
+const anonymousFlight = Symbol("anonymous-deployment-history-flight")
+
 function normalizedLimit(request?: HistoryRequest): number {
   return Math.min(MAX_LIMIT, Math.max(1, request?.limit ?? DEFAULT_LIMIT))
 }
 
 function repository(owner: string, repo: string): GitHubRepository {
   const normalizedRepo = repo.replace(/\.git$/i, "")
-  if (!SEGMENT_PATTERN.test(owner) || !SEGMENT_PATTERN.test(normalizedRepo)) {
+  if (
+    owner === "." ||
+    owner === ".." ||
+    normalizedRepo === "." ||
+    normalizedRepo === ".." ||
+    !SEGMENT_PATTERN.test(owner) ||
+    !SEGMENT_PATTERN.test(normalizedRepo)
+  ) {
     throw new Error("The GitHub origin is invalid.")
   }
   return { owner, repo: normalizedRepo }
@@ -100,7 +125,7 @@ function publicLinks(
   }
 }
 
-export function isSafeHistoryUrl(value: string): boolean {
+function isExactRunUrl(value: string, repo: GitHubRepository): boolean {
   let url: URL
   try {
     url = new URL(value)
@@ -116,16 +141,17 @@ export function isSafeHistoryUrl(value: string): boolean {
     url.port
   )
     return false
-  const host = url.hostname.toLowerCase()
-  if (host === "github.com") {
-    return /^\/[A-Za-z0-9_.-]+\/[A-Za-z0-9_.-]+\/actions\/(?:workflows\/deploy\.yml|runs\/\d+)\/?$/.test(
-      url.pathname,
-    )
-  }
+  const prefix = `/${encodeURIComponent(repo.owner)}/${encodeURIComponent(repo.repo)}/actions/runs/`
   return (
-    /^[a-z0-9](?:[a-z0-9-]{0,38}[a-z0-9])?\.github\.io$/.test(host) &&
-    /^\/(?:[A-Za-z0-9_.-]+\/?)?$/.test(url.pathname)
+    url.hostname.toLowerCase() === "github.com" &&
+    url.pathname.startsWith(prefix) &&
+    /^\d+$/.test(url.pathname.slice(prefix.length))
   )
+}
+
+export function isSafeHistoryUrl(value: string, repo: GitHubRepository): boolean {
+  const links = publicLinks(repo)
+  return value === links.actionsUrl || value === links.liveSiteUrl || isExactRunUrl(value, repo)
 }
 
 function gitFailure(message: string): never {
@@ -196,7 +222,6 @@ function parseRuns(body: string, limit: number, repo: GitHubRepository): readonl
   if (Buffer.byteLength(body, "utf8") > API_OUTPUT_LIMIT) throw new Error("response too large")
   const parsed = JSON.parse(body) as { readonly workflow_runs?: unknown }
   if (!Array.isArray(parsed.workflow_runs)) throw new Error("invalid response")
-  const prefix = `https://github.com/${repo.owner}/${repo.repo}/actions/runs/`
   const runs: DeploymentRun[] = []
   for (const candidate of parsed.workflow_runs.slice(0, limit)) {
     if (!candidate || typeof candidate !== "object") continue
@@ -209,7 +234,7 @@ function parseRuns(body: string, limit: number, repo: GitHubRepository): readonl
     const rawUrl = stringField(value.html_url, 2_048)
     if (!headSha || !SHA_PATTERN.test(headSha) || !startedAt || !status || !/^\d+$/.test(rawId))
       continue
-    const url = rawUrl?.startsWith(prefix) ? rawUrl : undefined
+    const url = rawUrl && isExactRunUrl(rawUrl, repo) ? rawUrl : undefined
     const completedAt =
       status === "pending" || status === "running" ? undefined : stringField(value.updated_at, 64)
     runs.push({
@@ -255,16 +280,16 @@ function isTerminal(status: DeploymentRun["status"]): boolean {
 
 class DeploymentHistoryServiceImpl implements DeploymentHistoryService {
   readonly #workspace: string
-  readonly #runner: CommandRunner
+  readonly #runner: BoundedCommandRunner
   readonly #fetcher: Fetcher
   readonly #wait: Wait
   readonly #timeoutMs: number
   readonly #openExternal?: (url: string) => Promise<void>
-  #flight?: Promise<DeploymentHistory>
-  #controller?: AbortController
   #disposed = false
   #cache?: CachedRuns
-  #lastRepositoryKey?: string
+  #currentRepository?: GitHubRepository
+  #resolutionGeneration = 0
+  readonly #flights = new Map<string | symbol, DeploymentFlight>()
 
   constructor(dependencies: DeploymentHistoryDependencies) {
     this.#workspace = dependencies.workspace
@@ -314,51 +339,65 @@ class DeploymentHistoryServiceImpl implements DeploymentHistoryService {
     throw new Error("unreachable")
   }
 
-  deployments(request?: HistoryRequest): Promise<DeploymentHistory> {
-    if (this.#flight) return this.#flight
+  deployments(request?: DeploymentHistoryRequest): Promise<DeploymentHistory> {
+    const key = request?.requestId ?? anonymousFlight
+    const existing = this.#flights.get(key)
+    if (existing) return existing.promise
     if (this.#disposed)
       return Promise.reject({ code: "SERVICE_UNAVAILABLE", message: "发布历史服务已停止。" })
+    const generation = ++this.#resolutionGeneration
+    this.#currentRepository = undefined
     const controller = new AbortController()
-    this.#controller = controller
     let timedOut = false
+    let resolved: ResolvedRepository | undefined
     const timer = setTimeout(() => {
       timedOut = true
       controller.abort()
     }, this.#timeoutMs)
-    const operation = this.#loadDeployments(normalizedLimit(request), controller.signal).catch(
-      () => {
-        const links = this.#lastLinks
-        if (!links) throw { code: "GIT_STATUS_FAILED", message: "无法识别 GitHub 仓库。" }
-        const cache = this.#cache
-        return {
-          runs: cache && cache.repositoryKey === this.#lastRepositoryKey ? cache.runs : [],
-          ...links,
-          unavailableMessage: this.#disposed
-            ? "部署状态检查已停止。"
-            : timedOut
-              ? "部署状态检查超时，请通过下面的链接查看。"
-              : "暂时无法读取部署状态，请通过下面的链接查看。",
-        }
+    const operation = this.#loadDeployments(
+      normalizedLimit(request),
+      controller.signal,
+      (current) => {
+        resolved = current
+        if (this.#resolutionGeneration === generation)
+          this.#currentRepository = current.repository
       },
-    )
+    ).catch(() => {
+      if (!resolved) throw { code: "GIT_STATUS_FAILED", message: "无法识别 GitHub 仓库。" }
+      const cache = this.#cache
+      return {
+        runs: cache && cache.repositoryKey === resolved.repositoryKey ? cache.runs : [],
+        ...resolved.links,
+        unavailableMessage: this.#disposed
+          ? "部署状态检查已停止。"
+          : timedOut
+            ? "部署状态检查超时，请通过下面的链接查看。"
+            : "暂时无法读取部署状态，请通过下面的链接查看。",
+      }
+    })
     const tracked = operation.finally(() => {
       clearTimeout(timer)
-      if (this.#flight === tracked) this.#flight = undefined
-      if (this.#controller === controller) this.#controller = undefined
+      if (this.#flights.get(key)?.promise === tracked) this.#flights.delete(key)
     })
-    this.#flight = tracked
+    this.#flights.set(key, { controller, promise: tracked })
     return tracked
+  }
+
+  async cancel(request: HistoryCancelRequest): Promise<void> {
+    const flight = this.#flights.get(request.requestId)
+    if (!flight) return
+    flight.controller.abort()
+    await flight.promise.catch(() => undefined)
   }
 
   async openLink(url: string): Promise<void> {
     if (this.#disposed || !this.#openExternal)
       throw { code: "SERVICE_UNAVAILABLE", message: "暂时无法打开外部链接。" }
-    if (!isSafeHistoryUrl(url))
+    if (!this.#currentRepository || !isSafeHistoryUrl(url, this.#currentRepository))
       throw { code: "SERVICE_UNAVAILABLE", message: "这个历史链接不安全，已阻止打开。" }
     await this.#openExternal(url)
   }
 
-  #lastLinks?: Pick<DeploymentHistory, "actionsUrl" | "liveSiteUrl">
   readonly #controllers = new Set<AbortController>()
   readonly #gitFlights = new Set<Promise<void>>()
 
@@ -374,13 +413,16 @@ class DeploymentHistoryServiceImpl implements DeploymentHistoryService {
     return result.stdout.trim()
   }
 
-  async #loadDeployments(limit: number, signal: AbortSignal): Promise<DeploymentHistory> {
+  async #loadDeployments(
+    limit: number,
+    signal: AbortSignal,
+    onResolved: (repository: ResolvedRepository) => void,
+  ): Promise<DeploymentHistory> {
     const remote = await this.#gitValue(["remote", "get-url", "origin"], signal)
     const repo = parseGitHubRemote(remote)
     const links = publicLinks(repo)
-    this.#lastLinks = links
     const repositoryKey = `${repo.owner.toLowerCase()}/${repo.repo.toLowerCase()}`
-    this.#lastRepositoryKey = repositoryKey
+    onResolved({ repository: repo, repositoryKey, links })
     const headSha = await this.#gitValue(["rev-parse", "--verify", "HEAD"], signal)
     if (!SHA_PATTERN.test(headSha)) gitFailure("无法识别当前发布版本。")
     const endpoint = `https://api.github.com/repos/${encodeURIComponent(repo.owner)}/${encodeURIComponent(repo.repo)}/actions/workflows/deploy.yml/runs?per_page=${limit}`
@@ -434,9 +476,9 @@ class DeploymentHistoryServiceImpl implements DeploymentHistoryService {
   async dispose(): Promise<void> {
     this.#disposed = true
     for (const controller of this.#controllers) controller.abort()
-    this.#controller?.abort()
+    for (const flight of this.#flights.values()) flight.controller.abort()
     await Promise.all([
-      this.#flight?.catch(() => undefined),
+      ...[...this.#flights.values()].map((flight) => flight.promise.catch(() => undefined)),
       ...[...this.#gitFlights].map((flight) => flight.catch(() => undefined)),
     ])
   }

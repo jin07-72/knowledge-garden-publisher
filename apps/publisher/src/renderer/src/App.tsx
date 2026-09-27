@@ -543,15 +543,21 @@ function PublisherApp({ api }: { readonly api: GardenApi }): React.JSX.Element {
     void changeVisibility(note, visibility)
   }
 
-  const loadHistory = useCallback(async (): Promise<HistorySnapshot> => {
+  const loadHistory = useCallback(async (requestId: string): Promise<HistorySnapshot> => {
     const [git, deployments] = await Promise.all([
       api.history.git({ limit: 20 }),
-      api.history.deployments({ limit: 20 }),
+      api.history.deployments({ limit: 20, requestId }),
     ])
     if (!git.ok) throw new Error(messageFor(git.error, "本地发布历史暂不可用。"))
     if (!deployments.ok) throw new Error(messageFor(deployments.error, "部署历史暂不可用。"))
     return { commits: git.value, deployments: deployments.value }
   }, [api])
+  const cancelHistory = useCallback(
+    async (requestId: string): Promise<void> => {
+      await api.history.cancel({ requestId })
+    },
+    [api],
+  )
   const openHistoryLink = useCallback(
     async (url: string): Promise<void> => {
       const result = await api.history.openLink({ url })
@@ -724,6 +730,7 @@ function PublisherApp({ api }: { readonly api: GardenApi }): React.JSX.Element {
           note={selectedNote}
           preview={preview}
           onLoadHistory={loadHistory}
+          onCancelHistory={cancelHistory}
           onOpenHistoryLink={openHistoryLink}
         />
       </div>

@@ -38,6 +38,7 @@ describe("renderer security", () => {
             liveSiteUrl: "https://octocat.github.io/garden/",
           },
         })}
+        onCancelHistory={async () => undefined}
         onOpenHistoryLink={async () => undefined}
       />,
     )
