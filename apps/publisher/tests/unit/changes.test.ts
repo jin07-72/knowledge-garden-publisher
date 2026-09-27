@@ -1,13 +1,17 @@
 import { mkdir, symlink, writeFile } from "node:fs/promises"
+import { EventEmitter } from "node:events"
 import { join } from "node:path"
+import { PassThrough } from "node:stream"
 import { afterEach, describe, expect, it, vi } from "vitest"
 import { createTemporaryGitRepository, git, type TemporaryGitRepository } from "../helpers/git"
 import {
   createChangeScanner,
+  createBoundedChangeCommandRunner,
   listChanges,
   MAX_CHANGE_STATUS_BYTES,
   parsePorcelainV2,
   type ChangeCommandRunner,
+  type ChangeCommandProcess,
 } from "../../src/main/services/changes"
 
 const repositories: TemporaryGitRepository[] = []
@@ -119,11 +123,105 @@ describe("parsePorcelainV2", () => {
         raw(`1 .M N... 100644 100644 100644 ${oidA} ${"b".repeat(64)} content/a.md\0`),
       ),
     )
-    expectInvalid(() =>
+    expect(
       parsePorcelainV2(
         raw(`2 .R N... 100644 100644 100644 ${oidA} ${oidA} R100 content/new.md\0content/old.md\0`),
       ),
-    )
+    ).toEqual([expect.objectContaining({ recordType: "rename", index: ".", worktree: "R" })])
+    expect(
+      parsePorcelainV2(
+        raw(`2 .C N... 100644 100644 100644 ${oidA} ${oidA} C75 content/new.md\0content/old.md\0`),
+      ),
+    ).toEqual([expect.objectContaining({ recordType: "rename", index: ".", worktree: "C" })])
+    for (const [status, score] of [
+      [".R", "C100"],
+      ["C.", "R100"],
+      ["RR", "R100"],
+      [".M", "R100"],
+    ]) {
+      expectInvalid(() =>
+        parsePorcelainV2(
+          raw(
+            `2 ${status} N... 100644 100644 100644 ${oidA} ${oidA} ${score} content/new.md\0content/old.md\0`,
+          ),
+        ),
+      )
+    }
+  })
+})
+
+describe("bounded change command runner", () => {
+  function child(kill: () => boolean): {
+    process: EventEmitter & ChangeCommandProcess
+    stdout: PassThrough
+  } {
+    const stdout = new PassThrough()
+    const process = Object.assign(new EventEmitter(), {
+      pid: 4242,
+      stdout,
+      stderr: new PassThrough(),
+      kill,
+    }) as EventEmitter & ChangeCommandProcess
+    return { process, stdout }
+  }
+
+  function request(
+    signal: AbortSignal,
+    deadlineMs = 100,
+  ): Parameters<ChangeCommandRunner["run"]>[0] {
+    return {
+      executable: "git",
+      args: ["status"],
+      cwd: process.cwd(),
+      env: {},
+      signal,
+      deadlineMs,
+      maxStdoutBytes: 8,
+      maxStderrBytes: 8,
+    }
+  }
+
+  it("escalates kill=false and settles fail-closed without a close event", async () => {
+    const { process } = child(() => false)
+    const terminate = vi.fn(async () => false)
+    const runner = createBoundedChangeCommandRunner({
+      spawner: () => process,
+      terminate,
+      terminationDeadlineMs: 5,
+    })
+    const controller = new AbortController()
+    const command = runner.run(request(controller.signal))
+    controller.abort()
+
+    await expect(command).rejects.toMatchObject({ code: "CHANGE_SCAN_FAILED" })
+    expect(terminate).toHaveBeenCalledWith(process)
+  })
+
+  it("preserves the output-limit error after confirmed escalation and ignores late close", async () => {
+    const { process, stdout } = child(() => false)
+    const terminate = vi.fn(async () => true)
+    const runner = createBoundedChangeCommandRunner({ spawner: () => process, terminate })
+    const command = runner.run(request(new AbortController().signal))
+    stdout.write(Buffer.alloc(9, 0x61))
+
+    await expect(command).rejects.toMatchObject({ code: "CHANGE_SCAN_LIMIT" })
+    expect(() => process.emit("close", null)).not.toThrow()
+  })
+
+  it("bounds timeout teardown even when direct kill succeeds but close never arrives", async () => {
+    const { process } = child(() => true)
+    const terminate = vi.fn(async () => true)
+    const runner = createBoundedChangeCommandRunner({
+      spawner: () => process,
+      terminate,
+      terminationGraceMs: 1,
+    })
+
+    await expect(runner.run(request(new AbortController().signal, 1))).rejects.toMatchObject({
+      code: "CHANGE_SCAN_FAILED",
+      message: expect.stringMatching(/timed out/i),
+    })
+    expect(terminate).toHaveBeenCalledWith(process)
   })
 })
 
@@ -211,6 +309,24 @@ describe("listChanges", () => {
         label: "grid-layout",
         kind: "modified",
         selection: "default",
+        paths: ["content/technology/grid-layout.md", "content/technology/css-grid.md"],
+      }),
+    ])
+  })
+
+  it("forces rename detection even when repository status.renames is disabled", async () => {
+    const fixture = await repository()
+    await git(fixture.root, ["config", "status.renames", "false"])
+    await git(fixture.root, [
+      "mv",
+      "content/technology/css-grid.md",
+      "content/technology/grid-layout.md",
+    ])
+
+    const review = await listChanges({ workspace: fixture.root })
+    expect(review.groups).toEqual([
+      expect.objectContaining({
+        kind: "modified",
         paths: ["content/technology/grid-layout.md", "content/technology/css-grid.md"],
       }),
     ])

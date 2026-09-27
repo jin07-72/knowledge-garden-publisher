@@ -12,6 +12,8 @@ import {
   type ChangeReview,
   type ChangeSelection,
 } from "../../shared/contracts"
+import type { PreviewProcess } from "./preview"
+import { createProductionProcessTreeTerminator } from "./previewRuntime"
 
 export const MAX_CHANGE_STATUS_BYTES = 2 * 1024 * 1024
 export const MAX_CHANGE_STDERR_BYTES = 64 * 1024
@@ -29,6 +31,7 @@ class ChangeScanError extends Error {
   constructor(
     readonly code: ChangeScanCode,
     message: string,
+    readonly terminationUncertain = false,
   ) {
     super(message)
   }
@@ -55,6 +58,20 @@ export interface ChangeCommandRunner {
   run(request: ChangeCommandRequest): Promise<ChangeCommandResult>
 }
 
+export interface ChangeCommandProcess extends PreviewProcess {}
+
+export type ChangeCommandSpawner = (
+  executable: string,
+  args: readonly string[],
+  options: {
+    readonly cwd: string
+    readonly env: NodeJS.ProcessEnv
+    readonly shell: false
+    readonly windowsHide: true
+    readonly detached: true
+  },
+) => ChangeCommandProcess
+
 export type PorcelainEntry = {
   readonly recordType: "ordinary" | "rename" | "unmerged" | "untracked" | "ignored"
   readonly path: string
@@ -75,6 +92,7 @@ export interface ListChangesOptions {
 export interface ChangeScanner {
   list(): Promise<ChangeReview>
   cancel(): Promise<void>
+  dispose(): Promise<void>
 }
 
 type MutableGroup = {
@@ -88,7 +106,7 @@ type MutableGroup = {
 }
 
 const ordinaryStatusPattern = /^[.MTAD]{2}$/
-const renameStatusPattern = /^[RC][.MTAD]$/
+const renameStatusPattern = /^(?:[RC][.MTAD]|[.MTAD][RC])$/
 const unmergedStatusPattern = /^(?:DD|AU|UD|UA|DU|AA|UU)$/
 const submodulePattern = /^(?:N\.\.\.|S[.C][.M][.U])$/
 const modePattern = /^(?:000000|100644|100755|120000|160000)$/
@@ -262,7 +280,20 @@ export function parsePorcelainV2(output: Buffer): readonly PorcelainEntry[] {
   return parsePorcelainBuffer(output).entries
 }
 
-function createSystemChangeCommandRunner(): ChangeCommandRunner {
+function terminationFailure(): ChangeScanError {
+  return new ChangeScanError(
+    "CHANGE_SCAN_FAILED",
+    "Publication scan termination was not confirmed.",
+    true,
+  )
+}
+
+export function createBoundedChangeCommandRunner(options: {
+  readonly spawner: ChangeCommandSpawner
+  readonly terminate: (child: ChangeCommandProcess) => Promise<boolean>
+  readonly terminationGraceMs?: number
+  readonly terminationDeadlineMs?: number
+}): ChangeCommandRunner {
   return {
     run(request) {
       if (request.signal?.aborted) {
@@ -270,20 +301,21 @@ function createSystemChangeCommandRunner(): ChangeCommandRunner {
       }
       return new Promise<ChangeCommandResult>((resolvePromise, rejectPromise) => {
         let settled = false
-        let timedOut = false
-        let cancelled = false
+        let stopping = false
         let pendingError: ChangeScanError | undefined
+        let escalationTimer: ReturnType<typeof setTimeout> | undefined
         let stdoutBytes = 0
         let stderrBytes = 0
         const stdout: Buffer[] = []
         const stderr: Buffer[] = []
-        let child: ReturnType<typeof spawn>
+        let child: ChangeCommandProcess
         try {
-          child = spawn(request.executable, request.args, {
+          child = options.spawner(request.executable, request.args, {
             cwd: request.cwd,
             env: { ...process.env, ...request.env },
             shell: false,
             windowsHide: true,
+            detached: true,
           })
         } catch {
           rejectPromise(scanError("CHANGE_SCAN_FAILED", "Could not start the publication scan."))
@@ -293,39 +325,68 @@ function createSystemChangeCommandRunner(): ChangeCommandRunner {
           if (settled) return
           settled = true
           clearTimeout(timer)
+          if (escalationTimer) clearTimeout(escalationTimer)
           request.signal?.removeEventListener("abort", abort)
           if (error) rejectPromise(error)
           else resolvePromise(result!)
         }
-        const stop = (): void => {
+        const escalate = async (): Promise<void> => {
+          if (settled) return
+          let deadline: ReturnType<typeof setTimeout> | undefined
           try {
-            child.kill()
+            const confirmed = await Promise.race([
+              options.terminate(child),
+              new Promise<false>((resolvePromise) => {
+                deadline = setTimeout(
+                  () => resolvePromise(false),
+                  options.terminationDeadlineMs ?? 3_500,
+                )
+              }),
+            ])
+            if (!settled) {
+              finish(
+                confirmed
+                  ? (pendingError ??
+                      scanError("CHANGE_SCAN_FAILED", "Publication scan was stopped."))
+                  : terminationFailure(),
+              )
+            }
           } catch {
-            pendingError ??= scanError("CHANGE_SCAN_FAILED", "Could not stop the publication scan.")
+            if (!settled) finish(terminationFailure())
+          } finally {
+            if (deadline) clearTimeout(deadline)
           }
         }
-        const abort = (): void => {
-          cancelled = true
-          stop()
+        const stop = (error: ChangeScanError): void => {
+          if (settled || stopping) return
+          stopping = true
+          pendingError = error
+          let accepted = false
+          try {
+            accepted = child.kill()
+          } catch {
+            accepted = false
+          }
+          if (settled) return
+          if (accepted) {
+            escalationTimer = setTimeout(() => void escalate(), options.terminationGraceMs ?? 100)
+          } else {
+            void escalate()
+          }
         }
-        const timer = setTimeout(() => {
-          timedOut = true
-          stop()
-        }, request.deadlineMs)
+        const abort = (): void =>
+          stop(scanError("CHANGE_SCAN_CANCELLED", "Change scan was cancelled."))
+        const timer = setTimeout(
+          () => stop(scanError("CHANGE_SCAN_FAILED", "Publication scan timed out.")),
+          request.deadlineMs,
+        )
         request.signal?.addEventListener("abort", abort, { once: true })
         if (request.signal?.aborted) abort()
         child.on("error", () => {
-          pendingError ??= scanError(
-            "CHANGE_SCAN_FAILED",
-            "Could not start or stop the publication scan.",
-          )
+          stop(scanError("CHANGE_SCAN_FAILED", "Could not start or stop the publication scan."))
         })
         child.on("close", (code) => {
-          if (cancelled) {
-            finish(scanError("CHANGE_SCAN_CANCELLED", "Change scan was cancelled."))
-          } else if (timedOut) {
-            finish(scanError("CHANGE_SCAN_FAILED", "Publication scan timed out."))
-          } else if (pendingError) {
+          if (stopping && pendingError) {
             finish(pendingError)
           } else if (code === null) {
             finish(scanError("CHANGE_SCAN_FAILED", "Publication scan did not finish safely."))
@@ -340,35 +401,25 @@ function createSystemChangeCommandRunner(): ChangeCommandRunner {
         const childStdout = child.stdout
         const childStderr = child.stderr
         if (!childStdout || !childStderr) {
-          pendingError = scanError(
-            "CHANGE_SCAN_FAILED",
-            "Publication scan streams were unavailable.",
-          )
-          stop()
+          stop(scanError("CHANGE_SCAN_FAILED", "Publication scan streams were unavailable."))
           return
         }
         childStdout.on("data", (chunk: Buffer | string) => {
+          if (settled || stopping) return
           const bytes = Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk)
           stdoutBytes += bytes.byteLength
           if (stdoutBytes > request.maxStdoutBytes) {
-            pendingError = scanError(
-              "CHANGE_SCAN_LIMIT",
-              "Publication status exceeded the safe size limit.",
-            )
-            stop()
+            stop(scanError("CHANGE_SCAN_LIMIT", "Publication status exceeded the safe size limit."))
             return
           }
           stdout.push(bytes)
         })
         childStderr.on("data", (chunk: Buffer | string) => {
+          if (settled || stopping) return
           const bytes = Buffer.isBuffer(chunk) ? chunk : Buffer.from(chunk)
           stderrBytes += bytes.byteLength
           if (stderrBytes > request.maxStderrBytes) {
-            pendingError = scanError(
-              "CHANGE_SCAN_LIMIT",
-              "Git diagnostics exceeded the safe size limit.",
-            )
-            stop()
+            stop(scanError("CHANGE_SCAN_LIMIT", "Git diagnostics exceeded the safe size limit."))
             return
           }
           stderr.push(bytes)
@@ -378,7 +429,12 @@ function createSystemChangeCommandRunner(): ChangeCommandRunner {
   }
 }
 
-const systemChangeCommandRunner = createSystemChangeCommandRunner()
+const productionTerminator = createProductionProcessTreeTerminator()
+const systemChangeCommandRunner = createBoundedChangeCommandRunner({
+  spawner: (executable, args, options) =>
+    spawn(executable, [...args], options) as unknown as ChangeCommandProcess,
+  terminate: (child) => productionTerminator(child),
+})
 
 function assertRelativePath(path: string): void {
   const normalized = path.endsWith("/") ? path.slice(0, -1) : path
@@ -563,7 +619,14 @@ export async function listChanges(options: ListChangesOptions): Promise<ChangeRe
     const result = await runner.run(
       commandRequest(
         workspace,
-        ["status", "--porcelain=v2", "-z", "--untracked-files=all", "--ignore-submodules=none"],
+        [
+          "status",
+          "--porcelain=v2",
+          "-z",
+          "--renames",
+          "--untracked-files=all",
+          "--ignore-submodules=none",
+        ],
         remainingDeadline(),
         MAX_CHANGE_STATUS_BYTES,
         MAX_CHANGE_STDERR_BYTES,
@@ -589,6 +652,7 @@ export async function listChanges(options: ListChangesOptions): Promise<ChangeRe
           "status",
           "--porcelain=v2",
           "-z",
+          "--renames",
           "--untracked-files=all",
           "--ignore-submodules=none",
           "--ignored=matching",
@@ -801,14 +865,25 @@ export function createChangeScanner(options: {
   readonly runner?: ChangeCommandRunner
 }): ChangeScanner {
   let active: { readonly controller: AbortController; readonly settled: Promise<void> } | undefined
+  let blocked: ChangeScanError | undefined
+  const cancel = async (): Promise<void> => {
+    const current = active
+    current?.controller.abort()
+    await current?.settled
+    if (blocked) throw blocked
+  }
   return {
     list() {
+      if (blocked) return Promise.reject(blocked)
       const predecessor = active?.settled ?? Promise.resolve()
       active?.controller.abort()
       const controller = new AbortController()
-      const operation = predecessor.then(() =>
-        listChanges({ ...options, signal: controller.signal }),
-      )
+      const operation = predecessor
+        .then(() => listChanges({ ...options, signal: controller.signal }))
+        .catch((error: unknown) => {
+          if (error instanceof ChangeScanError && error.terminationUncertain) blocked = error
+          throw error
+        })
       const settled = operation.then(
         () => undefined,
         () => undefined,
@@ -819,10 +894,7 @@ export function createChangeScanner(options: {
       })
       return operation
     },
-    async cancel() {
-      const current = active
-      current?.controller.abort()
-      await current?.settled
-    },
+    cancel,
+    dispose: cancel,
   }
 }

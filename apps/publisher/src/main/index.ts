@@ -8,6 +8,7 @@ import {
   createPublisherCloseCoordinator,
   createPublisherServices,
   disposePublisherRuntime,
+  type PublisherRuntimeServices,
 } from "./publisherServices"
 import {
   configureTrustedRendererNavigation,
@@ -23,6 +24,7 @@ let mainWindow: BrowserWindow | undefined
 let mainWindowTrust: RendererTrustPolicy | undefined
 let unregisterIpc: (() => void) | undefined
 let previewManager: PreviewManager | undefined
+let publisherServices: PublisherRuntimeServices | undefined
 
 let pendingClose:
   | {
@@ -70,9 +72,10 @@ const closeCoordinator = createPublisherCloseCoordinator({
       unregisterIpc = undefined
       return
     }
-    await disposePublisherRuntime(unregister, manager)
+    await disposePublisherRuntime(unregister, manager, publisherServices)
     unregisterIpc = undefined
     previewManager = undefined
+    publisherServices = undefined
   },
   allowQuit: () => app.quit(),
   allowClose: () => mainWindow?.close(),
@@ -145,14 +148,15 @@ app.whenReady().then(() => {
     ? join(process.resourcesPath, "node", "node.exe")
     : join(app.getAppPath(), "vendor", "node", "node.exe")
   previewManager = createProductionPreviewManager(runtimePath)
+  publisherServices = createPublisherServices({
+    workspace: DEFAULT_GARDEN_PATH,
+    trash: { trashItem: (absolutePath) => shell.trashItem(absolutePath) },
+    isTracked,
+    preview: previewManager,
+  })
   unregisterIpc = registerPublisherIpc({
     ipcMain,
-    services: createPublisherServices({
-      workspace: DEFAULT_GARDEN_PATH,
-      trash: { trashItem: (absolutePath) => shell.trashItem(absolutePath) },
-      isTracked,
-      preview: previewManager,
-    }),
+    services: publisherServices,
     isTrustedSender: (event) => {
       const window = mainWindow
       const trust = mainWindowTrust

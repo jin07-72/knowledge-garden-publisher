@@ -116,6 +116,58 @@ describe("publisher service wiring", () => {
     expect(disposeAfterUnregisterFailure).toHaveBeenCalledOnce()
   })
 
+  it("cancels an active change scan before preview and IPC disposal", async () => {
+    const workspace = await garden()
+    const order: string[] = []
+    let rejectScan!: (error: unknown) => void
+    const activeScan = new Promise<never>((_, reject) => {
+      rejectScan = reject
+    })
+    const scanner = {
+      list: vi.fn(() => activeScan),
+      cancel: vi.fn(async () => {
+        order.push("changes")
+        rejectScan({ code: "CHANGE_SCAN_CANCELLED", message: "cancelled" })
+      }),
+    }
+    const services = createPublisherServices({
+      workspace,
+      trash: { trashItem: async () => undefined },
+      isTracked: async () => false,
+      preview: preview(),
+      changeScanner: scanner,
+    })
+    const scan = services.changes.list()
+    const manager = {
+      dispose: vi.fn(async () => {
+        order.push("preview")
+      }),
+    }
+    const unregister = vi.fn(() => order.push("ipc"))
+
+    await disposePublisherRuntime(unregister, manager, services)
+    await expect(scan).rejects.toMatchObject({ code: "CHANGE_SCAN_CANCELLED" })
+    expect(order).toEqual(["changes", "preview", "ipc"])
+  })
+
+  it("keeps quit cleanup blocked when change-scan disposal is uncertain", async () => {
+    const disposePreview = vi.fn(async () => undefined)
+    const unregister = vi.fn()
+    await expect(
+      disposePublisherRuntime(
+        unregister,
+        { dispose: disposePreview },
+        {
+          dispose: async () => {
+            throw new Error("change scan termination was not confirmed")
+          },
+        },
+      ),
+    ).rejects.toThrow(/not confirmed/)
+    expect(disposePreview).not.toHaveBeenCalled()
+    expect(unregister).not.toHaveBeenCalled()
+  })
+
   it("keeps quit blocked after cleanup failure and retries without concurrent cleanup", async () => {
     let resolveFirst!: () => void
     const first = new Promise<void>((resolve) => {

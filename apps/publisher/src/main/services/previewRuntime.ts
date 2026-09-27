@@ -86,9 +86,11 @@ function wait(milliseconds: number): Promise<void> {
   return new Promise((resolve) => setTimeout(resolve, milliseconds))
 }
 
-export function createProductionPreviewManager(runtimePath: string): PreviewManager {
+export function createProductionProcessTreeTerminator(): ReturnType<
+  typeof createProcessTreeTerminator
+> {
   const platform = process.platform
-  const terminate = createProcessTreeTerminator({
+  return createProcessTreeTerminator({
     platform,
     isAlive,
     signalGroup: (target, signal) => process.kill(target, signal),
@@ -97,6 +99,11 @@ export function createProductionPreviewManager(runtimePath: string): PreviewMana
     gracefulWaitMs: 1_500,
     forceWaitMs: 1_500,
   })
+}
+
+export function createProductionPreviewManager(runtimePath: string): PreviewManager {
+  const platform = process.platform
+  const terminate = createProductionProcessTreeTerminator()
   const dependencies: PreviewDependencies = {
     resolveWorkspace: (workspace) => realpath(workspace),
     isDirectory: pathIs("directory"),

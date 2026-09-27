@@ -17,7 +17,7 @@ import {
 } from "./services/editorRecovery"
 import { scanNotes } from "./services/noteIndex"
 import { inspectWorkspace } from "./services/workspace"
-import { createChangeScanner } from "./services/changes"
+import { createChangeScanner, type ChangeScanner } from "./services/changes"
 
 export interface PreviewServicePort {
   start(request: {
@@ -34,7 +34,11 @@ export interface PublisherServiceDependencies {
   readonly trash: TrashAdapter
   readonly isTracked: (workspace: string, path: string) => Promise<boolean>
   readonly preview: PreviewServicePort
+  readonly changeScanner?: Pick<ChangeScanner, "list" | "cancel"> &
+    Partial<Pick<ChangeScanner, "dispose">>
 }
+
+export type PublisherRuntimeServices = PublisherIpcServices & { dispose(): Promise<void> }
 
 function unavailable(name: string): AppError {
   return { code: "SERVICE_UNAVAILABLE", message: `${name} is not available yet.` }
@@ -43,11 +47,12 @@ function unavailable(name: string): AppError {
 /** Wires implemented capabilities; publishing remains unavailable until Task 11. */
 export function createPublisherServices(
   dependencies: PublisherServiceDependencies,
-): PublisherIpcServices {
+): PublisherRuntimeServices {
   const { workspace, trash, preview, isTracked } = dependencies
-  const changeScanner = createChangeScanner({ workspace })
+  const changeScanner = dependencies.changeScanner ?? createChangeScanner({ workspace })
   const reject = async <T>(name: string): Promise<T> => Promise.reject(unavailable(name))
   return {
+    dispose: () => changeScanner.dispose?.() ?? changeScanner.cancel(),
     workspace: {
       inspect: () => inspectWorkspace(workspace, { checkGit: true }),
     },
@@ -96,7 +101,9 @@ export function createPublisherServices(
 export async function disposePublisherRuntime(
   unregisterIpc: (() => void) | undefined,
   preview: { dispose(): Promise<void> },
+  services?: { dispose(): Promise<void> },
 ): Promise<void> {
+  await services?.dispose()
   await preview.dispose()
   unregisterIpc?.()
 }
