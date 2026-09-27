@@ -1,4 +1,15 @@
-import { mkdir, readFile, readdir, rename, rm, symlink, unlink, writeFile } from "node:fs/promises"
+import {
+  lstat,
+  mkdir,
+  readFile,
+  realpath,
+  readdir,
+  rename,
+  rm,
+  symlink,
+  unlink,
+  writeFile,
+} from "node:fs/promises"
 import { EventEmitter } from "node:events"
 import { dirname, join } from "node:path"
 import { PassThrough } from "node:stream"
@@ -70,6 +81,7 @@ function publisher(
   return new Publisher({
     workspace: repository.root,
     runtime: {
+      root: join(repository.root, "apps/publisher/vendor/node"),
       nodeExecutable: join(repository.root, "apps/publisher/vendor/node/node.exe"),
       npmCliPath: join(
         repository.root,
@@ -224,6 +236,224 @@ describe("exact-tree publication", () => {
     expect(await readdir(publishRoot).catch(() => [])).toEqual([])
   })
 
+  it("pushes the verified commit instead of a concurrently switched HEAD and confirms its remote tree", async () => {
+    const repository = await fixture()
+    await put(repository.root, "content/technology/css-grid.md", "verified publication\n")
+    let switched = false
+    const pushRequests: CommandRequest[] = []
+    const runner = {
+      run: async (request: CommandRequest) => {
+        if (request.executable === "git" && request.args[0] === "push") {
+          pushRequests.push(request)
+          if (!switched) {
+            switched = true
+            const parent = await output(repository.root, ["rev-parse", "refs/heads/main^"])
+            expect(
+              (await git(repository.root, ["update-ref", "refs/heads/attacker", parent])).exitCode,
+            ).toBe(0)
+            expect(
+              (await git(repository.root, ["symbolic-ref", "HEAD", "refs/heads/attacker"]))
+                .exitCode,
+            ).toBe(0)
+          }
+        }
+        return runCommand(request)
+      },
+    }
+
+    const result = await publisher(repository, { runner }).publish({
+      paths: ["content/technology/css-grid.md"],
+    })
+
+    expect(pushRequests).toHaveLength(1)
+    expect(pushRequests[0]!.args).toContain(`${result.commit}:refs/heads/main`)
+    expect(await output(repository.root, ["rev-parse", "refs/remotes/origin/main"])).toBe(
+      result.commit,
+    )
+    expect(await output(repository.root, ["rev-parse", "refs/remotes/origin/main^{tree}"])).toBe(
+      result.tree,
+    )
+    expect(await output(repository.root, ["rev-parse", "HEAD"])).not.toBe(result.commit)
+  })
+
+  it("finishes atomic ref/index installation after caller cancellation and retains the verified commit for retry", async () => {
+    const repository = await fixture()
+    const before = await output(repository.root, ["rev-parse", "HEAD"])
+    await put(repository.root, "content/technology/css-grid.md", "cancel after ref\n")
+    const controller = new AbortController()
+    let cancelledAfterRef = false
+    const runner = {
+      run: async (request: CommandRequest) => {
+        const result = await runCommand(request)
+        if (
+          !cancelledAfterRef &&
+          request.executable === "git" &&
+          request.args[0] === "update-ref" &&
+          request.args[1] === "refs/heads/main" &&
+          result.exitCode === 0
+        ) {
+          cancelledAfterRef = true
+          controller.abort()
+        }
+        return result
+      },
+    }
+    const service = publisher(repository, { runner })
+
+    await expect(
+      service.publish({ paths: ["content/technology/css-grid.md"], signal: controller.signal }),
+    ).rejects.toMatchObject({ code: "PUBLISH_CANCELLED" })
+
+    const retained = await output(repository.root, ["rev-parse", "refs/heads/main"])
+    expect(retained).not.toBe(before)
+    expect(await output(repository.root, ["diff", "--cached", "--name-only"])).toBe("")
+    const retried = await service.retryPush()
+    expect(retried.commit).toBe(retained)
+    expect(await output(repository.root, ["rev-parse", "refs/remotes/origin/main"])).toBe(retained)
+  })
+
+  it("uses a bounded independent recovery signal when index installation times out after ref update", async () => {
+    const repository = await fixture()
+    const before = await output(repository.root, ["rev-parse", "HEAD"])
+    await put(repository.root, "content/technology/css-grid.md", "critical timeout\n")
+    let blockIndexInstall = true
+    const runner = {
+      run: async (request: CommandRequest) => {
+        if (
+          blockIndexInstall &&
+          request.executable === "git" &&
+          request.args[0] === "update-ref" &&
+          request.args[1] === "refs/heads/main"
+        ) {
+          const result = await runCommand(request)
+          expect(result.exitCode).toBe(0)
+          await new Promise<void>((resolve) => {
+            request.signal?.addEventListener("abort", () => resolve(), { once: true })
+          })
+          blockIndexInstall = false
+          throw new Error("critical install timed out")
+        }
+        return runCommand(request)
+      },
+    }
+
+    await expect(
+      publisher(repository, { runner, criticalSectionTimeoutMs: 50 }).publish({
+        paths: ["content/technology/css-grid.md"],
+      }),
+    ).rejects.toMatchObject({ code: "REF_UPDATE_FAILED" })
+
+    expect(await output(repository.root, ["rev-parse", "refs/heads/main"])).toBe(before)
+    expect(await output(repository.root, ["diff", "--cached", "--name-only"])).toBe("")
+  })
+
+  it("uses the real Git index lock, rechecks staged state inside it, and preserves a concurrent intent", async () => {
+    const repository = await fixture()
+    await put(repository.root, "content/technology/css-grid.md", "selected\n")
+    await put(repository.root, "content/life/weekly-review.md", "concurrent intent\n")
+    let stagedChecks = 0
+    let concurrentStageExit: number | undefined
+    let lockObserved = false
+    const runner = {
+      run: async (request: CommandRequest) => {
+        if (
+          request.executable === "git" &&
+          request.args[0] === "diff" &&
+          request.args[1] === "--cached" &&
+          request.args.includes("--quiet")
+        ) {
+          stagedChecks += 1
+          if (stagedChecks === 2) {
+            lockObserved = await lstat(join(repository.root, ".git", "index.lock")).then(
+              () => true,
+              () => false,
+            )
+            concurrentStageExit = (
+              await git(repository.root, ["add", "content/life/weekly-review.md"])
+            ).exitCode
+          }
+        }
+        return runCommand(request)
+      },
+    }
+
+    await publisher(repository, { runner }).publish({
+      paths: ["content/technology/css-grid.md"],
+    })
+
+    expect(lockObserved).toBe(true)
+    expect(concurrentStageExit).not.toBe(0)
+    expect(await output(repository.root, ["diff", "--cached", "--name-only"])).toBe("")
+    expect(await readFile(join(repository.root, "content/life/weekly-review.md"), "utf8")).toBe(
+      "concurrent intent\n",
+    )
+  })
+
+  it("does not remove or overwrite a foreign Git index lock", async () => {
+    const repository = await fixture()
+    const before = await output(repository.root, ["rev-parse", "HEAD"])
+    await put(repository.root, "content/technology/css-grid.md", "selected\n")
+    const lock = join(repository.root, ".git", "index.lock")
+    let installedForeignLock = false
+    const runner = {
+      run: async (request: CommandRequest) => {
+        const result = await runCommand(request)
+        if (
+          !installedForeignLock &&
+          request.executable === "git" &&
+          request.args[0] === "rev-parse" &&
+          request.args[1] === "--absolute-git-dir" &&
+          result.exitCode === 0
+        ) {
+          installedForeignLock = true
+          await writeFile(lock, "foreign lock")
+        }
+        return result
+      },
+    }
+
+    await expect(
+      publisher(repository, { runner }).publish({
+        paths: ["content/technology/css-grid.md"],
+      }),
+    ).rejects.toMatchObject({ code: "INDEX_LOCKED" })
+
+    expect(await readFile(lock, "utf8")).toBe("foreign lock")
+    expect(await output(repository.root, ["rev-parse", "HEAD"])).toBe(before)
+    await unlink(lock)
+  })
+
+  it("retains the installed commit but fails closed when final tree confirmation is uncertain", async () => {
+    const repository = await fixture()
+    const before = await output(repository.root, ["rev-parse", "HEAD"])
+    await put(repository.root, "content/technology/css-grid.md", "uncertain final tree\n")
+    let failConfirmation = true
+    const runner = {
+      run: async (request: CommandRequest) => {
+        if (
+          failConfirmation &&
+          request.executable === "git" &&
+          request.args[0] === "rev-parse" &&
+          request.args[2] === "refs/heads/main^{tree}"
+        ) {
+          failConfirmation = false
+          return { exitCode: 1, stdout: "", stderr: "uncertain" }
+        }
+        return runCommand(request)
+      },
+    }
+    const service = publisher(repository, { runner })
+
+    await expect(
+      service.publish({ paths: ["content/technology/css-grid.md"] }),
+    ).rejects.toMatchObject({ code: "REF_UPDATE_FAILED" })
+    expect(await output(repository.root, ["rev-parse", "refs/heads/main"])).not.toBe(before)
+    await expect(service.retryPush()).rejects.toMatchObject({ code: "CLEANUP_FAILED" })
+    await expect(
+      service.publish({ paths: ["content/technology/css-grid.md"] }),
+    ).rejects.toMatchObject({ code: "CLEANUP_FAILED" })
+  })
+
   it("blocks real staged changes before creating a publication commit", async () => {
     const repository = await fixture()
     await put(repository.root, "content/life/weekly-review.md", "staged elsewhere\n")
@@ -318,11 +548,19 @@ describe("exact-tree publication", () => {
     const retry = service.retryPush()
     await vi.waitFor(() => expect(releaseRetry).toBeTypeOf("function"))
     await expect(service.retryPush()).rejects.toMatchObject({ code: "PUBLISH_ACTIVE" })
+    const parent = await output(repository.root, ["rev-parse", "refs/heads/main^"])
+    expect(
+      (await git(repository.root, ["update-ref", "refs/heads/attacker", parent])).exitCode,
+    ).toBe(0)
+    expect(
+      (await git(repository.root, ["symbolic-ref", "HEAD", "refs/heads/attacker"])).exitCode,
+    ).toBe(0)
     holdRetry = false
     releaseRetry?.()
     const retried = await retry
     expect(retried.commit).toBe(retained)
     expect(await output(repository.root, ["rev-parse", "origin/main"])).toBe(retained)
+    expect(await output(repository.root, ["rev-parse", "origin/main^{tree}"])).toBe(retried.tree)
     const pushArguments = commands
       .filter((request) => request.args[0] === "push")
       .flatMap((request) => request.args)
@@ -346,6 +584,7 @@ describe("exact-tree publication", () => {
     await put(repository.root, "content/technology/css-grid.md", "selected\n")
     const missing = publisher(repository, {
       runtime: {
+        root: join(repository.root, "apps/publisher/vendor/node"),
         nodeExecutable: join(repository.root, "missing-node.exe"),
         npmCliPath: join(repository.root, "missing-npm.js"),
         nodeModules: join(repository.root, "node_modules"),
@@ -364,6 +603,120 @@ describe("exact-tree publication", () => {
       await readdir(join(repository.root, ".garden-publisher", "publish")).catch(() => []),
     ).toEqual([])
   })
+
+  it.each([
+    {
+      name: "node executable outside its declared bundle root",
+      runtime: async (repository: TemporaryGitRepository) => {
+        await put(repository.root, "arbitrary/node.exe", "not bundled")
+        return {
+          root: join(repository.root, "apps/publisher/vendor/node"),
+          nodeExecutable: join(repository.root, "arbitrary/node.exe"),
+          npmCliPath: join(
+            repository.root,
+            "apps/publisher/vendor/node/node_modules/npm/bin/npm-cli.js",
+          ),
+          nodeModules: join(repository.root, "node_modules"),
+        }
+      },
+    },
+    {
+      name: "npm CLI outside its fixed bundle location",
+      runtime: async (repository: TemporaryGitRepository) => {
+        await put(repository.root, "apps/publisher/vendor/node/arbitrary-npm.js", "not npm")
+        return {
+          root: join(repository.root, "apps/publisher/vendor/node"),
+          nodeExecutable: join(repository.root, "apps/publisher/vendor/node/node.exe"),
+          npmCliPath: join(repository.root, "apps/publisher/vendor/node/arbitrary-npm.js"),
+          nodeModules: join(repository.root, "node_modules"),
+        }
+      },
+    },
+    {
+      name: "dependency directory outside workspace root",
+      runtime: async (repository: TemporaryGitRepository) => {
+        const outside = join(dirname(repository.root), "outside-modules")
+        await mkdir(outside)
+        return {
+          root: join(repository.root, "apps/publisher/vendor/node"),
+          nodeExecutable: join(repository.root, "apps/publisher/vendor/node/node.exe"),
+          npmCliPath: join(
+            repository.root,
+            "apps/publisher/vendor/node/node_modules/npm/bin/npm-cli.js",
+          ),
+          nodeModules: outside,
+        }
+      },
+    },
+  ])("rejects $name before staging", async ({ runtime }) => {
+    const repository = await fixture()
+    await put(repository.root, "content/technology/css-grid.md", "selected\n")
+
+    await expect(
+      publisher(repository, { runtime: await runtime(repository) }).publish({
+        paths: ["content/technology/css-grid.md"],
+      }),
+    ).rejects.toMatchObject({ code: "RUNTIME_MISSING" })
+    expect(
+      await readdir(join(repository.root, ".garden-publisher", "publish")).catch(() => []),
+    ).toEqual([])
+  })
+
+  it.skipIf(process.platform !== "win32")(
+    "creates and removes a real Windows node_modules junction inside the verification worktree",
+    async () => {
+      const repository = await fixture()
+      await put(repository.root, "content/technology/css-grid.md", "junction verify\n")
+      let observed = false
+      const service = publisher(repository, {
+        verifySite: async ({ cwd }) => {
+          const link = join(cwd, "node_modules")
+          const details = await lstat(link)
+          expect(details.isSymbolicLink()).toBe(true)
+          expect((await realpath(link)).toLowerCase()).toBe(
+            (await realpath(join(repository.root, "node_modules"))).toLowerCase(),
+          )
+          observed = true
+          return { exitCode: 0 }
+        },
+      })
+
+      await service.publish({ paths: ["content/technology/css-grid.md"] })
+
+      expect(observed).toBe(true)
+      expect(await readdir(join(repository.root, ".garden-publisher", "publish"))).toEqual([])
+    },
+  )
+
+  it.skipIf(process.platform !== "win32")(
+    "rejects runtime and workspace dependency junction escapes before staging",
+    async () => {
+      const runtimeRepository = await fixture()
+      await put(runtimeRepository.root, "content/technology/css-grid.md", "selected\n")
+      const runtimeRoot = join(runtimeRepository.root, "apps/publisher/vendor/node")
+      const outsideRuntime = join(dirname(runtimeRepository.root), "outside-runtime")
+      await mkdir(join(outsideRuntime, "node_modules/npm/bin"), { recursive: true })
+      await writeFile(join(outsideRuntime, "node.exe"), "outside")
+      await writeFile(join(outsideRuntime, "node_modules/npm/bin/npm-cli.js"), "outside")
+      await rm(runtimeRoot, { recursive: true })
+      await symlink(outsideRuntime, runtimeRoot, "junction")
+
+      await expect(
+        publisher(runtimeRepository).publish({ paths: ["content/technology/css-grid.md"] }),
+      ).rejects.toMatchObject({ code: "RUNTIME_MISSING" })
+
+      const modulesRepository = await fixture()
+      await put(modulesRepository.root, "content/technology/css-grid.md", "selected\n")
+      const outsideModules = join(dirname(modulesRepository.root), "outside-dependencies")
+      await mkdir(outsideModules)
+      await rm(join(modulesRepository.root, "node_modules"), { recursive: true })
+      await symlink(outsideModules, join(modulesRepository.root, "node_modules"), "junction")
+
+      await expect(
+        publisher(modulesRepository).publish({ paths: ["content/technology/css-grid.md"] }),
+      ).rejects.toMatchObject({ code: "RUNTIME_MISSING" })
+    },
+  )
 
   it("cancels a hung verification within the operation deadline without updating HEAD", async () => {
     const repository = await fixture()
@@ -427,6 +780,45 @@ describe("exact-tree publication", () => {
     ).rejects.toMatchObject({ code: "PUBLISH_ACTIVE" })
     await service.cancel()
     await expect(operation).rejects.toMatchObject({ code: "PUBLISH_CANCELLED" })
+  })
+
+  it("fails closed after cancelled cleanup cannot remove its verification worktree", async () => {
+    const repository = await fixture()
+    await put(repository.root, "content/technology/css-grid.md", "cancel cleanup\n")
+    let verifyCalls = 0
+    const entered = vi.fn()
+    const runner = {
+      run: async (request: CommandRequest) => {
+        if (
+          request.executable === "git" &&
+          request.args[0] === "worktree" &&
+          request.args[1] === "remove"
+        ) {
+          return { exitCode: 1, stdout: "", stderr: "cleanup diagnostic" }
+        }
+        return runCommand(request)
+      },
+    }
+    const service = publisher(repository, {
+      runner,
+      verifySite: ({ signal }) => {
+        verifyCalls += 1
+        if (verifyCalls > 1) return Promise.resolve({ exitCode: 0 })
+        return new Promise((resolve) => {
+          entered()
+          signal.addEventListener("abort", () => resolve({ exitCode: 130 }), { once: true })
+        })
+      },
+    })
+    const operation = service.publish({ paths: ["content/technology/css-grid.md"] })
+    await vi.waitFor(() => expect(entered).toHaveBeenCalledOnce(), { timeout: 10_000 })
+    await service.cancel()
+    await expect(operation).rejects.toMatchObject({ code: "PUBLISH_CANCELLED" })
+
+    await expect(
+      service.publish({ paths: ["content/technology/css-grid.md"] }),
+    ).rejects.toMatchObject({ code: "CLEANUP_FAILED" })
+    await expect(service.retryPush()).rejects.toMatchObject({ code: "CLEANUP_FAILED" })
   })
 
   it("exports typed errors without command stderr or absolute paths", async () => {

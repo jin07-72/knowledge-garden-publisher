@@ -1,6 +1,18 @@
 import { spawn } from "node:child_process"
-import { lstat, mkdir, mkdtemp, realpath, rm, symlink, unlink } from "node:fs/promises"
-import { isAbsolute, join, relative, resolve, sep } from "node:path"
+import {
+  lstat,
+  mkdir,
+  mkdtemp,
+  open,
+  readFile,
+  realpath,
+  rename,
+  rm,
+  stat,
+  symlink,
+  unlink,
+} from "node:fs/promises"
+import { dirname, isAbsolute, join, relative, resolve, sep } from "node:path"
 import { type CommandRequest, type CommandResult, type CommandRunner } from "../lib/commandRunner"
 import type { PreviewProcess } from "./preview"
 import { createProductionProcessTreeTerminator } from "./previewRuntime"
@@ -40,6 +52,7 @@ export type PublishErrorCode =
   | "COMMIT_FAILED"
   | "VERIFY_FAILED"
   | "REF_CHANGED"
+  | "INDEX_LOCKED"
   | "REF_UPDATE_FAILED"
   | "PUSH_FAILED"
   | "PUBLISH_ACTIVE"
@@ -59,6 +72,7 @@ export class PublishError extends Error {
 }
 
 export interface PublishRuntime {
+  readonly root: string
   readonly nodeExecutable: string
   readonly npmCliPath: string
   readonly nodeModules: string
@@ -86,6 +100,7 @@ export interface PublishDependencies {
   readonly createDependencyLink?: (request: DependencyLinkRequest) => Promise<void>
   readonly onProgress?: (progress: PublishProgressEvent) => void
   readonly timeoutMs?: number
+  readonly criticalSectionTimeoutMs?: number
 }
 
 export interface PublishSelection {
@@ -112,6 +127,7 @@ const MAX_PATH_BYTES = 512
 const MAX_OUTPUT_BYTES = 2 * 1024 * 1024
 const DEFAULT_TIMEOUT_MS = 5 * 60_000
 const MAX_STDERR_BYTES = 64 * 1024
+const MAX_GIT_INDEX_BYTES = 32 * 1024 * 1024
 const gitEnvironment = {
   GIT_DIR: undefined,
   GIT_WORK_TREE: undefined,
@@ -342,22 +358,8 @@ function safeMessage(message: string | undefined): string {
   return normalized
 }
 
-async function safeRuntimeFile(path: string): Promise<boolean> {
-  try {
-    const details = await lstat(path)
-    return details.isFile() && !details.isSymbolicLink()
-  } catch {
-    return false
-  }
-}
-
-async function safeRuntimeDirectory(path: string): Promise<boolean> {
-  try {
-    const details = await lstat(path)
-    return details.isDirectory() && !details.isSymbolicLink()
-  } catch {
-    return false
-  }
+function pathsEqual(left: string, right: string): boolean {
+  return process.platform === "win32" ? left.toLowerCase() === right.toLowerCase() : left === right
 }
 
 function progressMessage(phase: PublishPhase): string {
@@ -462,6 +464,254 @@ export class Publisher {
     )
   }
 
+  async #confirmRemote(
+    workspace: string,
+    commit: string,
+    tree: string,
+    signal: AbortSignal,
+  ): Promise<void> {
+    await this.#git(
+      workspace,
+      ["fetch", "--no-tags", "origin", "main"],
+      signal,
+      "PUSH_FAILED",
+      "The uploaded publication could not be confirmed.",
+    )
+    const remoteCommit = (
+      await this.#git(
+        workspace,
+        ["rev-parse", "--verify", "refs/remotes/origin/main"],
+        signal,
+        "PUSH_FAILED",
+        "The uploaded publication could not be confirmed.",
+      )
+    ).stdout.trim()
+    const remoteTree = (
+      await this.#git(
+        workspace,
+        ["rev-parse", "--verify", "refs/remotes/origin/main^{tree}"],
+        signal,
+        "PUSH_FAILED",
+        "The uploaded publication tree could not be confirmed.",
+      )
+    ).stdout.trim()
+    if (remoteCommit !== commit || remoteTree !== tree) {
+      throw error("PUSH_FAILED", "The uploaded publication differs from the verified version.")
+    }
+  }
+
+  async #realIndexPaths(
+    workspace: string,
+    signal: AbortSignal,
+  ): Promise<{ readonly index: string; readonly lock: string }> {
+    const rawGitDirectory = (
+      await this.#git(
+        workspace,
+        ["rev-parse", "--absolute-git-dir"],
+        signal,
+        "REF_UPDATE_FAILED",
+        "The Git metadata folder could not be resolved safely.",
+      )
+    ).stdout.trim()
+    const rawIndex = (
+      await this.#git(
+        workspace,
+        ["rev-parse", "--git-path", "index"],
+        signal,
+        "REF_UPDATE_FAILED",
+        "The Git index path could not be resolved safely.",
+      )
+    ).stdout.trim()
+    if (!rawGitDirectory || !rawIndex || /[\0\r\n]/.test(rawGitDirectory + rawIndex)) {
+      throw error("REF_UPDATE_FAILED", "Git returned an unsafe index path.")
+    }
+    let gitDirectory: string
+    let index: string
+    try {
+      gitDirectory = await realpath(resolve(rawGitDirectory))
+      const candidate = isAbsolute(rawIndex) ? resolve(rawIndex) : resolve(workspace, rawIndex)
+      const parent = await realpath(dirname(candidate))
+      const details = await lstat(candidate)
+      index = await realpath(candidate)
+      if (
+        !details.isFile() ||
+        details.isSymbolicLink() ||
+        !isInside(gitDirectory, parent) ||
+        !isInside(gitDirectory, index)
+      ) {
+        throw new Error("unsafe index")
+      }
+    } catch {
+      throw error("REF_UPDATE_FAILED", "The Git index path is unsafe.")
+    }
+    return { index, lock: `${index}.lock` }
+  }
+
+  async #recoverRefAfterInstallFailure(
+    workspace: string,
+    oldHead: string,
+    commit: string,
+    tree: string,
+  ): Promise<void> {
+    const recovery = new AbortController()
+    const timer = setTimeout(
+      () => recovery.abort(error("REF_UPDATE_FAILED", "Publication recovery timed out.")),
+      10_000,
+    )
+    try {
+      const current = (
+        await this.#git(
+          workspace,
+          ["rev-parse", "--verify", "refs/heads/main"],
+          recovery.signal,
+          "REF_UPDATE_FAILED",
+          "The publication ref could not be inspected during recovery.",
+        )
+      ).stdout.trim()
+      if (current === oldHead) {
+        this.#pendingPush = undefined
+        return
+      }
+      if (current !== commit) {
+        this.#terminationUncertain = true
+        throw error("REF_UPDATE_FAILED", "The main branch changed during publication recovery.")
+      }
+      this.#pendingPush = { commit, tree }
+      await this.#git(
+        workspace,
+        ["update-ref", "refs/heads/main", oldHead, commit],
+        recovery.signal,
+        "REF_UPDATE_FAILED",
+        "The publication ref could not be restored safely.",
+      )
+      this.#pendingPush = undefined
+    } catch (caught) {
+      this.#terminationUncertain = true
+      throw caught
+    } finally {
+      clearTimeout(timer)
+    }
+  }
+
+  async #installVerifiedRefAndIndex(options: {
+    readonly workspace: string
+    readonly temporaryIndex: string
+    readonly oldHead: string
+    readonly commit: string
+    readonly tree: string
+    readonly callerSignal: AbortSignal
+  }): Promise<void> {
+    if (options.callerSignal.aborted) throw options.callerSignal.reason
+    const paths = await this.#realIndexPaths(options.workspace, options.callerSignal)
+    let lock: Awaited<ReturnType<typeof open>>
+    try {
+      lock = await open(paths.lock, "wx", 0o600)
+    } catch (caught) {
+      if ((caught as NodeJS.ErrnoException).code === "EEXIST") {
+        throw error("INDEX_LOCKED", "Another Git operation is updating the publication index.")
+      }
+      throw error("REF_UPDATE_FAILED", "The Git index could not be locked safely.")
+    }
+    let ownsLock = true
+    let lockOpen = true
+    let refMayHaveAdvanced = false
+    const critical = new AbortController()
+    const criticalTimer = setTimeout(
+      () =>
+        critical.abort(error("REF_UPDATE_FAILED", "Publication installation timed out safely.")),
+      Math.max(1, this.dependencies.criticalSectionTimeoutMs ?? 10_000),
+    )
+    try {
+      const staged = await this.#git(
+        options.workspace,
+        ["diff", "--cached", "--quiet", "--exit-code"],
+        critical.signal,
+        "REF_UPDATE_FAILED",
+        "The prepared Git state could not be rechecked safely.",
+        { acceptedExitCodes: [0, 1] },
+      )
+      if (staged.exitCode !== 0) {
+        throw error("STAGED_CHANGES", "Other prepared changes appeared during publication.")
+      }
+      refMayHaveAdvanced = true
+      await this.#git(
+        options.workspace,
+        ["update-ref", "refs/heads/main", options.commit, options.oldHead],
+        critical.signal,
+        "REF_UPDATE_FAILED",
+        "The verified publication version could not be installed.",
+      )
+      this.#pendingPush = { commit: options.commit, tree: options.tree }
+
+      const indexDetails = await stat(options.temporaryIndex)
+      if (
+        !indexDetails.isFile() ||
+        indexDetails.size <= 0 ||
+        indexDetails.size > MAX_GIT_INDEX_BYTES
+      ) {
+        throw error("REF_UPDATE_FAILED", "The verified temporary index is invalid.")
+      }
+      const verifiedIndex = await readFile(options.temporaryIndex)
+      if (critical.signal.aborted) throw critical.signal.reason
+      await lock.writeFile(verifiedIndex)
+      await lock.sync()
+      await lock.close()
+      lockOpen = false
+      await rename(paths.lock, paths.index)
+      ownsLock = false
+
+      const installedTree = (
+        await this.#git(
+          options.workspace,
+          ["rev-parse", "--verify", "refs/heads/main^{tree}"],
+          critical.signal,
+          "REF_UPDATE_FAILED",
+          "The installed publication tree could not be confirmed.",
+        )
+      ).stdout.trim()
+      if (installedTree !== options.tree) {
+        this.#terminationUncertain = true
+        throw error("TREE_INVALID", "The installed tree differs from the verified tree.")
+      }
+    } catch (caught) {
+      if (!ownsLock) this.#terminationUncertain = true
+      if (refMayHaveAdvanced && this.#pendingPush?.commit !== options.commit) {
+        this.#pendingPush = { commit: options.commit, tree: options.tree }
+      }
+      if (refMayHaveAdvanced && ownsLock) {
+        try {
+          await this.#recoverRefAfterInstallFailure(
+            options.workspace,
+            options.oldHead,
+            options.commit,
+            options.tree,
+          )
+        } catch {
+          // Recovery marks the service fail-closed and retains any installed ref state.
+        }
+      }
+      throw caught
+    } finally {
+      clearTimeout(criticalTimer)
+      if (ownsLock) {
+        let lockCleanupFailed = false
+        if (lockOpen) {
+          await lock.close().catch(() => {
+            lockCleanupFailed = true
+          })
+        }
+        await unlink(paths.lock).catch(() => {
+          lockCleanupFailed = true
+        })
+        if (lockCleanupFailed) {
+          this.#terminationUncertain = true
+          throw error("CLEANUP_FAILED", "The Git index lock could not be released safely.")
+        }
+      }
+    }
+    if (options.callerSignal.aborted) throw options.callerSignal.reason
+  }
+
   async #workspace(signal: AbortSignal): Promise<string> {
     let workspace: string
     try {
@@ -492,19 +742,64 @@ export class Publisher {
     return workspace
   }
 
-  async #assertRuntime(signal: AbortSignal): Promise<void> {
+  async #assertRuntime(workspace: string, signal: AbortSignal): Promise<void> {
     const runtime = this.dependencies.runtime
+    const declaredRoot = resolve(runtime.root)
+    const expectedNode = resolve(declaredRoot, "node.exe")
+    const expectedNpm = resolve(declaredRoot, "node_modules", "npm", "bin", "npm-cli.js")
+    const expectedModules = resolve(workspace, "node_modules")
     if (
-      !(await safeRuntimeFile(runtime.nodeExecutable)) ||
-      !(await safeRuntimeFile(runtime.npmCliPath)) ||
-      !(await safeRuntimeDirectory(runtime.nodeModules))
+      !pathsEqual(resolve(runtime.nodeExecutable), expectedNode) ||
+      !pathsEqual(resolve(runtime.npmCliPath), expectedNpm) ||
+      !pathsEqual(resolve(runtime.nodeModules), expectedModules)
     ) {
+      throw error("RUNTIME_MISSING", "The bundled publication runtime is unavailable.")
+    }
+    try {
+      const rootDetails = await lstat(declaredRoot)
+      const modulesDetails = await lstat(expectedModules)
+      if (
+        !rootDetails.isDirectory() ||
+        rootDetails.isSymbolicLink() ||
+        !modulesDetails.isDirectory() ||
+        modulesDetails.isSymbolicLink()
+      ) {
+        throw new Error("linked runtime root")
+      }
+      const canonicalRoot = await realpath(declaredRoot)
+      const canonicalModules = await realpath(expectedModules)
+      if (
+        !pathsEqual(canonicalRoot, declaredRoot) ||
+        !pathsEqual(canonicalModules, expectedModules)
+      ) {
+        throw new Error("aliased runtime root")
+      }
+      for (const path of [
+        expectedNode,
+        resolve(declaredRoot, "node_modules"),
+        resolve(declaredRoot, "node_modules", "npm"),
+        resolve(declaredRoot, "node_modules", "npm", "bin"),
+        expectedNpm,
+      ]) {
+        const details = await lstat(path)
+        if (details.isSymbolicLink()) throw new Error("linked runtime component")
+        if (path === expectedNode || path === expectedNpm) {
+          if (!details.isFile()) throw new Error("runtime component is not a file")
+        } else if (!details.isDirectory()) {
+          throw new Error("runtime component is not a directory")
+        }
+        const canonical = await realpath(path)
+        if (!isInside(canonicalRoot, canonical) || !pathsEqual(canonical, resolve(path))) {
+          throw new Error("runtime component escaped bundle root")
+        }
+      }
+    } catch {
       throw error("RUNTIME_MISSING", "The bundled publication runtime is unavailable.")
     }
     const request: VerifySiteRequest = {
       executable: runtime.nodeExecutable,
       args: [runtime.npmCliPath, "ls", "--all", "--json", "--ignore-scripts"],
-      cwd: this.dependencies.workspace,
+      cwd: workspace,
       signal,
     }
     let valid = false
@@ -631,7 +926,7 @@ export class Publisher {
     } catch (caught) {
       if ((caught as NodeJS.ErrnoException).code !== "ENOENT") cleanupFailure = true
     }
-    if (cleanupFailure && !signal.aborted) {
+    if (cleanupFailure) {
       throw error("CLEANUP_FAILED", "Temporary publication files could not be removed safely.")
     }
   }
@@ -641,7 +936,7 @@ export class Publisher {
     const message = safeMessage(selection.message)
     this.#emit("preflight-fetch")
     const workspace = await this.#workspace(signal)
-    await this.#assertRuntime(signal)
+    await this.#assertRuntime(workspace, signal)
 
     const branchResult = await this.#git(
       workspace,
@@ -870,75 +1165,24 @@ export class Publisher {
       ).stdout.trim()
       if (currentBranch !== "main")
         throw error("REF_CHANGED", "The current branch changed during publication.")
-      const stagedAgain = await this.#git(
+      await this.#installVerifiedRefAndIndex({
         workspace,
-        ["diff", "--cached", "--quiet", "--exit-code"],
-        signal,
-        "REF_CHANGED",
-        "The prepared Git state changed during publication.",
-        { acceptedExitCodes: [0, 1] },
-      )
-      if (stagedAgain.exitCode !== 0) {
-        throw error("STAGED_CHANGES", "Other prepared changes appeared during publication.")
-      }
-      await this.#git(
-        workspace,
-        ["update-ref", "refs/heads/main", commit, oldHead],
-        signal,
-        "REF_UPDATE_FAILED",
-        "The verified publication version could not be installed.",
-      )
-      try {
-        await this.#git(
-          workspace,
-          ["read-tree", commit],
-          signal,
-          "REF_UPDATE_FAILED",
-          "The Git index could not be synchronized with the verified version.",
-        )
-      } catch (caught) {
-        await this.#git(
-          workspace,
-          ["update-ref", "refs/heads/main", oldHead, commit],
-          signal,
-          "REF_UPDATE_FAILED",
-          "The publication ref could not be restored safely.",
-        )
-        throw caught
-      }
-      const finalTree = (
-        await this.#git(
-          workspace,
-          ["rev-parse", "HEAD^{tree}"],
-          signal,
-          "TREE_INVALID",
-          "The installed publication tree could not be confirmed.",
-        )
-      ).stdout.trim()
-      if (finalTree !== tree)
-        throw error("TREE_INVALID", "The installed tree differs from the verified tree.")
-      this.#pendingPush = { commit, tree }
+        temporaryIndex: operationPaths.index,
+        oldHead,
+        commit,
+        tree,
+        callerSignal: signal,
+      })
 
       this.#emit("push")
       await this.#git(
         workspace,
-        ["push", "origin", "HEAD:refs/heads/main"],
+        ["push", "origin", `${commit}:refs/heads/main`],
         signal,
         "PUSH_FAILED",
         "Could not upload the verified publication. The local version was kept for retry.",
       )
-      const remote = (
-        await this.#git(
-          workspace,
-          ["rev-parse", "refs/remotes/origin/main"],
-          signal,
-          "PUSH_FAILED",
-          "The uploaded publication could not be confirmed.",
-        )
-      ).stdout.trim()
-      if (remote !== commit) {
-        throw error("PUSH_FAILED", "The uploaded publication could not be confirmed.")
-      }
+      await this.#confirmRemote(workspace, commit, tree, signal)
       this.#pendingPush = undefined
       return { commit, tree, pushed: true }
     } catch (caught) {
@@ -1035,16 +1279,16 @@ export class Publisher {
           "REMOTE_UNAVAILABLE",
           "The remote publication branch could not be refreshed.",
         )
-        const head = (
+        const retainedMain = (
           await this.#git(
             workspace,
-            ["rev-parse", "HEAD"],
+            ["rev-parse", "--verify", "refs/heads/main"],
             controller.signal,
             "REF_CHANGED",
             "The retained publication version is unavailable.",
           )
         ).stdout.trim()
-        if (head !== pending.commit)
+        if (retainedMain !== pending.commit)
           throw error("REF_CHANGED", "The retained publication version changed.")
         const ancestry = await this.#git(
           workspace,
@@ -1059,11 +1303,12 @@ export class Publisher {
         this.#emit("push")
         await this.#git(
           workspace,
-          ["push", "origin", "HEAD:refs/heads/main"],
+          ["push", "origin", `${pending.commit}:refs/heads/main`],
           controller.signal,
           "PUSH_FAILED",
           "Could not upload the retained publication.",
         )
+        await this.#confirmRemote(workspace, pending.commit, pending.tree, controller.signal)
         this.#pendingPush = undefined
         this.#emit("complete")
         return { ...pending, pushed: true }
