@@ -2,8 +2,11 @@ import { lstat, realpath, stat } from "node:fs/promises"
 import { isAbsolute, relative, resolve } from "node:path"
 import {
   type WorkspaceCapabilities,
+  type AppError,
   type WorkspaceInspection,
-  type WorkspaceIssue
+  type WorkspaceIssue,
+  type WorkspaceRepairReceipt,
+  type WorkspaceRepairRequest,
 } from "../../shared/contracts"
 import {
   type CommandResult,
@@ -14,6 +17,20 @@ import {
 export interface InspectWorkspaceOptions {
   readonly checkGit: boolean
   readonly runner?: CommandRunner
+  readonly runtime?: BundledNpmRuntime
+  readonly checkRemote?: boolean
+  readonly online?: () => boolean | Promise<boolean>
+  readonly previewPortAvailable?: () => Promise<boolean>
+}
+
+export interface BundledNpmRuntime {
+  readonly nodePath: string
+  readonly npmCliPath: string
+}
+
+export interface RepairWorkspaceOptions {
+  readonly runner?: CommandRunner
+  readonly runtime: BundledNpmRuntime
 }
 
 interface RequiredPath {
@@ -78,8 +95,18 @@ const requiredPaths: readonly RequiredPath[] = [
   }
 ]
 
-function issue(code: WorkspaceIssue["code"], message: string, path?: string): WorkspaceIssue {
-  return path === undefined ? { code, message } : { code, message, path }
+function issue(
+  code: WorkspaceIssue["code"],
+  message: string,
+  path?: string,
+  repair?: WorkspaceIssue["repair"],
+): WorkspaceIssue {
+  return {
+    code,
+    message,
+    ...(path === undefined ? {} : { path }),
+    ...(repair === undefined ? {} : { repair }),
+  } as WorkspaceIssue
 }
 
 function errorCode(error: unknown): string | undefined {
@@ -153,7 +180,16 @@ function didSucceed(result: CommandResult): boolean {
   return result.exitCode === 0
 }
 
-async function inspectGit(root: string, runner: CommandRunner): Promise<WorkspaceIssue[]> {
+function isCredentialFailure(stderr: string): boolean {
+  return /authenticat|credential|permission denied|could not read username|terminal prompts disabled/i.test(stderr)
+}
+
+async function inspectGit(
+  root: string,
+  runner: CommandRunner,
+  checkRemote: boolean,
+  online: () => boolean | Promise<boolean>,
+): Promise<WorkspaceIssue[]> {
   const issues: WorkspaceIssue[] = []
   let topLevel: CommandResult
   try {
@@ -204,6 +240,30 @@ async function inspectGit(root: string, runner: CommandRunner): Promise<Workspac
     }
     if (!didSucceed(origin) || origin.stdout.trim() === "") {
       issues.push(issue("GIT_ORIGIN_FAILED", "Could not read the origin remote. Check the repository configuration."))
+    } else if (checkRemote && (await Promise.resolve().then(online).catch(() => false))) {
+      let fetch: CommandResult
+      try {
+        fetch = await runner.run({
+          executable: "git",
+          args: ["ls-remote", "--exit-code", "origin", "refs/heads/main"],
+          cwd: root,
+          env: {
+            ...readOnlyGitEnv,
+            GIT_TERMINAL_PROMPT: "0",
+            GCM_INTERACTIVE: "Never",
+          },
+        })
+      } catch {
+        issues.push(issue("GIT_ORIGIN_UNREACHABLE", "Could not safely read origin/main."))
+        fetch = { exitCode: 0, stdout: "", stderr: "" }
+      }
+      if (!didSucceed(fetch)) {
+        issues.push(
+          isCredentialFailure(fetch.stderr)
+            ? issue("GIT_FETCH_AUTH_FAILED", "Git credentials could not read origin/main.")
+            : issue("GIT_ORIGIN_UNREACHABLE", "origin/main is not reachable right now."),
+        )
+      }
     }
   }
 
@@ -224,6 +284,39 @@ async function inspectGit(root: string, runner: CommandRunner): Promise<Workspac
   return issues
 }
 
+async function inspectDependencies(
+  root: string,
+  runtime: BundledNpmRuntime,
+  runner: CommandRunner,
+): Promise<WorkspaceIssue[]> {
+  try {
+    const result = await runner.run({
+      executable: runtime.nodePath,
+      args: [runtime.npmCliPath, "ls", "--all", "--ignore-scripts", "--json"],
+      cwd: root,
+      env: { npm_config_audit: "false", npm_config_fund: "false" },
+    })
+    if (didSucceed(result)) return []
+    return [
+      issue(
+        "DEPENDENCIES_MISSING",
+        "Repository dependencies are missing or incomplete.",
+        undefined,
+        "install-dependencies",
+      ),
+    ]
+  } catch {
+    return [
+      issue(
+        "DEPENDENCIES_INVALID",
+        "The bundled runtime could not verify repository dependencies.",
+        undefined,
+        "install-dependencies",
+      ),
+    ]
+  }
+}
+
 export async function inspectWorkspace(
   rootPath: string,
   options: InspectWorkspaceOptions
@@ -236,19 +329,77 @@ export async function inspectWorkspace(
   }
   const files = issues.length === 0
   const gitIssues = options.checkGit && workspaceRoot.issues.length === 0
-    ? await inspectGit(root, options.runner ?? systemCommandRunner)
+    ? await inspectGit(
+        root,
+        options.runner ?? systemCommandRunner,
+        options.checkRemote ?? false,
+        options.online ?? (() => true),
+      )
     : []
   issues.push(...gitIssues)
+  const dependencyIssues =
+    options.runtime && workspaceRoot.issues.length === 0 && issues.every((item) => item.code !== "PACKAGE_LOCK_MISSING")
+      ? await inspectDependencies(root, options.runtime, options.runner ?? systemCommandRunner)
+      : []
+  issues.push(...dependencyIssues)
+  if (options.previewPortAvailable && workspaceRoot.issues.length === 0) {
+    let available = false
+    try {
+      available = await options.previewPortAvailable()
+    } catch {
+      available = false
+    }
+    if (!available) {
+      issues.push(issue("PREVIEW_PORT_UNAVAILABLE", "The local preview port is already in use."))
+    }
+  }
   const git = options.checkGit && workspaceRoot.issues.length === 0 && gitIssues.length === 0
+  const dependencies = dependencyIssues.length === 0
+  const previewPort = !issues.some((item) => item.code === "PREVIEW_PORT_UNAVAILABLE")
   const capabilities: WorkspaceCapabilities = {
     files,
-    preview: files,
+    preview: files && dependencies && previewPort,
     git,
-    publish: files && git
+    publish: files && dependencies && git
   }
 
   if (issues.length === 0) {
     return { ok: true, root, capabilities, issues: [] }
   }
   return { ok: false, root, capabilities, issues }
+}
+
+/** The only automatic first-run repair: an explicit npm ci through the bundled runtime. */
+export async function repairWorkspace(
+  rootPath: string,
+  request: WorkspaceRepairRequest,
+  options: RepairWorkspaceOptions,
+): Promise<WorkspaceRepairReceipt> {
+  if (request.action !== "install-dependencies") {
+    throw { code: "INVALID_INPUT", message: "This repair action is not supported." } satisfies AppError
+  }
+  const workspace = await canonicalWorkspaceRoot(rootPath)
+  if (workspace.issues.length > 0) throw workspace.issues[0]
+  const lockPath = resolve(workspace.root, "package-lock.json")
+  try {
+    const lock = await lstat(lockPath)
+    if (lock.isSymbolicLink() || !lock.isFile()) throw new Error("unsafe lock")
+  } catch {
+    throw issue("REPAIR_FAILED", "Restore package-lock.json before installing dependencies.")
+  }
+  let result: CommandResult
+  try {
+    result = await (options.runner ?? systemCommandRunner).run({
+      executable: options.runtime.nodePath,
+      args: [options.runtime.npmCliPath, "ci", "--no-audit", "--no-fund"],
+      cwd: workspace.root,
+      env: { npm_config_audit: "false", npm_config_fund: "false" },
+    })
+  } catch {
+    throw issue("REPAIR_FAILED", "The bundled npm runtime could not start dependency repair.")
+  }
+  if (!didSucceed(result)) {
+    throw issue("REPAIR_FAILED", "npm ci could not install the repository dependencies.")
+  }
+  return { action: request.action, message: "Repository dependencies were installed." }
 }

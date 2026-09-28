@@ -43,6 +43,20 @@ async function allocatePort(request: PortRequest): Promise<number> {
   throw new Error("No loopback port available")
 }
 
+export async function isPreviewPortAvailable(port = 8080): Promise<boolean> {
+  return new Promise((resolve) => {
+    const server = createServer()
+    const finish = (available: boolean): void => {
+      server.removeAllListeners()
+      resolve(available)
+    }
+    server.once("error", () => finish(false))
+    server.listen({ host: "127.0.0.1", port, exclusive: true }, () => {
+      server.close((error) => finish(!error))
+    })
+  })
+}
+
 function probeTcp(port: number, signal: AbortSignal): Promise<boolean> {
   if (signal.aborted) return Promise.resolve(false)
   return new Promise((resolve) => {

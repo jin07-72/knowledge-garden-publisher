@@ -30,7 +30,13 @@ export const APP_ERROR_CODES = [
   "GIT_ROOT_MISMATCH",
   "GIT_ORIGIN_MISSING",
   "GIT_ORIGIN_FAILED",
+  "GIT_ORIGIN_UNREACHABLE",
+  "GIT_FETCH_AUTH_FAILED",
   "GIT_STATUS_FAILED",
+  "DEPENDENCIES_MISSING",
+  "DEPENDENCIES_INVALID",
+  "PREVIEW_PORT_UNAVAILABLE",
+  "REPAIR_FAILED",
   "CHANGE_SCAN_INVALID",
   "CHANGE_SCAN_LIMIT",
   "CHANGE_SCAN_CANCELLED",
@@ -130,6 +136,18 @@ export type WorkspaceIssue = Exclude<
   NoteIndexError | NoteFileError | PreviewError | BridgeError | ChangeScanError
 > & {
   readonly path?: string
+  readonly repair?: WorkspaceRepairAction
+}
+
+export type WorkspaceRepairAction = "install-dependencies"
+
+export interface WorkspaceRepairRequest {
+  readonly action: WorkspaceRepairAction
+}
+
+export interface WorkspaceRepairReceipt {
+  readonly action: WorkspaceRepairAction
+  readonly message: string
 }
 
 export interface WorkspaceCapabilities {
@@ -244,6 +262,7 @@ export interface PreviewStatus {
 export const IPC_CHANNELS = {
   requests: {
     workspaceInspect: "garden:workspace:inspect",
+    workspaceRepair: "garden:workspace:repair",
     notesList: "garden:notes:list",
     notesRead: "garden:notes:read",
     notesSave: "garden:notes:save",
@@ -404,6 +423,7 @@ export interface GardenApi {
   }
   readonly workspace: {
     inspect(): Promise<IpcResult<WorkspaceInspection>>
+    repair(request: WorkspaceRepairRequest): Promise<IpcResult<WorkspaceRepairReceipt>>
   }
   readonly notes: {
     list(): Promise<IpcResult<readonly NoteSummary[]>>

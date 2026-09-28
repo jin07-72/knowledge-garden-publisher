@@ -1,4 +1,5 @@
-import { app, BrowserWindow, ipcMain, shell } from "electron"
+import { app, BrowserWindow, ipcMain, net, shell } from "electron"
+import { existsSync } from "node:fs"
 import { join } from "node:path"
 import { randomUUID } from "node:crypto"
 import { DEFAULT_GARDEN_PATH, IPC_CHANNELS } from "../shared/contracts"
@@ -19,6 +20,8 @@ import {
 } from "./rendererTrust"
 import type { PreviewManager } from "./services/preview"
 import { createProductionPreviewManager } from "./services/previewRuntime"
+import { isPreviewPortAvailable } from "./services/previewRuntime"
+import { createElectronTrashAdapter } from "./services/trash"
 
 let mainWindow: BrowserWindow | undefined
 let mainWindowTrust: RendererTrustPolicy | undefined
@@ -147,13 +150,23 @@ app.whenReady().then(() => {
   const runtimePath = app.isPackaged
     ? join(process.resourcesPath, "node", "node.exe")
     : join(app.getAppPath(), "vendor", "node", "node.exe")
+  const npmCliPath = app.isPackaged
+    ? join(process.resourcesPath, "node", "node_modules", "npm", "bin", "npm-cli.js")
+    : join(app.getAppPath(), "vendor", "node", "node_modules", "npm", "bin", "npm-cli.js")
+  const bundledRuntime =
+    app.isPackaged || (existsSync(runtimePath) && existsSync(npmCliPath))
+      ? { nodePath: runtimePath, npmCliPath }
+      : undefined
   previewManager = createProductionPreviewManager(runtimePath)
   publisherServices = createPublisherServices({
     workspace: DEFAULT_GARDEN_PATH,
-    trash: { trashItem: (absolutePath) => shell.trashItem(absolutePath) },
+    trash: createElectronTrashAdapter(shell),
     isTracked,
     preview: previewManager,
     openExternal: (url) => shell.openExternal(url),
+    ...(bundledRuntime ? { runtime: bundledRuntime } : {}),
+    previewPortAvailable: () => isPreviewPortAvailable(8080),
+    online: () => net.isOnline(),
   })
   unregisterIpc = registerPublisherIpc({
     ipcMain,

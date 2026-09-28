@@ -8,15 +8,15 @@ import {
   planVisibilityChange,
   readNote,
   saveNote,
-  trashNote,
 } from "./services/noteFiles"
+import { trashManagedNote } from "./services/trash"
 import {
   discardEditorRecovery,
   getEditorRecovery,
   writeEditorRecovery,
 } from "./services/editorRecovery"
 import { scanNotes } from "./services/noteIndex"
-import { inspectWorkspace } from "./services/workspace"
+import { inspectWorkspace, repairWorkspace, type BundledNpmRuntime } from "./services/workspace"
 import { createChangeScanner, type ChangeScanner } from "./services/changes"
 import {
   createDeploymentHistoryService,
@@ -42,6 +42,9 @@ export interface PublisherServiceDependencies {
     Partial<Pick<ChangeScanner, "dispose">>
   readonly deploymentHistory?: DeploymentHistoryService
   readonly openExternal?: (url: string) => Promise<void>
+  readonly runtime?: BundledNpmRuntime
+  readonly previewPortAvailable?: () => Promise<boolean>
+  readonly online?: () => boolean | Promise<boolean>
 }
 
 export type PublisherRuntimeServices = PublisherIpcServices & { dispose(): Promise<void> }
@@ -68,7 +71,18 @@ export function createPublisherServices(
       ])
     },
     workspace: {
-      inspect: () => inspectWorkspace(workspace, { checkGit: true }),
+      inspect: () =>
+        inspectWorkspace(workspace, {
+          checkGit: true,
+          checkRemote: dependencies.runtime !== undefined,
+          online: dependencies.online,
+          runtime: dependencies.runtime,
+          previewPortAvailable: dependencies.previewPortAvailable,
+        }),
+      repair: (request) => {
+        if (!dependencies.runtime) return reject("Dependency repair")
+        return repairWorkspace(workspace, request, { runtime: dependencies.runtime })
+      },
     },
     notes: {
       list: () => scanNotes(workspace),
@@ -83,7 +97,7 @@ export function createPublisherServices(
         const plan = await planVisibilityChange({ workspace, ...request })
         return executeVisibilityChange(plan, { workspace, transactionTrash: trash })
       },
-      trash: (request) => trashNote({ workspace, trash, isTracked, ...request }),
+      trash: (request) => trashManagedNote({ workspace, trash, isTracked, ...request }),
       recovery: {
         get: (request) => getEditorRecovery(workspace, request),
         write: (request) => writeEditorRecovery(workspace, request),

@@ -1,5 +1,5 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from "react"
-import { BookOpen, Check, Eye, GitBranch, LoaderCircle, TriangleAlert } from "lucide-react"
+import { BookOpen, Check, Eye, GitBranch, LoaderCircle, Trash2, TriangleAlert } from "lucide-react"
 import type {
   AppError,
   ChangeReview,
@@ -7,9 +7,12 @@ import type {
   NoteCreateRequest,
   NoteDocument,
   NoteSummary,
+  NoteTrashReceipt,
   PreviewStatus,
   PublishProgress,
   Visibility,
+  WorkspaceInspection,
+  WorkspaceRepairAction,
 } from "../../shared/contracts"
 import { NoteSidebar } from "./components/NoteSidebar"
 import { ModalShell } from "./components/ModalShell"
@@ -18,6 +21,8 @@ import { PreviewPane } from "./components/PreviewPane"
 import { VisibilityMenu } from "./components/VisibilityMenu"
 import { PublishReview } from "./components/PublishReview"
 import type { HistorySnapshot } from "./components/HistoryView"
+import { FirstRun } from "./components/FirstRun"
+import { DeleteNoteDialog } from "./components/DeleteNoteDialog"
 import "./app.css"
 
 type LoadState = "loading" | "ready" | "error"
@@ -145,7 +150,7 @@ function PaneSeparator({
   )
 }
 
-function PublisherApp({ api }: { readonly api: GardenApi }): React.JSX.Element {
+export function PublisherApp({ api }: { readonly api: GardenApi }): React.JSX.Element {
   const [notes, setNotes] = useState<readonly NoteSummary[]>([])
   const [selectedPath, setSelectedPath] = useState<string>()
   const [document, setDocument] = useState<NoteDocument>()
@@ -175,6 +180,8 @@ function PublisherApp({ api }: { readonly api: GardenApi }): React.JSX.Element {
     path: string
     messages: readonly string[]
   }>()
+  const [pendingDelete, setPendingDelete] = useState<NoteSummary>()
+  const [trashNotice, setTrashNotice] = useState<string>()
   const [workspaceWidth, setWorkspaceWidth] = useState(window.innerWidth || 1440)
   const initialPaneSizes = useRef(storedPaneSizes(workspaceWidth))
   const [paneSizes, setPaneSizes] = useState(initialPaneSizes.current ?? DEFAULT_PANE_SIZES)
@@ -303,7 +310,7 @@ function PublisherApp({ api }: { readonly api: GardenApi }): React.JSX.Element {
 
   const startPreview = useCallback(() => {
     if (!previewStart.current) {
-      previewStart.current = api.preview.start().finally(() => {
+      previewStart.current = api.preview.start({ preferredPort: 8080 }).finally(() => {
         previewStart.current = undefined
       })
     }
@@ -543,6 +550,28 @@ function PublisherApp({ api }: { readonly api: GardenApi }): React.JSX.Element {
     void changeVisibility(note, visibility)
   }
 
+  const deleteNote = async (note: NoteSummary): Promise<NoteTrashReceipt> => {
+    if (note.path === selectedPath && !((await markdownEditor.current?.flush()) ?? true)) {
+      throw new Error("当前笔记保存失败，编辑内容已保留；未执行删除。")
+    }
+    const result = await api.notes.trash({ path: note.path })
+    if (!result.ok) throw new Error(messageFor(result.error, "无法将笔记移入回收站。"))
+    if (!appMounted.current) return result.value
+    setNotes((current) => current.filter((candidate) => candidate.path !== note.path))
+    if (selectedPath === note.path) {
+      setSelectedPath(undefined)
+      setDocument(undefined)
+      setDocumentError(undefined)
+    }
+    setTrashNotice(
+      result.value.pendingPublicDeletion
+        ? "笔记已移入回收站；已发布的在线副本仍会保留，直到再次发布下架变化。"
+        : "笔记及其专属附件已移入 Windows 回收站。",
+    )
+    void loadChanges()
+    return result.value
+  }
+
   const loadHistory = useCallback(async (requestId: string): Promise<HistorySnapshot> => {
     const [git, deployments] = await Promise.all([
       api.history.git({ limit: 20, requestId }),
@@ -597,6 +626,13 @@ function PublisherApp({ api }: { readonly api: GardenApi }): React.JSX.Element {
           <span>
             {visibilityError.title}：{visibilityError.message}
           </span>
+        </div>
+      ) : null}
+      {trashNotice ? (
+        <div className="global-alert" role="status">
+          <Trash2 size={16} aria-hidden="true" />
+          <span>{trashNotice}</span>
+          <button type="button" aria-label="关闭删除提示" onClick={() => setTrashNotice(undefined)}>×</button>
         </div>
       ) : null}
 
@@ -662,11 +698,21 @@ function PublisherApp({ api }: { readonly api: GardenApi }): React.JSX.Element {
               ) : null}
             </div>
             {selectedNote ? (
-              <VisibilityMenu
-                value={selectedNote.visibility}
-                disabled={visibilityBusy}
-                onChange={(value) => requestVisibility(selectedNote, value)}
-              />
+              <div className="editor-actions">
+                <VisibilityMenu
+                  value={selectedNote.visibility}
+                  disabled={visibilityBusy}
+                  onChange={(value) => requestVisibility(selectedNote, value)}
+                />
+                <button
+                  type="button"
+                  className="icon-button danger-icon-button"
+                  aria-label="删除当前笔记"
+                  onClick={() => setPendingDelete(selectedNote)}
+                >
+                  <Trash2 size={16} aria-hidden="true" />
+                </button>
+              </div>
             ) : null}
           </header>
           <div className="editor-placeholder" data-editor-document={document?.path ?? ""}>
@@ -825,7 +871,68 @@ function PublisherApp({ api }: { readonly api: GardenApi }): React.JSX.Element {
           </div>
         </ModalShell>
       ) : null}
+      {pendingDelete ? (
+        <DeleteNoteDialog
+          note={pendingDelete}
+          onClose={() => setPendingDelete(undefined)}
+          onDelete={() => deleteNote(pendingDelete)}
+        />
+      ) : null}
     </main>
+  )
+}
+
+function PublisherStartup({ api }: { readonly api: GardenApi }): React.JSX.Element {
+  const [inspection, setInspection] = useState<WorkspaceInspection>()
+  const [busy, setBusy] = useState(false)
+  const [error, setError] = useState<string>()
+  const mounted = useRef(true)
+  useEffect(() => {
+    mounted.current = true
+    return () => { mounted.current = false }
+  }, [])
+
+  const inspect = useCallback(async (): Promise<void> => {
+    setBusy(true)
+    setError(undefined)
+    try {
+      const result = await api.workspace.inspect()
+      if (!mounted.current) return
+      if (!result.ok) {
+        setError(messageFor(result.error, "无法完成启动检查。"))
+        setInspection(undefined)
+      } else {
+        setInspection(result.value)
+      }
+    } catch (failure) {
+      if (mounted.current) setError(failure instanceof Error ? failure.message : "无法完成启动检查。")
+    } finally {
+      if (mounted.current) setBusy(false)
+    }
+  }, [api])
+
+  useEffect(() => { void inspect() }, [inspect])
+  if (inspection?.ok) return <PublisherApp api={api} />
+  return (
+    <FirstRun
+      inspection={inspection}
+      busy={busy}
+      error={error}
+      onRetry={() => void inspect()}
+      onRepair={async (action: WorkspaceRepairAction) => {
+        setBusy(true)
+        setError(undefined)
+        try {
+          const result = await api.workspace.repair({ action })
+          if (!result.ok) throw new Error(messageFor(result.error, "无法修复仓库依赖。"))
+          await inspect()
+        } catch (failure) {
+          if (mounted.current) setError(failure instanceof Error ? failure.message : "无法修复仓库依赖。")
+        } finally {
+          if (mounted.current) setBusy(false)
+        }
+      }}
+    />
   )
 }
 
@@ -868,5 +975,5 @@ export function App(): React.JSX.Element {
       </main>
     )
   }
-  return <PublisherApp api={window.garden} />
+  return <PublisherStartup api={window.garden} />
 }

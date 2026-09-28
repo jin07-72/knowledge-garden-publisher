@@ -40,6 +40,11 @@ const validByChannel: Record<string, unknown> = {
     issues: [],
     ...privateField,
   },
+  [IPC_CHANNELS.requests.workspaceRepair]: {
+    action: "install-dependencies",
+    message: "Repository dependencies were installed.",
+    ...privateField,
+  },
   [IPC_CHANNELS.requests.notesList]: [note],
   [IPC_CHANNELS.requests.notesRead]: {
     path: "content/life/daily.md",

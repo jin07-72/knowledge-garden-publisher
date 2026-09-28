@@ -53,7 +53,7 @@ function services(): PublisherIpcServices & {
 
   return {
     calls,
-    workspace: { inspect: call("workspaceInspect") },
+    workspace: { inspect: call("workspaceInspect"), repair: call("workspaceRepair") },
     notes: {
       list: call("notesList"),
       read: call("notesRead"),
@@ -572,6 +572,7 @@ describe("preload garden API", () => {
     const ipc = new FakeIpcRenderer()
     const api = createGardenApi(ipc)
     await api.workspace.inspect()
+    await api.workspace.repair({ action: "install-dependencies" })
     await api.notes.list()
     await api.notes.read({ path: "content/life/a.md" })
     await api.notes.save({

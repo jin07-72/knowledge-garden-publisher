@@ -31,6 +31,8 @@ import {
   type PublishRequest,
   type PublishStartReceipt,
   type WorkspaceInspection,
+  type WorkspaceRepairReceipt,
+  type WorkspaceRepairRequest,
 } from "../shared/contracts"
 import {
   IPC_SUCCESS_SCHEMAS,
@@ -115,6 +117,8 @@ export function createGardenApi(ipc: IpcRendererPort): GardenApi {
   })
   const workspace = Object.freeze({
     inspect: () => invoke<WorkspaceInspection>(ipc, IPC_CHANNELS.requests.workspaceInspect),
+    repair: (request: WorkspaceRepairRequest) =>
+      invoke<WorkspaceRepairReceipt>(ipc, IPC_CHANNELS.requests.workspaceRepair, request),
   })
   const notes = Object.freeze({
     list: () => invoke<readonly NoteSummary[]>(ipc, IPC_CHANNELS.requests.notesList),

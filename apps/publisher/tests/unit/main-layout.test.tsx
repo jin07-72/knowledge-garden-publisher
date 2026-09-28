@@ -5,7 +5,7 @@ import { createHash } from "node:crypto"
 import { StrictMode } from "react"
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest"
 import { createPublisherCloseCoordinator } from "../../src/main/publisherServices"
-import { App } from "../../src/renderer/src/App"
+import { PublisherApp } from "../../src/renderer/src/App"
 import { shanghaiCalendarDate } from "../../src/renderer/src/components/NoteSidebar"
 import type {
   ChangeReview,
@@ -120,6 +120,7 @@ function createGardenMock(): GardenApi {
           issues: [],
         }),
       ),
+      repair: vi.fn(async () => ok({ action: "install-dependencies" as const, message: "installed" })),
     },
     notes: {
       list: vi.fn(async () => ok(notes)),
@@ -172,6 +173,7 @@ function createGardenMock(): GardenApi {
 
 describe("publisher main layout", () => {
   let garden: GardenApi
+  const App = (): React.JSX.Element => <PublisherApp api={garden} />
 
   beforeEach(() => {
     localStorage.clear()
@@ -858,6 +860,42 @@ describe("publisher main layout", () => {
     expect(within(editor).queryByRole("alert")).not.toBeInTheDocument()
     expect(screen.getByRole("button", { name: "可见性：公开" })).toBeVisible()
     expect(screen.getByText("content/technology/css-grid.md")).toBeVisible()
+  })
+
+  it("flushes the active editor before recycle-bin deletion and warns about the online copy", async () => {
+    const user = userEvent.setup()
+    const save = deferred<IpcResult<NoteWriteReceipt>>()
+    vi.mocked(garden.notes.save).mockReturnValueOnce(save.promise)
+    vi.mocked(garden.notes.trash).mockResolvedValueOnce(
+      ok({
+        path: notes[0].path,
+        pendingPublicDeletion: notes[0].path,
+        historyWarning: true,
+      }),
+    )
+    render(<App />)
+    const view = await waitFor(() =>
+      EditorView.findFromDOM(document.querySelector(".cm-content") as HTMLElement),
+    )
+    act(() => view!.dispatch({ changes: { from: view!.state.doc.length, insert: "\ndelete me" } }))
+
+    await user.click(screen.getByRole("button", { name: "删除当前笔记" }))
+    const dialog = screen.getByRole("dialog", { name: "将笔记移入回收站？" })
+    expect(dialog).toHaveTextContent("它仍会在线，直到你再次发布下架变化")
+    await user.click(within(dialog).getByRole("button", { name: "移入回收站" }))
+    await waitFor(() => expect(garden.notes.save).toHaveBeenCalledOnce())
+    expect(garden.notes.trash).not.toHaveBeenCalled()
+    save.resolve(
+      ok({
+        path: notes[0].path,
+        updatedAt: "2026-09-28T00:00:00.000Z",
+        mtimeMs: 3,
+        contentHash: markdownHash(view!.state.doc.toString()),
+      }),
+    )
+    await waitFor(() => expect(garden.notes.trash).toHaveBeenCalledWith({ path: notes[0].path }))
+    expect(await screen.findByText(/在线副本仍会保留/)).toBeVisible()
+    expect(screen.queryByText(notes[0].path)).not.toBeInTheDocument()
   })
 
   it("attributes a late visibility failure to its original note", async () => {

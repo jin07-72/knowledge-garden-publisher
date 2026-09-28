@@ -31,6 +31,8 @@ import {
   type PublishRequest,
   type PublishStartReceipt,
   type WorkspaceInspection,
+  type WorkspaceRepairReceipt,
+  type WorkspaceRepairRequest,
 } from "../shared/contracts"
 import {
   IPC_SUCCESS_SCHEMAS,
@@ -56,6 +58,7 @@ export interface IpcEventTarget {
 export interface PublisherIpcServices {
   readonly workspace: {
     inspect(): Promise<WorkspaceInspection>
+    repair(request: WorkspaceRepairRequest): Promise<WorkspaceRepairReceipt>
   }
   readonly notes: {
     list(): Promise<readonly NoteSummary[]>
@@ -113,6 +116,7 @@ function bestEffortCleanup(actions: readonly (() => void)[]): void {
 }
 
 const noRequestSchema = z.undefined()
+const workspaceRepairSchema = z.object({ action: z.literal("install-dependencies") }).strict()
 const notePathSchema = z.string().max(512).regex(MANAGED_NOTE_PATH_PATTERN)
 const notePathRequestSchema = z.object({ path: notePathSchema }).strict()
 const domainSchema = z.enum(["technology", "reading", "language", "life"])
@@ -276,6 +280,15 @@ export function registerPublisherIpc(options: RegisterPublisherIpcOptions): () =
       IPC_CHANNELS.requests.workspaceInspect,
       secureHandler(IPC_CHANNELS.requests.workspaceInspect, noRequestSchema, isTrustedSender, () =>
         services.workspace.inspect(),
+      ),
+    ],
+    [
+      IPC_CHANNELS.requests.workspaceRepair,
+      secureHandler(
+        IPC_CHANNELS.requests.workspaceRepair,
+        workspaceRepairSchema,
+        isTrustedSender,
+        (request) => services.workspace.repair(request),
       ),
     ],
     [

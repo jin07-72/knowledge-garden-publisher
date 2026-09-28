@@ -45,13 +45,15 @@ const workspaceIssueSchema = z
     message: z.string().min(1).max(1_000),
     details: z.unknown().optional(),
     path: pathSchema.optional(),
+    repair: z.literal("install-dependencies").optional(),
   })
   .strip()
-  .transform(({ code, message, path }) => {
+  .transform(({ code, message, path, repair }) => {
     return {
       code,
       message,
       ...(path === undefined ? {} : { path }),
+      ...(repair === undefined ? {} : { repair }),
     }
   })
 const workspaceInspectionSchema = z.discriminatedUnion("ok", [
@@ -72,6 +74,12 @@ const workspaceInspectionSchema = z.discriminatedUnion("ok", [
     })
     .strip(),
 ])
+const workspaceRepairReceiptSchema = z
+  .object({
+    action: z.literal("install-dependencies"),
+    message: z.string().min(1).max(1_000),
+  })
+  .strip()
 const noteSummarySchema = z
   .object({
     path: pathSchema,
@@ -222,6 +230,7 @@ type RequestChannel = (typeof IPC_CHANNELS.requests)[keyof typeof IPC_CHANNELS.r
 
 export const IPC_SUCCESS_SCHEMAS = {
   [IPC_CHANNELS.requests.workspaceInspect]: workspaceInspectionSchema,
+  [IPC_CHANNELS.requests.workspaceRepair]: workspaceRepairReceiptSchema,
   [IPC_CHANNELS.requests.notesList]: z.array(noteSummarySchema).max(100_000),
   [IPC_CHANNELS.requests.notesRead]: noteDocumentSchema,
   [IPC_CHANNELS.requests.notesSave]: noteWriteReceiptSchema,
