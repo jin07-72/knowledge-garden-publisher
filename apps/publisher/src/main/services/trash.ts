@@ -1,4 +1,5 @@
-import { lstat, realpath } from "node:fs/promises"
+import type { BigIntStats } from "node:fs"
+import { lstat, realpath, rename } from "node:fs/promises"
 import { isAbsolute, relative, resolve } from "node:path"
 import {
   MANAGED_NOTE_PATH_PATTERN,
@@ -8,6 +9,7 @@ import {
   type TrashAdapter,
 } from "../../shared/contracts"
 import { trashNote as trashVerifiedNote } from "./noteFiles"
+import { prepareTrashRecovery, restoreLocalTrashStage } from "./trashRecovery"
 
 export interface TrashManagedNoteInput {
   readonly workspace: string
@@ -29,8 +31,8 @@ function isInside(parent: string, child: string): boolean {
   return pathFromParent === "" || (!pathFromParent.startsWith("..") && !isAbsolute(pathFromParent))
 }
 
-function entryIdentity(details: Awaited<ReturnType<typeof lstat>>): string {
-  return `${details.dev}:${details.ino}`
+function entryIdentity(details: BigIntStats): string {
+  return `${details.dev}:${details.ino}:${details.birthtimeNs}`
 }
 
 async function ownedAttachmentDirectory(
@@ -41,6 +43,7 @@ async function ownedAttachmentDirectory(
   | { readonly kind: "ambiguous" }
   | {
       readonly kind: "owned"
+      readonly workspace: string
       readonly directory: string
       readonly assetsRoot: string
       readonly assetsIdentity: string
@@ -65,6 +68,22 @@ async function ownedAttachmentDirectory(
   if (!isInside(workspace, managedRoot) || !isInside(managedRoot, directory)) {
     throw noteError("NOTE_FILE_UNSAFE_PATH", "The attachment path left the managed workspace.")
   }
+  try {
+    const details = await lstat(directory)
+    if (details.isSymbolicLink() || !details.isDirectory()) {
+      throw noteError("NOTE_FILE_UNSAFE_PATH", "The owned attachment path is unsafe.")
+    }
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code === "ENOENT") return { kind: "not-found" }
+    if (
+      typeof error === "object" &&
+      error !== null &&
+      "code" in error &&
+      String(error.code).startsWith("NOTE_")
+    )
+      throw error
+    throw noteError("NOTE_FILE_ACCESS_FAILED", "Could not validate the owned attachments.")
+  }
   const identities: string[] = []
   for (const domain of NOTE_DOMAINS) {
     const candidate = resolve(managedRoot, domain, `${slug}.md`)
@@ -83,7 +102,7 @@ async function ownedAttachmentDirectory(
   }
   if (identities.length > 1) return { kind: "ambiguous" }
   try {
-    const rootDetails = await lstat(assetsRoot)
+    const rootDetails = await lstat(assetsRoot, { bigint: true })
     if (rootDetails.isSymbolicLink() || !rootDetails.isDirectory()) {
       throw noteError("NOTE_FILE_UNSAFE_PATH", "The managed attachment root is unsafe.")
     }
@@ -91,7 +110,7 @@ async function ownedAttachmentDirectory(
     if (!pathsEqual(canonicalAssets, assetsRoot) || !isInside(managedRoot, canonicalAssets)) {
       throw noteError("NOTE_FILE_UNSAFE_PATH", "The managed attachment root is unsafe.")
     }
-    const details = await lstat(directory)
+    const details = await lstat(directory, { bigint: true })
     if (details.isSymbolicLink() || !details.isDirectory()) {
       throw noteError("NOTE_FILE_UNSAFE_PATH", "The owned attachment path is unsafe.")
     }
@@ -101,6 +120,7 @@ async function ownedAttachmentDirectory(
     }
     return {
       kind: "owned",
+      workspace,
       directory,
       assetsRoot: canonicalAssets,
       assetsIdentity: entryIdentity(rootDetails),
@@ -108,7 +128,12 @@ async function ownedAttachmentDirectory(
     }
   } catch (error) {
     if ((error as NodeJS.ErrnoException).code === "ENOENT") return { kind: "not-found" }
-    if (typeof error === "object" && error !== null && "code" in error && String(error.code).startsWith("NOTE_")) {
+    if (
+      typeof error === "object" &&
+      error !== null &&
+      "code" in error &&
+      String(error.code).startsWith("NOTE_")
+    ) {
       throw error
     }
     throw noteError("NOTE_FILE_ACCESS_FAILED", "Could not validate the owned attachments.")
@@ -118,6 +143,7 @@ async function ownedAttachmentDirectory(
 async function trashOwnedAttachments(
   owned: {
     readonly kind: "owned"
+    readonly workspace: string
     readonly directory: string
     readonly assetsRoot: string
     readonly assetsIdentity: string
@@ -127,8 +153,8 @@ async function trashOwnedAttachments(
 ): Promise<NoteTrashReceipt["attachmentCleanup"]> {
   try {
     const [assets, directory, canonicalAssets, canonicalDirectory] = await Promise.all([
-      lstat(owned.assetsRoot),
-      lstat(owned.directory),
+      lstat(owned.assetsRoot, { bigint: true }),
+      lstat(owned.directory, { bigint: true }),
       realpath(owned.assetsRoot),
       realpath(owned.directory),
     ])
@@ -150,14 +176,35 @@ async function trashOwnedAttachments(
       message: "The note was recycled, but its attachments remain because their path changed.",
     }
   }
+  let stage: Awaited<ReturnType<typeof prepareTrashRecovery>>
   try {
+    stage = await prepareTrashRecovery(
+      owned.workspace,
+      owned.directory,
+      relative(owned.workspace, owned.directory).replaceAll("\\", "/"),
+      "directory",
+      owned.directoryIdentity,
+    )
+    await rename(owned.directory, stage.stagedPath)
+    const [staged, canonicalStaged] = await Promise.all([
+      lstat(stage.stagedPath, { bigint: true }),
+      realpath(stage.stagedPath),
+    ])
+    if (
+      staged.isSymbolicLink() ||
+      !staged.isDirectory() ||
+      entryIdentity(staged) !== owned.directoryIdentity ||
+      !pathsEqual(canonicalStaged, stage.stagedPath)
+    ) {
+      throw new Error("staged attachment identity changed")
+    }
     try {
-      await trash.trashItem(owned.directory)
+      await trash.trashItem(stage.stagedPath)
     } catch {
       // shell.trashItem can reject after Windows has accepted the move; reconcile below.
     }
     const [assets, canonicalAssets] = await Promise.all([
-      lstat(owned.assetsRoot),
+      lstat(owned.assetsRoot, { bigint: true }),
       realpath(owned.assetsRoot),
     ])
     if (
@@ -172,16 +219,18 @@ async function trashOwnedAttachments(
       }
     }
     try {
-      const remaining = await lstat(owned.directory)
+      const remaining = await lstat(stage.stagedPath, { bigint: true })
       if (remaining.isDirectory() && entryIdentity(remaining) === owned.directoryIdentity) {
+        await restoreLocalTrashStage(stage)
         return {
           status: "failed",
           message: "The note was recycled, but its attachments remain in the workspace.",
         }
       }
-      // A different entry recreated the same path. Preserve it; the validated
-      // original attachment directory is no longer present.
-      return { status: "trashed" }
+      return {
+        status: "failed",
+        message: "The note was recycled, but attachment cleanup could not be confirmed.",
+      }
     } catch (error) {
       if ((error as NodeJS.ErrnoException).code === "ENOENT") return { status: "trashed" }
       throw error
@@ -245,7 +294,8 @@ export async function trashManagedNote(input: TrashManagedNoteInput): Promise<No
     } catch {
       attachmentCleanup = {
         status: "failed",
-        message: "The note was recycled, but its attachments remain because ownership could not be confirmed.",
+        message:
+          "The note was recycled, but its attachments remain because ownership could not be confirmed.",
       }
     }
   }

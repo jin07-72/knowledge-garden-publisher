@@ -8,11 +8,7 @@ import {
   type WorkspaceRepairReceipt,
   type WorkspaceRepairRequest,
 } from "../../shared/contracts"
-import {
-  type CommandResult,
-  type CommandRunner,
-  systemCommandRunner
-} from "../lib/commandRunner"
+import { type CommandResult, type CommandRunner, systemCommandRunner } from "../lib/commandRunner"
 
 export interface InspectWorkspaceOptions {
   readonly checkGit: boolean
@@ -51,7 +47,7 @@ const requiredPaths: readonly RequiredPath[] = [
     missingCode: "CONTENT_MISSING",
     wrongTypeCode: "CONTENT_NOT_DIRECTORY",
     missingMessage: "Create the content directory.",
-    wrongTypeMessage: "Replace content with a directory."
+    wrongTypeMessage: "Replace content with a directory.",
   },
   {
     relativePath: "private",
@@ -59,7 +55,7 @@ const requiredPaths: readonly RequiredPath[] = [
     missingCode: "PRIVATE_MISSING",
     wrongTypeCode: "PRIVATE_NOT_DIRECTORY",
     missingMessage: "Create the private directory.",
-    wrongTypeMessage: "Replace private with a directory."
+    wrongTypeMessage: "Replace private with a directory.",
   },
   {
     relativePath: "scripts",
@@ -67,7 +63,7 @@ const requiredPaths: readonly RequiredPath[] = [
     missingCode: "SCRIPTS_MISSING",
     wrongTypeCode: "SCRIPTS_NOT_DIRECTORY",
     missingMessage: "Create the scripts directory.",
-    wrongTypeMessage: "Replace scripts with a directory."
+    wrongTypeMessage: "Replace scripts with a directory.",
   },
   {
     relativePath: "package-lock.json",
@@ -75,7 +71,7 @@ const requiredPaths: readonly RequiredPath[] = [
     missingCode: "PACKAGE_LOCK_MISSING",
     wrongTypeCode: "PACKAGE_LOCK_NOT_FILE",
     missingMessage: "Restore package-lock.json.",
-    wrongTypeMessage: "Replace package-lock.json with a file."
+    wrongTypeMessage: "Replace package-lock.json with a file.",
   },
   {
     relativePath: "quartz.config.yaml",
@@ -83,7 +79,7 @@ const requiredPaths: readonly RequiredPath[] = [
     missingCode: "QUARTZ_CONFIG_MISSING",
     wrongTypeCode: "QUARTZ_CONFIG_NOT_FILE",
     missingMessage: "Restore quartz.config.yaml.",
-    wrongTypeMessage: "Replace quartz.config.yaml with a file."
+    wrongTypeMessage: "Replace quartz.config.yaml with a file.",
   },
   {
     relativePath: "scripts/validate-content.mjs",
@@ -91,8 +87,8 @@ const requiredPaths: readonly RequiredPath[] = [
     missingCode: "VALIDATE_CONTENT_MISSING",
     wrongTypeCode: "VALIDATE_CONTENT_NOT_FILE",
     missingMessage: "Restore scripts/validate-content.mjs.",
-    wrongTypeMessage: "Replace scripts/validate-content.mjs with a file."
-  }
+    wrongTypeMessage: "Replace scripts/validate-content.mjs with a file.",
+  },
 ]
 
 function issue(
@@ -122,21 +118,27 @@ function isInsideWorkspace(root: string, candidate: string): boolean {
   return pathFromRoot === "" || (!pathFromRoot.startsWith("..") && !isAbsolute(pathFromRoot))
 }
 
-async function canonicalWorkspaceRoot(rootPath: string): Promise<{ root: string; issues: WorkspaceIssue[] }> {
+async function canonicalWorkspaceRoot(
+  rootPath: string,
+): Promise<{ root: string; issues: WorkspaceIssue[] }> {
   const normalizedRoot = resolve(rootPath)
   try {
     const rootDetails = await stat(normalizedRoot)
     if (!rootDetails.isDirectory()) {
       return {
         root: normalizedRoot,
-        issues: [issue("INVALID_WORKSPACE", "Select an existing workspace directory.", normalizedRoot)]
+        issues: [
+          issue("INVALID_WORKSPACE", "Select an existing workspace directory.", normalizedRoot),
+        ],
       }
     }
     return { root: await realpath(normalizedRoot), issues: [] }
   } catch {
     return {
       root: normalizedRoot,
-      issues: [issue("INVALID_WORKSPACE", "Select an existing workspace directory.", normalizedRoot)]
+      issues: [
+        issue("INVALID_WORKSPACE", "Select an existing workspace directory.", normalizedRoot),
+      ],
     }
   }
 }
@@ -148,12 +150,16 @@ async function inspectRequiredPaths(root: string): Promise<WorkspaceIssue[]> {
     try {
       const linkDetails = await lstat(path)
       if (linkDetails.isSymbolicLink()) {
-        issues.push(issue("UNSAFE_PATH", "Replace linked required paths with workspace-owned entries.", path))
+        issues.push(
+          issue("UNSAFE_PATH", "Replace linked required paths with workspace-owned entries.", path),
+        )
         continue
       }
       const canonicalPath = await realpath(path)
       if (!isInsideWorkspace(root, canonicalPath)) {
-        issues.push(issue("UNSAFE_PATH", "Required paths must remain inside the selected workspace.", path))
+        issues.push(
+          issue("UNSAFE_PATH", "Required paths must remain inside the selected workspace.", path),
+        )
         continue
       }
       const details = await stat(canonicalPath)
@@ -169,7 +175,9 @@ async function inspectRequiredPaths(root: string): Promise<WorkspaceIssue[]> {
       } else if (code === "ENOTDIR") {
         issues.push(issue(requirement.wrongTypeCode, requirement.wrongTypeMessage, path))
       } else {
-        issues.push(issue("WORKSPACE_ACCESS_FAILED", "Could not inspect a required workspace path.", path))
+        issues.push(
+          issue("WORKSPACE_ACCESS_FAILED", "Could not inspect a required workspace path.", path),
+        )
       }
     }
   }
@@ -181,7 +189,9 @@ function didSucceed(result: CommandResult): boolean {
 }
 
 function isCredentialFailure(stderr: string): boolean {
-  return /authenticat|credential|permission denied|could not read username|terminal prompts disabled/i.test(stderr)
+  return /authenticat|credential|permission denied|could not read username|terminal prompts disabled/i.test(
+    stderr,
+  )
 }
 
 async function inspectGit(
@@ -197,7 +207,7 @@ async function inspectGit(
       executable: "git",
       args: ["rev-parse", "--show-toplevel"],
       cwd: root,
-      env: readOnlyGitEnv
+      env: readOnlyGitEnv,
     })
   } catch {
     return [issue("GIT_UNAVAILABLE", "Git is unavailable. Install Git and try again.")]
@@ -218,7 +228,12 @@ async function inspectGit(
 
   let remotes: CommandResult
   try {
-    remotes = await runner.run({ executable: "git", args: ["remote"], cwd: root, env: readOnlyGitEnv })
+    remotes = await runner.run({
+      executable: "git",
+      args: ["remote"],
+      cwd: root,
+      env: readOnlyGitEnv,
+    })
   } catch {
     return [issue("GIT_UNAVAILABLE", "Git is unavailable. Install Git and try again.")]
   }
@@ -233,14 +248,24 @@ async function inspectGit(
         executable: "git",
         args: ["remote", "get-url", "origin"],
         cwd: root,
-        env: readOnlyGitEnv
+        env: readOnlyGitEnv,
       })
     } catch {
       return [issue("GIT_UNAVAILABLE", "Git is unavailable. Install Git and try again.")]
     }
     if (!didSucceed(origin) || origin.stdout.trim() === "") {
-      issues.push(issue("GIT_ORIGIN_FAILED", "Could not read the origin remote. Check the repository configuration."))
-    } else if (checkRemote && (await Promise.resolve().then(online).catch(() => false))) {
+      issues.push(
+        issue(
+          "GIT_ORIGIN_FAILED",
+          "Could not read the origin remote. Check the repository configuration.",
+        ),
+      )
+    } else if (
+      checkRemote &&
+      (await Promise.resolve()
+        .then(online)
+        .catch(() => false))
+    ) {
       let fetch: CommandResult
       try {
         fetch = await runner.run({
@@ -273,7 +298,7 @@ async function inspectGit(
       executable: "git",
       args: ["status", "--porcelain=v2"],
       cwd: root,
-      env: readOnlyGitEnv
+      env: readOnlyGitEnv,
     })
   } catch {
     return [...issues, issue("GIT_UNAVAILABLE", "Git is unavailable. Install Git and try again.")]
@@ -305,13 +330,25 @@ async function inspectDependencies(
       nodeModules.isSymbolicLink() ||
       !nodeModules.isDirectory() ||
       hiddenDetails.isSymbolicLink() ||
-      !hiddenDetails.isFile()
+      !hiddenDetails.isFile() ||
+      sourceDetails.isSymbolicLink() ||
+      !sourceDetails.isFile()
     ) {
-      return [dependencyIssue("DEPENDENCIES_MISSING", "Repository dependencies are not installed safely.")]
+      return [
+        dependencyIssue(
+          "DEPENDENCIES_MISSING",
+          "Repository dependencies are not installed safely.",
+        ),
+      ]
     }
     const maximumLockBytes = 32 * 1024 * 1024
     if (hiddenDetails.size > maximumLockBytes || sourceDetails.size > maximumLockBytes) {
-      return [dependencyIssue("DEPENDENCIES_INVALID", "A dependency lock file is too large to verify safely.")]
+      return [
+        dependencyIssue(
+          "DEPENDENCIES_INVALID",
+          "A dependency lock file is too large to verify safely.",
+        ),
+      ]
     }
     const [sourceBytes, installedBytes] = await Promise.all([
       readFile(sourceLock),
@@ -332,32 +369,118 @@ async function inspectDependencies(
       !installed.packages ||
       typeof installed.packages !== "object"
     ) {
-      return [dependencyIssue("DEPENDENCIES_INVALID", "Installed dependencies do not match package-lock.json.")]
+      return [
+        dependencyIssue(
+          "DEPENDENCIES_INVALID",
+          "Installed dependencies do not match package-lock.json.",
+        ),
+      ]
     }
     const expected = source.packages as Record<string, unknown>
     const actual = installed.packages as Record<string, unknown>
-    const lockFields = ["version", "resolved", "integrity", "link", "dev", "optional", "peer"] as const
+    const lockFields = [
+      "version",
+      "resolved",
+      "integrity",
+      "link",
+      "dev",
+      "optional",
+      "peer",
+    ] as const
     const fingerprint = (value: unknown): string | undefined => {
       if (!value || typeof value !== "object" || Array.isArray(value)) return undefined
       const record = value as Record<string, unknown>
       return JSON.stringify(Object.fromEntries(lockFields.map((field) => [field, record[field]])))
     }
-    for (const [path, actualPackage] of Object.entries(actual)) {
+    for (const [path, expectedPackage] of Object.entries(expected)) {
       if (!path.startsWith("node_modules/")) continue
-      const expectedPackage = expected[path]
+      const expectedRecord = expectedPackage as Record<string, unknown>
+      const actualPackage = actual[path]
+      if (actualPackage === undefined && expectedRecord.optional === true) continue
       if (
-        expectedPackage === undefined ||
+        actualPackage === undefined ||
         fingerprint(expectedPackage) === undefined ||
         fingerprint(expectedPackage) !== fingerprint(actualPackage)
       ) {
-        return [dependencyIssue("DEPENDENCIES_INVALID", "Installed dependencies do not match package-lock.json.")]
+        return [
+          dependencyIssue(
+            "DEPENDENCIES_INVALID",
+            "Installed dependencies do not match package-lock.json.",
+          ),
+        ]
+      }
+      if (expectedRecord.link === true) continue
+      if (typeof expectedRecord.version !== "string") {
+        return [
+          dependencyIssue(
+            "DEPENDENCIES_INVALID",
+            "Installed dependencies do not match package-lock.json.",
+          ),
+        ]
+      }
+      const packageDirectory = resolve(root, ...path.split("/"))
+      const manifestPath = resolve(packageDirectory, "package.json")
+      if (!isInsideWorkspace(resolve(root, "node_modules"), packageDirectory)) {
+        return [
+          dependencyIssue(
+            "DEPENDENCIES_INVALID",
+            "Installed dependencies do not match package-lock.json.",
+          ),
+        ]
+      }
+      if (!pathsEqual(await realpath(packageDirectory), packageDirectory)) {
+        return [
+          dependencyIssue(
+            "DEPENDENCIES_INVALID",
+            "Installed dependencies do not match package-lock.json.",
+          ),
+        ]
+      }
+      const manifestDetails = await lstat(manifestPath)
+      if (
+        manifestDetails.isSymbolicLink() ||
+        !manifestDetails.isFile() ||
+        manifestDetails.size > 1024 * 1024
+      ) {
+        return [
+          dependencyIssue(
+            "DEPENDENCIES_INVALID",
+            "Installed dependencies do not match package-lock.json.",
+          ),
+        ]
+      }
+      const manifest = JSON.parse(await readFile(manifestPath, "utf8")) as { version?: unknown }
+      if (manifest.version !== expectedRecord.version) {
+        return [
+          dependencyIssue(
+            "DEPENDENCIES_INVALID",
+            "Installed dependencies do not match package-lock.json.",
+          ),
+        ]
+      }
+    }
+    for (const path of Object.keys(actual)) {
+      if (path.startsWith("node_modules/") && expected[path] === undefined) {
+        return [
+          dependencyIssue(
+            "DEPENDENCIES_INVALID",
+            "Installed dependencies do not match package-lock.json.",
+          ),
+        ]
       }
     }
   } catch (error) {
     if ((error as NodeJS.ErrnoException).code === "ENOENT") {
-      return [dependencyIssue("DEPENDENCIES_MISSING", "Repository dependencies are missing or incomplete.")]
+      return [
+        dependencyIssue(
+          "DEPENDENCIES_MISSING",
+          "Repository dependencies are missing or incomplete.",
+        ),
+      ]
     }
-    return [dependencyIssue("DEPENDENCIES_INVALID", "Installed dependency state could not be verified.")]
+    return [
+      dependencyIssue("DEPENDENCIES_INVALID", "Installed dependency state could not be verified."),
+    ]
   }
   try {
     const result = await runner.run({
@@ -367,15 +490,22 @@ async function inspectDependencies(
       env: { npm_config_audit: "false", npm_config_fund: "false" },
     })
     if (didSucceed(result)) return []
-    return [dependencyIssue("DEPENDENCIES_MISSING", "Repository dependencies are missing or incomplete.")]
+    return [
+      dependencyIssue("DEPENDENCIES_MISSING", "Repository dependencies are missing or incomplete."),
+    ]
   } catch {
-    return [dependencyIssue("DEPENDENCIES_INVALID", "The bundled runtime could not verify repository dependencies.")]
+    return [
+      dependencyIssue(
+        "DEPENDENCIES_INVALID",
+        "The bundled runtime could not verify repository dependencies.",
+      ),
+    ]
   }
 }
 
 export async function inspectWorkspace(
   rootPath: string,
-  options: InspectWorkspaceOptions
+  options: InspectWorkspaceOptions,
 ): Promise<WorkspaceInspection> {
   const workspaceRoot = await canonicalWorkspaceRoot(rootPath)
   const root = workspaceRoot.root
@@ -384,17 +514,20 @@ export async function inspectWorkspace(
     issues.push(...(await inspectRequiredPaths(root)))
   }
   const files = issues.length === 0
-  const gitIssues = options.checkGit && workspaceRoot.issues.length === 0
-    ? await inspectGit(
-        root,
-        options.runner ?? systemCommandRunner,
-        options.checkRemote ?? false,
-        options.online ?? (() => true),
-      )
-    : []
+  const gitIssues =
+    options.checkGit && workspaceRoot.issues.length === 0
+      ? await inspectGit(
+          root,
+          options.runner ?? systemCommandRunner,
+          options.checkRemote ?? false,
+          options.online ?? (() => true),
+        )
+      : []
   issues.push(...gitIssues)
   const dependencyIssues =
-    options.runtime && workspaceRoot.issues.length === 0 && issues.every((item) => item.code !== "PACKAGE_LOCK_MISSING")
+    options.runtime &&
+    workspaceRoot.issues.length === 0 &&
+    issues.every((item) => item.code !== "PACKAGE_LOCK_MISSING")
       ? await inspectDependencies(root, options.runtime, options.runner ?? systemCommandRunner)
       : []
   issues.push(...dependencyIssues)
@@ -416,7 +549,7 @@ export async function inspectWorkspace(
     files,
     preview: files && dependencies && previewPort,
     git,
-    publish: files && dependencies && git
+    publish: files && dependencies && git,
   }
 
   if (issues.length === 0) {
@@ -432,7 +565,10 @@ export async function repairWorkspace(
   options: RepairWorkspaceOptions,
 ): Promise<WorkspaceRepairReceipt> {
   if (request.action !== "install-dependencies") {
-    throw { code: "INVALID_INPUT", message: "This repair action is not supported." } satisfies AppError
+    throw {
+      code: "INVALID_INPUT",
+      message: "This repair action is not supported.",
+    } satisfies AppError
   }
   const workspace = await canonicalWorkspaceRoot(rootPath)
   if (workspace.issues.length > 0) throw workspace.issues[0]

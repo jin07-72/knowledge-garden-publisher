@@ -2,10 +2,8 @@ import { mkdir, mkdtemp, readFile, rename, rm, writeFile } from "node:fs/promise
 import { tmpdir } from "node:os"
 import { join } from "node:path"
 import { afterEach, describe, expect, it, vi } from "vitest"
-import {
-  createElectronTrashAdapter,
-  trashManagedNote,
-} from "../../src/main/services/trash"
+import { createElectronTrashAdapter, trashManagedNote } from "../../src/main/services/trash"
+import { reconcileTrashRecovery } from "../../src/main/services/trashRecovery"
 
 const temporaryDirectories: string[] = []
 
@@ -64,9 +62,23 @@ describe("safe note trash", () => {
       attachmentCleanup: { status: "trashed" },
     })
     expect(trashItem).toHaveBeenCalledTimes(2)
-    expect(trashItem).toHaveBeenNthCalledWith(1, join(root, "content", "life", "daily.md"))
-    expect(trashItem).toHaveBeenNthCalledWith(2, join(root, "content", "_assets", "daily"))
+    expect(trashItem.mock.calls[0]![0]).toMatch(/[\\/]content[\\/]life[\\/]daily\.md$/)
+    expect(trashItem.mock.calls[1]![0]).toMatch(/[\\/]content[\\/]_assets[\\/]daily$/)
+    expect(trashItem.mock.calls[0]![0]).not.toBe(join(root, "content", "life", "daily.md"))
+    expect(trashItem.mock.calls[1]![0]).not.toBe(join(root, "content", "_assets", "daily"))
     await expect(readFile(join(recycle, "item-2", "chart.png"), "utf8")).resolves.toBe("chart")
+    await rename(join(recycle, "item-1"), trashItem.mock.calls[0]![0])
+    await rename(join(recycle, "item-2"), trashItem.mock.calls[1]![0])
+    await expect(reconcileTrashRecovery(root)).resolves.toEqual({
+      restored: expect.arrayContaining(["content/life/daily.md", "content/_assets/daily"]),
+      conflicts: [],
+    })
+    await expect(readFile(join(root, "content", "life", "daily.md"), "utf8")).resolves.toBe(
+      "# Daily",
+    )
+    await expect(
+      readFile(join(root, "content", "_assets", "daily", "chart.png"), "utf8"),
+    ).resolves.toBe("chart")
   })
 
   it("retains ambiguous same-slug attachments shared by notes in different domains", async () => {
@@ -93,7 +105,61 @@ describe("safe note trash", () => {
       },
     })
     expect(trashItem).toHaveBeenCalledOnce()
-    await expect(readFile(join(root, "content", "_assets", "daily", "chart.png"), "utf8")).resolves.toBe("chart")
+    await expect(
+      readFile(join(root, "content", "_assets", "daily", "chart.png"), "utf8"),
+    ).resolves.toBe("chart")
+  })
+
+  it("does not report ambiguous attachment retention when no attachment directory exists", async () => {
+    const root = await garden()
+    await rm(join(root, "content", "_assets", "daily"), { recursive: true })
+    await mkdir(join(root, "content", "reading"), { recursive: true })
+    await writeFile(join(root, "content", "reading", "daily.md"), "# Other daily")
+    const trashItem = vi.fn(async (target: string) =>
+      rename(target, join(root, "recycled-note.md")),
+    )
+
+    await expect(
+      trashManagedNote({
+        workspace: root,
+        path: "content/life/daily.md",
+        trash: { trashItem },
+        isTracked: async () => false,
+      }),
+    ).resolves.toMatchObject({ attachmentCleanup: { status: "not-found" } })
+    expect(trashItem).toHaveBeenCalledOnce()
+  })
+
+  it("keeps an attachment replacement created inside trashItem and stages the recoverable original", async () => {
+    const root = await garden()
+    const note = join(root, "content", "life", "daily.md")
+    const attachments = join(root, "content", "_assets", "daily")
+    const recycle = await mkdtemp(join(tmpdir(), "garden-adversarial-recycle-"))
+    temporaryDirectories.push(recycle)
+    let call = 0
+    const trashItem = vi.fn(async (staged: string) => {
+      call += 1
+      if (call === 2) {
+        await mkdir(attachments)
+        await writeFile(join(attachments, "replacement.png"), "replacement attachment")
+      }
+      await rename(staged, join(recycle, `original-${call}`))
+    })
+
+    await expect(
+      trashManagedNote({
+        workspace: root,
+        path: "content/life/daily.md",
+        trash: { trashItem },
+        isTracked: async () => false,
+      }),
+    ).resolves.toMatchObject({ attachmentCleanup: { status: "trashed" } })
+    await expect(readFile(note, "utf8")).rejects.toMatchObject({ code: "ENOENT" })
+    await expect(readFile(join(attachments, "replacement.png"), "utf8")).resolves.toBe(
+      "replacement attachment",
+    )
+    await expect(readFile(join(recycle, "original-1"), "utf8")).resolves.toBe("# Daily")
+    await expect(readFile(join(recycle, "original-2", "chart.png"), "utf8")).resolves.toBe("chart")
   })
 
   it("returns note success and an attachment warning when the second recycle call fails", async () => {
@@ -120,8 +186,10 @@ describe("safe note trash", () => {
         message: expect.stringContaining("attachments remain"),
       },
     })
-    expect(trashItem).toHaveBeenNthCalledWith(2, join(root, "content", "_assets", "daily"))
-    await expect(readFile(join(root, "content", "_assets", "daily", "chart.png"), "utf8")).resolves.toBe("chart")
+    expect(trashItem.mock.calls[1]![0]).toMatch(/[\\/]content[\\/]_assets[\\/]daily$/)
+    await expect(
+      readFile(join(root, "content", "_assets", "daily", "chart.png"), "utf8"),
+    ).resolves.toBe("chart")
   })
 
   it("adapts only the injected Electron shell trash capability", async () => {

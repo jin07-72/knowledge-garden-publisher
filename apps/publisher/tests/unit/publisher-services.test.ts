@@ -1,4 +1,4 @@
-import { mkdir, mkdtemp, rm, writeFile } from "node:fs/promises"
+import { mkdir, mkdtemp, rename, rm, writeFile } from "node:fs/promises"
 import { tmpdir } from "node:os"
 import { join } from "node:path"
 import { afterEach, describe, expect, it, vi } from "vitest"
@@ -67,6 +67,29 @@ describe("publisher service wiring", () => {
     const listener = vi.fn()
     services.preview.subscribe(listener)
     expect(manager.subscribe).toHaveBeenCalledWith(listener)
+  })
+
+  it("reconciles a Recycle Bin restore before listing notes", async () => {
+    const workspace = await garden()
+    const recycled = join(workspace, "recycled-daily.md")
+    let staged = ""
+    const services = createPublisherServices({
+      workspace,
+      trash: {
+        trashItem: async (target) => {
+          staged = target
+          await rename(target, recycled)
+        },
+      },
+      isTracked: async () => false,
+      preview: preview(),
+    })
+    await services.notes.trash({ path: "content/life/daily.md" })
+    await rename(recycled, staged)
+
+    await expect(services.notes.list()).resolves.toEqual([
+      expect.objectContaining({ path: "content/life/daily.md" }),
+    ])
   })
 
   it("wires change review and history while keeping publishing explicitly unavailable", async () => {

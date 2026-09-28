@@ -3,6 +3,7 @@ import { tmpdir } from "node:os"
 import { join } from "node:path"
 import { afterEach, describe, expect, it, vi } from "vitest"
 import { readNote, trashNote } from "../../src/main/services/noteFiles"
+import { reconcileTrashRecovery } from "../../src/main/services/trashRecovery"
 
 const temporaryDirectories: string[] = []
 
@@ -84,7 +85,10 @@ describe("note access", () => {
       historyWarning: true,
     })
     expect(trashItem).toHaveBeenCalledOnce()
-    expect(trashItem).toHaveBeenCalledWith(note)
+    expect(trashItem).toHaveBeenCalledWith(
+      expect.stringMatching(/[\\/]content[\\/]life[\\/]daily\.md$/),
+    )
+    expect(trashItem).not.toHaveBeenCalledWith(note)
     expect(isTracked).toHaveBeenCalledWith(root, "content/life/daily.md")
   })
 
@@ -106,23 +110,109 @@ describe("note access", () => {
     ).resolves.toMatchObject({ path: "content/life/daily.md", historyWarning: false })
   })
 
-  it("never trashes a recreated original pathname", async () => {
-    const { root, note } = await garden()
+  it("never trashes a pathname recreated inside trashItem and keeps the original recoverable", async () => {
+    const { root, note, markdown } = await garden()
     const recycled = join(root, "recycled.md")
+    let staged = ""
     await expect(
       trashNote({
         workspace: root,
         path: "content/life/daily.md",
         trash: {
           trashItem: async (target) => {
-            await rename(target, recycled)
+            staged = target
             await writeFile(note, "replacement")
+            await rename(target, recycled)
           },
         },
         isTracked: async () => false,
       }),
     ).resolves.toMatchObject({ path: "content/life/daily.md" })
     await expect(readFile(note, "utf8")).resolves.toBe("replacement")
+    await expect(readFile(recycled, "utf8")).resolves.toBe(markdown)
+
+    await rename(recycled, staged)
+    await expect(reconcileTrashRecovery(root)).resolves.toEqual({
+      restored: [],
+      conflicts: ["content/life/daily.md"],
+    })
+    await expect(readFile(note, "utf8")).resolves.toBe("replacement")
+    await expect(readFile(staged, "utf8")).resolves.toBe(markdown)
+  })
+
+  it("reconciles a restored staged note to its exact original path without overwriting", async () => {
+    const { root, note, markdown } = await garden()
+    const recycled = join(root, "recycled.md")
+    let staged = ""
+    await trashNote({
+      workspace: root,
+      path: "content/life/daily.md",
+      trash: {
+        trashItem: async (target) => {
+          staged = target
+          await rename(target, recycled)
+        },
+      },
+      isTracked: async () => false,
+    })
+    await rename(recycled, staged)
+
+    await expect(reconcileTrashRecovery(root)).resolves.toEqual({
+      restored: ["content/life/daily.md"],
+      conflicts: [],
+    })
+    await expect(readFile(note, "utf8")).resolves.toBe(markdown)
+  })
+
+  it("refuses to reconcile an unauthenticated replacement at the journaled restore path", async () => {
+    const { root, note } = await garden()
+    const recycled = join(root, "recycled.md")
+    let staged = ""
+    await trashNote({
+      workspace: root,
+      path: "content/life/daily.md",
+      trash: {
+        trashItem: async (target) => {
+          staged = target
+          await rename(target, recycled)
+        },
+      },
+      isTracked: async () => false,
+    })
+    await writeFile(staged, "forged restored note")
+
+    await expect(reconcileTrashRecovery(root)).resolves.toEqual({
+      restored: [],
+      conflicts: ["content/life/daily.md"],
+    })
+    await expect(readFile(note, "utf8")).rejects.toMatchObject({ code: "ENOENT" })
+    await expect(readFile(staged, "utf8")).resolves.toBe("forged restored note")
+  })
+
+  it("retains a restored staged note when its original path has been recreated", async () => {
+    const { root, note, markdown } = await garden()
+    const recycled = join(root, "recycled.md")
+    let staged = ""
+    await trashNote({
+      workspace: root,
+      path: "content/life/daily.md",
+      trash: {
+        trashItem: async (target) => {
+          staged = target
+          await rename(target, recycled)
+        },
+      },
+      isTracked: async () => false,
+    })
+    await writeFile(note, "replacement")
+    await rename(recycled, staged)
+
+    await expect(reconcileTrashRecovery(root)).resolves.toEqual({
+      restored: [],
+      conflicts: ["content/life/daily.md"],
+    })
+    await expect(readFile(note, "utf8")).resolves.toBe("replacement")
+    await expect(readFile(staged, "utf8")).resolves.toBe(markdown)
   })
 
   it("fails uncertain when the Recycle Bin adapter replaces the managed parent", async () => {
@@ -165,7 +255,7 @@ describe("note access", () => {
     )
   })
 
-  it("fails uncertain without trashing when the validated final component is swapped", async () => {
+  it("fails uncertain without trashing when the staged final component is swapped", async () => {
     const { root } = await garden()
     const trashItem = vi.fn(async () => undefined)
     await expect(
@@ -177,9 +267,9 @@ describe("note access", () => {
           isTracked: async () => false,
         },
         {
-          afterStage: async (_staged, original) => {
-            await rename(original, `${original}.original`)
-            await writeFile(original, "attacker replacement")
+          afterStage: async (staged) => {
+            await rename(staged, `${staged}.original`)
+            await writeFile(staged, "attacker replacement")
           },
         },
       ),

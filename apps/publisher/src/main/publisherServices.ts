@@ -10,6 +10,7 @@ import {
   saveNote,
 } from "./services/noteFiles"
 import { trashManagedNote } from "./services/trash"
+import { reconcileTrashRecovery } from "./services/trashRecovery"
 import {
   discardEditorRecovery,
   getEditorRecovery,
@@ -85,7 +86,16 @@ export function createPublisherServices(
       },
     },
     notes: {
-      list: () => scanNotes(workspace),
+      list: async () => {
+        const recovery = await reconcileTrashRecovery(workspace)
+        if (recovery.conflicts.length > 0) {
+          throw {
+            code: "RECOVERY_CONFLICT",
+            message: `A restored Recycle Bin item conflicts with ${recovery.conflicts[0]}. Move or rename the current item, then refresh; the restored copy remains in .garden-publisher/trash-recovery.`,
+          } satisfies AppError
+        }
+        return scanNotes(workspace)
+      },
       read: (request) => readNote({ workspace, ...request }),
       save: (request) => saveNote({ workspace, recoveryTrash: trash, ...request }),
       create: (request) => createNote({ workspace, ...request }),

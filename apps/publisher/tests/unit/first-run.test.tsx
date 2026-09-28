@@ -47,9 +47,7 @@ const diagnostics: WorkspaceInspection = {
 
 describe("first-run diagnostics", () => {
   it("shows concrete, non-secret repair guidance for every startup boundary", () => {
-    render(
-      <FirstRun inspection={diagnostics} busy={false} onRetry={vi.fn()} onRepair={vi.fn()} />,
-    )
+    render(<FirstRun inspection={diagnostics} busy={false} onRetry={vi.fn()} onRepair={vi.fn()} />)
 
     const region = screen.getByRole("region", { name: "启动检查" })
     expect(within(region).getByText(/安装 Git/)).toBeVisible()
@@ -63,9 +61,7 @@ describe("first-run diagnostics", () => {
   it("runs dependency installation only after the explicit repair button is pressed", async () => {
     const user = userEvent.setup()
     const onRepair = vi.fn(async () => undefined)
-    render(
-      <FirstRun inspection={diagnostics} busy={false} onRetry={vi.fn()} onRepair={onRepair} />,
-    )
+    render(<FirstRun inspection={diagnostics} busy={false} onRetry={vi.fn()} onRepair={onRepair} />)
 
     expect(onRepair).not.toHaveBeenCalled()
     await user.click(screen.getByRole("button", { name: "安装仓库依赖" }))
@@ -74,15 +70,20 @@ describe("first-run diagnostics", () => {
 
   it("checks dependencies, credentialed origin/main access, and the preview port", async () => {
     const root = await repository()
-    const runner = { run: vi.fn(async ({ args }: { args: readonly string[] }) => {
-      if (args.includes("--show-toplevel")) return { exitCode: 0, stdout: root, stderr: "" }
-      if (args[0] === "remote" && args.length === 1) return { exitCode: 0, stdout: "origin\n", stderr: "" }
-      if (args.includes("get-url")) return { exitCode: 0, stdout: "https://github.com/a/b.git\n", stderr: "" }
-      if (args[0] === "status") return { exitCode: 0, stdout: "", stderr: "" }
-      if (args[0] === "ls-remote") return { exitCode: 128, stdout: "", stderr: "Authentication failed" }
-      if (args.includes("ls")) return { exitCode: 1, stdout: "", stderr: "missing" }
-      throw new Error(`unexpected ${args.join(" ")}`)
-    }) }
+    const runner = {
+      run: vi.fn(async ({ args }: { args: readonly string[] }) => {
+        if (args.includes("--show-toplevel")) return { exitCode: 0, stdout: root, stderr: "" }
+        if (args[0] === "remote" && args.length === 1)
+          return { exitCode: 0, stdout: "origin\n", stderr: "" }
+        if (args.includes("get-url"))
+          return { exitCode: 0, stdout: "https://github.com/a/b.git\n", stderr: "" }
+        if (args[0] === "status") return { exitCode: 0, stdout: "", stderr: "" }
+        if (args[0] === "ls-remote")
+          return { exitCode: 128, stdout: "", stderr: "Authentication failed" }
+        if (args.includes("ls")) return { exitCode: 1, stdout: "", stderr: "missing" }
+        throw new Error(`unexpected ${args.join(" ")}`)
+      }),
+    }
 
     const inspection = await inspectWorkspace(root, {
       checkGit: true,
@@ -93,25 +94,38 @@ describe("first-run diagnostics", () => {
     })
     expect(inspection.ok).toBe(false)
     if (inspection.ok) throw new Error("expected startup issues")
-    expect(inspection.issues).toEqual(expect.arrayContaining([
-      expect.objectContaining({ code: "DEPENDENCIES_MISSING", repair: "install-dependencies" }),
-      expect.objectContaining({ code: "GIT_FETCH_AUTH_FAILED" }),
-      expect.objectContaining({ code: "PREVIEW_PORT_UNAVAILABLE" }),
-    ]))
+    expect(inspection.issues).toEqual(
+      expect.arrayContaining([
+        expect.objectContaining({ code: "DEPENDENCIES_MISSING", repair: "install-dependencies" }),
+        expect.objectContaining({ code: "GIT_FETCH_AUTH_FAILED" }),
+        expect.objectContaining({ code: "PREVIEW_PORT_UNAVAILABLE" }),
+      ]),
+    )
   })
 
   it("repairs dependencies only through the injected bundled Node/npm runtime", async () => {
     const root = await repository()
     const run = vi.fn(async () => ({ exitCode: 0, stdout: "", stderr: "" }))
-    await expect(repairWorkspace(root, { action: "install-dependencies" }, {
-      runner: { run },
-      runtime: { nodePath: "C:/app/node/node.exe", npmCliPath: "C:/app/node/npm-cli.js" },
-    })).resolves.toEqual({ action: "install-dependencies", message: expect.stringContaining("installed") })
-    expect(run).toHaveBeenCalledWith(expect.objectContaining({
-      executable: "C:/app/node/node.exe",
-      args: ["C:/app/node/npm-cli.js", "ci", "--no-audit", "--no-fund"],
-      cwd: root,
-    }))
+    await expect(
+      repairWorkspace(
+        root,
+        { action: "install-dependencies" },
+        {
+          runner: { run },
+          runtime: { nodePath: "C:/app/node/node.exe", npmCliPath: "C:/app/node/npm-cli.js" },
+        },
+      ),
+    ).resolves.toEqual({
+      action: "install-dependencies",
+      message: expect.stringContaining("installed"),
+    })
+    expect(run).toHaveBeenCalledWith(
+      expect.objectContaining({
+        executable: "C:/app/node/node.exe",
+        args: ["C:/app/node/npm-cli.js", "ci", "--no-audit", "--no-fund"],
+        cwd: root,
+      }),
+    )
   })
 
   it("rejects a semver-compatible installed tree whose hidden lock differs from package-lock", async () => {
@@ -119,11 +133,17 @@ describe("first-run diagnostics", () => {
     await mkdir(join(root, "node_modules"))
     await writeFile(
       join(root, "package-lock.json"),
-      JSON.stringify({ lockfileVersion: 3, packages: { "": {}, "node_modules/example": { version: "1.2.3" } } }),
+      JSON.stringify({
+        lockfileVersion: 3,
+        packages: { "": {}, "node_modules/example": { version: "1.2.3" } },
+      }),
     )
     await writeFile(
       join(root, "node_modules", ".package-lock.json"),
-      JSON.stringify({ lockfileVersion: 3, packages: { "node_modules/example": { version: "1.2.4" } } }),
+      JSON.stringify({
+        lockfileVersion: 3,
+        packages: { "node_modules/example": { version: "1.2.4" } },
+      }),
     )
     const runner = { run: vi.fn(async () => ({ exitCode: 0, stdout: "{}", stderr: "" })) }
 
@@ -135,10 +155,117 @@ describe("first-run diagnostics", () => {
 
     expect(inspection.ok).toBe(false)
     if (inspection.ok) throw new Error("expected dependency mismatch")
-    expect(inspection.issues).toContainEqual(expect.objectContaining({
-      code: "DEPENDENCIES_INVALID",
-      repair: "install-dependencies",
-    }))
+    expect(inspection.issues).toContainEqual(
+      expect.objectContaining({
+        code: "DEPENDENCIES_INVALID",
+        repair: "install-dependencies",
+      }),
+    )
+    expect(runner.run).not.toHaveBeenCalled()
+  })
+
+  it("rejects a copied matching hidden lock when the live installed package version differs", async () => {
+    const root = await repository()
+    await mkdir(join(root, "node_modules", "@scope", "example"), { recursive: true })
+    const lock = {
+      lockfileVersion: 3,
+      packages: { "": {}, "node_modules/@scope/example": { version: "1.2.3" } },
+    }
+    await writeFile(join(root, "package-lock.json"), JSON.stringify(lock))
+    await writeFile(join(root, "node_modules", ".package-lock.json"), JSON.stringify(lock))
+    await writeFile(
+      join(root, "node_modules", "@scope", "example", "package.json"),
+      JSON.stringify({ version: "1.2.4" }),
+    )
+    const runner = { run: vi.fn(async () => ({ exitCode: 0, stdout: "{}", stderr: "" })) }
+
+    const inspection = await inspectWorkspace(root, {
+      checkGit: false,
+      runner,
+      runtime: { nodePath: "bundled-node.exe", npmCliPath: "bundled-npm-cli.js" },
+    })
+
+    expect(inspection.ok).toBe(false)
+    if (inspection.ok) throw new Error("expected live dependency mismatch")
+    expect(inspection.issues).toContainEqual(
+      expect.objectContaining({
+        code: "DEPENDENCIES_INVALID",
+        repair: "install-dependencies",
+      }),
+    )
+  })
+
+  it("checks every source-lock package even when the hidden lock omits a nested scoped package", async () => {
+    const root = await repository()
+    await mkdir(join(root, "node_modules", "parent"), { recursive: true })
+    const sourceLock = {
+      lockfileVersion: 3,
+      packages: {
+        "": {},
+        "node_modules/parent": { version: "2.0.0" },
+        "node_modules/parent/node_modules/@scope/child": { version: "1.2.3" },
+      },
+    }
+    const installedLock = {
+      lockfileVersion: 3,
+      packages: {
+        "": {},
+        "node_modules/parent": { version: "2.0.0" },
+      },
+    }
+    await writeFile(join(root, "package-lock.json"), JSON.stringify(sourceLock))
+    await writeFile(join(root, "node_modules", ".package-lock.json"), JSON.stringify(installedLock))
+    await writeFile(
+      join(root, "node_modules", "parent", "package.json"),
+      JSON.stringify({ version: "2.0.0" }),
+    )
+    const runner = { run: vi.fn(async () => ({ exitCode: 0, stdout: "{}", stderr: "" })) }
+
+    const inspection = await inspectWorkspace(root, {
+      checkGit: false,
+      runner,
+      runtime: { nodePath: "bundled-node.exe", npmCliPath: "bundled-npm-cli.js" },
+    })
+
+    expect(inspection.ok).toBe(false)
+    if (inspection.ok) throw new Error("expected missing nested package")
+    expect(inspection.issues).toContainEqual(
+      expect.objectContaining({
+        code: "DEPENDENCIES_INVALID",
+        repair: "install-dependencies",
+      }),
+    )
+    expect(runner.run).not.toHaveBeenCalled()
+  })
+
+  it("allows source-lock packages omitted because they are optional platform variants", async () => {
+    const root = await repository()
+    await mkdir(join(root, "node_modules"), { recursive: true })
+    const sourceLock = {
+      lockfileVersion: 3,
+      packages: {
+        "": {},
+        "node_modules/@native/linux-only": {
+          version: "1.2.3",
+          optional: true,
+          os: ["linux"],
+          cpu: ["x64"],
+        },
+      },
+    }
+    const installedLock = { lockfileVersion: 3, packages: { "": {} } }
+    await writeFile(join(root, "package-lock.json"), JSON.stringify(sourceLock))
+    await writeFile(join(root, "node_modules", ".package-lock.json"), JSON.stringify(installedLock))
+    const runner = { run: vi.fn(async () => ({ exitCode: 0, stdout: "{}", stderr: "" })) }
+
+    await expect(
+      inspectWorkspace(root, {
+        checkGit: false,
+        runner,
+        runtime: { nodePath: "bundled-node.exe", npmCliPath: "bundled-npm-cli.js" },
+      }),
+    ).resolves.toMatchObject({ ok: true })
+    expect(runner.run).toHaveBeenCalledOnce()
   })
 
   it("gates production renderer operations behind the startup inspection", async () => {

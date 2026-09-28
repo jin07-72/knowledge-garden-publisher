@@ -12,7 +12,6 @@ import {
   rename as nodeRename,
   rm,
   stat,
-  unlink,
 } from "node:fs/promises"
 import { dirname, isAbsolute, posix, relative, resolve } from "node:path"
 import { stringify } from "yaml"
@@ -24,6 +23,7 @@ import type {
   TrashAdapter,
   Visibility,
 } from "../../shared/contracts"
+import { prepareTrashRecovery, restoreLocalTrashStage } from "./trashRecovery"
 
 // Transactions are kept in a focused internal module because this service also
 // owns the lower-level 2,500-line atomic save/recovery implementation.
@@ -661,34 +661,45 @@ export async function trashNote(
     await lock.assertOwned()
     const managedRootIdentity = stableFileIdentity(await lstat(root.directory, { bigint: true }))
     const domainIdentity = stableFileIdentity(await lstat(directory, { bigint: true }))
+    const stage = await prepareTrashRecovery(
+      workspace,
+      target,
+      parsed.displayPath,
+      "file",
+      current.stableIdentity,
+      current.revision.contentHash,
+    )
     try {
-      await adapter.afterStage?.(target, target)
+      await nodeRename(target, stage.stagedPath)
+      await adapter.afterStage?.(stage.stagedPath, target)
       await assertTrashParents(root.directory, managedRootIdentity, directory, domainIdentity)
       const beforeTrash = await inspectStagedTrash(
-        target,
-        directory,
+        stage.stagedPath,
+        dirname(stage.stagedPath),
         current.stableIdentity,
         current.revision.contentHash,
       )
       if (beforeTrash !== "exact") throw uncertainTrash()
       try {
-        await input.trash.trashItem(target)
+        await input.trash.trashItem(stage.stagedPath)
       } catch {
         // A rejected shell promise can still mean the item moved. Reconcile
         // from filesystem state instead of trusting the transport outcome.
       }
       await assertTrashParents(root.directory, managedRootIdentity, directory, domainIdentity)
       const state = await inspectStagedTrash(
-        target,
-        directory,
+        stage.stagedPath,
+        dirname(stage.stagedPath),
         current.stableIdentity,
         current.revision.contentHash,
       )
-      if (state === "exact") throw restoredTrashFailure()
-      if (state === "modified") throw uncertainTrash()
-      // absent means Windows moved the exact path. replacement means the
-      // validated note moved and another writer recreated the original name;
-      // preserve that replacement and report the original deletion complete.
+      if (state === "exact") {
+        if (!(await restoreLocalTrashStage(stage))) throw uncertainTrash()
+        throw restoredTrashFailure()
+      }
+      if (state !== "absent") throw uncertainTrash()
+      // Windows Restore returns the original basename to this transaction.
+      // reconcileTrashRecovery then atomically reinstalls the mapped path.
     } catch (error) {
       if (isNoteError(error)) throw error
       throw uncertainTrash()
@@ -782,27 +793,6 @@ async function inspectStagedTrash(
     return "modified"
   } finally {
     await handle?.close().catch(() => undefined)
-  }
-}
-
-async function restoreStagedTrash(
-  staged: string,
-  target: string,
-  expectedIdentity: string,
-): Promise<boolean> {
-  try {
-    // link() is an atomic no-overwrite restore: unlike rename(), it cannot
-    // replace a note recreated at the original pathname.
-    await link(staged, target)
-    const restored = await lstat(target, { bigint: true })
-    if (!restored.isFile() || stableFileIdentity(restored) !== expectedIdentity) return false
-    // Only remove the temporary hard-link name after the original pathname is
-    // confirmed to reference the same file; the note content remains intact.
-    await unlink(staged)
-    const confirmed = await lstat(target, { bigint: true })
-    return confirmed.isFile() && stableFileIdentity(confirmed) === expectedIdentity
-  } catch {
-    return false
   }
 }
 
