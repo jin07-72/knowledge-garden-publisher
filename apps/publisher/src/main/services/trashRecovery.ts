@@ -6,7 +6,7 @@ import {
   link,
   mkdir,
   open,
-  readdir,
+  opendir,
   realpath,
   rename,
   rm,
@@ -26,6 +26,37 @@ const maximumDirectoryEntries = 10_000
 const maximumDirectoryBytes = 512 * 1024 * 1024
 const maximumAttachmentBytes = 64 * 1024 * 1024
 const maximumDirectoryDepth = 64
+const maximumRecoveryTransactions = 10_000
+
+interface DirectoryHandleLike {
+  readonly [Symbol.asyncIterator]: () => AsyncIterator<{ readonly name: string }>
+  close(): Promise<void>
+}
+
+type DirectoryOpener = (path: string) => Promise<DirectoryHandleLike>
+
+export async function readBoundedDirectoryNames(
+  path: string,
+  maximumEntries: number,
+  openDirectory: DirectoryOpener = opendir,
+): Promise<readonly string[]> {
+  if (!Number.isSafeInteger(maximumEntries) || maximumEntries < 0) {
+    throw new Error("Directory entry limit is invalid.")
+  }
+  const handle = await openDirectory(path)
+  const names: string[] = []
+  try {
+    for await (const entry of handle) {
+      names.push(entry.name)
+      if (names.length > maximumEntries) throw new Error("Directory has too many entries.")
+    }
+  } finally {
+    await handle.close().catch((error: NodeJS.ErrnoException) => {
+      if (error.code !== "ERR_DIR_CLOSED") throw error
+    })
+  }
+  return names.sort()
+}
 
 export interface TrashRecoveryStage {
   readonly id: string
@@ -102,7 +133,8 @@ async function directoryDigest(root: string): Promise<string> {
 
   async function visit(directory: string, relativeDirectory: string, depth: number): Promise<void> {
     if (depth > maximumDirectoryDepth) throw new Error("Attachment recovery tree is too deep.")
-    const before = (await readdir(directory)).sort()
+    const before = await readBoundedDirectoryNames(directory, maximumDirectoryEntries - entries)
+    entries += before.length
     for (const name of before) {
       const path = resolve(directory, name)
       const relativePath = relativeDirectory === "" ? name : `${relativeDirectory}/${name}`
@@ -113,9 +145,6 @@ async function directoryDigest(root: string): Promise<string> {
       if (!pathsEqual(await realpath(path), path) || !isInside(rootCanonical, path)) {
         throw new Error("Attachment recovery tree escaped its root.")
       }
-      entries += 1
-      if (entries > maximumDirectoryEntries)
-        throw new Error("Attachment recovery tree has too many entries.")
       if (details.isDirectory()) {
         output.update(`D\0${relativePath}\0`)
         await visit(path, relativePath, depth + 1)
@@ -175,7 +204,7 @@ async function directoryDigest(root: string): Promise<string> {
         await handle.close()
       }
     }
-    const after = (await readdir(directory)).sort()
+    const after = await readBoundedDirectoryNames(directory, before.length)
     if (before.length !== after.length || before.some((name, index) => name !== after[index])) {
       throw new Error("Attachment recovery directory changed while hashing.")
     }
@@ -441,9 +470,9 @@ export async function reconcileTrashRecovery(
   const conflicts: string[] = []
   const key = await loadKey()
   if (key.length !== 32) throw new Error("Trash recovery key is invalid.")
-  const entries = (await readdir(storage.root))
-    .filter((name) => transactionPattern.test(name))
-    .sort()
+  const entries = (
+    await readBoundedDirectoryNames(storage.root, maximumRecoveryTransactions)
+  ).filter((name) => transactionPattern.test(name))
   for (const id of entries) {
     const transactionPath = resolve(storage.root, id)
     try {
