@@ -114,6 +114,33 @@ describe("first-run diagnostics", () => {
     }))
   })
 
+  it("rejects a semver-compatible installed tree whose hidden lock differs from package-lock", async () => {
+    const root = await repository()
+    await mkdir(join(root, "node_modules"))
+    await writeFile(
+      join(root, "package-lock.json"),
+      JSON.stringify({ lockfileVersion: 3, packages: { "": {}, "node_modules/example": { version: "1.2.3" } } }),
+    )
+    await writeFile(
+      join(root, "node_modules", ".package-lock.json"),
+      JSON.stringify({ lockfileVersion: 3, packages: { "node_modules/example": { version: "1.2.4" } } }),
+    )
+    const runner = { run: vi.fn(async () => ({ exitCode: 0, stdout: "{}", stderr: "" })) }
+
+    const inspection = await inspectWorkspace(root, {
+      checkGit: false,
+      runner,
+      runtime: { nodePath: "bundled-node.exe", npmCliPath: "bundled-npm-cli.js" },
+    })
+
+    expect(inspection.ok).toBe(false)
+    if (inspection.ok) throw new Error("expected dependency mismatch")
+    expect(inspection.issues).toContainEqual(expect.objectContaining({
+      code: "DEPENDENCIES_INVALID",
+      repair: "install-dependencies",
+    }))
+  })
+
   it("gates production renderer operations behind the startup inspection", async () => {
     const inspect = vi.fn(async () => ({ ok: true as const, value: diagnostics }))
     const list = vi.fn()

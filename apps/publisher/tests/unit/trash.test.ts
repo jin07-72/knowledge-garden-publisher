@@ -61,12 +61,67 @@ describe("safe note trash", () => {
       path: "content/life/daily.md",
       pendingPublicDeletion: "content/life/daily.md",
       historyWarning: true,
+      attachmentCleanup: { status: "trashed" },
     })
     expect(trashItem).toHaveBeenCalledTimes(2)
-    expect(trashItem.mock.calls.some(([path]) => path.includes("content\\_assets\\.garden-trash-"))).toBe(
-      true,
-    )
+    expect(trashItem).toHaveBeenNthCalledWith(1, join(root, "content", "life", "daily.md"))
+    expect(trashItem).toHaveBeenNthCalledWith(2, join(root, "content", "_assets", "daily"))
     await expect(readFile(join(recycle, "item-2", "chart.png"), "utf8")).resolves.toBe("chart")
+  })
+
+  it("retains ambiguous same-slug attachments shared by notes in different domains", async () => {
+    const root = await garden()
+    await mkdir(join(root, "content", "reading"), { recursive: true })
+    await writeFile(join(root, "content", "reading", "daily.md"), "# Other daily")
+    const recycled = join(root, "recycled-note.md")
+    const trashItem = vi.fn(async (target: string) => rename(target, recycled))
+
+    await expect(
+      trashManagedNote({
+        workspace: root,
+        path: "content/life/daily.md",
+        trash: { trashItem },
+        isTracked: async () => true,
+      }),
+    ).resolves.toEqual({
+      path: "content/life/daily.md",
+      pendingPublicDeletion: "content/life/daily.md",
+      historyWarning: true,
+      attachmentCleanup: {
+        status: "retained-ambiguous",
+        message: expect.stringContaining("slug"),
+      },
+    })
+    expect(trashItem).toHaveBeenCalledOnce()
+    await expect(readFile(join(root, "content", "_assets", "daily", "chart.png"), "utf8")).resolves.toBe("chart")
+  })
+
+  it("returns note success and an attachment warning when the second recycle call fails", async () => {
+    const root = await garden()
+    const recycled = join(root, "recycled-note.md")
+    const trashItem = vi.fn(async (target: string) => {
+      if (target.endsWith("daily.md")) await rename(target, recycled)
+      else throw new Error("Recycle Bin unavailable")
+    })
+
+    await expect(
+      trashManagedNote({
+        workspace: root,
+        path: "content/life/daily.md",
+        trash: { trashItem },
+        isTracked: async () => true,
+      }),
+    ).resolves.toEqual({
+      path: "content/life/daily.md",
+      pendingPublicDeletion: "content/life/daily.md",
+      historyWarning: true,
+      attachmentCleanup: {
+        status: "failed",
+        message: expect.stringContaining("attachments remain"),
+      },
+    })
+    expect(trashItem).toHaveBeenNthCalledWith(2, join(root, "content", "_assets", "daily"))
+    await expect(readFile(join(root, "content", "_assets", "daily", "chart.png"), "utf8")).resolves.toBe("chart")
   })
 
   it("adapts only the injected Electron shell trash capability", async () => {

@@ -383,6 +383,9 @@ export interface NoteTrashReceipt {
   readonly path: string
   readonly pendingPublicDeletion?: string
   readonly historyWarning: boolean
+  readonly attachmentCleanup:
+    | { readonly status: "trashed" | "not-found" }
+    | { readonly status: "retained-ambiguous" | "failed"; readonly message: string }
 }
 
 export interface PreviewStartRequest {

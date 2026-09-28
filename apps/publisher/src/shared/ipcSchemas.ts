@@ -134,6 +134,15 @@ const noteTrashReceiptSchema = z
     path: pathSchema,
     pendingPublicDeletion: pathSchema.optional(),
     historyWarning: z.boolean(),
+    attachmentCleanup: z.discriminatedUnion("status", [
+      z.object({ status: z.enum(["trashed", "not-found"]) }).strict(),
+      z
+        .object({
+          status: z.enum(["retained-ambiguous", "failed"]),
+          message: z.string().min(1).max(1_000),
+        })
+        .strict(),
+    ]),
   })
   .strip()
 const loopbackUrlSchema = z

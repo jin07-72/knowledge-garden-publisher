@@ -1,4 +1,4 @@
-import { lstat, realpath, stat } from "node:fs/promises"
+import { lstat, readFile, realpath, stat } from "node:fs/promises"
 import { isAbsolute, relative, resolve } from "node:path"
 import {
   type WorkspaceCapabilities,
@@ -289,6 +289,76 @@ async function inspectDependencies(
   runtime: BundledNpmRuntime,
   runner: CommandRunner,
 ): Promise<WorkspaceIssue[]> {
+  const dependencyIssue = (
+    code: "DEPENDENCIES_MISSING" | "DEPENDENCIES_INVALID",
+    message: string,
+  ): WorkspaceIssue => issue(code, message, undefined, "install-dependencies")
+  const installedLock = resolve(root, "node_modules", ".package-lock.json")
+  const sourceLock = resolve(root, "package-lock.json")
+  try {
+    const [nodeModules, hiddenDetails, sourceDetails] = await Promise.all([
+      lstat(resolve(root, "node_modules")),
+      lstat(installedLock),
+      lstat(sourceLock),
+    ])
+    if (
+      nodeModules.isSymbolicLink() ||
+      !nodeModules.isDirectory() ||
+      hiddenDetails.isSymbolicLink() ||
+      !hiddenDetails.isFile()
+    ) {
+      return [dependencyIssue("DEPENDENCIES_MISSING", "Repository dependencies are not installed safely.")]
+    }
+    const maximumLockBytes = 32 * 1024 * 1024
+    if (hiddenDetails.size > maximumLockBytes || sourceDetails.size > maximumLockBytes) {
+      return [dependencyIssue("DEPENDENCIES_INVALID", "A dependency lock file is too large to verify safely.")]
+    }
+    const [sourceBytes, installedBytes] = await Promise.all([
+      readFile(sourceLock),
+      readFile(installedLock),
+    ])
+    const source = JSON.parse(sourceBytes.toString("utf8")) as {
+      lockfileVersion?: unknown
+      packages?: unknown
+    }
+    const installed = JSON.parse(installedBytes.toString("utf8")) as {
+      lockfileVersion?: unknown
+      packages?: unknown
+    }
+    if (
+      source.lockfileVersion !== installed.lockfileVersion ||
+      !source.packages ||
+      typeof source.packages !== "object" ||
+      !installed.packages ||
+      typeof installed.packages !== "object"
+    ) {
+      return [dependencyIssue("DEPENDENCIES_INVALID", "Installed dependencies do not match package-lock.json.")]
+    }
+    const expected = source.packages as Record<string, unknown>
+    const actual = installed.packages as Record<string, unknown>
+    const lockFields = ["version", "resolved", "integrity", "link", "dev", "optional", "peer"] as const
+    const fingerprint = (value: unknown): string | undefined => {
+      if (!value || typeof value !== "object" || Array.isArray(value)) return undefined
+      const record = value as Record<string, unknown>
+      return JSON.stringify(Object.fromEntries(lockFields.map((field) => [field, record[field]])))
+    }
+    for (const [path, actualPackage] of Object.entries(actual)) {
+      if (!path.startsWith("node_modules/")) continue
+      const expectedPackage = expected[path]
+      if (
+        expectedPackage === undefined ||
+        fingerprint(expectedPackage) === undefined ||
+        fingerprint(expectedPackage) !== fingerprint(actualPackage)
+      ) {
+        return [dependencyIssue("DEPENDENCIES_INVALID", "Installed dependencies do not match package-lock.json.")]
+      }
+    }
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code === "ENOENT") {
+      return [dependencyIssue("DEPENDENCIES_MISSING", "Repository dependencies are missing or incomplete.")]
+    }
+    return [dependencyIssue("DEPENDENCIES_INVALID", "Installed dependency state could not be verified.")]
+  }
   try {
     const result = await runner.run({
       executable: runtime.nodePath,
@@ -297,23 +367,9 @@ async function inspectDependencies(
       env: { npm_config_audit: "false", npm_config_fund: "false" },
     })
     if (didSucceed(result)) return []
-    return [
-      issue(
-        "DEPENDENCIES_MISSING",
-        "Repository dependencies are missing or incomplete.",
-        undefined,
-        "install-dependencies",
-      ),
-    ]
+    return [dependencyIssue("DEPENDENCIES_MISSING", "Repository dependencies are missing or incomplete.")]
   } catch {
-    return [
-      issue(
-        "DEPENDENCIES_INVALID",
-        "The bundled runtime could not verify repository dependencies.",
-        undefined,
-        "install-dependencies",
-      ),
-    ]
+    return [dependencyIssue("DEPENDENCIES_INVALID", "The bundled runtime could not verify repository dependencies.")]
   }
 }
 

@@ -84,8 +84,7 @@ describe("note access", () => {
       historyWarning: true,
     })
     expect(trashItem).toHaveBeenCalledOnce()
-    expect(trashItem).toHaveBeenCalledWith(expect.stringContaining(".garden-trash-"))
-    expect(trashItem).not.toHaveBeenCalledWith(note)
+    expect(trashItem).toHaveBeenCalledWith(note)
     expect(isTracked).toHaveBeenCalledWith(root, "content/life/daily.md")
   })
 
@@ -115,9 +114,9 @@ describe("note access", () => {
         workspace: root,
         path: "content/life/daily.md",
         trash: {
-          trashItem: async (staged) => {
+          trashItem: async (target) => {
+            await rename(target, recycled)
             await writeFile(note, "replacement")
-            await rename(staged, recycled)
           },
         },
         isTracked: async () => false,
@@ -147,7 +146,7 @@ describe("note access", () => {
     await expect(readFile(note, "utf8")).resolves.toBe("attacker replacement")
   })
 
-  it("restores the original note when the Recycle Bin adapter resolves without moving it", async () => {
+  it("leaves the original note unchanged when the Recycle Bin adapter resolves without moving it", async () => {
     const { root, note, markdown } = await garden()
     await expect(
       trashNote({
@@ -158,7 +157,7 @@ describe("note access", () => {
       }),
     ).rejects.toMatchObject({
       code: "NOTE_FILE_WRITE_FAILED",
-      message: "The note was not moved to the Recycle Bin and was safely restored.",
+      message: "The note was not moved to the Recycle Bin and remains unchanged.",
     })
     await expect(readFile(note, "utf8")).resolves.toBe(markdown)
     await expect(readdir(join(root, "content", "life"))).resolves.not.toEqual(
@@ -166,7 +165,7 @@ describe("note access", () => {
     )
   })
 
-  it("fails uncertain without trashing when the staged final component is swapped", async () => {
+  it("fails uncertain without trashing when the validated final component is swapped", async () => {
     const { root } = await garden()
     const trashItem = vi.fn(async () => undefined)
     await expect(
@@ -178,9 +177,9 @@ describe("note access", () => {
           isTracked: async () => false,
         },
         {
-          afterStage: async (staged) => {
-            await rename(staged, `${staged}.original`)
-            await writeFile(staged, "attacker replacement")
+          afterStage: async (_staged, original) => {
+            await rename(original, `${original}.original`)
+            await writeFile(original, "attacker replacement")
           },
         },
       ),
@@ -217,7 +216,7 @@ describe("note access", () => {
     await expect(readFile(note, "utf8")).resolves.toBe("attacker replacement")
   })
 
-  it("restores the exact staged note after a definite Recycle Bin rejection", async () => {
+  it("keeps the exact note after a definite Recycle Bin rejection", async () => {
     const { root, note, markdown } = await garden()
     await expect(
       trashNote({
@@ -228,7 +227,7 @@ describe("note access", () => {
       }),
     ).rejects.toMatchObject({
       code: "NOTE_FILE_WRITE_FAILED",
-      message: "The note was not moved to the Recycle Bin and was safely restored.",
+      message: "The note was not moved to the Recycle Bin and remains unchanged.",
     })
     await expect(readFile(note, "utf8")).resolves.toBe(markdown)
   })

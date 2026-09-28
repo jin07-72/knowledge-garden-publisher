@@ -373,7 +373,7 @@ function uncertainTrash(): AppError {
 function restoredTrashFailure(): AppError {
   return appError(
     "NOTE_FILE_WRITE_FAILED",
-    "The note was not moved to the Recycle Bin and was safely restored.",
+    "The note was not moved to the Recycle Bin and remains unchanged.",
   )
 }
 
@@ -632,7 +632,7 @@ export async function readNote(
 export async function trashNote(
   input: TrashNoteInput,
   adapter: TrashNoteAdapter = {},
-): Promise<NoteTrashReceipt> {
+): Promise<Omit<NoteTrashReceipt, "attachmentCleanup">> {
   if (typeof input.trash?.trashItem !== "function" || typeof input.isTracked !== "function")
     throw invalidInput(input.path || ".")
   const workspace = await canonicalWorkspace(input.workspace)
@@ -640,7 +640,7 @@ export async function trashNote(
   const root = await managedRoot(workspace, parsed.visibility)
   const lock = await acquireTargetLock(workspace, parsed.displayPath, {})
   let primaryError: unknown
-  let result: NoteTrashReceipt | undefined
+  let result: Omit<NoteTrashReceipt, "attachmentCleanup"> | undefined
   try {
     await lock.assertOwned()
     const current = await readCheckedFile(root, parsed.domain, parsed.filename, {
@@ -661,48 +661,34 @@ export async function trashNote(
     await lock.assertOwned()
     const managedRootIdentity = stableFileIdentity(await lstat(root.directory, { bigint: true }))
     const domainIdentity = stableFileIdentity(await lstat(directory, { bigint: true }))
-    const staged = resolve(directory, `.garden-trash-${randomUUID()}.md`)
     try {
-      await nodeRename(target, staged)
-    } catch (error) {
-      if (isNoteError(error)) throw error
-      throw writeFailure(parsed.displayPath)
-    }
-    try {
-      await adapter.afterStage?.(staged, target)
+      await adapter.afterStage?.(target, target)
       await assertTrashParents(root.directory, managedRootIdentity, directory, domainIdentity)
-      const stagedFile = await readCheckedFile(
-        root,
-        parsed.domain,
-        staged.slice(directory.length + 1),
-        { maximumBytes: 16 * 1024 * 1024 },
+      const beforeTrash = await inspectStagedTrash(
+        target,
+        directory,
+        current.stableIdentity,
+        current.revision.contentHash,
       )
-      if (
-        stagedFile.stableIdentity !== current.stableIdentity ||
-        stagedFile.revision.contentHash !== current.revision.contentHash
-      ) {
-        throw uncertainTrash()
-      }
+      if (beforeTrash !== "exact") throw uncertainTrash()
       try {
-        await input.trash.trashItem(staged)
+        await input.trash.trashItem(target)
       } catch {
         // A rejected shell promise can still mean the item moved. Reconcile
         // from filesystem state instead of trusting the transport outcome.
       }
       await assertTrashParents(root.directory, managedRootIdentity, directory, domainIdentity)
       const state = await inspectStagedTrash(
-        staged,
+        target,
         directory,
         current.stableIdentity,
         current.revision.contentHash,
       )
-      if (state !== "absent") {
-        if (state !== "exact") throw uncertainTrash()
-        await assertTrashParents(root.directory, managedRootIdentity, directory, domainIdentity)
-        if (!(await restoreStagedTrash(staged, target, current.stableIdentity)))
-          throw uncertainTrash()
-        throw restoredTrashFailure()
-      }
+      if (state === "exact") throw restoredTrashFailure()
+      if (state === "modified") throw uncertainTrash()
+      // absent means Windows moved the exact path. replacement means the
+      // validated note moved and another writer recreated the original name;
+      // preserve that replacement and report the original deletion complete.
     } catch (error) {
       if (isNoteError(error)) throw error
       throw uncertainTrash()
@@ -721,7 +707,7 @@ export async function trashNote(
     if (primaryError === undefined) primaryError = uncertainCommit()
   }
   if (primaryError !== undefined) throw primaryError
-  return result as NoteTrashReceipt
+  return result as Omit<NoteTrashReceipt, "attachmentCleanup">
 }
 
 function markdownFor(input: CreateNoteInput): string {
@@ -768,19 +754,19 @@ async function inspectStagedTrash(
   domain: string,
   expectedIdentity: string,
   expectedHash: string,
-): Promise<"absent" | "exact" | "different"> {
+): Promise<"absent" | "exact" | "replacement" | "modified"> {
   let details: BigIntStats
   try {
     details = await lstat(staged, { bigint: true })
   } catch (error) {
-    return (error as NodeJS.ErrnoException).code === "ENOENT" ? "absent" : "different"
+    return (error as NodeJS.ErrnoException).code === "ENOENT" ? "absent" : "modified"
   }
-  if (details.isSymbolicLink() || !details.isFile()) return "different"
+  if (details.isSymbolicLink() || !details.isFile()) return "replacement"
   let handle: FileHandle | undefined
   try {
     const canonical = await realpath(staged)
-    if (!isInside(domain, canonical) || stableFileIdentity(details) !== expectedIdentity)
-      return "different"
+    if (!isInside(domain, canonical)) return "replacement"
+    if (stableFileIdentity(details) !== expectedIdentity) return "replacement"
     handle = await open(
       staged,
       process.platform === "win32" ? "r" : constants.O_RDONLY | constants.O_NOFOLLOW,
@@ -791,9 +777,9 @@ async function inspectStagedTrash(
       bytes !== undefined &&
       hash(bytes) === expectedHash
       ? "exact"
-      : "different"
+      : "modified"
   } catch {
-    return "different"
+    return "modified"
   } finally {
     await handle?.close().catch(() => undefined)
   }

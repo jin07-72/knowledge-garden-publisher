@@ -60,6 +60,7 @@ const validByChannel: Record<string, unknown> = {
   [IPC_CHANNELS.requests.notesTrash]: {
     path: "content/life/daily.md",
     historyWarning: false,
+    attachmentCleanup: { status: "not-found" },
     ...privateField,
   },
   [IPC_CHANNELS.requests.notesRecoveryGet]: {

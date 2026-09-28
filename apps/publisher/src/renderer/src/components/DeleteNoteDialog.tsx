@@ -48,7 +48,7 @@ export function DeleteNoteDialog({ note, onClose, onDelete }: DeleteNoteDialogPr
       <div className="delete-note-copy">
         <p><strong>{note.title}</strong></p>
         <code>{note.path}</code>
-        <p>笔记及其专属附件会移入 Windows 回收站，可从回收站恢复。</p>
+        <p>笔记和归属明确的专属附件会以原名称移入 Windows 回收站，可从回收站恢复。未能安全清理的附件会明确提示。</p>
         {note.visibility === "public" ? (
           <p className="delete-public-warning">
             <TriangleAlert size={16} aria-hidden="true" />

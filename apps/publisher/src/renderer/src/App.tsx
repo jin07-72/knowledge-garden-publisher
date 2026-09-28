@@ -563,11 +563,18 @@ export function PublisherApp({ api }: { readonly api: GardenApi }): React.JSX.El
       setDocument(undefined)
       setDocumentError(undefined)
     }
-    setTrashNotice(
+    const deletionMessages = [
       result.value.pendingPublicDeletion
         ? "笔记已移入回收站；已发布的在线副本仍会保留，直到再次发布下架变化。"
-        : "笔记及其专属附件已移入 Windows 回收站。",
-    )
+        : "笔记已移入 Windows 回收站。",
+      ...(result.value.attachmentCleanup.status === "failed" ||
+      result.value.attachmentCleanup.status === "retained-ambiguous"
+        ? [result.value.attachmentCleanup.message]
+        : result.value.attachmentCleanup.status === "trashed"
+          ? ["专属附件也已移入 Windows 回收站。"]
+          : []),
+    ]
+    setTrashNotice(deletionMessages.join(" "))
     void loadChanges()
     return result.value
   }

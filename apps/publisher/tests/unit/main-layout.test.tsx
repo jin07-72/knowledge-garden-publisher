@@ -871,6 +871,10 @@ describe("publisher main layout", () => {
         path: notes[0].path,
         pendingPublicDeletion: notes[0].path,
         historyWarning: true,
+        attachmentCleanup: {
+          status: "failed",
+          message: "专属附件仍保留在工作区，请检查后重试清理。",
+        },
       }),
     )
     render(<App />)
@@ -895,6 +899,7 @@ describe("publisher main layout", () => {
     )
     await waitFor(() => expect(garden.notes.trash).toHaveBeenCalledWith({ path: notes[0].path }))
     expect(await screen.findByText(/在线副本仍会保留/)).toBeVisible()
+    expect(screen.getByText(/专属附件仍保留/)).toBeVisible()
     expect(screen.queryByText(notes[0].path)).not.toBeInTheDocument()
   })
 
