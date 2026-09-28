@@ -661,6 +661,7 @@ export async function trashNote(
     await lock.assertOwned()
     const managedRootIdentity = stableFileIdentity(await lstat(root.directory, { bigint: true }))
     const domainIdentity = stableFileIdentity(await lstat(directory, { bigint: true }))
+    const trashRecoveryKey = await internalRecoveryKey(workspace, true)
     const stage = await prepareTrashRecovery(
       workspace,
       target,
@@ -668,6 +669,7 @@ export async function trashNote(
       "file",
       current.stableIdentity,
       current.revision.contentHash,
+      trashRecoveryKey,
     )
     try {
       await nodeRename(target, stage.stagedPath)

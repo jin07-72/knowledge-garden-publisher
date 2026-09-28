@@ -8,8 +8,12 @@ import {
   type NoteTrashReceipt,
   type TrashAdapter,
 } from "../../shared/contracts"
-import { trashNote as trashVerifiedNote } from "./noteFiles"
-import { prepareTrashRecovery, restoreLocalTrashStage } from "./trashRecovery"
+import { internalRecoveryKey, trashNote as trashVerifiedNote } from "./noteFiles"
+import {
+  prepareTrashRecovery,
+  restoreLocalTrashStage,
+  verifyTrashRecoveryStage,
+} from "./trashRecovery"
 
 export interface TrashManagedNoteInput {
   readonly workspace: string
@@ -178,12 +182,15 @@ async function trashOwnedAttachments(
   }
   let stage: Awaited<ReturnType<typeof prepareTrashRecovery>>
   try {
+    const trashRecoveryKey = await internalRecoveryKey(owned.workspace, true)
     stage = await prepareTrashRecovery(
       owned.workspace,
       owned.directory,
       relative(owned.workspace, owned.directory).replaceAll("\\", "/"),
       "directory",
       owned.directoryIdentity,
+      undefined,
+      trashRecoveryKey,
     )
     await rename(owned.directory, stage.stagedPath)
     const [staged, canonicalStaged] = await Promise.all([
@@ -197,6 +204,9 @@ async function trashOwnedAttachments(
       !pathsEqual(canonicalStaged, stage.stagedPath)
     ) {
       throw new Error("staged attachment identity changed")
+    }
+    if (!(await verifyTrashRecoveryStage(stage))) {
+      throw new Error("staged attachment contents changed")
     }
     try {
       await trash.trashItem(stage.stagedPath)

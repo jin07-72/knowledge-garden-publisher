@@ -1,10 +1,11 @@
-import { createHash, randomUUID } from "node:crypto"
+import { createHash, createHmac, randomUUID, timingSafeEqual } from "node:crypto"
+import { constants } from "node:fs"
 import type { BigIntStats } from "node:fs"
 import {
   lstat,
   link,
   mkdir,
-  readFile,
+  open,
   readdir,
   realpath,
   rename,
@@ -20,6 +21,11 @@ const transactionPattern = /^[a-f0-9-]{36}$/i
 const notePattern =
   /^(content|private)\/(technology|reading|language|life)\/[a-z0-9]+(?:-[a-z0-9]+)*\.md$/
 const attachmentPattern = /^(content|private)\/_assets\/[a-z0-9]+(?:-[a-z0-9]+)*$/
+const digestPattern = /^[a-f0-9]{64}$/
+const maximumDirectoryEntries = 10_000
+const maximumDirectoryBytes = 512 * 1024 * 1024
+const maximumAttachmentBytes = 64 * 1024 * 1024
+const maximumDirectoryDepth = 64
 
 export interface TrashRecoveryStage {
   readonly id: string
@@ -30,16 +36,21 @@ export interface TrashRecoveryStage {
   readonly transactionPath: string
   readonly kind: "file" | "directory"
   readonly expectedIdentity: string
-  readonly expectedContentHash?: string
+  readonly expectedContentHash: string
 }
 
 interface TrashRecoveryJournal {
   readonly version: 1
+  readonly id: string
   readonly kind: "file" | "directory"
   readonly originalRelativePath: string
+  readonly stagedRelativePath: string
   readonly expectedIdentity: string
-  readonly expectedContentHash?: string
+  readonly expectedContentHash: string
+  readonly integrity: string
 }
+
+type UnsignedTrashRecoveryJournal = Omit<TrashRecoveryJournal, "integrity">
 
 function pathsEqual(left: string, right: string): boolean {
   return process.platform === "win32" ? left.toLowerCase() === right.toLowerCase() : left === right
@@ -52,6 +63,133 @@ function isInside(parent: string, child: string): boolean {
 
 function validRelativePath(path: string, kind: TrashRecoveryStage["kind"]): boolean {
   return (kind === "file" ? notePattern : attachmentPattern).test(path)
+}
+
+function canonicalJournal(journal: UnsignedTrashRecoveryJournal): string {
+  return JSON.stringify({
+    version: journal.version,
+    id: journal.id,
+    kind: journal.kind,
+    originalRelativePath: journal.originalRelativePath,
+    stagedRelativePath: journal.stagedRelativePath,
+    expectedIdentity: journal.expectedIdentity,
+    expectedContentHash: journal.expectedContentHash,
+  })
+}
+
+function journalIntegrity(key: Buffer, journal: UnsignedTrashRecoveryJournal): string {
+  return createHmac("sha256", key)
+    .update("garden-publisher/trash-recovery/journal/v1\0")
+    .update(canonicalJournal(journal))
+    .digest("hex")
+}
+
+function sameIntegrity(left: string, right: string): boolean {
+  if (!digestPattern.test(left) || !digestPattern.test(right)) return false
+  return timingSafeEqual(Buffer.from(left, "hex"), Buffer.from(right, "hex"))
+}
+
+async function directoryDigest(root: string): Promise<string> {
+  let entries = 0
+  let totalBytes = 0
+  const output = createHash("sha256")
+  const rootBefore = await lstat(root, { bigint: true })
+  if (rootBefore.isSymbolicLink() || !rootBefore.isDirectory()) {
+    throw new Error("Attachment recovery root is unsafe.")
+  }
+  const rootCanonical = await realpath(root)
+  if (!pathsEqual(rootCanonical, root)) throw new Error("Attachment recovery tree is unsafe.")
+
+  async function visit(directory: string, relativeDirectory: string, depth: number): Promise<void> {
+    if (depth > maximumDirectoryDepth) throw new Error("Attachment recovery tree is too deep.")
+    const before = (await readdir(directory)).sort()
+    for (const name of before) {
+      const path = resolve(directory, name)
+      const relativePath = relativeDirectory === "" ? name : `${relativeDirectory}/${name}`
+      if (Buffer.byteLength(relativePath, "utf8") > 4_096)
+        throw new Error("Attachment recovery path is too long.")
+      const details = await lstat(path, { bigint: true })
+      if (details.isSymbolicLink()) throw new Error("Attachment recovery tree contains a link.")
+      if (!pathsEqual(await realpath(path), path) || !isInside(rootCanonical, path)) {
+        throw new Error("Attachment recovery tree escaped its root.")
+      }
+      entries += 1
+      if (entries > maximumDirectoryEntries)
+        throw new Error("Attachment recovery tree has too many entries.")
+      if (details.isDirectory()) {
+        output.update(`D\0${relativePath}\0`)
+        await visit(path, relativePath, depth + 1)
+        const directoryAfter = await lstat(path, { bigint: true })
+        if (
+          stableIdentity(directoryAfter) !== stableIdentity(details) ||
+          directoryAfter.mtimeNs !== details.mtimeNs
+        ) {
+          throw new Error("Attachment recovery directory changed while hashing.")
+        }
+        continue
+      }
+      if (!details.isFile()) throw new Error("Attachment recovery tree contains a special file.")
+      const size = Number(details.size)
+      if (!Number.isSafeInteger(size) || size > maximumAttachmentBytes)
+        throw new Error("Attachment recovery file is too large.")
+      totalBytes += size
+      if (totalBytes > maximumDirectoryBytes)
+        throw new Error("Attachment recovery tree is too large.")
+      const handle = await open(
+        path,
+        process.platform === "win32" ? "r" : constants.O_RDONLY | constants.O_NOFOLLOW,
+      )
+      try {
+        const opened = await handle.stat({ bigint: true })
+        if (
+          !opened.isFile() ||
+          stableIdentity(opened) !== stableIdentity(details) ||
+          opened.size !== details.size
+        ) {
+          throw new Error("Attachment recovery file changed while hashing.")
+        }
+        const content = createHash("sha256")
+        const buffer = Buffer.allocUnsafe(64 * 1024)
+        let offset = 0
+        while (offset < size) {
+          const { bytesRead } = await handle.read(
+            buffer,
+            0,
+            Math.min(buffer.length, size - offset),
+            offset,
+          )
+          if (bytesRead === 0) throw new Error("Attachment recovery file was truncated.")
+          content.update(buffer.subarray(0, bytesRead))
+          offset += bytesRead
+        }
+        const after = await handle.stat({ bigint: true })
+        if (
+          stableIdentity(after) !== stableIdentity(details) ||
+          after.size !== details.size ||
+          after.mtimeNs !== details.mtimeNs
+        ) {
+          throw new Error("Attachment recovery file changed while hashing.")
+        }
+        output.update(`F\0${relativePath}\0${size}\0${content.digest("hex")}\0`)
+      } finally {
+        await handle.close()
+      }
+    }
+    const after = (await readdir(directory)).sort()
+    if (before.length !== after.length || before.some((name, index) => name !== after[index])) {
+      throw new Error("Attachment recovery directory changed while hashing.")
+    }
+  }
+
+  await visit(root, "", 0)
+  const rootAfter = await lstat(root, { bigint: true })
+  if (
+    stableIdentity(rootAfter) !== stableIdentity(rootBefore) ||
+    rootAfter.mtimeNs !== rootBefore.mtimeNs
+  ) {
+    throw new Error("Attachment recovery root changed while hashing.")
+  }
+  return output.digest("hex")
 }
 
 async function safeRecoveryRoot(
@@ -102,7 +240,8 @@ export async function prepareTrashRecovery(
   originalRelativePath: string,
   kind: TrashRecoveryStage["kind"],
   expectedIdentity: string,
-  expectedContentHash?: string,
+  expectedContentHash: string | undefined,
+  key: Buffer,
 ): Promise<TrashRecoveryStage> {
   const { workspace, root } = await safeRecoveryRoot(workspaceInput, true)
   const normalized = originalRelativePath.replaceAll("\\", "/")
@@ -112,23 +251,29 @@ export async function prepareTrashRecovery(
     !pathsEqual(resolve(workspace, ...normalized.split("/")), originalPath) ||
     !isInside(workspace, originalPath) ||
     !/^\d+:\d+:\d+$/.test(expectedIdentity) ||
-    (kind === "file" && !/^[a-f0-9]{64}$/.test(expectedContentHash ?? "")) ||
-    (kind === "directory" && expectedContentHash !== undefined)
+    (kind === "file" && !digestPattern.test(expectedContentHash ?? "")) ||
+    key?.length !== 32
   ) {
     throw new Error("Trash recovery target is unsafe.")
   }
   const id = randomUUID()
   const transactionPath = resolve(root, id)
-  const stagedPath = resolve(transactionPath, "items", ...normalized.split("/"))
+  const stagedRelativePath = `items/${normalized}`
+  const stagedPath = resolve(transactionPath, ...stagedRelativePath.split("/"))
   await mkdir(transactionPath, { mode: 0o700 })
   await mkdir(dirname(stagedPath), { recursive: true, mode: 0o700 })
-  const journal: TrashRecoveryJournal = {
+  const contentHash =
+    kind === "directory" ? await directoryDigest(originalPath) : expectedContentHash!
+  const unsigned: UnsignedTrashRecoveryJournal = {
     version: journalVersion,
+    id,
     kind,
     originalRelativePath: normalized,
+    stagedRelativePath,
     expectedIdentity,
-    ...(expectedContentHash === undefined ? {} : { expectedContentHash }),
+    expectedContentHash: contentHash,
   }
+  const journal: TrashRecoveryJournal = { ...unsigned, integrity: journalIntegrity(key!, unsigned) }
   await writeFile(resolve(transactionPath, "journal.json"), JSON.stringify(journal), {
     encoding: "utf8",
     flag: "wx",
@@ -143,7 +288,7 @@ export async function prepareTrashRecovery(
     transactionPath,
     kind,
     expectedIdentity,
-    ...(expectedContentHash === undefined ? {} : { expectedContentHash }),
+    expectedContentHash: contentHash,
   }
 }
 
@@ -165,10 +310,29 @@ export async function restoreLocalTrashStage(stage: TrashRecoveryStage): Promise
   }
 }
 
-function parseJournal(value: unknown): TrashRecoveryJournal | undefined {
+function parseJournal(
+  value: unknown,
+  expectedId: string,
+  key: Buffer,
+): TrashRecoveryJournal | undefined {
   if (!value || typeof value !== "object" || Array.isArray(value)) return undefined
   const record = value as Record<string, unknown>
-  if (record.version !== journalVersion || (record.kind !== "file" && record.kind !== "directory"))
+  const fields = [
+    "expectedContentHash",
+    "expectedIdentity",
+    "id",
+    "integrity",
+    "kind",
+    "originalRelativePath",
+    "stagedRelativePath",
+    "version",
+  ]
+  if (Object.keys(record).sort().join("\0") !== fields.join("\0")) return undefined
+  if (
+    record.version !== journalVersion ||
+    record.id !== expectedId ||
+    (record.kind !== "file" && record.kind !== "directory")
+  )
     return undefined
   if (
     typeof record.originalRelativePath !== "string" ||
@@ -178,13 +342,49 @@ function parseJournal(value: unknown): TrashRecoveryJournal | undefined {
   if (typeof record.expectedIdentity !== "string" || !/^\d+:\d+:\d+$/.test(record.expectedIdentity))
     return undefined
   if (
-    record.kind === "file" &&
-    (typeof record.expectedContentHash !== "string" ||
-      !/^[a-f0-9]{64}$/.test(record.expectedContentHash))
+    typeof record.stagedRelativePath !== "string" ||
+    record.stagedRelativePath !== `items/${record.originalRelativePath}`
   )
     return undefined
-  if (record.kind === "directory" && record.expectedContentHash !== undefined) return undefined
-  return record as unknown as TrashRecoveryJournal
+  if (
+    typeof record.expectedContentHash !== "string" ||
+    !digestPattern.test(record.expectedContentHash)
+  )
+    return undefined
+  if (typeof record.integrity !== "string") return undefined
+  const journal = record as unknown as TrashRecoveryJournal
+  const { integrity, ...unsigned } = journal
+  return sameIntegrity(integrity, journalIntegrity(key, unsigned)) ? journal : undefined
+}
+
+async function readBoundedRegularFile(path: string, maximumBytes: number): Promise<Buffer> {
+  const handle = await open(
+    path,
+    process.platform === "win32" ? "r" : constants.O_RDONLY | constants.O_NOFOLLOW,
+  )
+  try {
+    const before = await handle.stat({ bigint: true })
+    if (!before.isFile() || before.size > BigInt(maximumBytes))
+      throw new Error("Recovery file is unsafe.")
+    const buffer = Buffer.alloc(Number(before.size))
+    let offset = 0
+    while (offset < buffer.length) {
+      const { bytesRead } = await handle.read(buffer, offset, buffer.length - offset, offset)
+      if (bytesRead === 0) throw new Error("Recovery file was truncated.")
+      offset += bytesRead
+    }
+    const after = await handle.stat({ bigint: true })
+    if (
+      stableIdentity(after) !== stableIdentity(before) ||
+      after.size !== before.size ||
+      after.mtimeNs !== before.mtimeNs
+    ) {
+      throw new Error("Recovery file changed while reading.")
+    }
+    return buffer
+  } finally {
+    await handle.close()
+  }
 }
 
 function stableIdentity(details: BigIntStats): string {
@@ -204,11 +404,16 @@ async function matchesExpectedItem(
     ) {
       return false
     }
-    if (expected.kind === "file") {
-      const contentHash = createHash("sha256")
-        .update(await readFile(path))
-        .digest("hex")
-      if (contentHash !== expected.expectedContentHash) return false
+    const contentHash =
+      expected.kind === "file"
+        ? createHash("sha256")
+            .update(await readBoundedRegularFile(path, 16 * 1024 * 1024))
+            .digest("hex")
+        : await directoryDigest(path)
+    if (contentHash !== expected.expectedContentHash) return false
+    const after = await lstat(path, { bigint: true })
+    if (stableIdentity(after) !== stableIdentity(details) || after.mtimeNs !== details.mtimeNs) {
+      return false
     }
     return pathsEqual(await realpath(path), path)
   } catch {
@@ -216,9 +421,14 @@ async function matchesExpectedItem(
   }
 }
 
+export async function verifyTrashRecoveryStage(stage: TrashRecoveryStage): Promise<boolean> {
+  return matchesExpectedItem(stage.stagedPath, stage)
+}
+
 /** Reinstalls items restored from Windows Recycle Bin; conflicts remain in the recovery area. */
 export async function reconcileTrashRecovery(
   workspaceInput: string,
+  loadKey: () => Promise<Buffer>,
 ): Promise<{ readonly restored: readonly string[]; readonly conflicts: readonly string[] }> {
   let storage: { workspace: string; root: string }
   try {
@@ -229,6 +439,8 @@ export async function reconcileTrashRecovery(
   }
   const restored: string[] = []
   const conflicts: string[] = []
+  const key = await loadKey()
+  if (key.length !== 32) throw new Error("Trash recovery key is invalid.")
   const entries = (await readdir(storage.root))
     .filter((name) => transactionPattern.test(name))
     .sort()
@@ -247,10 +459,14 @@ export async function reconcileTrashRecovery(
       )
         continue
       if (!pathsEqual(await realpath(transactionPath), transactionPath)) continue
-      const journal = parseJournal(JSON.parse(await readFile(journalPath, "utf8")))
+      const journal = parseJournal(
+        JSON.parse((await readBoundedRegularFile(journalPath, 64 * 1024)).toString("utf8")),
+        id,
+        key,
+      )
       if (!journal) continue
       const original = resolve(storage.workspace, ...journal.originalRelativePath.split("/"))
-      const staged = resolve(transactionPath, "items", ...journal.originalRelativePath.split("/"))
+      const staged = resolve(transactionPath, ...journal.stagedRelativePath.split("/"))
       if (!isInside(transactionPath, staged) || !isInside(storage.workspace, original)) continue
       let stagedDetails
       try {
@@ -285,9 +501,7 @@ export async function reconcileTrashRecovery(
         transactionPath,
         kind: journal.kind,
         expectedIdentity: journal.expectedIdentity,
-        ...(journal.expectedContentHash === undefined
-          ? {}
-          : { expectedContentHash: journal.expectedContentHash }),
+        expectedContentHash: journal.expectedContentHash,
       }
       if (!(await matchesExpectedItem(staged, stage))) {
         conflicts.push(journal.originalRelativePath)

@@ -1,11 +1,16 @@
+import { createHash } from "node:crypto"
 import { mkdir, mkdtemp, readFile, readdir, rename, rm, symlink, writeFile } from "node:fs/promises"
 import { tmpdir } from "node:os"
-import { join } from "node:path"
+import { dirname, join } from "node:path"
 import { afterEach, describe, expect, it, vi } from "vitest"
-import { readNote, trashNote } from "../../src/main/services/noteFiles"
+import { internalRecoveryKey, readNote, trashNote } from "../../src/main/services/noteFiles"
 import { reconcileTrashRecovery } from "../../src/main/services/trashRecovery"
 
 const temporaryDirectories: string[] = []
+
+function reconcile(root: string) {
+  return reconcileTrashRecovery(root, () => internalRecoveryKey(root, false))
+}
 
 afterEach(async () => {
   await Promise.all(temporaryDirectories.splice(0).map((path) => rm(path, { recursive: true })))
@@ -132,7 +137,7 @@ describe("note access", () => {
     await expect(readFile(recycled, "utf8")).resolves.toBe(markdown)
 
     await rename(recycled, staged)
-    await expect(reconcileTrashRecovery(root)).resolves.toEqual({
+    await expect(reconcile(root)).resolves.toEqual({
       restored: [],
       conflicts: ["content/life/daily.md"],
     })
@@ -157,7 +162,7 @@ describe("note access", () => {
     })
     await rename(recycled, staged)
 
-    await expect(reconcileTrashRecovery(root)).resolves.toEqual({
+    await expect(reconcile(root)).resolves.toEqual({
       restored: ["content/life/daily.md"],
       conflicts: [],
     })
@@ -181,12 +186,65 @@ describe("note access", () => {
     })
     await writeFile(staged, "forged restored note")
 
-    await expect(reconcileTrashRecovery(root)).resolves.toEqual({
+    await expect(reconcile(root)).resolves.toEqual({
       restored: [],
       conflicts: ["content/life/daily.md"],
     })
     await expect(readFile(note, "utf8")).rejects.toMatchObject({ code: "ENOENT" })
     await expect(readFile(staged, "utf8")).resolves.toBe("forged restored note")
+  })
+
+  it("rejects a structurally valid journal forged and retagged without the workspace key", async () => {
+    const { root, note } = await garden()
+    const recycled = join(root, "recycled.md")
+    let staged = ""
+    await trashNote({
+      workspace: root,
+      path: "content/life/daily.md",
+      trash: {
+        trashItem: async (target) => {
+          staged = target
+          await rename(target, recycled)
+        },
+      },
+      isTracked: async () => false,
+    })
+    await rename(recycled, staged)
+    const journalPath = join(dirname(dirname(dirname(dirname(staged)))), "journal.json")
+    const journal = JSON.parse(await readFile(journalPath, "utf8")) as Record<string, unknown>
+    journal.expectedContentHash = "0".repeat(64)
+    const { integrity: _integrity, ...unsigned } = journal
+    journal.integrity = createHash("sha256").update(JSON.stringify(unsigned)).digest("hex")
+    await writeFile(journalPath, JSON.stringify(journal))
+
+    await expect(reconcile(root)).resolves.toEqual({ restored: [], conflicts: [] })
+    await expect(readFile(note, "utf8")).rejects.toMatchObject({ code: "ENOENT" })
+    await expect(readFile(staged, "utf8")).resolves.toContain("# Daily")
+  })
+
+  it("fails closed when a trash-recovery journal has a missing or corrupt workspace key", async () => {
+    for (const keyBytes of [undefined, Buffer.from("corrupt")]) {
+      const { root } = await garden()
+      const recycled = join(root, `recycled-${temporaryDirectories.length}.md`)
+      let staged = ""
+      await trashNote({
+        workspace: root,
+        path: "content/life/daily.md",
+        trash: {
+          trashItem: async (target) => {
+            staged = target
+            await rename(target, recycled)
+          },
+        },
+        isTracked: async () => false,
+      })
+      await rename(recycled, staged)
+      const keyPath = join(root, ".garden-publisher", "keys", "recovery-hmac.key")
+      if (keyBytes === undefined) await rm(keyPath)
+      else await writeFile(keyPath, keyBytes)
+
+      await expect(reconcile(root)).rejects.toMatchObject({ code: "RECOVERY_INVALID" })
+    }
   })
 
   it("retains a restored staged note when its original path has been recreated", async () => {
@@ -207,7 +265,7 @@ describe("note access", () => {
     await writeFile(note, "replacement")
     await rename(recycled, staged)
 
-    await expect(reconcileTrashRecovery(root)).resolves.toEqual({
+    await expect(reconcile(root)).resolves.toEqual({
       restored: [],
       conflicts: ["content/life/daily.md"],
     })

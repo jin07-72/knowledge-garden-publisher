@@ -4,6 +4,7 @@ import {
   createNote,
   executeRename,
   executeVisibilityChange,
+  internalRecoveryKey,
   planRename,
   planVisibilityChange,
   readNote,
@@ -87,7 +88,9 @@ export function createPublisherServices(
     },
     notes: {
       list: async () => {
-        const recovery = await reconcileTrashRecovery(workspace)
+        const recovery = await reconcileTrashRecovery(workspace, () =>
+          internalRecoveryKey(workspace, false),
+        )
         if (recovery.conflicts.length > 0) {
           throw {
             code: "RECOVERY_CONFLICT",

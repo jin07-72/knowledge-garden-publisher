@@ -1,8 +1,9 @@
-import { mkdir, mkdtemp, readFile, rename, rm, writeFile } from "node:fs/promises"
+import { mkdir, mkdtemp, readFile, rename, rm, symlink, writeFile } from "node:fs/promises"
 import { tmpdir } from "node:os"
 import { join } from "node:path"
 import { afterEach, describe, expect, it, vi } from "vitest"
 import { createElectronTrashAdapter, trashManagedNote } from "../../src/main/services/trash"
+import { internalRecoveryKey } from "../../src/main/services/noteFiles"
 import { reconcileTrashRecovery } from "../../src/main/services/trashRecovery"
 
 const temporaryDirectories: string[] = []
@@ -69,7 +70,9 @@ describe("safe note trash", () => {
     await expect(readFile(join(recycle, "item-2", "chart.png"), "utf8")).resolves.toBe("chart")
     await rename(join(recycle, "item-1"), trashItem.mock.calls[0]![0])
     await rename(join(recycle, "item-2"), trashItem.mock.calls[1]![0])
-    await expect(reconcileTrashRecovery(root)).resolves.toEqual({
+    await expect(
+      reconcileTrashRecovery(root, () => internalRecoveryKey(root, false)),
+    ).resolves.toEqual({
       restored: expect.arrayContaining(["content/life/daily.md", "content/_assets/daily"]),
       conflicts: [],
     })
@@ -160,6 +163,62 @@ describe("safe note trash", () => {
     )
     await expect(readFile(join(recycle, "original-1"), "utf8")).resolves.toBe("# Daily")
     await expect(readFile(join(recycle, "original-2", "chart.png"), "utf8")).resolves.toBe("chart")
+  })
+
+  it("refuses to restore an attachment tree whose signed contents were modified", async () => {
+    const root = await garden()
+    const recycle = await mkdtemp(join(tmpdir(), "garden-modified-attachment-recycle-"))
+    temporaryDirectories.push(recycle)
+    const staged: string[] = []
+    await trashManagedNote({
+      workspace: root,
+      path: "content/life/daily.md",
+      trash: {
+        trashItem: async (target) => {
+          staged.push(target)
+          await rename(target, join(recycle, `item-${staged.length}`))
+        },
+      },
+      isTracked: async () => false,
+    })
+    await rename(join(recycle, "item-2"), staged[1]!)
+    await writeFile(join(staged[1]!, "chart.png"), "modified")
+
+    await expect(
+      reconcileTrashRecovery(root, () => internalRecoveryKey(root, false)),
+    ).resolves.toEqual({ restored: [], conflicts: ["content/_assets/daily"] })
+  })
+
+  it("refuses to restore an attachment tree containing a symlink", async ({ skip }) => {
+    const root = await garden()
+    const recycle = await mkdtemp(join(tmpdir(), "garden-linked-attachment-recycle-"))
+    temporaryDirectories.push(recycle)
+    const outside = join(root, "outside.png")
+    await writeFile(outside, "outside")
+    const staged: string[] = []
+    await trashManagedNote({
+      workspace: root,
+      path: "content/life/daily.md",
+      trash: {
+        trashItem: async (target) => {
+          staged.push(target)
+          await rename(target, join(recycle, `item-${staged.length}`))
+        },
+      },
+      isTracked: async () => false,
+    })
+    await rename(join(recycle, "item-2"), staged[1]!)
+    await rm(join(staged[1]!, "chart.png"))
+    try {
+      await symlink(outside, join(staged[1]!, "chart.png"), "file")
+    } catch {
+      skip()
+      return
+    }
+
+    await expect(
+      reconcileTrashRecovery(root, () => internalRecoveryKey(root, false)),
+    ).resolves.toEqual({ restored: [], conflicts: ["content/_assets/daily"] })
   })
 
   it("returns note success and an attachment warning when the second recycle call fails", async () => {
