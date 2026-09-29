@@ -273,7 +273,10 @@ describe("first-run diagnostics", () => {
     const list = vi.fn()
     Object.defineProperty(window, "garden", {
       configurable: true,
-      value: { workspace: { inspect, repair: vi.fn() }, notes: { list } } as unknown as GardenApi,
+      value: {
+        workspace: { inspectSafety: inspect, inspect: vi.fn(), repair: vi.fn() },
+        notes: { list },
+      } as unknown as GardenApi,
     })
 
     render(<App />)

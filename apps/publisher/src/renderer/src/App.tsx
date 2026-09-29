@@ -351,6 +351,18 @@ export function PublisherApp({ api }: { readonly api: GardenApi }): React.JSX.El
   }, [api])
 
   useEffect(() => {
+    const unsubscribeRecovery = api.notes.onRecovery(({ restored, conflicts }) => {
+      if (!appMounted.current) return
+      if (restored.length > 0) {
+        setTrashNotice(`已从 Windows 回收站恢复 ${restored.length} 项，笔记列表已更新。`)
+        void loadNotes()
+      }
+      if (conflicts.length > 0) {
+        setTrashNotice(
+          `回收站恢复项与 ${conflicts[0]} 冲突；恢复副本仍安全保留在恢复区。`,
+        )
+      }
+    })
     void loadNotes()
     const currentPreviewRequest = ++previewRequest.current
     void api.preview
@@ -388,6 +400,7 @@ export function PublisherApp({ api }: { readonly api: GardenApi }): React.JSX.El
     const unsubscribePreview = api.preview.onProgress(applyPreview)
     const unsubscribePublish = api.publish.onProgress(setPublishProgress)
     return () => {
+      unsubscribeRecovery()
       unsubscribePreview()
       unsubscribePublish()
       notesRequest.current += 1
@@ -576,7 +589,6 @@ export function PublisherApp({ api }: { readonly api: GardenApi }): React.JSX.El
           : []),
     ]
     setTrashNotice(deletionMessages.join(" "))
-    queueMicrotask(() => postDeleteFocus.current?.focus())
     void loadChanges()
     return result.value
   }
@@ -891,6 +903,10 @@ export function PublisherApp({ api }: { readonly api: GardenApi }): React.JSX.El
           note={pendingDelete}
           onClose={() => setPendingDelete(undefined)}
           onDelete={() => deleteNote(pendingDelete)}
+          onDeleted={() => {
+            setPendingDelete(undefined)
+            requestAnimationFrame(() => postDeleteFocus.current?.focus())
+          }}
         />
       ) : null}
     </main>
@@ -898,6 +914,7 @@ export function PublisherApp({ api }: { readonly api: GardenApi }): React.JSX.El
 }
 
 function PublisherStartup({ api }: { readonly api: GardenApi }): React.JSX.Element {
+  const [safety, setSafety] = useState<WorkspaceInspection>()
   const [inspection, setInspection] = useState<WorkspaceInspection>()
   const [busy, setBusy] = useState(false)
   const [error, setError] = useState<string>()
@@ -909,7 +926,7 @@ function PublisherStartup({ api }: { readonly api: GardenApi }): React.JSX.Eleme
     }
   }, [])
 
-  const inspect = useCallback(async (): Promise<void> => {
+  const inspectDiagnostics = useCallback(async (): Promise<void> => {
     setBusy(true)
     setError(undefined)
     try {
@@ -929,51 +946,73 @@ function PublisherStartup({ api }: { readonly api: GardenApi }): React.JSX.Eleme
     }
   }, [api])
 
+  const inspectSafety = useCallback(async (): Promise<void> => {
+    setBusy(true)
+    setError(undefined)
+    try {
+      const result = await api.workspace.inspectSafety()
+      if (!mounted.current) return
+      if (!result.ok) {
+        setError(messageFor(result.error, "无法完成本地安全检查。"))
+        setSafety(undefined)
+        return
+      }
+      setSafety(result.value)
+      if (result.value.capabilities.files) void inspectDiagnostics()
+    } catch (failure) {
+      if (mounted.current)
+        setError(failure instanceof Error ? failure.message : "无法完成本地安全检查。")
+    } finally {
+      if (mounted.current) setBusy(false)
+    }
+  }, [api, inspectDiagnostics])
+
   useEffect(() => {
-    void inspect()
-  }, [inspect])
-  if (inspection?.ok) return <PublisherApp api={api} />
-  if (inspection?.capabilities.files) {
+    void inspectSafety()
+  }, [inspectSafety])
+  if (safety?.capabilities.files) {
     return (
       <>
-        <FirstRun
-          compact
-          inspection={inspection}
-          busy={busy}
-          error={error}
-          onRetry={() => void inspect()}
-          onRepair={async (action: WorkspaceRepairAction) => {
-            setBusy(true)
-            setError(undefined)
-            try {
-              const result = await api.workspace.repair({ action })
-              if (!result.ok) throw new Error(messageFor(result.error, "无法修复仓库依赖。"))
-              await inspect()
-            } catch (failure) {
-              if (mounted.current)
-                setError(failure instanceof Error ? failure.message : "无法修复仓库依赖。")
-            } finally {
-              if (mounted.current) setBusy(false)
-            }
-          }}
-        />
+        {inspection?.ok === false || error ? (
+          <FirstRun
+            compact
+            inspection={inspection}
+            busy={busy}
+            error={error}
+            onRetry={() => void inspectDiagnostics()}
+            onRepair={async (action: WorkspaceRepairAction) => {
+              setBusy(true)
+              setError(undefined)
+              try {
+                const result = await api.workspace.repair({ action })
+                if (!result.ok) throw new Error(messageFor(result.error, "无法修复仓库依赖。"))
+                await inspectDiagnostics()
+              } catch (failure) {
+                if (mounted.current)
+                  setError(failure instanceof Error ? failure.message : "无法修复仓库依赖。")
+              } finally {
+                if (mounted.current) setBusy(false)
+              }
+            }}
+          />
+        ) : null}
         <PublisherApp api={api} />
       </>
     )
   }
   return (
     <FirstRun
-      inspection={inspection}
+      inspection={safety}
       busy={busy}
       error={error}
-      onRetry={() => void inspect()}
+      onRetry={() => void inspectSafety()}
       onRepair={async (action: WorkspaceRepairAction) => {
         setBusy(true)
         setError(undefined)
         try {
           const result = await api.workspace.repair({ action })
           if (!result.ok) throw new Error(messageFor(result.error, "无法修复仓库依赖。"))
-          await inspect()
+          await inspectSafety()
         } catch (failure) {
           if (mounted.current)
             setError(failure instanceof Error ? failure.message : "无法修复仓库依赖。")

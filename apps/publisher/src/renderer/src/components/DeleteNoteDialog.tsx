@@ -7,12 +7,14 @@ interface DeleteNoteDialogProps {
   readonly note: NoteSummary
   readonly onClose: () => void
   readonly onDelete: () => Promise<NoteTrashReceipt>
+  readonly onDeleted: () => void
 }
 
 export function DeleteNoteDialog({
   note,
   onClose,
   onDelete,
+  onDeleted,
 }: DeleteNoteDialogProps): React.JSX.Element {
   const [busy, setBusy] = useState(false)
   const [error, setError] = useState("")
@@ -31,7 +33,7 @@ export function DeleteNoteDialog({
     setError("")
     try {
       await onDelete()
-      if (mounted.current) onClose()
+      if (mounted.current) onDeleted()
     } catch (failure) {
       if (!mounted.current) return
       setError(failure instanceof Error ? failure.message : "无法将笔记移入回收站。")

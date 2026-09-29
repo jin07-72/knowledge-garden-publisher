@@ -112,6 +112,14 @@ function createGardenMock(): GardenApi {
       onCloseBlocked: vi.fn(() => () => undefined),
     },
     workspace: {
+      inspectSafety: vi.fn(async () =>
+        ok<WorkspaceInspection>({
+          ok: true,
+          root: String.raw`C:\Users\11546\Desktop\web`,
+          capabilities: { files: true, preview: true, git: false, publish: false },
+          issues: [],
+        }),
+      ),
       inspect: vi.fn(async () =>
         ok<WorkspaceInspection>({
           ok: true,
@@ -125,6 +133,7 @@ function createGardenMock(): GardenApi {
       ),
     },
     notes: {
+      onRecovery: vi.fn(() => () => undefined),
       list: vi.fn(async () => ok(notes)),
       read: vi.fn(async ({ path }) => ok(documents.get(path)!)),
       save: vi.fn(),
@@ -234,6 +243,37 @@ describe("publisher main layout", () => {
     expect(garden.notes.list).toHaveBeenCalledOnce()
     expect(screen.getByText("origin/main is temporarily unreachable.")).toBeVisible()
     expect(screen.getByText("The preferred preview port is occupied.")).toBeVisible()
+  })
+
+  it("mounts the editor after local safety passes while slow diagnostics remain pending", async () => {
+    vi.mocked(garden.workspace.inspect).mockImplementationOnce(() => new Promise(() => undefined))
+
+    render(<StartupApp />)
+
+    expect(await screen.findByRole("region", { name: "Markdown 编辑器" })).toBeVisible()
+    expect(garden.workspace.inspectSafety).toHaveBeenCalledOnce()
+    expect(garden.workspace.inspect).toHaveBeenCalledOnce()
+    expect(garden.notes.list).toHaveBeenCalledOnce()
+  })
+
+  it("reloads after recovered items and reports conflicts without a reload loop", async () => {
+    let recoveryListener:
+      | ((update: { restored: readonly string[]; conflicts: readonly string[] }) => void)
+      | undefined
+    vi.mocked(garden.notes.onRecovery).mockImplementation((listener) => {
+      recoveryListener = listener
+      return () => undefined
+    })
+    render(<PublisherApp api={garden} />)
+    await waitFor(() => expect(garden.notes.list).toHaveBeenCalledOnce())
+
+    act(() => recoveryListener?.({ restored: ["content/life/daily.md"], conflicts: [] }))
+    await waitFor(() => expect(garden.notes.list).toHaveBeenCalledTimes(2))
+    expect(screen.getByText(/回收站恢复 1 项/)).toBeVisible()
+
+    act(() => recoveryListener?.({ restored: [], conflicts: ["content/life/daily.md"] }))
+    expect(await screen.findByText(/恢复项与 content\/life\/daily\.md 冲突/)).toBeVisible()
+    expect(garden.notes.list).toHaveBeenCalledTimes(2)
   })
 
   it("acknowledges close only after an edit younger than 750ms and its recovery are durable", async () => {
@@ -890,6 +930,7 @@ describe("publisher main layout", () => {
 
   it("flushes the active editor before recycle-bin deletion and warns about the online copy", async () => {
     const user = userEvent.setup()
+    let postCloseFocus: FrameRequestCallback | undefined
     const save = deferred<IpcResult<NoteWriteReceipt>>()
     vi.mocked(garden.notes.save).mockReturnValueOnce(save.promise)
     vi.mocked(garden.notes.trash).mockResolvedValueOnce(
@@ -912,6 +953,10 @@ describe("publisher main layout", () => {
     await user.click(screen.getByRole("button", { name: "删除当前笔记" }))
     const dialog = screen.getByRole("dialog", { name: "将笔记移入回收站？" })
     expect(dialog).toHaveTextContent("它仍会在线，直到你再次发布下架变化")
+    vi.spyOn(window, "requestAnimationFrame").mockImplementation((callback) => {
+      postCloseFocus = callback
+      return 1
+    })
     await user.click(within(dialog).getByRole("button", { name: "移入回收站" }))
     await waitFor(() => expect(garden.notes.save).toHaveBeenCalledOnce())
     expect(garden.notes.trash).not.toHaveBeenCalled()
@@ -927,7 +972,11 @@ describe("publisher main layout", () => {
     expect(await screen.findByText(/在线副本仍会保留/)).toBeVisible()
     expect(screen.getByText(/专属附件仍保留/)).toBeVisible()
     expect(screen.queryByText(notes[0].path)).not.toBeInTheDocument()
-    await waitFor(() => expect(screen.getByRole("button", { name: "新建笔记" })).toHaveFocus())
+    await waitFor(() => expect(dialog).not.toBeInTheDocument())
+    const newNote = screen.getByRole("button", { name: "新建笔记" })
+    expect(newNote).not.toHaveFocus()
+    act(() => postCloseFocus?.(performance.now()))
+    expect(newNote).toHaveFocus()
   })
 
   it("attributes a late visibility failure to its original note", async () => {

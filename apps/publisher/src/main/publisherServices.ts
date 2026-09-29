@@ -1,4 +1,9 @@
-import type { AppError, PreviewStatus, TrashAdapter } from "../shared/contracts"
+import type {
+  AppError,
+  PreviewStatus,
+  TrashAdapter,
+  TrashRecoveryUpdate,
+} from "../shared/contracts"
 import type { PublisherIpcServices } from "./ipc"
 import {
   createNote,
@@ -18,7 +23,12 @@ import {
   writeEditorRecovery,
 } from "./services/editorRecovery"
 import { scanNotes } from "./services/noteIndex"
-import { inspectWorkspace, repairWorkspace, type BundledNpmRuntime } from "./services/workspace"
+import {
+  inspectWorkspace,
+  inspectWorkspaceSafety,
+  repairWorkspace,
+  type BundledNpmRuntime,
+} from "./services/workspace"
 import { createChangeScanner, type ChangeScanner } from "./services/changes"
 import {
   createDeploymentHistoryService,
@@ -47,7 +57,11 @@ export interface PublisherServiceDependencies {
   readonly runtime?: BundledNpmRuntime
   readonly previewPortAvailable?: () => Promise<boolean>
   readonly online?: () => boolean | Promise<boolean>
-  readonly reconcileTrash?: () => Promise<{ readonly pending: boolean }>
+  readonly reconcileTrash?: (signal: AbortSignal) => Promise<{
+    readonly pending: boolean
+    readonly restored?: readonly string[]
+    readonly conflicts?: readonly string[]
+  }>
 }
 
 export type PublisherRuntimeServices = PublisherIpcServices & { dispose(): Promise<void> }
@@ -66,27 +80,49 @@ export function createPublisherServices(
     dependencies.deploymentHistory ??
     createDeploymentHistoryService({ workspace, openExternal: dependencies.openExternal })
   const reject = async <T>(name: string): Promise<T> => Promise.reject(unavailable(name))
+  const recoveryListeners = new Set<(update: TrashRecoveryUpdate) => void>()
   const reconcileTrash =
     dependencies.reconcileTrash ??
-    (() => reconcileTrashRecoveryPass(workspace, () => internalRecoveryKey(workspace, false)))
+    ((signal: AbortSignal) =>
+      reconcileTrashRecoveryPass(workspace, () => internalRecoveryKey(workspace, false), {
+        signal,
+      }))
   let recoveryFlight: Promise<void> | undefined
   let recoveryTimer: ReturnType<typeof setTimeout> | undefined
+  let recoveryAbort: AbortController | undefined
+  let recoveryRetryMs = 50
   let recoveryDisposed = false
+  const scheduleRecovery = (delayMs: number): void => {
+    if (recoveryDisposed || recoveryTimer !== undefined) return
+    recoveryTimer = setTimeout(() => {
+      recoveryTimer = undefined
+      recoveryFlight = undefined
+      startRecovery()
+    }, delayMs)
+  }
   const startRecovery = (): void => {
     if (recoveryDisposed || recoveryFlight !== undefined) return
-    const pass = Promise.resolve().then(reconcileTrash)
+    recoveryAbort = new AbortController()
+    const pass = Promise.resolve().then(() => reconcileTrash(recoveryAbort!.signal))
     recoveryFlight = pass
-      .then(({ pending }) => {
+      .then(({ pending, restored = [], conflicts = [] }) => {
+        recoveryRetryMs = 50
+        if (restored.length > 0 || conflicts.length > 0) {
+          const update = { restored, conflicts }
+          for (const listener of recoveryListeners) listener(update)
+        }
         if (pending && !recoveryDisposed) {
-          recoveryTimer = setTimeout(() => {
-            recoveryTimer = undefined
-            recoveryFlight = undefined
-            startRecovery()
-          }, 0)
+          scheduleRecovery(0)
         }
       })
-      .catch(() => undefined)
+      .catch(() => {
+        if (!recoveryDisposed && !recoveryAbort?.signal.aborted) {
+          scheduleRecovery(recoveryRetryMs)
+          recoveryRetryMs = Math.min(5_000, recoveryRetryMs * 2)
+        }
+      })
       .finally(() => {
+        recoveryAbort = undefined
         if (recoveryTimer === undefined) recoveryFlight = undefined
       })
   }
@@ -94,6 +130,7 @@ export function createPublisherServices(
     dispose: async () => {
       recoveryDisposed = true
       if (recoveryTimer) clearTimeout(recoveryTimer)
+      recoveryAbort?.abort()
       await Promise.all([
         recoveryFlight,
         changeScanner.dispose?.() ?? changeScanner.cancel(),
@@ -101,6 +138,7 @@ export function createPublisherServices(
       ])
     },
     workspace: {
+      inspectSafety: () => inspectWorkspaceSafety(workspace),
       inspect: () =>
         inspectWorkspace(workspace, {
           checkGit: true,
@@ -115,6 +153,10 @@ export function createPublisherServices(
       },
     },
     notes: {
+      subscribeRecovery: (listener) => {
+        recoveryListeners.add(listener)
+        return () => recoveryListeners.delete(listener)
+      },
       list: async () => {
         startRecovery()
         return scanNotes(workspace)

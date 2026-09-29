@@ -261,6 +261,7 @@ export interface PreviewStatus {
 
 export const IPC_CHANNELS = {
   requests: {
+    workspaceInspectSafety: "garden:workspace:inspect-safety",
     workspaceInspect: "garden:workspace:inspect",
     workspaceRepair: "garden:workspace:repair",
     notesList: "garden:notes:list",
@@ -287,6 +288,7 @@ export const IPC_CHANNELS = {
     lifecycleCloseAck: "garden:lifecycle:close-ack",
   },
   events: {
+    notesRecovery: "garden:event:notes-recovery",
     previewProgress: "garden:event:preview-progress",
     publishProgress: "garden:event:publish-progress",
     beforeClose: "garden:event:before-close",
@@ -425,10 +427,12 @@ export interface GardenApi {
     onCloseBlocked(listener: (message: string) => void): Unsubscribe
   }
   readonly workspace: {
+    inspectSafety(): Promise<IpcResult<WorkspaceInspection>>
     inspect(): Promise<IpcResult<WorkspaceInspection>>
     repair(request: WorkspaceRepairRequest): Promise<IpcResult<WorkspaceRepairReceipt>>
   }
   readonly notes: {
+    onRecovery(listener: (update: TrashRecoveryUpdate) => void): Unsubscribe
     list(): Promise<IpcResult<readonly NoteSummary[]>>
     read(request: NotePathRequest): Promise<IpcResult<NoteDocument>>
     save(request: NoteSaveRequest): Promise<IpcResult<NoteWriteReceipt>>
@@ -463,6 +467,11 @@ export interface GardenApi {
     cancel(request: HistoryCancelRequest): Promise<IpcResult<void>>
     openLink(request: HistoryLinkRequest): Promise<IpcResult<void>>
   }
+}
+
+export interface TrashRecoveryUpdate {
+  readonly restored: readonly string[]
+  readonly conflicts: readonly string[]
 }
 
 export const DEFAULT_GARDEN_PATH = String.raw`C:\Users\11546\Desktop\web`

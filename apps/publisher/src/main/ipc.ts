@@ -33,6 +33,7 @@ import {
   type WorkspaceInspection,
   type WorkspaceRepairReceipt,
   type WorkspaceRepairRequest,
+  type TrashRecoveryUpdate,
 } from "../shared/contracts"
 import {
   IPC_SUCCESS_SCHEMAS,
@@ -40,6 +41,7 @@ import {
   markdownSchema,
   previewProgressSchema,
   publishProgressSchema,
+  trashRecoveryUpdateSchema,
 } from "../shared/ipcSchemas"
 
 type RequestHandler = (event: unknown, request?: unknown) => Promise<unknown>
@@ -57,10 +59,12 @@ export interface IpcEventTarget {
 
 export interface PublisherIpcServices {
   readonly workspace: {
+    inspectSafety(): Promise<WorkspaceInspection>
     inspect(): Promise<WorkspaceInspection>
     repair(request: WorkspaceRepairRequest): Promise<WorkspaceRepairReceipt>
   }
   readonly notes: {
+    subscribeRecovery(listener: (update: TrashRecoveryUpdate) => void): () => void
     list(): Promise<readonly NoteSummary[]>
     read(request: NotePathRequest): Promise<NoteDocument>
     save(request: NoteSaveRequest): Promise<NoteWriteReceipt>
@@ -267,6 +271,15 @@ function secureHandler<Input, Output>(
 export function registerPublisherIpc(options: RegisterPublisherIpcOptions): () => void {
   const { ipcMain, services, isTrustedSender, eventTargets } = options
   const handlers: ReadonlyArray<readonly [string, RequestHandler]> = [
+    [
+      IPC_CHANNELS.requests.workspaceInspectSafety,
+      secureHandler(
+        IPC_CHANNELS.requests.workspaceInspectSafety,
+        noRequestSchema,
+        isTrustedSender,
+        () => services.workspace.inspectSafety(),
+      ),
+    ],
     [
       IPC_CHANNELS.requests.lifecycleCloseAck,
       secureHandler(
@@ -491,6 +504,11 @@ export function registerPublisherIpc(options: RegisterPublisherIpcOptions): () =
       ipcMain.handle(channel, handler)
       registered.push(channel)
     }
+    subscriptions.push(
+      services.notes.subscribeRecovery((update) =>
+        broadcast(IPC_CHANNELS.events.notesRecovery, trashRecoveryUpdateSchema, update),
+      ),
+    )
     subscriptions.push(
       services.preview.subscribe((status) =>
         broadcast(IPC_CHANNELS.events.previewProgress, previewProgressSchema, status),

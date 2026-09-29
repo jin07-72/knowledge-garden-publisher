@@ -56,7 +56,7 @@ const workspaceIssueSchema = z
       ...(repair === undefined ? {} : { repair }),
     }
   })
-const workspaceInspectionSchema = z.discriminatedUnion("ok", [
+export const workspaceInspectionSchema = z.discriminatedUnion("ok", [
   z
     .object({
       ok: z.literal(true),
@@ -234,10 +234,17 @@ export const publishProgressSchema = z
 export const previewProgressSchema = previewStatusSchema
 export const beforeCloseSchema = z.object({ requestId: z.string().uuid() }).strict()
 export const closeBlockedSchema = z.object({ message: z.string().min(1).max(1_000) }).strict()
+export const trashRecoveryUpdateSchema = z
+  .object({
+    restored: z.array(pathSchema).max(1_024),
+    conflicts: z.array(pathSchema).max(1_024),
+  })
+  .strict()
 
 type RequestChannel = (typeof IPC_CHANNELS.requests)[keyof typeof IPC_CHANNELS.requests]
 
 export const IPC_SUCCESS_SCHEMAS = {
+  [IPC_CHANNELS.requests.workspaceInspectSafety]: workspaceInspectionSchema,
   [IPC_CHANNELS.requests.workspaceInspect]: workspaceInspectionSchema,
   [IPC_CHANNELS.requests.workspaceRepair]: workspaceRepairReceiptSchema,
   [IPC_CHANNELS.requests.notesList]: z.array(noteSummarySchema).max(100_000),

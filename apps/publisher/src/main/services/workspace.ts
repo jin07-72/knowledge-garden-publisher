@@ -142,6 +142,8 @@ const requiredPaths: readonly RequiredPath[] = [
     wrongTypeMessage: "Replace scripts/validate-content.mjs with a file.",
   },
 ]
+const editingRequiredPaths = requiredPaths.slice(0, 2)
+const toolingRequiredPaths = requiredPaths.slice(2)
 
 function issue(
   code: WorkspaceIssue["code"],
@@ -195,9 +197,12 @@ async function canonicalWorkspaceRoot(
   }
 }
 
-async function inspectRequiredPaths(root: string): Promise<WorkspaceIssue[]> {
+async function inspectRequiredPaths(
+  root: string,
+  requirements: readonly RequiredPath[] = requiredPaths,
+): Promise<WorkspaceIssue[]> {
   const issues: WorkspaceIssue[] = []
-  for (const requirement of requiredPaths) {
+  for (const requirement of requirements) {
     const path = resolve(root, requirement.relativePath)
     try {
       const linkDetails = await lstat(path)
@@ -562,10 +567,17 @@ export async function inspectWorkspace(
   const workspaceRoot = await canonicalWorkspaceRoot(rootPath)
   const root = workspaceRoot.root
   const issues = [...workspaceRoot.issues]
+  let editingIssues: readonly WorkspaceIssue[] = []
+  let toolingIssues: readonly WorkspaceIssue[] = []
   if (workspaceRoot.issues.length === 0) {
-    issues.push(...(await inspectRequiredPaths(root)))
+    ;[editingIssues, toolingIssues] = await Promise.all([
+      inspectRequiredPaths(root, editingRequiredPaths),
+      inspectRequiredPaths(root, toolingRequiredPaths),
+    ])
+    issues.push(...editingIssues, ...toolingIssues)
   }
-  const files = issues.length === 0
+  const files = workspaceRoot.issues.length === 0 && editingIssues.length === 0
+  const tooling = workspaceRoot.issues.length === 0 && toolingIssues.length === 0
   const gitIssues =
     options.checkGit && workspaceRoot.issues.length === 0
       ? await inspectGit(
@@ -604,15 +616,34 @@ export async function inspectWorkspace(
     files,
     // Preview startup chooses an available fallback port. Occupancy of the
     // preferred port remains diagnostic information, not a lost capability.
-    preview: files && dependencies,
+    preview: files && tooling && dependencies,
     git,
-    publish: files && dependencies && git,
+    publish: files && tooling && dependencies && git,
   }
 
   if (issues.length === 0) {
     return { ok: true, root, capabilities, issues: [] }
   }
   return { ok: false, root, capabilities, issues }
+}
+
+/** Fast local-only gate used before any Git, network, port, or npm diagnostics. */
+export async function inspectWorkspaceSafety(rootPath: string): Promise<WorkspaceInspection> {
+  const workspaceRoot = await canonicalWorkspaceRoot(rootPath)
+  const root = workspaceRoot.root
+  const issues = [...workspaceRoot.issues]
+  if (issues.length === 0)
+    issues.push(...(await inspectRequiredPaths(root, editingRequiredPaths)))
+  const files = issues.length === 0
+  const capabilities: WorkspaceCapabilities = {
+    files,
+    preview: files,
+    git: false,
+    publish: false,
+  }
+  return issues.length === 0
+    ? { ok: true, root, capabilities, issues: [] }
+    : { ok: false, root, capabilities, issues }
 }
 
 /** The only automatic first-run repair: an explicit npm ci through the bundled runtime. */

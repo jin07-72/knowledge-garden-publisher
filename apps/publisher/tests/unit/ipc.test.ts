@@ -38,6 +38,7 @@ function services(): PublisherIpcServices & {
   readonly calls: Record<string, ReturnType<typeof vi.fn>>
   emitPreview(status: PreviewStatus): void
   emitPublish(progress: PublishProgress): void
+  emitRecovery(update: { restored: readonly string[]; conflicts: readonly string[] }): void
   previewSubscriptions(): number
   publishSubscriptions(): number
 } {
@@ -50,11 +51,22 @@ function services(): PublisherIpcServices & {
   const call = (name: string): any => calls[name]
   const previewListeners = new Set<(status: PreviewStatus) => void>()
   const publishListeners = new Set<(progress: PublishProgress) => void>()
+  const recoveryListeners = new Set<
+    (update: { restored: readonly string[]; conflicts: readonly string[] }) => void
+  >()
 
   return {
     calls,
-    workspace: { inspect: call("workspaceInspect"), repair: call("workspaceRepair") },
+    workspace: {
+      inspectSafety: call("workspaceInspectSafety"),
+      inspect: call("workspaceInspect"),
+      repair: call("workspaceRepair"),
+    },
     notes: {
+      subscribeRecovery(listener) {
+        recoveryListeners.add(listener)
+        return () => recoveryListeners.delete(listener)
+      },
       list: call("notesList"),
       read: call("notesRead"),
       save: call("notesSave"),
@@ -97,6 +109,9 @@ function services(): PublisherIpcServices & {
     },
     emitPublish(progress) {
       for (const listener of publishListeners) listener(progress)
+    },
+    emitRecovery(update) {
+      for (const listener of recoveryListeners) listener(update)
     },
     previewSubscriptions: () => previewListeners.size,
     publishSubscriptions: () => publishListeners.size,
@@ -571,6 +586,7 @@ describe("preload garden API", () => {
   it("maps each method to its one allowlisted channel", async () => {
     const ipc = new FakeIpcRenderer()
     const api = createGardenApi(ipc)
+    await api.workspace.inspectSafety()
     await api.workspace.inspect()
     await api.workspace.repair({ action: "install-dependencies" })
     await api.notes.list()

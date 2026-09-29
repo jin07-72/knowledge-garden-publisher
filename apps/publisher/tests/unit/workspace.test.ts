@@ -11,7 +11,11 @@ import {
   type CommandProcess,
   type CommandRunner,
 } from "../../src/main/lib/commandRunner"
-import { inspectWorkspace, repairWorkspace } from "../../src/main/services/workspace"
+import {
+  inspectWorkspace,
+  inspectWorkspaceSafety,
+  repairWorkspace,
+} from "../../src/main/services/workspace"
 import { exists, removeTemporaryDirectory } from "../helpers/fs"
 import {
   createTemporaryGitRepository,
@@ -95,6 +99,22 @@ describe("inspectWorkspace", () => {
     expect(result.ok).toBe(false)
     expect(result.issues.map((issue) => issue.code)).toContain("PREVIEW_PORT_UNAVAILABLE")
     expect(result.capabilities).toMatchObject({ files: true, preview: true })
+  })
+
+  it("keeps local editing available when build and dependency files are missing", async () => {
+    const root = await createGarden()
+    await rm(join(root, "scripts"), { recursive: true })
+    await rm(join(root, "package-lock.json"))
+    await rm(join(root, "quartz.config.yaml"))
+
+    const safety = await inspectWorkspaceSafety(root)
+    const diagnostics = await inspectWorkspace(root, { checkGit: false })
+
+    expect(safety).toMatchObject({ ok: true, capabilities: { files: true } })
+    expect(diagnostics).toMatchObject({
+      ok: false,
+      capabilities: { files: true, preview: false, publish: false },
+    })
   })
 
   it("returns actionable errors for every missing required path", async () => {
@@ -432,7 +452,7 @@ describe("inspectWorkspace", () => {
 
     expect(result.ok).toBe(false)
     expect(result.issues.map((issue) => issue.code)).toContain("UNSAFE_PATH")
-    expect(result.capabilities).toMatchObject({ files: false, preview: false })
+    expect(result.capabilities).toMatchObject({ files: true, preview: false })
   })
 
   it("rejects a required directory junction or symlink outside the workspace", async ({ skip }) => {

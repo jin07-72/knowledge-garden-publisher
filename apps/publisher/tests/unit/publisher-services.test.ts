@@ -14,6 +14,7 @@ import { git } from "../helpers/git"
 const temporaryDirectories: string[] = []
 
 afterEach(async () => {
+  vi.useRealTimers()
   await Promise.all(temporaryDirectories.splice(0).map((path) => rm(path, { recursive: true })))
 })
 
@@ -93,6 +94,7 @@ describe("publisher service wiring", () => {
         expect.objectContaining({ path: "content/life/daily.md" }),
       ])
     })
+    await services.dispose()
   })
 
   it("returns notes while a recovery backlog pass is still pending", async () => {
@@ -115,6 +117,59 @@ describe("publisher service wiring", () => {
     ])
     expect(reconcileTrash).toHaveBeenCalledOnce()
     finishRecovery()
+  })
+
+  it("retries a rejected background recovery pass with bounded backoff", async () => {
+    vi.useFakeTimers()
+    const workspace = await garden()
+    const reconcileTrash = vi
+      .fn()
+      .mockRejectedValueOnce(new Error("temporary recovery failure"))
+      .mockResolvedValueOnce({ pending: false })
+    const services = createPublisherServices({
+      workspace,
+      trash: { trashItem: async () => undefined },
+      isTracked: async () => false,
+      preview: preview(),
+      reconcileTrash,
+    })
+
+    await services.notes.list()
+    await vi.waitFor(() => expect(reconcileTrash).toHaveBeenCalledOnce())
+    await vi.advanceTimersByTimeAsync(50)
+    await vi.waitFor(() => expect(reconcileTrash).toHaveBeenCalledTimes(2))
+    await services.dispose()
+    vi.useRealTimers()
+  })
+
+  it("aborts an in-flight recovery pass during runtime disposal", async () => {
+    const workspace = await garden()
+    let aborted = false
+    const reconcileTrash = vi.fn(
+      (signal: AbortSignal) =>
+        new Promise<{ pending: boolean }>((_resolve, reject) => {
+          signal.addEventListener(
+            "abort",
+            () => {
+              aborted = true
+              reject(new Error("aborted"))
+            },
+            { once: true },
+          )
+        }),
+    )
+    const services = createPublisherServices({
+      workspace,
+      trash: { trashItem: async () => undefined },
+      isTracked: async () => false,
+      preview: preview(),
+      reconcileTrash,
+    })
+    await services.notes.list()
+    await vi.waitFor(() => expect(reconcileTrash).toHaveBeenCalledOnce())
+
+    await expect(services.dispose()).resolves.toBeUndefined()
+    expect(aborted).toBe(true)
   })
 
   it("wires change review and history while keeping publishing explicitly unavailable", async () => {

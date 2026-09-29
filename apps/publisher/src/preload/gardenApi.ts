@@ -33,6 +33,7 @@ import {
   type WorkspaceInspection,
   type WorkspaceRepairReceipt,
   type WorkspaceRepairRequest,
+  type TrashRecoveryUpdate,
 } from "../shared/contracts"
 import {
   IPC_SUCCESS_SCHEMAS,
@@ -41,6 +42,7 @@ import {
   ipcResultSchema,
   previewProgressSchema,
   publishProgressSchema,
+  trashRecoveryUpdateSchema,
 } from "../shared/ipcSchemas"
 import { z } from "zod"
 
@@ -116,11 +118,15 @@ export function createGardenApi(ipc: IpcRendererPort): GardenApi {
       ),
   })
   const workspace = Object.freeze({
+    inspectSafety: () =>
+      invoke<WorkspaceInspection>(ipc, IPC_CHANNELS.requests.workspaceInspectSafety),
     inspect: () => invoke<WorkspaceInspection>(ipc, IPC_CHANNELS.requests.workspaceInspect),
     repair: (request: WorkspaceRepairRequest) =>
       invoke<WorkspaceRepairReceipt>(ipc, IPC_CHANNELS.requests.workspaceRepair, request),
   })
   const notes = Object.freeze({
+    onRecovery: (listener: (update: TrashRecoveryUpdate) => void) =>
+      subscription(ipc, IPC_CHANNELS.events.notesRecovery, trashRecoveryUpdateSchema, listener),
     list: () => invoke<readonly NoteSummary[]>(ipc, IPC_CHANNELS.requests.notesList),
     read: (request: NotePathRequest) =>
       invoke<NoteDocument>(ipc, IPC_CHANNELS.requests.notesRead, request),

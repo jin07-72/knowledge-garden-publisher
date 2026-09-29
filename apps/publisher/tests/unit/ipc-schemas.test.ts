@@ -33,6 +33,13 @@ const transaction = {
 const preview = { state: "stopped", generation: 0, ...privateField }
 
 const validByChannel: Record<string, unknown> = {
+  [IPC_CHANNELS.requests.workspaceInspectSafety]: {
+    ok: true,
+    root: "C:/garden",
+    capabilities,
+    issues: [],
+    ...privateField,
+  },
   [IPC_CHANNELS.requests.workspaceInspect]: {
     ok: true,
     root: "C:/garden",
