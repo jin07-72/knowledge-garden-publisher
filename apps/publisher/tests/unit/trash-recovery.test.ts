@@ -1,4 +1,18 @@
-import { mkdir, mkdtemp, opendir, readFile, rename, rm, writeFile } from "node:fs/promises"
+import { createHash } from "node:crypto"
+import { existsSync } from "node:fs"
+import {
+  lstat,
+  mkdir,
+  mkdtemp,
+  open as nodeOpen,
+  opendir,
+  readFile,
+  readdir,
+  rename,
+  rm,
+  symlink,
+  writeFile,
+} from "node:fs/promises"
 import { tmpdir } from "node:os"
 import { dirname, join, resolve } from "node:path"
 import { afterEach, describe, expect, it, vi } from "vitest"
@@ -36,6 +50,63 @@ async function recycleAndRestore(root: string, path: string): Promise<string> {
   })
   await rename(join(recycle, "item"), staged)
   return staged
+}
+
+async function stageFile(
+  root: string,
+  relativePath: string,
+  options: trashRecovery.TrashRecoveryPrepareOptions = {},
+): Promise<trashRecovery.TrashRecoveryStage> {
+  const original = join(root, ...relativePath.split("/"))
+  const details = await lstat(original, { bigint: true })
+  const stage = await trashRecovery.prepareTrashRecovery(
+    root,
+    original,
+    relativePath,
+    "file",
+    `${details.dev}:${details.ino}:${details.birthtimeNs}`,
+    createHash("sha256")
+      .update(await readFile(original))
+      .digest("hex"),
+    await internalRecoveryKey(root, true),
+    options,
+  )
+  await rename(original, stage.stagedPath)
+  return stage
+}
+
+async function stageDirectory(
+  root: string,
+  relativePath: string,
+): Promise<trashRecovery.TrashRecoveryStage> {
+  const original = join(root, ...relativePath.split("/"))
+  const details = await lstat(original, { bigint: true })
+  const stage = await trashRecovery.prepareTrashRecovery(
+    root,
+    original,
+    relativePath,
+    "directory",
+    `${details.dev}:${details.ino}:${details.birthtimeNs}`,
+    undefined,
+    await internalRecoveryKey(root, true),
+  )
+  await rename(original, stage.stagedPath)
+  return stage
+}
+
+function boundedClock(activeChecks: number): () => number {
+  let checks = 0
+  return () => (checks++ < activeChecks ? 0 : 10)
+}
+
+async function sortedDirectory(path: string) {
+  const names = (await readdir(path)).sort()
+  return {
+    async *[Symbol.asyncIterator]() {
+      for (const name of names) yield { name }
+    },
+    async close() {},
+  }
 }
 
 describe("trash recovery directory bounds", () => {
@@ -76,7 +147,7 @@ describe("trash recovery directory bounds", () => {
     const staged = await recycleAndRestore(root, "content/life/daily.md")
 
     expect(staged.replaceAll("\\", "/")).toMatch(
-      /\.garden-publisher\/trash-recovery\/transactions\/[a-f0-9]{2}\/[a-f0-9-]{36}\/items\/content\/life\/daily\.md$/i,
+      /\.garden-publisher\/trash-recovery\/indexed-transactions\/[a-f0-9]{2}\/[a-f0-9-]{36}\/items\/content\/life\/daily\.md$/i,
     )
   })
 
@@ -134,9 +205,14 @@ describe("trash recovery directory bounds", () => {
       )
     }
 
-    await expect(
-      trashRecovery.reconcileTrashRecovery(root, () => internalRecoveryKey(root, false)),
-    ).resolves.toEqual({ restored: ["content/life/legacy.md"], conflicts: [] })
+    const restored: string[] = []
+    for (let pass = 0; pass < 8 && restored.length === 0; pass += 1) {
+      const result = await trashRecovery.reconcileTrashRecoveryPass(root, () =>
+        internalRecoveryKey(root, false),
+      )
+      restored.push(...result.restored)
+    }
+    expect(restored).toEqual(["content/life/legacy.md"])
   })
 
   it("restores an indexed journal even when more than 10,000 junk entries precede it", async () => {
@@ -178,7 +254,7 @@ describe("trash recovery directory bounds", () => {
     expect(restored).toContain("content/life/crowded.md")
   })
 
-  it("restarts a legacy directory page when entries mutate before its cursor", async () => {
+  it("shrinks legacy work across deadlines and mutations until an old journal is found", async () => {
     const root = await garden()
     await writeFile(join(root, "content", "life", "legacy-race.md"), "# Legacy race")
     const staged = await recycleAndRestore(root, "content/life/legacy-race.md")
@@ -186,38 +262,251 @@ describe("trash recovery directory bounds", () => {
     const id = transaction.split(/[\\/]/).at(-1)!
     const recoveryRoot = join(root, ".garden-publisher", "trash-recovery")
     await rename(transaction, join(recoveryRoot, id))
-    let rootPages = 0
-    const openDirectory = async (path: string) => {
-      if (resolve(path) !== resolve(recoveryRoot)) return opendir(path)
-      rootPages += 1
-      const names =
-        rootPages === 1
-          ? [...Array.from({ length: 1_100 }, (_, index) => `junk-${index}`), id]
-          : [id, ...Array.from({ length: 1_100 }, (_, index) => `junk-${index}`)]
-      return {
-        async *[Symbol.asyncIterator]() {
-          for (const name of names) yield { name }
-        },
-        async close() {},
-      }
+    for (let index = 0; index < 1_100; index += 1) {
+      await writeFile(
+        join(recoveryRoot, `0000-junk-${index.toString().padStart(4, "0")}`),
+        `junk-${index}`,
+      )
     }
 
     const first = await trashRecovery.reconcileTrashRecoveryPass(
       root,
       () => internalRecoveryKey(root, false),
-      { openDirectory },
+      { maximumElapsedMs: 10, now: boundedClock(1_040), openDirectory: sortedDirectory },
     )
     expect(first.restored).toEqual([])
-    await writeFile(join(recoveryRoot, "mutation-marker"), "changed")
+    expect(first.pending).toBe(true)
+    const remainingAfterDeadline = (await readdir(recoveryRoot)).filter((name) =>
+      name.startsWith("0000-junk-"),
+    )
+    expect(remainingAfterDeadline.length).toBeLessThan(1_100)
+    await rm(join(recoveryRoot, remainingAfterDeadline[0]!))
+    await writeFile(join(recoveryRoot, "0000-junk-inserted"), "inserted")
 
-    const second = await trashRecovery.reconcileTrashRecoveryPass(
+    const restored: string[] = []
+    for (let restart = 0; restart < 8 && restored.length === 0; restart += 1) {
+      const pass = await trashRecovery.reconcileTrashRecoveryPass(
+        root,
+        () => internalRecoveryKey(root, false),
+        { openDirectory: sortedDirectory },
+      )
+      restored.push(...pass.restored)
+    }
+
+    expect(restored).toContain("content/life/legacy-race.md")
+    await expect(readFile(join(root, "content", "life", "legacy-race.md"), "utf8")).resolves.toBe(
+      "# Legacy race",
+    )
+    const quarantined = await readdir(join(recoveryRoot, "legacy-quarantine", "000"))
+    expect(quarantined.length).toBeGreaterThan(1_000)
+  })
+
+  it("moves a legacy junk link into quarantine without following or deleting its target", async () => {
+    const root = await garden()
+    const recoveryRoot = join(root, ".garden-publisher", "trash-recovery")
+    await mkdir(recoveryRoot, { recursive: true })
+    const outside = join(root, "outside-sentinel")
+    await mkdir(outside)
+    await writeFile(join(outside, "sentinel.txt"), "keep")
+    const junkLink = join(recoveryRoot, "legacy-junction")
+    await symlink(outside, junkLink, "junction")
+
+    await trashRecovery.reconcileTrashRecoveryPass(root, () => internalRecoveryKey(root, true), {
+      openDirectory: sortedDirectory,
+    })
+
+    await expect(readFile(join(outside, "sentinel.txt"), "utf8")).resolves.toBe("keep")
+    await expect(lstat(junkLink)).rejects.toMatchObject({ code: "ENOENT" })
+    const quarantined = await readdir(join(recoveryRoot, "legacy-quarantine", "000"))
+    expect(quarantined).toHaveLength(1)
+    expect(
+      (
+        await lstat(join(recoveryRoot, "legacy-quarantine", "000", quarantined[0]!))
+      ).isSymbolicLink(),
+    ).toBe(true)
+  })
+
+  it("quarantines an invalid legacy UUID journal instead of retrying it forever", async () => {
+    const root = await garden()
+    const recoveryRoot = join(root, ".garden-publisher", "trash-recovery")
+    const invalid = join(recoveryRoot, "00000000-0000-4000-8000-000000000000")
+    await mkdir(invalid, { recursive: true })
+    await writeFile(join(invalid, "journal.json"), "{torn")
+
+    const result = await trashRecovery.reconcileTrashRecoveryPass(
       root,
-      () => internalRecoveryKey(root, false),
-      { openDirectory },
+      () => internalRecoveryKey(root, true),
+      { openDirectory: sortedDirectory },
     )
 
-    expect(second.restored).toContain("content/life/legacy-race.md")
-    expect(rootPages).toBe(2)
+    expect(result.pending).toBe(false)
+    await expect(lstat(invalid)).rejects.toMatchObject({ code: "ENOENT" })
+    const quarantined = await readdir(join(recoveryRoot, "legacy-quarantine", "000"))
+    expect(quarantined).toHaveLength(1)
+    await expect(
+      readFile(
+        join(recoveryRoot, "legacy-quarantine", "000", quarantined[0]!, "journal.json"),
+        "utf8",
+      ),
+    ).resolves.toBe("{torn")
+  })
+
+  it("leaves a torn queue tail unconsumed until the next append repairs it", async () => {
+    const root = await garden()
+    await writeFile(join(root, "content", "life", "alpha.md"), "# Alpha")
+    await recycleAndRestore(root, "content/life/alpha.md")
+    const segment = join(
+      root,
+      ".garden-publisher",
+      "trash-recovery",
+      "queue",
+      "0000000000000000.log",
+    )
+    const handle = await nodeOpen(segment, "a")
+    await handle.writeFile('{"version":1,"id":"torn')
+    await handle.close()
+
+    const first = await trashRecovery.reconcileTrashRecoveryPass(root, () =>
+      internalRecoveryKey(root, false),
+    )
+    expect(first.restored).toContain("content/life/alpha.md")
+    expect(first.pending).toBe(false)
+    const before = await readFile(segment)
+    const cursorPath = join(root, ".garden-publisher", "trash-recovery", "cursor.json")
+    const cursorBefore = JSON.parse(await readFile(cursorPath, "utf8")) as Record<string, unknown>
+    const second = await trashRecovery.reconcileTrashRecoveryPass(root, () =>
+      internalRecoveryKey(root, false),
+    )
+    expect(second).toEqual({ restored: [], conflicts: [], pending: false })
+    expect(await readFile(segment)).toEqual(before)
+    const cursorAfter = JSON.parse(await readFile(cursorPath, "utf8")) as Record<string, unknown>
+    expect({ segment: cursorAfter.queueSegment, offset: cursorAfter.queueOffset }).toEqual({
+      segment: cursorBefore.queueSegment,
+      offset: cursorBefore.queueOffset,
+    })
+
+    await writeFile(join(root, "content", "life", "beta.md"), "# Beta")
+    await recycleAndRestore(root, "content/life/beta.md")
+    expect((await readFile(segment, "utf8")).endsWith("\n")).toBe(true)
+    const repaired = await trashRecovery.reconcileTrashRecoveryPass(root, () =>
+      internalRecoveryKey(root, false),
+    )
+    expect(repaired.restored).toContain("content/life/beta.md")
+  })
+
+  it("syncs a new queue file before its parent and propagates either sync failure", async () => {
+    const root = await garden()
+    await writeFile(join(root, "content", "life", "durable.md"), "# Durable")
+    const events: string[] = []
+    let failFileSync = false
+    let failDirectorySync = true
+    const openFile: NonNullable<trashRecovery.TrashRecoveryPrepareOptions["openFile"]> = async (
+      path,
+      flags,
+      mode,
+    ) => {
+      const handle = await nodeOpen(path, flags, mode)
+      const normalized = path.replaceAll("\\", "/")
+      const queueDirectory = normalized.endsWith("/.garden-publisher/trash-recovery/queue")
+      const queueSegment = /\/queue\/[a-f0-9]{16}\.log$/.test(normalized)
+      if (!queueDirectory && !queueSegment) return handle
+      const sync = handle.sync.bind(handle)
+      handle.sync = async () => {
+        events.push(queueSegment ? "file-sync" : "directory-sync")
+        if (queueSegment && failFileSync) throw new Error("injected file sync failure")
+        if (queueDirectory && failDirectorySync) throw new Error("injected directory sync failure")
+        await sync()
+      }
+      return handle
+    }
+
+    const directorySyncFailure = await stageFile(root, "content/life/durable.md", {
+      openFile,
+    }).catch((error: unknown) => error)
+    expect(events).toEqual(["file-sync", "directory-sync"])
+    expect(directorySyncFailure).toMatchObject({ message: "injected directory sync failure" })
+
+    events.length = 0
+    failDirectorySync = false
+    failFileSync = true
+    await writeFile(join(root, "content", "life", "durable-file.md"), "# Durable file")
+    const fileSyncFailure = await stageFile(root, "content/life/durable-file.md", {
+      openFile,
+    }).catch((error: unknown) => error)
+    expect(events).toEqual(["file-sync"])
+    expect(fileSyncFailure).toMatchObject({ message: "injected file sync failure" })
+  })
+
+  it("rotates an at-cap queue and eventually processes the next segment", async () => {
+    const root = await garden()
+    const queue = join(root, ".garden-publisher", "trash-recovery", "queue")
+    await mkdir(queue, { recursive: true })
+    await writeFile(join(queue, "0000000000000000.log"), Buffer.alloc(1024 * 1024, 0x0a))
+    await writeFile(join(root, "content", "life", "rotated.md"), "# Rotated")
+    await recycleAndRestore(root, "content/life/rotated.md")
+
+    await expect(lstat(join(queue, "0000000000000001.log"))).resolves.toMatchObject({
+      size: expect.any(Number),
+    })
+    const restored: string[] = []
+    for (let pass = 0; pass < 24 && restored.length === 0; pass += 1) {
+      const result = await trashRecovery.reconcileTrashRecoveryPass(root, () =>
+        internalRecoveryKey(root, false),
+      )
+      restored.push(...result.restored)
+    }
+    expect(restored).toContain("content/life/rotated.md")
+  })
+
+  it("rolls back a file link when the pass aborts after mutation", async () => {
+    const root = await garden()
+    await writeFile(join(root, "content", "life", "rollback.md"), "# Rollback")
+    const stage = await stageFile(root, "content/life/rollback.md")
+
+    const abortAfterMutation = {
+      get aborted() {
+        return existsSync(stage.originalPath)
+      },
+    } as AbortSignal
+    await expect(
+      trashRecovery.reconcileTrashRecoveryPass(root, () => internalRecoveryKey(root, false), {
+        signal: abortAfterMutation,
+      }),
+    ).resolves.toEqual({ restored: [], conflicts: [], pending: true })
+    await expect(lstat(stage.originalPath)).rejects.toMatchObject({ code: "ENOENT" })
+    await expect(readFile(stage.stagedPath, "utf8")).resolves.toBe("# Rollback")
+
+    const completed = await trashRecovery.reconcileTrashRecoveryPass(root, () =>
+      internalRecoveryKey(root, false),
+    )
+    expect(completed.restored).toContain("content/life/rollback.md")
+    await expect(readFile(stage.originalPath, "utf8")).resolves.toBe("# Rollback")
+  })
+
+  it("rolls back a directory rename when the pass aborts after mutation", async () => {
+    const root = await garden()
+    const attachment = join(root, "content", "_assets", "rollback")
+    await mkdir(attachment, { recursive: true })
+    const stage = await stageDirectory(root, "content/_assets/rollback")
+
+    const abortAfterMutation = {
+      get aborted() {
+        return existsSync(stage.originalPath)
+      },
+    } as AbortSignal
+    await expect(
+      trashRecovery.reconcileTrashRecoveryPass(root, () => internalRecoveryKey(root, false), {
+        signal: abortAfterMutation,
+      }),
+    ).resolves.toEqual({ restored: [], conflicts: [], pending: true })
+    await expect(lstat(stage.originalPath)).rejects.toMatchObject({ code: "ENOENT" })
+    await expect(lstat(stage.stagedPath)).resolves.toMatchObject({})
+
+    const completed = await trashRecovery.reconcileTrashRecoveryPass(root, () =>
+      internalRecoveryKey(root, false),
+    )
+    expect(completed.restored).toContain("content/_assets/rollback")
+    await expect(lstat(stage.originalPath)).resolves.toMatchObject({})
   })
 
   it("defers during attachment hashing without advancing or deleting the journal", async () => {
@@ -258,9 +547,8 @@ describe("trash recovery directory bounds", () => {
     expect(deferred).toEqual({ restored: [], conflicts: [], pending: true })
     await expect(readFile(join(staged[1]!, "large.bin"))).resolves.toHaveLength(1024 * 1024)
     await expect(readFile(join(root, "content", "_assets", "daily", "large.bin"))).rejects.toThrow()
-    const completed = await trashRecovery.reconcileTrashRecoveryPass(
-      root,
-      () => internalRecoveryKey(root, false),
+    const completed = await trashRecovery.reconcileTrashRecoveryPass(root, () =>
+      internalRecoveryKey(root, false),
     )
     expect(completed.restored).toContain("content/_assets/daily")
   })

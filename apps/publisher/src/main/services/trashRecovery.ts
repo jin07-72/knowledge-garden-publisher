@@ -30,8 +30,13 @@ const recoveryTransactionsPerPass = 64
 const recoveryJournalBytesPerPass = 512 * 1024
 const recoveryElapsedMsPerPass = 250
 const recoveryTransactionsDirectory = "transactions"
+const indexedTransactionsDirectory = "indexed-transactions"
 const recoveryCursorName = "cursor.json"
-const recoveryQueueName = "pending.jsonl"
+const legacyRecoveryQueueName = "pending.jsonl"
+const recoveryQueueDirectory = "queue"
+const recoveryQueueSegmentBytes = 1024 * 1024
+const recoveryQueueRecordBytes = 512
+const recoveryQueueSegmentPattern = /^[a-f0-9]{16}\.log$/
 const recoveryCursorVersion = 1
 const shardPattern = /^[a-f0-9]{2}$/
 const recoveryDirectoryEntriesPerPass = 1_024
@@ -42,9 +47,15 @@ interface DirectoryHandleLike {
 }
 
 type DirectoryOpener = (path: string) => Promise<DirectoryHandleLike>
+type RecoveryFileOpener = (
+  path: string,
+  flags: string | number,
+  mode?: number,
+) => ReturnType<typeof open>
 
 interface RecoveryCursorPayload {
   readonly version: 1
+  readonly queueSegment?: number
   readonly queueOffset?: number
   readonly migrationLocation?: number
   readonly migrationOffset?: number
@@ -163,37 +174,155 @@ function queueIntegrity(key: Buffer, id: string): string {
     .digest("hex")
 }
 
-async function appendRecoveryQueue(root: string, id: string, key: Buffer): Promise<void> {
-  const path = resolve(root, recoveryQueueName)
-  const line = `${JSON.stringify({ version: 1, id, integrity: queueIntegrity(key, id) })}\n`
-  const handle = await open(
-    path,
-    process.platform === "win32"
-      ? "a"
-      : constants.O_APPEND | constants.O_CREAT | constants.O_WRONLY | constants.O_NOFOLLOW,
-    0o600,
+function queueSegmentSequence(name: string): number | undefined {
+  if (!recoveryQueueSegmentPattern.test(name)) return undefined
+  const sequence = Number.parseInt(name.slice(0, 16), 16)
+  return Number.isSafeInteger(sequence) ? sequence : undefined
+}
+
+async function appendRecoveryQueue(
+  root: string,
+  id: string,
+  key: Buffer,
+  openFile: RecoveryFileOpener = open,
+): Promise<void> {
+  const record = Buffer.from(
+    `${JSON.stringify({ version: 1, id, integrity: queueIntegrity(key, id) })}\n`,
+    "utf8",
   )
+  if (record.length > recoveryQueueRecordBytes) {
+    throw new Error("Trash recovery queue record is too large.")
+  }
+  const directory = resolve(root, recoveryQueueDirectory)
+  await mkdir(directory, { mode: 0o700 }).catch((error: NodeJS.ErrnoException) => {
+    if (error.code !== "EEXIST") throw error
+  })
+  const directoryDetails = await lstat(directory)
+  if (
+    directoryDetails.isSymbolicLink() ||
+    !directoryDetails.isDirectory() ||
+    !pathsEqual(await realpath(directory), directory) ||
+    !isInside(root, directory)
+  ) {
+    throw new Error("Trash recovery queue is unsafe.")
+  }
+  const lease = resolve(directory, ".append.lock")
+  let leaseHandle
   try {
-    const [opened, pathDetails, canonical] = await Promise.all([
-      handle.stat({ bigint: true }),
-      lstat(path, { bigint: true }),
-      realpath(path),
-    ])
-    if (
-      !opened.isFile() ||
-      pathDetails.isSymbolicLink() ||
-      !pathDetails.isFile() ||
-      opened.size > BigInt(256 * 1024 * 1024) ||
-      stableIdentity(opened) !== stableIdentity(pathDetails) ||
-      !pathsEqual(canonical, path) ||
-      !isInside(root, canonical)
-    ) {
-      throw new Error("Trash recovery queue is unsafe.")
+    for (let attempt = 0; ; attempt += 1) {
+      try {
+        leaseHandle = await openFile(
+          lease,
+          process.platform === "win32"
+            ? "wx"
+            : constants.O_WRONLY | constants.O_CREAT | constants.O_EXCL | constants.O_NOFOLLOW,
+          0o600,
+        )
+        break
+      } catch (error) {
+        if ((error as NodeJS.ErrnoException).code !== "EEXIST" || attempt >= 200) throw error
+        await new Promise((resolveDelay) => setTimeout(resolveDelay, 10))
+      }
     }
-    await handle.writeFile(line)
-    await handle.sync()
+    await leaseHandle.writeFile(`${process.pid}\n`)
+    await leaseHandle.sync()
+    const names = await readBoundedDirectoryNames(directory, 10_000)
+    const segments = names
+      .map((name) => ({ name, sequence: queueSegmentSequence(name) }))
+      .filter((entry): entry is { name: string; sequence: number } => entry.sequence !== undefined)
+      .sort((left, right) => left.sequence - right.sequence)
+    let sequence = segments.at(-1)?.sequence ?? 0
+    let path = resolve(directory, `${sequence.toString(16).padStart(16, "0")}.log`)
+    let created = !segments.some((entry) => entry.name === path.split(/[\\/]/).at(-1)!)
+    let handle = await openFile(
+      path,
+      process.platform === "win32"
+        ? created
+          ? "wx+"
+          : "r+"
+        : constants.O_RDWR |
+            constants.O_NOFOLLOW |
+            (created ? constants.O_CREAT | constants.O_EXCL : 0),
+      0o600,
+    )
+    try {
+      let details = await handle.stat({ bigint: true })
+      let pathDetails = await lstat(path, { bigint: true })
+      if (
+        !details.isFile() ||
+        pathDetails.isSymbolicLink() ||
+        !pathDetails.isFile() ||
+        stableIdentity(details) !== stableIdentity(pathDetails) ||
+        !pathsEqual(await realpath(path), path) ||
+        !isInside(directory, path)
+      ) {
+        throw new Error("Trash recovery queue is unsafe.")
+      }
+      let size = Number(details.size)
+      if (size <= recoveryQueueSegmentBytes) {
+        const existing = Buffer.alloc(size)
+        if (size > 0) await handle.read(existing, 0, size, 0)
+        const newline = existing.lastIndexOf(0x0a)
+        const repaired = newline < 0 ? 0 : newline + 1
+        if (repaired !== size) {
+          await handle.truncate(repaired)
+          size = repaired
+        }
+      }
+      if (size > recoveryQueueSegmentBytes || size + record.length > recoveryQueueSegmentBytes) {
+        await handle.close()
+        sequence += 1
+        path = resolve(directory, `${sequence.toString(16).padStart(16, "0")}.log`)
+        created = true
+        handle = await openFile(
+          path,
+          process.platform === "win32"
+            ? "wx+"
+            : constants.O_RDWR | constants.O_CREAT | constants.O_EXCL | constants.O_NOFOLLOW,
+          0o600,
+        )
+        size = 0
+        details = await handle.stat({ bigint: true })
+        pathDetails = await lstat(path, { bigint: true })
+        if (
+          !details.isFile() ||
+          pathDetails.isSymbolicLink() ||
+          !pathDetails.isFile() ||
+          stableIdentity(details) !== stableIdentity(pathDetails) ||
+          !pathsEqual(await realpath(path), path) ||
+          !isInside(directory, path)
+        ) {
+          throw new Error("Trash recovery queue is unsafe.")
+        }
+      }
+      let written = 0
+      while (written < record.length) {
+        const result = await handle.write(record, written, record.length - written, size + written)
+        if (result.bytesWritten === 0) throw new Error("Trash recovery queue write stalled.")
+        written += result.bytesWritten
+      }
+      await handle.sync()
+    } finally {
+      await handle.close().catch(() => undefined)
+    }
+    if (created) {
+      const parent = await openFile(directory, "r")
+      try {
+        await parent.sync().catch((error: NodeJS.ErrnoException) => {
+          if (
+            process.platform !== "win32" ||
+            (error.code !== "EPERM" && error.code !== "EINVAL" && error.code !== "ENOTSUP")
+          ) {
+            throw error
+          }
+        })
+      } finally {
+        await parent.close()
+      }
+    }
   } finally {
-    await handle.close()
+    await leaseHandle?.close().catch(() => undefined)
+    await unlink(lease).catch(() => undefined)
   }
 }
 
@@ -202,10 +331,7 @@ function sameIntegrity(left: string, right: string): boolean {
   return timingSafeEqual(Buffer.from(left, "hex"), Buffer.from(right, "hex"))
 }
 
-async function directoryDigest(
-  root: string,
-  control?: RecoveryTraversalControl,
-): Promise<string> {
+async function directoryDigest(root: string, control?: RecoveryTraversalControl): Promise<string> {
   let entries = 0
   let totalBytes = 0
   const output = createHash("sha256")
@@ -356,6 +482,10 @@ async function safeRecoveryRoot(
   return { workspace, root }
 }
 
+export interface TrashRecoveryPrepareOptions {
+  readonly openFile?: RecoveryFileOpener
+}
+
 export async function prepareTrashRecovery(
   workspaceInput: string,
   originalPathInput: string,
@@ -364,6 +494,7 @@ export async function prepareTrashRecovery(
   expectedIdentity: string,
   expectedContentHash: string | undefined,
   key: Buffer,
+  options: TrashRecoveryPrepareOptions = {},
 ): Promise<TrashRecoveryStage> {
   const { workspace, root } = await safeRecoveryRoot(workspaceInput, true)
   const normalized = originalRelativePath.replaceAll("\\", "/")
@@ -379,7 +510,7 @@ export async function prepareTrashRecovery(
     throw new Error("Trash recovery target is unsafe.")
   }
   const id = randomUUID()
-  const transactions = resolve(root, recoveryTransactionsDirectory)
+  const transactions = resolve(root, indexedTransactionsDirectory)
   const shard = resolve(transactions, id.slice(0, 2))
   await mkdir(transactions, { mode: 0o700 }).catch((error: NodeJS.ErrnoException) => {
     if (error.code !== "EEXIST") throw error
@@ -418,7 +549,7 @@ export async function prepareTrashRecovery(
   // Publish the durable queue entry first. A concurrent recovery pass may observe an
   // incomplete transaction, but the cyclic queue will revisit it. The opposite order
   // could strand a complete journal forever if the process exited before queueing it.
-  await appendRecoveryQueue(root, id, key)
+  await appendRecoveryQueue(root, id, key, options.openFile)
   await writeFile(resolve(transactionPath, "journal.json"), JSON.stringify(journal), {
     encoding: "utf8",
     flag: "wx",
@@ -437,26 +568,62 @@ export async function prepareTrashRecovery(
   }
 }
 
+async function rollbackTrashRecoveryMutation(
+  stage: TrashRecoveryStage,
+  mutation: "file-linked" | "directory-renamed" | undefined,
+): Promise<void> {
+  if (mutation === undefined) return
+  try {
+    if (!(await matchesExpectedItem(stage.originalPath, stage))) {
+      throw new RecoveryPassDeferred("Trash recovery rollback was deferred.")
+    }
+    if (mutation === "file-linked") {
+      await unlink(stage.originalPath)
+      return
+    }
+    try {
+      await lstat(stage.stagedPath)
+      throw new RecoveryPassDeferred("Trash recovery rollback target is occupied.")
+    } catch (error) {
+      if (error instanceof RecoveryPassDeferred) throw error
+      if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error
+    }
+    await rename(stage.originalPath, stage.stagedPath)
+  } catch (error) {
+    if (error instanceof RecoveryPassDeferred) throw error
+    throw new RecoveryPassDeferred("Trash recovery rollback was deferred.")
+  }
+}
+
 export async function restoreLocalTrashStage(
   stage: TrashRecoveryStage,
   control?: RecoveryTraversalControl,
 ): Promise<boolean> {
+  let mutation: "file-linked" | "directory-renamed" | undefined
   try {
     if (!(await matchesExpectedItem(stage.stagedPath, stage, control))) return false
     assertRecoveryActive(control)
     if (stage.kind === "file") {
       await link(stage.stagedPath, stage.originalPath)
+      mutation = "file-linked"
       if (!(await matchesExpectedItem(stage.originalPath, stage, control))) return false
       await unlink(stage.stagedPath)
+      mutation = undefined
     } else {
       await rename(stage.stagedPath, stage.originalPath)
+      mutation = "directory-renamed"
       if (!(await matchesExpectedItem(stage.originalPath, stage, control))) return false
+      mutation = undefined
     }
     await rm(stage.transactionPath, { recursive: true }).catch(() => undefined)
     return true
   } catch (error) {
     if (error instanceof RecoveryPassDeferred) throw error
     return false
+  } finally {
+    // A failed verification returns rather than throws; restore the staged shape in
+    // that path too so a later authenticated pass can retry instead of conflicting.
+    await rollbackTrashRecoveryMutation(stage, mutation)
   }
 }
 
@@ -586,6 +753,7 @@ export async function verifyTrashRecoveryStage(stage: TrashRecoveryStage): Promi
 function cursorPayload(cursor: RecoveryCursorPayload): string {
   return JSON.stringify({
     version: cursor.version,
+    queueSegment: cursor.queueSegment ?? 0,
     queueOffset: cursor.queueOffset ?? 0,
     migrationLocation: cursor.migrationLocation ?? 0,
     migrationOffset: cursor.migrationOffset ?? 0,
@@ -607,6 +775,8 @@ function parseRecoveryCursor(value: unknown, key: Buffer): RecoveryCursorPayload
   const cursor = value as Partial<RecoveryCursorFile>
   if (
     cursor.version !== recoveryCursorVersion ||
+    (cursor.queueSegment !== undefined &&
+      (!Number.isSafeInteger(cursor.queueSegment) || cursor.queueSegment < 0)) ||
     (cursor.queueOffset !== undefined &&
       (!Number.isSafeInteger(cursor.queueOffset) || cursor.queueOffset < 0)) ||
     (cursor.migrationLocation !== undefined &&
@@ -628,13 +798,12 @@ function parseRecoveryCursor(value: unknown, key: Buffer): RecoveryCursorPayload
   }
   const payload: RecoveryCursorPayload = {
     version: recoveryCursorVersion,
+    ...(cursor.queueSegment === undefined ? {} : { queueSegment: cursor.queueSegment }),
     ...(cursor.queueOffset === undefined ? {} : { queueOffset: cursor.queueOffset }),
     ...(cursor.migrationLocation === undefined
       ? {}
       : { migrationLocation: cursor.migrationLocation }),
-    ...(cursor.migrationOffset === undefined
-      ? {}
-      : { migrationOffset: cursor.migrationOffset }),
+    ...(cursor.migrationOffset === undefined ? {} : { migrationOffset: cursor.migrationOffset }),
     ...(cursor.migrationDirectoryIdentity === undefined
       ? {}
       : { migrationDirectoryIdentity: cursor.migrationDirectoryIdentity }),
@@ -699,8 +868,11 @@ async function writeRecoveryCursor(
   }
 }
 
-async function recoveryTransactionsRoot(root: string): Promise<string> {
-  const transactions = resolve(root, recoveryTransactionsDirectory)
+async function recoveryTransactionsRoot(
+  root: string,
+  directoryName = recoveryTransactionsDirectory,
+): Promise<string> {
+  const transactions = resolve(root, directoryName)
   await mkdir(transactions, { mode: 0o700 }).catch((error: NodeJS.ErrnoException) => {
     if (error.code !== "EEXIST") throw error
   })
@@ -736,6 +908,8 @@ interface RecoveryQueuePageEntry {
 
 interface RecoveryQueuePage {
   readonly entries: readonly RecoveryQueuePageEntry[]
+  readonly segment: number
+  readonly nextSegment: number
   readonly nextOffset: number
   readonly done: boolean
 }
@@ -769,6 +943,11 @@ async function readRecoveryDirectoryPage(
       currentOffset += 1
     }
     return { entries, nextOffset: currentOffset, done: false }
+  } catch (error) {
+    if (error instanceof RecoveryPassDeferred && entries.length > 0) {
+      return { entries, nextOffset: currentOffset, done: false }
+    }
+    throw error
   } finally {
     await handle.close().catch(() => undefined)
   }
@@ -776,17 +955,59 @@ async function readRecoveryDirectoryPage(
 
 async function readRecoveryQueuePage(
   root: string,
+  segmentInput: number,
   offsetInput: number,
   key: Buffer,
   control: RecoveryTraversalControl,
 ): Promise<RecoveryQueuePage> {
-  const path = resolve(root, recoveryQueueName)
+  const directory = resolve(root, recoveryQueueDirectory)
+  await mkdir(directory, { mode: 0o700 }).catch((error: NodeJS.ErrnoException) => {
+    if (error.code !== "EEXIST") throw error
+  })
+  const directoryDetails = await lstat(directory)
+  if (
+    directoryDetails.isSymbolicLink() ||
+    !directoryDetails.isDirectory() ||
+    !pathsEqual(await realpath(directory), directory) ||
+    !isInside(root, directory)
+  ) {
+    throw new Error("Trash recovery queue is unsafe.")
+  }
+  const legacy = resolve(root, legacyRecoveryQueueName)
+  const firstSegment = resolve(directory, "0000000000000000.log")
+  try {
+    const legacyDetails = await lstat(legacy)
+    if (!legacyDetails.isSymbolicLink() && legacyDetails.isFile()) {
+      await rename(legacy, firstSegment).catch((error: NodeJS.ErrnoException) => {
+        if (error.code !== "EEXIST") throw error
+      })
+    }
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error
+  }
+  const segments = (await readBoundedDirectoryNames(directory, 10_000))
+    .map(queueSegmentSequence)
+    .filter((sequence): sequence is number => sequence !== undefined)
+    .sort((left, right) => left - right)
+  if (segments.length === 0) {
+    return { entries: [], segment: 0, nextSegment: 0, nextOffset: 0, done: true }
+  }
+  const segment = segments.find((candidate) => candidate >= segmentInput) ?? segments[0]!
+  const segmentIndex = segments.indexOf(segment)
+  const following = segments[segmentIndex + 1]
+  const path = resolve(directory, `${segment.toString(16).padStart(16, "0")}.log`)
   let handle
   try {
     handle = await open(path, "r")
   } catch (error) {
     if ((error as NodeJS.ErrnoException).code === "ENOENT") {
-      return { entries: [], nextOffset: 0, done: true }
+      return {
+        entries: [],
+        segment,
+        nextSegment: following ?? segments[0]!,
+        nextOffset: 0,
+        done: following === undefined,
+      }
     }
     throw error
   }
@@ -800,22 +1021,36 @@ async function readRecoveryQueuePage(
       !details.isFile() ||
       pathDetails.isSymbolicLink() ||
       !pathDetails.isFile() ||
-      details.size > BigInt(256 * 1024 * 1024) ||
+      details.size > BigInt(recoveryQueueSegmentBytes) ||
       stableIdentity(details) !== stableIdentity(pathDetails) ||
       !pathsEqual(canonical, path) ||
       !isInside(root, canonical)
     ) {
-      throw new Error("Trash recovery queue is unsafe.")
+      return {
+        entries: [],
+        segment,
+        nextSegment: following ?? segments[0]!,
+        nextOffset: 0,
+        done: following === undefined,
+      }
     }
     const size = Number(details.size)
     const offset = offsetInput > size ? 0 : offsetInput
     const buffer = Buffer.alloc(64 * 1024)
     assertRecoveryActive(control)
     const { bytesRead } = await handle.read(buffer, 0, buffer.length, offset)
-    if (bytesRead === 0) return { entries: [], nextOffset: 0, done: true }
+    if (bytesRead === 0)
+      return {
+        entries: [],
+        segment,
+        nextSegment: following ?? segments[0]!,
+        nextOffset: 0,
+        done: following === undefined,
+      }
     const bytes = buffer.subarray(0, bytesRead)
     const lastNewline = bytes.lastIndexOf(0x0a)
-    const consumed = lastNewline < 0 ? bytesRead : lastNewline + 1
+    // A crash-torn tail is never interpreted as a complete authenticated record.
+    const consumed = lastNewline < 0 ? 0 : lastNewline + 1
     const entries: RecoveryQueuePageEntry[] = []
     let lineOffset = 0
     for (const line of bytes.subarray(0, consumed).toString("utf8").split("\n")) {
@@ -845,135 +1080,196 @@ async function readRecoveryQueuePage(
       }
       lineOffset += lineBytes
     }
-    const done = offset + consumed >= size
-    return { entries, nextOffset: done ? 0 : offset + consumed, done }
+    const reachedTail = offset + consumed >= size
+    const hasIncompleteTail = consumed < bytesRead
+    if (hasIncompleteTail && following === undefined) {
+      return {
+        entries,
+        segment,
+        nextSegment: segment,
+        nextOffset: offset + consumed,
+        done: true,
+      }
+    }
+    const segmentDone = reachedTail || hasIncompleteTail
+    return {
+      entries,
+      segment,
+      nextSegment: segmentDone ? (following ?? segments[0]!) : segment,
+      nextOffset: segmentDone ? 0 : offset + consumed,
+      done: segmentDone && following === undefined,
+    }
   } finally {
     await handle.close()
+  }
+}
+
+async function validLegacyTransaction(
+  root: string,
+  source: string,
+  id: string,
+  key: Buffer,
+  control: RecoveryTraversalControl,
+): Promise<boolean> {
+  try {
+    const details = await lstat(source)
+    if (
+      details.isSymbolicLink() ||
+      !details.isDirectory() ||
+      !pathsEqual(await realpath(source), source) ||
+      !isInside(root, source)
+    ) {
+      return false
+    }
+    const journalPath = resolve(source, "journal.json")
+    const journalDetails = await lstat(journalPath)
+    if (
+      journalDetails.isSymbolicLink() ||
+      !journalDetails.isFile() ||
+      journalDetails.size > 64 * 1024
+    ) {
+      return false
+    }
+    return Boolean(
+      parseJournal(
+        JSON.parse(
+          (await readBoundedRegularFile(journalPath, 64 * 1024, control)).toString("utf8"),
+        ),
+        id,
+        key,
+      ),
+    )
+  } catch (error) {
+    if (error instanceof RecoveryPassDeferred) throw error
+    return false
   }
 }
 
 async function discoverLegacyTransactions(
   root: string,
   transactions: string,
+  indexedTransactions: string,
   cursor: RecoveryCursorPayload,
   key: Buffer,
   openDirectory: DirectoryOpener,
   control: RecoveryTraversalControl,
 ): Promise<{ readonly cursor: RecoveryCursorPayload; readonly pending: boolean }> {
   let location = cursor.migrationLocation ?? 0
-  let offset = cursor.migrationOffset ?? 0
+  const quarantine = resolve(root, "legacy-quarantine")
+  await mkdir(quarantine, { mode: 0o700 }).catch((error: NodeJS.ErrnoException) => {
+    if (error.code !== "EEXIST") throw error
+  })
+  const [quarantineDetails, canonicalQuarantine] = await Promise.all([
+    lstat(quarantine),
+    realpath(quarantine),
+  ])
+  if (
+    quarantineDetails.isSymbolicLink() ||
+    !quarantineDetails.isDirectory() ||
+    !pathsEqual(canonicalQuarantine, quarantine) ||
+    !isInside(root, quarantine)
+  ) {
+    throw new Error("Trash recovery quarantine is unsafe.")
+  }
+  const reservedRootEntries = new Set([
+    recoveryCursorName,
+    legacyRecoveryQueueName,
+    recoveryQueueDirectory,
+    recoveryTransactionsDirectory,
+    indexedTransactionsDirectory,
+    "legacy-quarantine",
+  ])
+
+  const actionable = (entry: RecoveryDirectoryPageEntry): boolean =>
+    location !== 0 || !reservedRootEntries.has(entry.name)
+
   while (location <= 256) {
     assertRecoveryActive(control)
+    if (location === 1) {
+      const legacyShards = await readRecoveryDirectoryPage(transactions, 0, openDirectory, control)
+      if (legacyShards.done && legacyShards.entries.length === 0) break
+    }
     const directory =
-      location === 0
-        ? root
-        : resolve(transactions, (location - 1).toString(16).padStart(2, "0"))
-    let directoryBefore: BigIntStats
+      location === 0 ? root : resolve(transactions, (location - 1).toString(16).padStart(2, "0"))
     let page: RecoveryDirectoryPage
     try {
-      directoryBefore = await lstat(directory, { bigint: true })
-      if (directoryBefore.isSymbolicLink() || !directoryBefore.isDirectory()) {
+      const directoryDetails = await lstat(directory)
+      if (directoryDetails.isSymbolicLink() || !directoryDetails.isDirectory()) {
         throw new Error("Trash recovery migration directory is unsafe.")
       }
-      const identity = stableIdentity(directoryBefore)
-      const mtimeNs = directoryBefore.mtimeNs.toString()
-      if (
-        offset > 0 &&
-        (cursor.migrationDirectoryIdentity !== identity ||
-          cursor.migrationDirectoryMtimeNs !== mtimeNs)
-      ) {
-        // An insertion or removal before a raw directory offset could otherwise hide
-        // an older journal. Restart this one bounded directory until a stable sweep.
-        offset = 0
-      }
-      cursor = {
-        ...cursor,
-        migrationLocation: location,
-        migrationOffset: offset,
-        migrationDirectoryIdentity: identity,
-        migrationDirectoryMtimeNs: mtimeNs,
-      }
-      page = await readRecoveryDirectoryPage(directory, offset, openDirectory, control)
+      page = await readRecoveryDirectoryPage(directory, 0, openDirectory, control)
     } catch (error) {
       if ((error as NodeJS.ErrnoException).code === "ENOENT") {
         location += 1
-        offset = 0
-        const {
-          migrationDirectoryIdentity: _identity,
-          migrationDirectoryMtimeNs: _mtime,
-          ...withoutDirectory
-        } = cursor
-        cursor = withoutDirectory
         continue
       }
       throw error
     }
-    for (const entry of page.entries) {
-      assertRecoveryActive(control)
+    const bucket = resolve(quarantine, location.toString(16).padStart(3, "0"))
+    await mkdir(bucket, { mode: 0o700 }).catch((error: NodeJS.ErrnoException) => {
+      if (error.code !== "EEXIST") throw error
+    })
+    const [bucketDetails, canonicalBucket] = await Promise.all([lstat(bucket), realpath(bucket)])
+    if (
+      bucketDetails.isSymbolicLink() ||
+      !bucketDetails.isDirectory() ||
+      !pathsEqual(canonicalBucket, bucket) ||
+      !isInside(quarantine, bucket)
+    ) {
+      throw new Error("Trash recovery quarantine is unsafe.")
+    }
+    let blocked = false
+    let transformed = false
+    for (const entry of page.entries.filter(actionable)) {
+      if (transformed) assertRecoveryActive(control)
       const id = entry.name
-      if (!transactionPattern.test(id)) continue
-      await appendRecoveryQueue(root, id, key)
-      if (location !== 0) continue
-      const source = resolve(root, id)
-      const shard = resolve(transactions, id.slice(0, 2))
-      const target = resolve(shard, id)
+      const source = resolve(directory, id)
       try {
-        const [details, canonical] = await Promise.all([lstat(source), realpath(source)])
         if (
-          details.isSymbolicLink() ||
-          !details.isDirectory() ||
-          !pathsEqual(canonical, source) ||
-          !isInside(root, source)
+          transactionPattern.test(id) &&
+          (await validLegacyTransaction(root, source, id, key, transformed ? control : {}))
         ) {
+          const shard = resolve(indexedTransactions, id.slice(0, 2))
+          const target = resolve(shard, id)
+          await mkdir(shard, { mode: 0o700 }).catch((error: NodeJS.ErrnoException) => {
+            if (error.code !== "EEXIST") throw error
+          })
+          const [shardDetails, canonicalShard] = await Promise.all([lstat(shard), realpath(shard)])
+          if (
+            shardDetails.isSymbolicLink() ||
+            !shardDetails.isDirectory() ||
+            !pathsEqual(canonicalShard, shard) ||
+            !isInside(indexedTransactions, shard)
+          ) {
+            throw new Error("Trash recovery migration target is unsafe.")
+          }
+          await appendRecoveryQueue(root, id, key)
+          await rename(source, target)
+          transformed = true
           continue
         }
-        await mkdir(shard, { mode: 0o700 }).catch((error: NodeJS.ErrnoException) => {
-          if (error.code !== "EEXIST") throw error
-        })
-        const [shardDetails, canonicalShard] = await Promise.all([lstat(shard), realpath(shard)])
-        if (
-          shardDetails.isSymbolicLink() ||
-          !shardDetails.isDirectory() ||
-          !pathsEqual(canonicalShard, shard) ||
-          !isInside(transactions, shard)
-        ) {
-          continue
-        }
-        await rename(source, target)
-      } catch {
-        // Racing or invalid legacy entries stay in place for a later/manual pass.
+        await rename(source, resolve(bucket, randomUUID()))
+        transformed = true
+      } catch (error) {
+        if (error instanceof RecoveryPassDeferred) throw error
+        if ((error as NodeJS.ErrnoException).code === "ENOENT") transformed = true
+        else blocked = true
       }
     }
-    const directoryAfter = await lstat(directory, { bigint: true })
-    if (
-      stableIdentity(directoryAfter) !== stableIdentity(directoryBefore) ||
-      directoryAfter.mtimeNs !== directoryBefore.mtimeNs
-    ) {
+    if (!page.done || blocked) {
       return {
-        cursor: {
-          ...cursor,
-          migrationLocation: location,
-          migrationOffset: 0,
-          migrationDirectoryIdentity: stableIdentity(directoryAfter),
-          migrationDirectoryMtimeNs: directoryAfter.mtimeNs.toString(),
-        },
+        cursor: { ...cursor, migrationLocation: location, migrationOffset: 0 },
         pending: true,
       }
     }
-    if (!page.done) {
+    const remaining = await readRecoveryDirectoryPage(directory, 0, openDirectory, control)
+    if (remaining.entries.some(actionable) || !remaining.done) {
       return {
-        cursor: { ...cursor, migrationLocation: location, migrationOffset: page.nextOffset },
+        cursor: { ...cursor, migrationLocation: location, migrationOffset: 0 },
         pending: true,
       }
     }
     location += 1
-    offset = 0
-    const {
-      migrationDirectoryIdentity: _identity,
-      migrationDirectoryMtimeNs: _mtime,
-      ...withoutDirectory
-    } = cursor
-    cursor = withoutDirectory
   }
   const {
     migrationDirectoryIdentity: _identity,
@@ -1048,6 +1344,10 @@ export async function reconcileTrashRecoveryPass(
   }
   const openDirectory = options.openDirectory ?? opendir
   const transactions = await recoveryTransactionsRoot(storage.root)
+  const indexedTransactions = await recoveryTransactionsRoot(
+    storage.root,
+    indexedTransactionsDirectory,
+  )
   let cursor = await readRecoveryCursor(storage.root, key)
   let pending = false
   try {
@@ -1055,6 +1355,7 @@ export async function reconcileTrashRecoveryPass(
       const legacy = await discoverLegacyTransactions(
         storage.root,
         transactions,
+        indexedTransactions,
         cursor,
         key,
         openDirectory,
@@ -1075,6 +1376,7 @@ export async function reconcileTrashRecoveryPass(
   try {
     queuePage = await readRecoveryQueuePage(
       storage.root,
+      cursor.queueSegment ?? 0,
       cursor.queueOffset ?? 0,
       key,
       control,
@@ -1085,111 +1387,115 @@ export async function reconcileTrashRecoveryPass(
     return { restored, conflicts, pending: true }
   }
   for (const entry of queuePage.entries) {
-      const id = entry.id
-      cursor = { ...cursor, queueOffset: entry.offsetBefore }
-      if (seenIds.has(id)) {
-        cursor = { ...cursor, queueOffset: entry.offsetAfter }
+    const id = entry.id
+    cursor = { ...cursor, queueSegment: queuePage.segment, queueOffset: entry.offsetBefore }
+    if (seenIds.has(id)) {
+      cursor = { ...cursor, queueSegment: queuePage.segment, queueOffset: entry.offsetAfter }
+      continue
+    }
+    seenIds.add(id)
+    if (processed >= maximumTransactions) {
+      pending = true
+      await writeRecoveryCursor(storage.root, key, cursor)
+      return { restored, conflicts, pending }
+    }
+    const shardName = id.slice(0, 2)
+    if (!shardPattern.test(shardName)) continue
+    const shard = resolve(indexedTransactions, shardName)
+    const transactionPath = resolve(shard, id)
+    let advanceCursor = true
+    try {
+      const transaction = await lstat(transactionPath)
+      const journalPath = resolve(transactionPath, "journal.json")
+      const journalDetails = await lstat(journalPath)
+      if (
+        transaction.isSymbolicLink() ||
+        !transaction.isDirectory() ||
+        journalDetails.isSymbolicLink() ||
+        !journalDetails.isFile() ||
+        journalDetails.size > 64 * 1024
+      ) {
         continue
       }
-      seenIds.add(id)
-      if (processed >= maximumTransactions) {
+      if (journalBytes + journalDetails.size > maximumJournalBytes) {
+        advanceCursor = false
         pending = true
         await writeRecoveryCursor(storage.root, key, cursor)
         return { restored, conflicts, pending }
       }
-      const shardName = id.slice(0, 2)
-      if (!shardPattern.test(shardName)) continue
-      const shard = resolve(transactions, shardName)
-      const transactionPath = resolve(shard, id)
-      let advanceCursor = true
+      journalBytes += journalDetails.size
+      if (!pathsEqual(await realpath(transactionPath), transactionPath)) continue
+      const journal = parseJournal(
+        JSON.parse(
+          (await readBoundedRegularFile(journalPath, 64 * 1024, control)).toString("utf8"),
+        ),
+        id,
+        key,
+      )
+      if (!journal) continue
+      const original = resolve(storage.workspace, ...journal.originalRelativePath.split("/"))
+      const staged = resolve(transactionPath, ...journal.stagedRelativePath.split("/"))
+      if (!isInside(transactionPath, staged) || !isInside(storage.workspace, original)) continue
+      let stagedDetails
       try {
-        const transaction = await lstat(transactionPath)
-        const journalPath = resolve(transactionPath, "journal.json")
-        const journalDetails = await lstat(journalPath)
-        if (
-          transaction.isSymbolicLink() ||
-          !transaction.isDirectory() ||
-          journalDetails.isSymbolicLink() ||
-          !journalDetails.isFile() ||
-          journalDetails.size > 64 * 1024
-        ) {
-          continue
-        }
-        if (journalBytes + journalDetails.size > maximumJournalBytes) {
-          advanceCursor = false
-          pending = true
-          await writeRecoveryCursor(storage.root, key, cursor)
-          return { restored, conflicts, pending }
-        }
-        journalBytes += journalDetails.size
-        if (!pathsEqual(await realpath(transactionPath), transactionPath)) continue
-        const journal = parseJournal(
-          JSON.parse(
-            (await readBoundedRegularFile(journalPath, 64 * 1024, control)).toString("utf8"),
-          ),
-          id,
-          key,
-        )
-        if (!journal) continue
-        const original = resolve(storage.workspace, ...journal.originalRelativePath.split("/"))
-        const staged = resolve(transactionPath, ...journal.stagedRelativePath.split("/"))
-        if (!isInside(transactionPath, staged) || !isInside(storage.workspace, original)) continue
-        let stagedDetails
-        try {
-          stagedDetails = await lstat(staged)
-        } catch (error) {
-          if ((error as NodeJS.ErrnoException).code === "ENOENT") continue
-          throw error
-        }
-        if (
-          stagedDetails.isSymbolicLink() ||
-          (journal.kind === "file" ? !stagedDetails.isFile() : !stagedDetails.isDirectory())
-        )
-          continue
-        if (!pathsEqual(await realpath(staged), staged)) continue
-        try {
-          await lstat(original)
-          conflicts.push(journal.originalRelativePath)
-          continue
-        } catch (error) {
-          if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error
-        }
-        const parent = dirname(original)
-        const canonicalParent = await realpath(parent)
-        if (!pathsEqual(canonicalParent, parent) || !isInside(storage.workspace, canonicalParent))
-          continue
-        const stage: TrashRecoveryStage = {
-          id,
-          workspace: storage.workspace,
-          originalPath: original,
-          originalRelativePath: journal.originalRelativePath,
-          stagedPath: staged,
-          transactionPath,
-          kind: journal.kind,
-          expectedIdentity: journal.expectedIdentity,
-          expectedContentHash: journal.expectedContentHash,
-        }
-        if (!(await matchesExpectedItem(staged, stage, control))) {
-          conflicts.push(journal.originalRelativePath)
-          continue
-        }
-        if (await restoreLocalTrashStage(stage, control)) restored.push(journal.originalRelativePath)
-        else conflicts.push(journal.originalRelativePath)
+        stagedDetails = await lstat(staged)
       } catch (error) {
-        if (error instanceof RecoveryPassDeferred) {
-          advanceCursor = false
-          await writeRecoveryCursor(storage.root, key, cursor)
-          return { restored, conflicts, pending: true }
-        }
-        // Invalid or racing journals are retained for manual inspection.
-      } finally {
-        if (advanceCursor) {
-          cursor = { ...cursor, queueOffset: entry.offsetAfter }
-        }
-        processed += 1
+        if ((error as NodeJS.ErrnoException).code === "ENOENT") continue
+        throw error
       }
+      if (
+        stagedDetails.isSymbolicLink() ||
+        (journal.kind === "file" ? !stagedDetails.isFile() : !stagedDetails.isDirectory())
+      )
+        continue
+      if (!pathsEqual(await realpath(staged), staged)) continue
+      try {
+        await lstat(original)
+        conflicts.push(journal.originalRelativePath)
+        continue
+      } catch (error) {
+        if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error
+      }
+      const parent = dirname(original)
+      const canonicalParent = await realpath(parent)
+      if (!pathsEqual(canonicalParent, parent) || !isInside(storage.workspace, canonicalParent))
+        continue
+      const stage: TrashRecoveryStage = {
+        id,
+        workspace: storage.workspace,
+        originalPath: original,
+        originalRelativePath: journal.originalRelativePath,
+        stagedPath: staged,
+        transactionPath,
+        kind: journal.kind,
+        expectedIdentity: journal.expectedIdentity,
+        expectedContentHash: journal.expectedContentHash,
+      }
+      if (!(await matchesExpectedItem(staged, stage, control))) {
+        conflicts.push(journal.originalRelativePath)
+        continue
+      }
+      if (await restoreLocalTrashStage(stage, control)) restored.push(journal.originalRelativePath)
+      else conflicts.push(journal.originalRelativePath)
+    } catch (error) {
+      if (error instanceof RecoveryPassDeferred) {
+        advanceCursor = false
+        await writeRecoveryCursor(storage.root, key, cursor)
+        return { restored, conflicts, pending: true }
+      }
+      // Invalid or racing journals are retained for manual inspection.
+    } finally {
+      if (advanceCursor) {
+        cursor = { ...cursor, queueSegment: queuePage.segment, queueOffset: entry.offsetAfter }
+      }
+      processed += 1
+    }
   }
-  cursor = { ...cursor, queueOffset: queuePage.nextOffset }
+  cursor = {
+    ...cursor,
+    queueSegment: queuePage.nextSegment,
+    queueOffset: queuePage.nextOffset,
+  }
   pending ||= !queuePage.done
   await writeRecoveryCursor(storage.root, key, cursor)
   return { restored, conflicts, pending }
