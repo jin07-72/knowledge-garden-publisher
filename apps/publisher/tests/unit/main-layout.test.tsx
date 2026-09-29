@@ -5,7 +5,7 @@ import { createHash } from "node:crypto"
 import { StrictMode } from "react"
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest"
 import { createPublisherCloseCoordinator } from "../../src/main/publisherServices"
-import { PublisherApp } from "../../src/renderer/src/App"
+import { App as StartupApp, PublisherApp } from "../../src/renderer/src/App"
 import { shanghaiCalendarDate } from "../../src/renderer/src/components/NoteSidebar"
 import type {
   ChangeReview,
@@ -120,7 +120,9 @@ function createGardenMock(): GardenApi {
           issues: [],
         }),
       ),
-      repair: vi.fn(async () => ok({ action: "install-dependencies" as const, message: "installed" })),
+      repair: vi.fn(async () =>
+        ok({ action: "install-dependencies" as const, message: "installed" }),
+      ),
     },
     notes: {
       list: vi.fn(async () => ok(notes)),
@@ -208,6 +210,30 @@ describe("publisher main layout", () => {
     await act(async () => Promise.resolve())
     expect(document.querySelector(".app-shell")).toHaveAttribute("inert")
     expect(within(dialog).getByRole("textbox", { name: "标题" })).toHaveFocus()
+  })
+
+  it("keeps editing available while transient remote and preferred-port diagnostics remain visible", async () => {
+    vi.mocked(garden.workspace.inspect).mockResolvedValueOnce(
+      ok({
+        ok: false,
+        root: String.raw`C:\Users\11546\Desktop\web`,
+        capabilities: { files: true, preview: true, git: false, publish: false },
+        issues: [
+          { code: "GIT_ORIGIN_UNREACHABLE", message: "origin/main is temporarily unreachable." },
+          { code: "PREVIEW_PORT_UNAVAILABLE", message: "The preferred preview port is occupied." },
+        ],
+      }),
+    )
+
+    render(<StartupApp />)
+
+    await waitFor(() => {
+      expect(screen.getByRole("region", { name: "启动检查" })).toBeVisible()
+      expect(screen.getByRole("region", { name: "Markdown 编辑器" })).toBeVisible()
+    })
+    expect(garden.notes.list).toHaveBeenCalledOnce()
+    expect(screen.getByText("origin/main is temporarily unreachable.")).toBeVisible()
+    expect(screen.getByText("The preferred preview port is occupied.")).toBeVisible()
   })
 
   it("acknowledges close only after an edit younger than 750ms and its recovery are durable", async () => {
@@ -901,6 +927,7 @@ describe("publisher main layout", () => {
     expect(await screen.findByText(/在线副本仍会保留/)).toBeVisible()
     expect(screen.getByText(/专属附件仍保留/)).toBeVisible()
     expect(screen.queryByText(notes[0].path)).not.toBeInTheDocument()
+    await waitFor(() => expect(screen.getByRole("button", { name: "新建笔记" })).toHaveFocus())
   })
 
   it("attributes a late visibility failure to its original note", async () => {

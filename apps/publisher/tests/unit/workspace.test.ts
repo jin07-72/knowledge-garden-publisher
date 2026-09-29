@@ -3,27 +3,28 @@ import { EventEmitter } from "node:events"
 import { tmpdir } from "node:os"
 import { join } from "node:path"
 import { PassThrough } from "node:stream"
-import { afterEach, describe, expect, it } from "vitest"
+import { afterEach, describe, expect, it, vi } from "vitest"
 import {
   CommandRunnerError,
   createCommandRunner,
   runCommand,
   type CommandProcess,
-  type CommandRunner
+  type CommandRunner,
 } from "../../src/main/lib/commandRunner"
-import { inspectWorkspace } from "../../src/main/services/workspace"
+import { inspectWorkspace, repairWorkspace } from "../../src/main/services/workspace"
 import { exists, removeTemporaryDirectory } from "../helpers/fs"
 import {
   createTemporaryGitRepository,
   git,
   type GitFixtureDependencies,
-  type TemporaryGitRepository
+  type TemporaryGitRepository,
 } from "../helpers/git"
 
 const temporaryDirectories: string[] = []
 const temporaryRepositories: TemporaryGitRepository[] = []
 
 afterEach(async () => {
+  vi.useRealTimers()
   await Promise.all(temporaryDirectories.splice(0).map(removeTemporaryDirectory))
   await Promise.all(temporaryRepositories.splice(0).map((repository) => repository.cleanup()))
 })
@@ -41,6 +42,36 @@ async function createGarden(root?: string): Promise<string> {
 }
 
 describe("inspectWorkspace", () => {
+  it("bounds a hanging startup command and cancels it", async () => {
+    vi.useFakeTimers()
+    const root = await createGarden()
+    let aborted = false
+    const runner: CommandRunner = {
+      run: (request) =>
+        new Promise((_resolve, reject) => {
+          request.signal?.addEventListener("abort", () => {
+            aborted = true
+            reject(new Error("aborted"))
+          })
+        }),
+    }
+
+    let commandStarted!: () => void
+    const started = new Promise<void>((resolve) => {
+      commandStarted = resolve
+    })
+    const originalRun = runner.run
+    runner.run = (request) => {
+      commandStarted()
+      return originalRun(request)
+    }
+    const inspection = inspectWorkspace(root, { checkGit: true, runner })
+    await started
+    await vi.advanceTimersByTimeAsync(15_001)
+
+    await expect(inspection).resolves.toMatchObject({ ok: false, capabilities: { files: true } })
+    expect(aborted).toBe(true)
+  })
   it("accepts a garden with required roots and scripts", async () => {
     const root = await createGarden()
 
@@ -51,6 +82,19 @@ describe("inspectWorkspace", () => {
     expect(result.capabilities.preview).toBe(true)
     expect(result.capabilities.git).toBe(false)
     expect(result.capabilities.publish).toBe(false)
+  })
+
+  it("keeps preview capability when only the preferred port is occupied", async () => {
+    const root = await createGarden()
+
+    const result = await inspectWorkspace(root, {
+      checkGit: false,
+      previewPortAvailable: async () => false,
+    })
+
+    expect(result.ok).toBe(false)
+    expect(result.issues.map((issue) => issue.code)).toContain("PREVIEW_PORT_UNAVAILABLE")
+    expect(result.capabilities).toMatchObject({ files: true, preview: true })
   })
 
   it("returns actionable errors for every missing required path", async () => {
@@ -67,8 +111,8 @@ describe("inspectWorkspace", () => {
         "SCRIPTS_MISSING",
         "PACKAGE_LOCK_MISSING",
         "QUARTZ_CONFIG_MISSING",
-        "VALIDATE_CONTENT_MISSING"
-      ])
+        "VALIDATE_CONTENT_MISSING",
+      ]),
     )
     expect(result.capabilities).toMatchObject({ files: false, preview: false })
   })
@@ -92,7 +136,7 @@ describe("inspectWorkspace", () => {
     ["scripts", "SCRIPTS_MISSING"],
     ["package-lock.json", "PACKAGE_LOCK_MISSING"],
     ["quartz.config.yaml", "QUARTZ_CONFIG_MISSING"],
-    ["scripts/validate-content.mjs", "VALIDATE_CONTENT_MISSING"]
+    ["scripts/validate-content.mjs", "VALIDATE_CONTENT_MISSING"],
   ] as const)("reports %s when that required path is absent", async (relativePath, code) => {
     const root = await createGarden()
     await rm(join(root, relativePath), { force: true, recursive: true })
@@ -120,8 +164,8 @@ describe("inspectWorkspace", () => {
       expect.arrayContaining([
         "CONTENT_NOT_DIRECTORY",
         "PACKAGE_LOCK_NOT_FILE",
-        "VALIDATE_CONTENT_NOT_FILE"
-      ])
+        "VALIDATE_CONTENT_NOT_FILE",
+      ]),
     )
   })
 
@@ -131,22 +175,25 @@ describe("inspectWorkspace", () => {
     ["scripts", "directory", "SCRIPTS_NOT_DIRECTORY"],
     ["package-lock.json", "file", "PACKAGE_LOCK_NOT_FILE"],
     ["quartz.config.yaml", "file", "QUARTZ_CONFIG_NOT_FILE"],
-    ["scripts/validate-content.mjs", "file", "VALIDATE_CONTENT_NOT_FILE"]
-  ] as const)("reports %s when required %s has the wrong type", async (relativePath, expectedType, code) => {
-    const root = await createGarden()
-    const path = join(root, relativePath)
-    await rm(path, { force: true, recursive: true })
-    if (expectedType === "directory") {
-      await writeFile(path, "not a directory")
-    } else {
-      await mkdir(path)
-    }
+    ["scripts/validate-content.mjs", "file", "VALIDATE_CONTENT_NOT_FILE"],
+  ] as const)(
+    "reports %s when required %s has the wrong type",
+    async (relativePath, expectedType, code) => {
+      const root = await createGarden()
+      const path = join(root, relativePath)
+      await rm(path, { force: true, recursive: true })
+      if (expectedType === "directory") {
+        await writeFile(path, "not a directory")
+      } else {
+        await mkdir(path)
+      }
 
-    const result = await inspectWorkspace(root, { checkGit: false })
+      const result = await inspectWorkspace(root, { checkGit: false })
 
-    expect(result.ok).toBe(false)
-    expect(result.issues.map((issue) => issue.code)).toContain(code)
-  })
+      expect(result.ok).toBe(false)
+      expect(result.issues.map((issue) => issue.code)).toContain(code)
+    },
+  )
 
   it("enables git and publishing only for a matching repository with origin", async () => {
     const repository = await createTemporaryGitRepository()
@@ -199,10 +246,11 @@ describe("inspectWorkspace", () => {
     const runner: CommandRunner = {
       run: async ({ args }) => {
         if (args[0] === "rev-parse") return { exitCode: 0, stdout: `${root}\n`, stderr: "" }
-        if (args[0] === "remote" && args.length === 1) return { exitCode: 0, stdout: "origin\n", stderr: "" }
+        if (args[0] === "remote" && args.length === 1)
+          return { exitCode: 0, stdout: "origin\n", stderr: "" }
         if (args[0] === "remote") return { exitCode: 1, stdout: "", stderr: "任意语言的失败" }
         return { exitCode: 0, stdout: "", stderr: "" }
-      }
+      },
     }
 
     const result = await inspectWorkspace(root, { checkGit: true, runner })
@@ -219,7 +267,7 @@ describe("inspectWorkspace", () => {
         if (args[0] === "rev-parse") return { exitCode: 0, stdout: `${root}\n`, stderr: "" }
         if (args[0] === "remote") return { exitCode: 1, stdout: "", stderr: "任意语言的失败" }
         return { exitCode: 0, stdout: "", stderr: "" }
-      }
+      },
     }
 
     const result = await inspectWorkspace(root, { checkGit: true, runner })
@@ -236,10 +284,12 @@ describe("inspectWorkspace", () => {
         requests.push(request)
         const { args } = request
         if (args[0] === "rev-parse") return { exitCode: 0, stdout: `${root}\n`, stderr: "" }
-        if (args[0] === "remote" && args.length === 1) return { exitCode: 0, stdout: "origin\n", stderr: "" }
-        if (args[0] === "remote") return { exitCode: 0, stdout: "https://example.invalid/garden.git\n", stderr: "" }
+        if (args[0] === "remote" && args.length === 1)
+          return { exitCode: 0, stdout: "origin\n", stderr: "" }
+        if (args[0] === "remote")
+          return { exitCode: 0, stdout: "https://example.invalid/garden.git\n", stderr: "" }
         return { exitCode: 1, stdout: "", stderr: "git status failed" }
-      }
+      },
     }
 
     const result = await inspectWorkspace(root, { checkGit: true, runner })
@@ -248,30 +298,67 @@ describe("inspectWorkspace", () => {
     expect(result.issues.map((issue) => issue.code)).toContain("GIT_STATUS_FAILED")
     expect(result.capabilities.git).toBe(false)
     expect(requests).toEqual([
-      {
+      expect.objectContaining({
         executable: "git",
         args: ["rev-parse", "--show-toplevel"],
         cwd: root,
-        env: { GIT_OPTIONAL_LOCKS: "0" }
-      },
-      {
+        env: { GIT_OPTIONAL_LOCKS: "0" },
+      }),
+      expect.objectContaining({
         executable: "git",
         args: ["remote"],
         cwd: root,
-        env: { GIT_OPTIONAL_LOCKS: "0" }
-      },
-      {
+        env: { GIT_OPTIONAL_LOCKS: "0" },
+      }),
+      expect.objectContaining({
         executable: "git",
         args: ["remote", "get-url", "origin"],
         cwd: root,
-        env: { GIT_OPTIONAL_LOCKS: "0" }
-      },
-      {
+        env: { GIT_OPTIONAL_LOCKS: "0" },
+      }),
+      expect.objectContaining({
         executable: "git",
         args: ["status", "--porcelain=v2"],
         cwd: root,
-        env: { GIT_OPTIONAL_LOCKS: "0" }
-      }
+        env: { GIT_OPTIONAL_LOCKS: "0" },
+      }),
+    ])
+    expect(requests).toEqual(
+      expect.arrayContaining([
+        expect.objectContaining({ maxOutputBytes: 512 * 1024, signal: expect.any(AbortSignal) }),
+      ]),
+    )
+  })
+
+  it("bounds explicit npm ci output and cancellation without exposing command diagnostics", async () => {
+    const root = await createGarden()
+    const requests: Array<Parameters<CommandRunner["run"]>[0] & { maxOutputBytes?: number }> = []
+    const runner: CommandRunner = {
+      run: async (request) => {
+        requests.push(request)
+        throw new Error("top-secret npm output")
+      },
+    }
+
+    await expect(
+      repairWorkspace(
+        root,
+        { action: "install-dependencies" },
+        {
+          runner,
+          runtime: { nodePath: "node.exe", npmCliPath: "npm-cli.js" },
+        },
+      ),
+    ).rejects.toMatchObject({
+      code: "REPAIR_FAILED",
+      message: expect.not.stringContaining("top-secret"),
+    })
+    expect(requests).toEqual([
+      expect.objectContaining({
+        args: ["npm-cli.js", "ci", "--no-audit", "--no-fund"],
+        maxOutputBytes: 2 * 1024 * 1024,
+        signal: expect.any(AbortSignal),
+      }),
     ])
   })
 
@@ -280,7 +367,7 @@ describe("inspectWorkspace", () => {
     const runner: CommandRunner = {
       run: async () => {
         throw new CommandRunnerError("COMMAND_FAILED", "Could not start command.")
-      }
+      },
     }
 
     const result = await inspectWorkspace(root, { checkGit: true, runner })
@@ -306,22 +393,29 @@ describe("inspectWorkspace", () => {
     expect(result.ok).toBe(true)
   })
 
-  it.skipIf(process.platform !== "win32")("accepts a Git root whose reported path differs only by case", async () => {
-    const root = await createGarden()
-    const runner: CommandRunner = {
-      run: async ({ args }) => {
-        if (args[0] === "rev-parse") return { exitCode: 0, stdout: `${root.toUpperCase()}\n`, stderr: "" }
-        if (args[0] === "remote" && args.length === 1) return { exitCode: 0, stdout: "origin\n", stderr: "" }
-        return { exitCode: 0, stdout: "https://example.invalid/garden.git\n", stderr: "" }
+  it.skipIf(process.platform !== "win32")(
+    "accepts a Git root whose reported path differs only by case",
+    async () => {
+      const root = await createGarden()
+      const runner: CommandRunner = {
+        run: async ({ args }) => {
+          if (args[0] === "rev-parse")
+            return { exitCode: 0, stdout: `${root.toUpperCase()}\n`, stderr: "" }
+          if (args[0] === "remote" && args.length === 1)
+            return { exitCode: 0, stdout: "origin\n", stderr: "" }
+          return { exitCode: 0, stdout: "https://example.invalid/garden.git\n", stderr: "" }
+        },
       }
-    }
 
-    const result = await inspectWorkspace(root, { checkGit: true, runner })
+      const result = await inspectWorkspace(root, { checkGit: true, runner })
 
-    expect(result.ok).toBe(true)
-  })
+      expect(result.ok).toBe(true)
+    },
+  )
 
-  it("rejects a required file symlink even when it resolves inside the workspace", async ({ skip }) => {
+  it("rejects a required file symlink even when it resolves inside the workspace", async ({
+    skip,
+  }) => {
     const root = await createGarden()
     const target = join(root, "quartz.config.real.yaml")
     const linkedPath = join(root, "quartz.config.yaml")
@@ -372,16 +466,16 @@ describe("runCommand", () => {
         args: [
           "-e",
           "process.stdout.write(process.argv[1] + ':' + process.env.GARDEN_INHERITED_VALUE); process.stderr.write(process.env.GARDEN_TEST_VALUE)",
-          "literal && not-a-shell-command"
+          "literal && not-a-shell-command",
         ],
         cwd: process.cwd(),
-        env: { GARDEN_TEST_VALUE: "stderr-value" }
+        env: { GARDEN_TEST_VALUE: "stderr-value" },
       })
 
       expect(result).toEqual({
         exitCode: 0,
         stdout: "literal && not-a-shell-command:inherited-value",
-        stderr: "stderr-value"
+        stderr: "stderr-value",
       })
     } finally {
       if (inheritedValue === undefined) delete process.env.GARDEN_INHERITED_VALUE
@@ -393,7 +487,7 @@ describe("runCommand", () => {
     const result = await runCommand({
       executable: process.execPath,
       args: ["-e", "process.stderr.write('failed'); process.exit(7)"],
-      cwd: process.cwd()
+      cwd: process.cwd(),
     })
 
     expect(result).toEqual({ exitCode: 7, stdout: "", stderr: "failed" })
@@ -405,7 +499,7 @@ describe("runCommand", () => {
       executable: process.execPath,
       args: ["-e", "setInterval(() => {}, 1000)"],
       cwd: process.cwd(),
-      signal: controller.signal
+      signal: controller.signal,
     })
     controller.abort()
 
@@ -423,7 +517,12 @@ describe("runCommand", () => {
     }
     const runner = createCommandRunner(() => child)
     const controller = new AbortController()
-    const command = runner.run({ executable: "ignored", args: [], cwd: process.cwd(), signal: controller.signal })
+    const command = runner.run({
+      executable: "ignored",
+      args: [],
+      cwd: process.cwd(),
+      signal: controller.signal,
+    })
     let settled = false
     void command.catch(() => {
       settled = true
@@ -445,7 +544,12 @@ describe("runCommand", () => {
     child.kill = () => true
     const runner = createCommandRunner(() => child)
     const controller = new AbortController()
-    const command = runner.run({ executable: "ignored", args: [], cwd: process.cwd(), signal: controller.signal })
+    const command = runner.run({
+      executable: "ignored",
+      args: [],
+      cwd: process.cwd(),
+      signal: controller.signal,
+    })
 
     controller.abort()
     child.emit("error")
@@ -453,15 +557,18 @@ describe("runCommand", () => {
     await expect(command).rejects.toMatchObject({
       code: "COMMAND_FAILED",
       message: "Command termination was not confirmed.",
-      details: { reason: "termination" }
+      details: { reason: "termination" },
     })
   })
 
   it.each([
     ["returns false", () => false],
-    ["throws", () => {
-      throw new Error("kill failed")
-    }]
+    [
+      "throws",
+      () => {
+        throw new Error("kill failed")
+      },
+    ],
   ])("reports a termination failure when kill %s", async (_description, kill) => {
     const child = new EventEmitter() as EventEmitter & CommandProcess
     child.stdout = new PassThrough()
@@ -470,13 +577,18 @@ describe("runCommand", () => {
     const runner = createCommandRunner(() => child)
     const controller = new AbortController()
 
-    const command = runner.run({ executable: "ignored", args: [], cwd: process.cwd(), signal: controller.signal })
+    const command = runner.run({
+      executable: "ignored",
+      args: [],
+      cwd: process.cwd(),
+      signal: controller.signal,
+    })
     controller.abort()
 
     await expect(command).rejects.toMatchObject({
       code: "COMMAND_FAILED",
       message: "Command termination was not confirmed.",
-      details: { reason: "termination" }
+      details: { reason: "termination" },
     })
   })
 
@@ -490,7 +602,12 @@ describe("runCommand", () => {
     }
     const runner = createCommandRunner(() => child)
     const controller = new AbortController()
-    const command = runner.run({ executable: "ignored", args: [], cwd: process.cwd(), signal: controller.signal })
+    const command = runner.run({
+      executable: "ignored",
+      args: [],
+      cwd: process.cwd(),
+      signal: controller.signal,
+    })
 
     controller.abort()
 
@@ -508,7 +625,12 @@ describe("runCommand", () => {
     }
     const runner = createCommandRunner(() => child)
     const controller = new AbortController()
-    const command = runner.run({ executable: "ignored", args: [], cwd: process.cwd(), signal: controller.signal })
+    const command = runner.run({
+      executable: "ignored",
+      args: [],
+      cwd: process.cwd(),
+      signal: controller.signal,
+    })
     let rejectionCount = 0
     void command.catch(() => {
       rejectionCount += 1
@@ -532,7 +654,7 @@ describe("runCommand", () => {
     const result = await runCommand({
       executable: process.execPath,
       args: ["-e", "process.stdout.write(process.cwd())"],
-      cwd
+      cwd,
     })
 
     expect(result.stdout).toBe(cwd)
@@ -550,8 +672,8 @@ describe("runCommand", () => {
         executable: process.execPath,
         args: ["-e", `require('node:fs').writeFileSync(${JSON.stringify(marker)}, 'spawned')`],
         cwd,
-        signal: controller.signal
-      })
+        signal: controller.signal,
+      }),
     ).rejects.toMatchObject({ code: "COMMAND_CANCELLED" })
     expect(await exists(marker)).toBe(false)
   })
@@ -566,7 +688,12 @@ describe("runCommand", () => {
     })
 
     await expect(
-      runner.run({ executable: "ignored", args: [], cwd: process.cwd(), signal: controller.signal })
+      runner.run({
+        executable: "ignored",
+        args: [],
+        cwd: process.cwd(),
+        signal: controller.signal,
+      }),
     ).rejects.toMatchObject({ code: "COMMAND_CANCELLED" })
     expect(spawnCalls).toBe(0)
   })
@@ -576,8 +703,8 @@ describe("runCommand", () => {
       runCommand({
         executable: "missing-command-top-secret",
         args: [],
-        cwd: process.cwd()
-      })
+        cwd: process.cwd(),
+      }),
     ).rejects.toMatchObject({ code: "COMMAND_FAILED", message: "Could not start command." })
   })
 })
@@ -589,7 +716,7 @@ describe("createTemporaryGitRepository", () => {
       runGit: async (request) => {
         requests.push(request)
         return { exitCode: 0, stdout: "", stderr: "" }
-      }
+      },
     })
     temporaryRepositories.push(repository)
 
@@ -598,18 +725,23 @@ describe("createTemporaryGitRepository", () => {
       args: ["init", "--bare", "--initial-branch=main", "--object-format=sha1", repository.remote],
       env: {
         GIT_CONFIG_NOSYSTEM: "1",
-        GIT_CONFIG_GLOBAL: expect.stringContaining("empty-global.gitconfig")
-      }
+        GIT_CONFIG_GLOBAL: expect.stringContaining("empty-global.gitconfig"),
+      },
     })
     expect(requests[1]).toMatchObject({
       args: ["init", "--initial-branch=main", "--object-format=sha1"],
       env: {
         GIT_CONFIG_NOSYSTEM: "1",
-        GIT_CONFIG_GLOBAL: expect.stringContaining("empty-global.gitconfig")
-      }
+        GIT_CONFIG_GLOBAL: expect.stringContaining("empty-global.gitconfig"),
+      },
     })
     expect(requests.every((request) => request.env?.GIT_CONFIG_NOSYSTEM === "1")).toBe(true)
-    expect(requests.every((request) => request.env?.GIT_CONFIG_GLOBAL === join(repository.root, "..", "empty-global.gitconfig"))).toBe(true)
+    expect(
+      requests.every(
+        (request) =>
+          request.env?.GIT_CONFIG_GLOBAL === join(repository.root, "..", "empty-global.gitconfig"),
+      ),
+    ).toBe(true)
     expect(await exists(join(repository.root, "..", "empty-global.gitconfig"))).toBe(true)
   })
 
@@ -620,7 +752,7 @@ describe("createTemporaryGitRepository", () => {
 
     const result = await git(root, ["config", "--global", "--get", "user.name"], {
       GIT_CONFIG_NOSYSTEM: "0",
-      GIT_CONFIG_GLOBAL: callerGlobalConfig
+      GIT_CONFIG_GLOBAL: callerGlobalConfig,
     })
 
     expect(result.exitCode).toBe(1)
@@ -643,7 +775,7 @@ describe("createTemporaryGitRepository", () => {
       GIT_CONFIG_COUNT: "1",
       GIT_CONFIG_KEY_0: "user.name",
       GIT_CONFIG_VALUE_0: "Caller Injection",
-      GIT_CONFIG_PARAMETERS: "'user.name'='Caller Parameters'"
+      GIT_CONFIG_PARAMETERS: "'user.name'='Caller Parameters'",
     })
 
     expect(result.exitCode).toBe(1)
@@ -656,13 +788,13 @@ describe("createTemporaryGitRepository", () => {
       count: process.env.GIT_CONFIG_COUNT,
       key: process.env.GIT_CONFIG_KEY_0,
       value: process.env.GIT_CONFIG_VALUE_0,
-      parameters: process.env.GIT_CONFIG_PARAMETERS
+      parameters: process.env.GIT_CONFIG_PARAMETERS,
     }
     Object.assign(process.env, {
       GIT_CONFIG_COUNT: "1",
       GIT_CONFIG_KEY_0: "user.name",
       GIT_CONFIG_VALUE_0: "Process Injection",
-      GIT_CONFIG_PARAMETERS: "'user.name'='Process Parameters'"
+      GIT_CONFIG_PARAMETERS: "'user.name'='Process Parameters'",
     })
     try {
       const result = await git(root, ["config", "user.name"])
@@ -683,7 +815,7 @@ describe("createTemporaryGitRepository", () => {
     temporaryDirectories.push(base)
     const repository = createTemporaryGitRepository({
       createTempDirectory: async () => base,
-      runGit: async () => ({ exitCode: 1, stdout: "", stderr: "failure" })
+      runGit: async () => ({ exitCode: 1, stdout: "", stderr: "failure" }),
     })
 
     await expect(repository).rejects.toThrow("git init failed")

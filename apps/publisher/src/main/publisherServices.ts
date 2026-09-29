@@ -11,7 +11,7 @@ import {
   saveNote,
 } from "./services/noteFiles"
 import { trashManagedNote } from "./services/trash"
-import { reconcileTrashRecovery } from "./services/trashRecovery"
+import { reconcileTrashRecoveryPass } from "./services/trashRecovery"
 import {
   discardEditorRecovery,
   getEditorRecovery,
@@ -47,6 +47,7 @@ export interface PublisherServiceDependencies {
   readonly runtime?: BundledNpmRuntime
   readonly previewPortAvailable?: () => Promise<boolean>
   readonly online?: () => boolean | Promise<boolean>
+  readonly reconcileTrash?: () => Promise<{ readonly pending: boolean }>
 }
 
 export type PublisherRuntimeServices = PublisherIpcServices & { dispose(): Promise<void> }
@@ -65,9 +66,36 @@ export function createPublisherServices(
     dependencies.deploymentHistory ??
     createDeploymentHistoryService({ workspace, openExternal: dependencies.openExternal })
   const reject = async <T>(name: string): Promise<T> => Promise.reject(unavailable(name))
+  const reconcileTrash =
+    dependencies.reconcileTrash ??
+    (() => reconcileTrashRecoveryPass(workspace, () => internalRecoveryKey(workspace, false)))
+  let recoveryFlight: Promise<void> | undefined
+  let recoveryTimer: ReturnType<typeof setTimeout> | undefined
+  let recoveryDisposed = false
+  const startRecovery = (): void => {
+    if (recoveryDisposed || recoveryFlight !== undefined) return
+    const pass = Promise.resolve().then(reconcileTrash)
+    recoveryFlight = pass
+      .then(({ pending }) => {
+        if (pending && !recoveryDisposed) {
+          recoveryTimer = setTimeout(() => {
+            recoveryTimer = undefined
+            recoveryFlight = undefined
+            startRecovery()
+          }, 0)
+        }
+      })
+      .catch(() => undefined)
+      .finally(() => {
+        if (recoveryTimer === undefined) recoveryFlight = undefined
+      })
+  }
   return {
     dispose: async () => {
+      recoveryDisposed = true
+      if (recoveryTimer) clearTimeout(recoveryTimer)
       await Promise.all([
+        recoveryFlight,
         changeScanner.dispose?.() ?? changeScanner.cancel(),
         deploymentHistory.dispose(),
       ])
@@ -88,15 +116,7 @@ export function createPublisherServices(
     },
     notes: {
       list: async () => {
-        const recovery = await reconcileTrashRecovery(workspace, () =>
-          internalRecoveryKey(workspace, false),
-        )
-        if (recovery.conflicts.length > 0) {
-          throw {
-            code: "RECOVERY_CONFLICT",
-            message: `A restored Recycle Bin item conflicts with ${recovery.conflicts[0]}. Move or rename the current item, then refresh; the restored copy remains in .garden-publisher/trash-recovery.`,
-          } satisfies AppError
-        }
+        startRecovery()
         return scanNotes(workspace)
       },
       read: (request) => readNote({ workspace, ...request }),

@@ -187,6 +187,7 @@ export function PublisherApp({ api }: { readonly api: GardenApi }): React.JSX.El
   const [paneSizes, setPaneSizes] = useState(initialPaneSizes.current ?? DEFAULT_PANE_SIZES)
   const [customPaneSizes, setCustomPaneSizes] = useState(Boolean(initialPaneSizes.current))
   const confirmationCancel = useRef<HTMLButtonElement>(null)
+  const postDeleteFocus = useRef<HTMLButtonElement>(null)
   const appMounted = useRef(true)
   const workspace = useRef<HTMLDivElement>(null)
   const markdownEditor = useRef<MarkdownEditorHandle>(null)
@@ -575,19 +576,23 @@ export function PublisherApp({ api }: { readonly api: GardenApi }): React.JSX.El
           : []),
     ]
     setTrashNotice(deletionMessages.join(" "))
+    queueMicrotask(() => postDeleteFocus.current?.focus())
     void loadChanges()
     return result.value
   }
 
-  const loadHistory = useCallback(async (requestId: string): Promise<HistorySnapshot> => {
-    const [git, deployments] = await Promise.all([
-      api.history.git({ limit: 20, requestId }),
-      api.history.deployments({ limit: 20, requestId }),
-    ])
-    if (!git.ok) throw new Error(messageFor(git.error, "本地发布历史暂不可用。"))
-    if (!deployments.ok) throw new Error(messageFor(deployments.error, "部署历史暂不可用。"))
-    return { commits: git.value, deployments: deployments.value }
-  }, [api])
+  const loadHistory = useCallback(
+    async (requestId: string): Promise<HistorySnapshot> => {
+      const [git, deployments] = await Promise.all([
+        api.history.git({ limit: 20, requestId }),
+        api.history.deployments({ limit: 20, requestId }),
+      ])
+      if (!git.ok) throw new Error(messageFor(git.error, "本地发布历史暂不可用。"))
+      if (!deployments.ok) throw new Error(messageFor(deployments.error, "部署历史暂不可用。"))
+      return { commits: git.value, deployments: deployments.value }
+    },
+    [api],
+  )
   const cancelHistory = useCallback(
     async (requestId: string): Promise<void> => {
       await api.history.cancel({ requestId })
@@ -639,7 +644,9 @@ export function PublisherApp({ api }: { readonly api: GardenApi }): React.JSX.El
         <div className="global-alert" role="status">
           <Trash2 size={16} aria-hidden="true" />
           <span>{trashNotice}</span>
-          <button type="button" aria-label="关闭删除提示" onClick={() => setTrashNotice(undefined)}>×</button>
+          <button type="button" aria-label="关闭删除提示" onClick={() => setTrashNotice(undefined)}>
+            ×
+          </button>
         </div>
       ) : null}
 
@@ -663,6 +670,7 @@ export function PublisherApp({ api }: { readonly api: GardenApi }): React.JSX.El
           onSelect={(path) => void selectNote(path)}
           onCreate={createNote}
           onRetry={() => void loadNotes()}
+          focusTarget={postDeleteFocus}
           separator={
             !compactPanes ? (
               <PaneSeparator
@@ -896,7 +904,9 @@ function PublisherStartup({ api }: { readonly api: GardenApi }): React.JSX.Eleme
   const mounted = useRef(true)
   useEffect(() => {
     mounted.current = true
-    return () => { mounted.current = false }
+    return () => {
+      mounted.current = false
+    }
   }, [])
 
   const inspect = useCallback(async (): Promise<void> => {
@@ -912,14 +922,45 @@ function PublisherStartup({ api }: { readonly api: GardenApi }): React.JSX.Eleme
         setInspection(result.value)
       }
     } catch (failure) {
-      if (mounted.current) setError(failure instanceof Error ? failure.message : "无法完成启动检查。")
+      if (mounted.current)
+        setError(failure instanceof Error ? failure.message : "无法完成启动检查。")
     } finally {
       if (mounted.current) setBusy(false)
     }
   }, [api])
 
-  useEffect(() => { void inspect() }, [inspect])
+  useEffect(() => {
+    void inspect()
+  }, [inspect])
   if (inspection?.ok) return <PublisherApp api={api} />
+  if (inspection?.capabilities.files) {
+    return (
+      <>
+        <FirstRun
+          compact
+          inspection={inspection}
+          busy={busy}
+          error={error}
+          onRetry={() => void inspect()}
+          onRepair={async (action: WorkspaceRepairAction) => {
+            setBusy(true)
+            setError(undefined)
+            try {
+              const result = await api.workspace.repair({ action })
+              if (!result.ok) throw new Error(messageFor(result.error, "无法修复仓库依赖。"))
+              await inspect()
+            } catch (failure) {
+              if (mounted.current)
+                setError(failure instanceof Error ? failure.message : "无法修复仓库依赖。")
+            } finally {
+              if (mounted.current) setBusy(false)
+            }
+          }}
+        />
+        <PublisherApp api={api} />
+      </>
+    )
+  }
   return (
     <FirstRun
       inspection={inspection}
@@ -934,7 +975,8 @@ function PublisherStartup({ api }: { readonly api: GardenApi }): React.JSX.Eleme
           if (!result.ok) throw new Error(messageFor(result.error, "无法修复仓库依赖。"))
           await inspect()
         } catch (failure) {
-          if (mounted.current) setError(failure instanceof Error ? failure.message : "无法修复仓库依赖。")
+          if (mounted.current)
+            setError(failure instanceof Error ? failure.message : "无法修复仓库依赖。")
         } finally {
           if (mounted.current) setBusy(false)
         }

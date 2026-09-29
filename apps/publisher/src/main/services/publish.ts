@@ -305,6 +305,7 @@ const internalGitEnvironmentKeys = new Set([
   "GIT_ALTERNATE_OBJECT_DIRECTORIES",
   "GIT_TERMINAL_PROMPT",
 ])
+const safeRequestedEnvironmentKeys = new Set(["npm_config_audit", "npm_config_fund"])
 
 function publishCommandEnvironment(
   executable: string,
@@ -316,6 +317,9 @@ function publishCommandEnvironment(
     if (value !== undefined) environment[key] = value
   }
   const git = ["git", "git.exe"].includes(basename(executable).toLowerCase())
+  for (const [key, value] of Object.entries(requested ?? {})) {
+    if (safeRequestedEnvironmentKeys.has(key) && value !== undefined) environment[key] = value
+  }
   if (git) {
     for (const key of [...gitCredentialEnvironmentKeys, ...gitProxyEnvironmentKeys]) {
       const value = process.env[key]
@@ -461,12 +465,19 @@ export function createBoundedPublishCommandRunner(options: {
   }
 }
 
-export function createSystemBoundedCommandRunner(): BoundedCommandRunner {
+export function createSystemBoundedCommandRunner(
+  options: {
+    readonly commandDeadlineMs?: number
+    readonly terminationDeadlineMs?: number
+  } = {},
+): BoundedCommandRunner {
   const terminate = createProductionProcessTreeTerminator()
   return createBoundedPublishCommandRunner({
     spawner: (executable, args, options) =>
       spawn(executable, [...args], options) as unknown as PublishCommandProcess,
     terminate: (child) => terminate(child),
+    commandDeadlineMs: options.commandDeadlineMs,
+    terminationDeadlineMs: options.terminationDeadlineMs,
   })
 }
 

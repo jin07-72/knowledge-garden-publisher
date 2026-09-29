@@ -69,7 +69,7 @@ describe("publisher service wiring", () => {
     expect(manager.subscribe).toHaveBeenCalledWith(listener)
   })
 
-  it("reconciles a Recycle Bin restore before listing notes", async () => {
+  it("reconciles a Recycle Bin restore in the background without blocking note listing", async () => {
     const workspace = await garden()
     const recycled = join(workspace, "recycled-daily.md")
     let staged = ""
@@ -87,9 +87,34 @@ describe("publisher service wiring", () => {
     await services.notes.trash({ path: "content/life/daily.md" })
     await rename(recycled, staged)
 
+    await expect(services.notes.list()).resolves.toEqual(expect.any(Array))
+    await vi.waitFor(async () => {
+      await expect(services.notes.list()).resolves.toEqual([
+        expect.objectContaining({ path: "content/life/daily.md" }),
+      ])
+    })
+  })
+
+  it("returns notes while a recovery backlog pass is still pending", async () => {
+    const workspace = await garden()
+    let finishRecovery!: () => void
+    const recovery = new Promise<{ pending: boolean }>((resolve) => {
+      finishRecovery = () => resolve({ pending: false })
+    })
+    const reconcileTrash = vi.fn(() => recovery)
+    const services = createPublisherServices({
+      workspace,
+      trash: { trashItem: async () => undefined },
+      isTracked: async () => false,
+      preview: preview(),
+      reconcileTrash,
+    })
+
     await expect(services.notes.list()).resolves.toEqual([
       expect.objectContaining({ path: "content/life/daily.md" }),
     ])
+    expect(reconcileTrash).toHaveBeenCalledOnce()
+    finishRecovery()
   })
 
   it("wires change review and history while keeping publishing explicitly unavailable", async () => {

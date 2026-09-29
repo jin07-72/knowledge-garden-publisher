@@ -28,6 +28,7 @@ interface NoteSidebarProps {
   readonly onSelect: (path: string) => void
   readonly onCreate: (request: NoteCreateRequest) => Promise<string | undefined>
   readonly onRetry: () => void
+  readonly focusTarget?: React.RefObject<HTMLButtonElement | null>
   readonly separator?: React.ReactNode
 }
 
@@ -253,7 +254,10 @@ export function NoteSidebar(props: NoteSidebarProps): React.JSX.Element {
           <h2>笔记</h2>
         </div>
         <button
-          ref={createButton}
+          ref={(node) => {
+            createButton.current = node
+            if (props.focusTarget) props.focusTarget.current = node
+          }}
           className="new-note-button"
           type="button"
           onClick={() => setCreating(true)}

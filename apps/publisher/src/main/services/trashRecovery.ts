@@ -26,7 +26,13 @@ const maximumDirectoryEntries = 10_000
 const maximumDirectoryBytes = 512 * 1024 * 1024
 const maximumAttachmentBytes = 64 * 1024 * 1024
 const maximumDirectoryDepth = 64
-const maximumRecoveryTransactions = 10_000
+const recoveryTransactionsPerPass = 64
+const recoveryJournalBytesPerPass = 512 * 1024
+const recoveryElapsedMsPerPass = 250
+const recoveryTransactionsDirectory = "transactions"
+const recoveryCursorName = "cursor.json"
+const recoveryCursorVersion = 1
+const shardPattern = /^[a-f0-9]{2}$/
 
 interface DirectoryHandleLike {
   readonly [Symbol.asyncIterator]: () => AsyncIterator<{ readonly name: string }>
@@ -34,6 +40,16 @@ interface DirectoryHandleLike {
 }
 
 type DirectoryOpener = (path: string) => Promise<DirectoryHandleLike>
+
+interface RecoveryCursorPayload {
+  readonly version: 1
+  readonly shard: number
+  readonly after?: string
+}
+
+interface RecoveryCursorFile extends RecoveryCursorPayload {
+  readonly integrity: string
+}
 
 export async function readBoundedDirectoryNames(
   path: string,
@@ -286,7 +302,26 @@ export async function prepareTrashRecovery(
     throw new Error("Trash recovery target is unsafe.")
   }
   const id = randomUUID()
-  const transactionPath = resolve(root, id)
+  const transactions = resolve(root, recoveryTransactionsDirectory)
+  const shard = resolve(transactions, id.slice(0, 2))
+  await mkdir(transactions, { mode: 0o700 }).catch((error: NodeJS.ErrnoException) => {
+    if (error.code !== "EEXIST") throw error
+  })
+  await mkdir(shard, { mode: 0o700 }).catch((error: NodeJS.ErrnoException) => {
+    if (error.code !== "EEXIST") throw error
+  })
+  for (const directory of [transactions, shard]) {
+    const [details, canonical] = await Promise.all([lstat(directory), realpath(directory)])
+    if (
+      details.isSymbolicLink() ||
+      !details.isDirectory() ||
+      !pathsEqual(canonical, directory) ||
+      !isInside(root, directory)
+    ) {
+      throw new Error("Trash recovery storage is unsafe.")
+    }
+  }
+  const transactionPath = resolve(shard, id)
   const stagedRelativePath = `items/${normalized}`
   const stagedPath = resolve(transactionPath, ...stagedRelativePath.split("/"))
   await mkdir(transactionPath, { mode: 0o700 })
@@ -454,93 +489,350 @@ export async function verifyTrashRecoveryStage(stage: TrashRecoveryStage): Promi
   return matchesExpectedItem(stage.stagedPath, stage)
 }
 
-/** Reinstalls items restored from Windows Recycle Bin; conflicts remain in the recovery area. */
-export async function reconcileTrashRecovery(
+function cursorPayload(cursor: RecoveryCursorPayload): string {
+  return JSON.stringify({
+    version: cursor.version,
+    shard: cursor.shard,
+    after: cursor.after ?? null,
+  })
+}
+
+function cursorIntegrity(key: Buffer, cursor: RecoveryCursorPayload): string {
+  return createHmac("sha256", key)
+    .update("garden-publisher/trash-recovery/cursor/v1\0")
+    .update(cursorPayload(cursor))
+    .digest("hex")
+}
+
+function parseRecoveryCursor(value: unknown, key: Buffer): RecoveryCursorPayload | undefined {
+  if (!value || typeof value !== "object" || Array.isArray(value)) return undefined
+  const cursor = value as Partial<RecoveryCursorFile>
+  if (
+    cursor.version !== recoveryCursorVersion ||
+    !Number.isSafeInteger(cursor.shard) ||
+    cursor.shard! < 0 ||
+    cursor.shard! > 255 ||
+    (cursor.after !== undefined && !transactionPattern.test(cursor.after)) ||
+    typeof cursor.integrity !== "string"
+  ) {
+    return undefined
+  }
+  const payload: RecoveryCursorPayload = {
+    version: recoveryCursorVersion,
+    shard: cursor.shard!,
+    ...(cursor.after === undefined ? {} : { after: cursor.after }),
+  }
+  return sameIntegrity(cursor.integrity, cursorIntegrity(key, payload)) ? payload : undefined
+}
+
+async function readRecoveryCursor(root: string, key: Buffer): Promise<RecoveryCursorPayload> {
+  const path = resolve(root, recoveryCursorName)
+  try {
+    const details = await lstat(path)
+    if (
+      details.isSymbolicLink() ||
+      !details.isFile() ||
+      details.size > 4_096 ||
+      !pathsEqual(await realpath(path), path)
+    ) {
+      return { version: recoveryCursorVersion, shard: 0 }
+    }
+    return (
+      parseRecoveryCursor(
+        JSON.parse((await readBoundedRegularFile(path, 4_096)).toString("utf8")),
+        key,
+      ) ?? { version: recoveryCursorVersion, shard: 0 }
+    )
+  } catch {
+    return { version: recoveryCursorVersion, shard: 0 }
+  }
+}
+
+async function writeRecoveryCursor(
+  root: string,
+  key: Buffer,
+  cursor: RecoveryCursorPayload,
+): Promise<void> {
+  const path = resolve(root, recoveryCursorName)
+  const temporary = resolve(root, `.cursor-${randomUUID()}.tmp`)
+  const file: RecoveryCursorFile = {
+    ...cursor,
+    integrity: cursorIntegrity(key, cursor),
+  }
+  try {
+    await writeFile(temporary, JSON.stringify(file), { encoding: "utf8", flag: "wx", mode: 0o600 })
+    const details = await lstat(temporary)
+    if (
+      details.isSymbolicLink() ||
+      !details.isFile() ||
+      !pathsEqual(await realpath(temporary), temporary) ||
+      !isInside(root, temporary)
+    ) {
+      throw new Error("Trash recovery cursor is unsafe.")
+    }
+    await rename(temporary, path)
+  } finally {
+    await rm(temporary, { force: true }).catch(() => undefined)
+  }
+}
+
+async function recoveryTransactionsRoot(root: string): Promise<string> {
+  const transactions = resolve(root, recoveryTransactionsDirectory)
+  await mkdir(transactions, { mode: 0o700 }).catch((error: NodeJS.ErrnoException) => {
+    if (error.code !== "EEXIST") throw error
+  })
+  const [details, canonical] = await Promise.all([lstat(transactions), realpath(transactions)])
+  if (
+    details.isSymbolicLink() ||
+    !details.isDirectory() ||
+    !pathsEqual(canonical, transactions) ||
+    !isInside(root, transactions)
+  ) {
+    throw new Error("Trash recovery storage is unsafe.")
+  }
+  return transactions
+}
+
+async function migrateLegacyTransactions(
+  root: string,
+  transactions: string,
+  maximumTransactions: number,
+  deadline: number,
+  openDirectory: DirectoryOpener,
+): Promise<boolean> {
+  const handle = await openDirectory(root)
+  let migrated = 0
+  let pending = false
+  try {
+    for await (const entry of handle) {
+      if (Date.now() >= deadline || migrated >= maximumTransactions) {
+        pending = true
+        break
+      }
+      const id = entry.name
+      if (!transactionPattern.test(id)) continue
+      const source = resolve(root, id)
+      const shard = resolve(transactions, id.slice(0, 2))
+      const target = resolve(shard, id)
+      try {
+        const [details, canonical] = await Promise.all([lstat(source), realpath(source)])
+        if (
+          details.isSymbolicLink() ||
+          !details.isDirectory() ||
+          !pathsEqual(canonical, source) ||
+          !isInside(root, source)
+        ) {
+          continue
+        }
+        await mkdir(shard, { mode: 0o700 }).catch((error: NodeJS.ErrnoException) => {
+          if (error.code !== "EEXIST") throw error
+        })
+        const [shardDetails, canonicalShard] = await Promise.all([lstat(shard), realpath(shard)])
+        if (
+          shardDetails.isSymbolicLink() ||
+          !shardDetails.isDirectory() ||
+          !pathsEqual(canonicalShard, shard) ||
+          !isInside(transactions, shard)
+        ) {
+          continue
+        }
+        await rename(source, target)
+        migrated += 1
+      } catch {
+        // Racing or invalid legacy entries stay in place for a later/manual pass.
+      }
+    }
+  } finally {
+    await handle.close().catch(() => undefined)
+  }
+  return pending
+}
+
+export interface TrashRecoveryPassOptions {
+  readonly maximumTransactions?: number
+  readonly maximumJournalBytes?: number
+  readonly maximumElapsedMs?: number
+  readonly openDirectory?: DirectoryOpener
+}
+
+export interface TrashRecoveryPassResult {
+  readonly restored: readonly string[]
+  readonly conflicts: readonly string[]
+  readonly pending: boolean
+}
+
+/** Performs one authenticated, bounded page of Recycle Bin reconciliation. */
+export async function reconcileTrashRecoveryPass(
   workspaceInput: string,
   loadKey: () => Promise<Buffer>,
-): Promise<{ readonly restored: readonly string[]; readonly conflicts: readonly string[] }> {
+  options: TrashRecoveryPassOptions = {},
+): Promise<TrashRecoveryPassResult> {
   let storage: { workspace: string; root: string }
   try {
     storage = await safeRecoveryRoot(workspaceInput, false)
   } catch (error) {
-    if ((error as NodeJS.ErrnoException).code === "ENOENT") return { restored: [], conflicts: [] }
+    if ((error as NodeJS.ErrnoException).code === "ENOENT") {
+      return { restored: [], conflicts: [], pending: false }
+    }
     throw error
   }
   const restored: string[] = []
   const conflicts: string[] = []
   const key = await loadKey()
   if (key.length !== 32) throw new Error("Trash recovery key is invalid.")
-  const entries = (
-    await readBoundedDirectoryNames(storage.root, maximumRecoveryTransactions)
-  ).filter((name) => transactionPattern.test(name))
-  for (const id of entries) {
-    const transactionPath = resolve(storage.root, id)
+  const maximumTransactions = Math.max(
+    1,
+    Math.min(1_024, Math.floor(options.maximumTransactions ?? recoveryTransactionsPerPass)),
+  )
+  const maximumJournalBytes = Math.max(
+    64 * 1024,
+    Math.min(
+      16 * 1024 * 1024,
+      Math.floor(options.maximumJournalBytes ?? recoveryJournalBytesPerPass),
+    ),
+  )
+  const maximumElapsedMs = Math.max(
+    10,
+    Math.min(5_000, Math.floor(options.maximumElapsedMs ?? recoveryElapsedMsPerPass)),
+  )
+  const deadline = Date.now() + maximumElapsedMs
+  const openDirectory = options.openDirectory ?? opendir
+  const transactions = await recoveryTransactionsRoot(storage.root)
+  let pending = await migrateLegacyTransactions(
+    storage.root,
+    transactions,
+    maximumTransactions,
+    deadline,
+    openDirectory,
+  )
+  let cursor = await readRecoveryCursor(storage.root, key)
+  let journalBytes = 0
+  let processed = 0
+  const start = cursor
+  let firstShard = true
+  for (let offset = 0; offset < 256; offset += 1) {
+    const shardNumber = (start.shard + offset) % 256
+    const shardName = shardNumber.toString(16).padStart(2, "0")
+    if (!shardPattern.test(shardName)) throw new Error("Trash recovery shard is invalid.")
+    const shard = resolve(transactions, shardName)
+    let entries: readonly string[]
     try {
-      const transaction = await lstat(transactionPath)
-      const journalPath = resolve(transactionPath, "journal.json")
-      const journalDetails = await lstat(journalPath)
+      const [details, canonical] = await Promise.all([lstat(shard), realpath(shard)])
       if (
-        transaction.isSymbolicLink() ||
-        !transaction.isDirectory() ||
-        journalDetails.isSymbolicLink() ||
-        !journalDetails.isFile() ||
-        journalDetails.size > 64 * 1024
-      )
-        continue
-      if (!pathsEqual(await realpath(transactionPath), transactionPath)) continue
-      const journal = parseJournal(
-        JSON.parse((await readBoundedRegularFile(journalPath, 64 * 1024)).toString("utf8")),
-        id,
-        key,
-      )
-      if (!journal) continue
-      const original = resolve(storage.workspace, ...journal.originalRelativePath.split("/"))
-      const staged = resolve(transactionPath, ...journal.stagedRelativePath.split("/"))
-      if (!isInside(transactionPath, staged) || !isInside(storage.workspace, original)) continue
-      let stagedDetails
-      try {
-        stagedDetails = await lstat(staged)
-      } catch (error) {
-        if ((error as NodeJS.ErrnoException).code === "ENOENT") continue
-        throw error
-      }
-      if (
-        stagedDetails.isSymbolicLink() ||
-        (journal.kind === "file" ? !stagedDetails.isFile() : !stagedDetails.isDirectory())
-      )
-        continue
-      if (!pathsEqual(await realpath(staged), staged)) continue
-      try {
-        await lstat(original)
-        conflicts.push(journal.originalRelativePath)
-        continue
-      } catch (error) {
-        if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error
-      }
-      const parent = dirname(original)
-      const canonicalParent = await realpath(parent)
-      if (!pathsEqual(canonicalParent, parent) || !isInside(storage.workspace, canonicalParent))
-        continue
-      const stage: TrashRecoveryStage = {
-        id,
-        workspace: storage.workspace,
-        originalPath: original,
-        originalRelativePath: journal.originalRelativePath,
-        stagedPath: staged,
-        transactionPath,
-        kind: journal.kind,
-        expectedIdentity: journal.expectedIdentity,
-        expectedContentHash: journal.expectedContentHash,
-      }
-      if (!(await matchesExpectedItem(staged, stage))) {
-        conflicts.push(journal.originalRelativePath)
+        details.isSymbolicLink() ||
+        !details.isDirectory() ||
+        !pathsEqual(canonical, shard) ||
+        !isInside(transactions, shard)
+      ) {
         continue
       }
-      if (await restoreLocalTrashStage(stage)) restored.push(journal.originalRelativePath)
-      else conflicts.push(journal.originalRelativePath)
-    } catch {
-      // Invalid or racing journals are retained for manual inspection.
+      entries = (await readBoundedDirectoryNames(shard, maximumDirectoryEntries, openDirectory))
+        .filter((name) => transactionPattern.test(name) && name.slice(0, 2) === shardName)
+        .filter((name) => !firstShard || start.after === undefined || name > start.after)
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code === "ENOENT") {
+        firstShard = false
+        continue
+      }
+      throw error
     }
+    firstShard = false
+    for (const id of entries) {
+      if (processed >= maximumTransactions || Date.now() >= deadline) {
+        pending = true
+        await writeRecoveryCursor(storage.root, key, cursor)
+        return { restored, conflicts, pending }
+      }
+      const transactionPath = resolve(shard, id)
+      try {
+        const transaction = await lstat(transactionPath)
+        const journalPath = resolve(transactionPath, "journal.json")
+        const journalDetails = await lstat(journalPath)
+        if (
+          transaction.isSymbolicLink() ||
+          !transaction.isDirectory() ||
+          journalDetails.isSymbolicLink() ||
+          !journalDetails.isFile() ||
+          journalDetails.size > 64 * 1024
+        ) {
+          continue
+        }
+        if (journalBytes + journalDetails.size > maximumJournalBytes) {
+          pending = true
+          await writeRecoveryCursor(storage.root, key, cursor)
+          return { restored, conflicts, pending }
+        }
+        journalBytes += journalDetails.size
+        if (!pathsEqual(await realpath(transactionPath), transactionPath)) continue
+        const journal = parseJournal(
+          JSON.parse((await readBoundedRegularFile(journalPath, 64 * 1024)).toString("utf8")),
+          id,
+          key,
+        )
+        if (!journal) continue
+        const original = resolve(storage.workspace, ...journal.originalRelativePath.split("/"))
+        const staged = resolve(transactionPath, ...journal.stagedRelativePath.split("/"))
+        if (!isInside(transactionPath, staged) || !isInside(storage.workspace, original)) continue
+        let stagedDetails
+        try {
+          stagedDetails = await lstat(staged)
+        } catch (error) {
+          if ((error as NodeJS.ErrnoException).code === "ENOENT") continue
+          throw error
+        }
+        if (
+          stagedDetails.isSymbolicLink() ||
+          (journal.kind === "file" ? !stagedDetails.isFile() : !stagedDetails.isDirectory())
+        )
+          continue
+        if (!pathsEqual(await realpath(staged), staged)) continue
+        try {
+          await lstat(original)
+          conflicts.push(journal.originalRelativePath)
+          continue
+        } catch (error) {
+          if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error
+        }
+        const parent = dirname(original)
+        const canonicalParent = await realpath(parent)
+        if (!pathsEqual(canonicalParent, parent) || !isInside(storage.workspace, canonicalParent))
+          continue
+        const stage: TrashRecoveryStage = {
+          id,
+          workspace: storage.workspace,
+          originalPath: original,
+          originalRelativePath: journal.originalRelativePath,
+          stagedPath: staged,
+          transactionPath,
+          kind: journal.kind,
+          expectedIdentity: journal.expectedIdentity,
+          expectedContentHash: journal.expectedContentHash,
+        }
+        if (!(await matchesExpectedItem(staged, stage))) {
+          conflicts.push(journal.originalRelativePath)
+          continue
+        }
+        if (await restoreLocalTrashStage(stage)) restored.push(journal.originalRelativePath)
+        else conflicts.push(journal.originalRelativePath)
+      } catch {
+        // Invalid or racing journals are retained for manual inspection.
+      } finally {
+        cursor = { version: recoveryCursorVersion, shard: shardNumber, after: id }
+        processed += 1
+      }
+    }
+    cursor = { version: recoveryCursorVersion, shard: (shardNumber + 1) % 256 }
   }
+  await writeRecoveryCursor(storage.root, key, { version: recoveryCursorVersion, shard: 0 })
+  return { restored, conflicts, pending }
+}
+
+/** Reinstalls one bounded page; conflicts remain authenticated in recovery storage. */
+export async function reconcileTrashRecovery(
+  workspaceInput: string,
+  loadKey: () => Promise<Buffer>,
+  options: TrashRecoveryPassOptions = {},
+): Promise<{ readonly restored: readonly string[]; readonly conflicts: readonly string[] }> {
+  const { restored, conflicts } = await reconcileTrashRecoveryPass(workspaceInput, loadKey, options)
   return { restored, conflicts }
 }

@@ -206,6 +206,8 @@ export interface NoteReadAdapter {
 
 export interface TrashNoteAdapter extends NoteReadAdapter {
   readonly afterStage?: (stagedPath: string, originalPath: string) => Promise<void> | void
+  /** Lets a wider multi-path operation hold the exact target lease. */
+  readonly lease?: InternalNotePathLease
 }
 
 export interface ReadNoteInput {
@@ -638,7 +640,8 @@ export async function trashNote(
   const workspace = await canonicalWorkspace(input.workspace)
   const parsed = parseManagedPath(workspace, input.path)
   const root = await managedRoot(workspace, parsed.visibility)
-  const lock = await acquireTargetLock(workspace, parsed.displayPath, {})
+  const ownsLock = adapter.lease === undefined
+  const lock = adapter.lease ?? (await acquireTargetLock(workspace, parsed.displayPath, {}))
   let primaryError: unknown
   let result: Omit<NoteTrashReceipt, "attachmentCleanup"> | undefined
   try {
@@ -714,10 +717,12 @@ export async function trashNote(
   } catch (error) {
     primaryError = error
   }
-  try {
-    await lock.release()
-  } catch {
-    if (primaryError === undefined) primaryError = uncertainCommit()
+  if (ownsLock) {
+    try {
+      await lock.release()
+    } catch {
+      if (primaryError === undefined) primaryError = uncertainCommit()
+    }
   }
   if (primaryError !== undefined) throw primaryError
   return result as Omit<NoteTrashReceipt, "attachmentCleanup">

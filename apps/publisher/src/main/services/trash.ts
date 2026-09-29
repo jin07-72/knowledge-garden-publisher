@@ -8,7 +8,11 @@ import {
   type NoteTrashReceipt,
   type TrashAdapter,
 } from "../../shared/contracts"
-import { internalRecoveryKey, trashNote as trashVerifiedNote } from "./noteFiles"
+import {
+  acquireInternalNotePathLease,
+  internalRecoveryKey,
+  trashNote as trashVerifiedNote,
+} from "./noteFiles"
 import {
   prepareTrashRecovery,
   restoreLocalTrashStage,
@@ -20,6 +24,10 @@ export interface TrashManagedNoteInput {
   readonly path: string
   readonly trash: TrashAdapter
   readonly isTracked: (workspace: string, path: string) => Promise<boolean>
+}
+
+export interface TrashManagedNoteAdapter {
+  readonly afterAttachmentStage?: () => Promise<void>
 }
 
 function noteError(code: AppError["code"], message: string): AppError {
@@ -153,7 +161,10 @@ async function trashOwnedAttachments(
     readonly assetsIdentity: string
     readonly directoryIdentity: string
   },
+  notePath: string,
   trash: TrashAdapter,
+  adapter: TrashManagedNoteAdapter,
+  assertOwnerLeases: () => Promise<void>,
 ): Promise<NoteTrashReceipt["attachmentCleanup"]> {
   try {
     const [assets, directory, canonicalAssets, canonicalDirectory] = await Promise.all([
@@ -208,6 +219,21 @@ async function trashOwnedAttachments(
     if (!(await verifyTrashRecoveryStage(stage))) {
       throw new Error("staged attachment contents changed")
     }
+    await adapter.afterAttachmentStage?.()
+    await assertOwnerLeases()
+    if (await hasAnotherOwner(owned.workspace, notePath)) {
+      const restored = await restoreLocalTrashStage(stage)
+      return restored
+        ? {
+            status: "retained-ambiguous",
+            message: "Attachments were retained because another note now uses this slug.",
+          }
+        : {
+            status: "failed",
+            message: "The note was recycled, but attachment ownership changed during cleanup.",
+          }
+    }
+    await assertOwnerLeases()
     try {
       await trash.trashItem(stage.stagedPath)
     } catch {
@@ -277,39 +303,80 @@ export function createElectronTrashAdapter(shell: Pick<TrashAdapter, "trashItem"
 }
 
 /** Deletes only one validated note and the attachment directory owned by its slug. */
-export async function trashManagedNote(input: TrashManagedNoteInput): Promise<NoteTrashReceipt> {
+export async function trashManagedNote(
+  input: TrashManagedNoteInput,
+  adapter: TrashManagedNoteAdapter = {},
+): Promise<NoteTrashReceipt> {
   if (typeof input.trash?.trashItem !== "function" || typeof input.isTracked !== "function") {
     throw noteError("INVALID_INPUT", "A Recycle Bin adapter and tracking check are required.")
   }
-  const owned = await ownedAttachmentDirectory(input.workspace, input.path)
-  const receipt = await trashVerifiedNote(input)
-  let attachmentCleanup: NoteTrashReceipt["attachmentCleanup"]
-  if (owned.kind === "not-found") {
-    attachmentCleanup = { status: "not-found" }
-  } else if (owned.kind === "ambiguous") {
-    attachmentCleanup = {
-      status: "retained-ambiguous",
-      message: "Attachments were retained because this slug belongs to notes in multiple domains.",
-    }
-  } else {
-    const confirmedOwned = owned
-    try {
-      const workspace = await realpath(resolve(input.workspace))
-      attachmentCleanup = (await hasAnotherOwner(workspace, input.path))
-        ? {
-            status: "retained-ambiguous",
-            message: "Attachments were retained because another note now uses this slug.",
-          }
-        : await trashOwnedAttachments(confirmedOwned, input.trash)
-    } catch {
+  const match = MANAGED_NOTE_PATH_PATTERN.exec(input.path)
+  if (!match)
+    throw noteError("NOTE_FILE_INVALID", "Choose a note inside a managed content directory.")
+  const paths = ["content", "private"]
+    .flatMap((root) => NOTE_DOMAINS.map((domain) => `${root}/${domain}/${match[3]}.md`))
+    .sort((left, right) => left.localeCompare(right))
+  const leases: Awaited<ReturnType<typeof acquireInternalNotePathLease>>[] = []
+  try {
+    for (const path of paths) leases.push(await acquireInternalNotePathLease(input.workspace, path))
+  } catch (error) {
+    await Promise.allSettled(leases.reverse().map((lease) => lease.release()))
+    throw error
+  }
+  const targetLease = leases[paths.indexOf(input.path)]
+  if (!targetLease) {
+    await Promise.allSettled(leases.reverse().map((lease) => lease.release()))
+    throw noteError("NOTE_FILE_LOCKED", "The note is being changed by another process.")
+  }
+  const assertOwnerLeases = async (): Promise<void> => {
+    for (const lease of leases) await lease.assertOwned()
+  }
+  try {
+    await assertOwnerLeases()
+    const owned = await ownedAttachmentDirectory(input.workspace, input.path)
+    await assertOwnerLeases()
+    const receipt = await trashVerifiedNote(input, { lease: targetLease })
+    await assertOwnerLeases()
+    let attachmentCleanup: NoteTrashReceipt["attachmentCleanup"]
+    if (owned.kind === "not-found") {
+      attachmentCleanup = { status: "not-found" }
+    } else if (owned.kind === "ambiguous") {
       attachmentCleanup = {
-        status: "failed",
+        status: "retained-ambiguous",
         message:
-          "The note was recycled, but its attachments remain because ownership could not be confirmed.",
+          "Attachments were retained because this slug belongs to notes in multiple domains.",
+      }
+    } else {
+      const confirmedOwned = owned
+      try {
+        const workspace = await realpath(resolve(input.workspace))
+        attachmentCleanup = (await hasAnotherOwner(workspace, input.path))
+          ? {
+              status: "retained-ambiguous",
+              message: "Attachments were retained because another note now uses this slug.",
+            }
+          : await trashOwnedAttachments(
+              confirmedOwned,
+              input.path,
+              input.trash,
+              adapter,
+              assertOwnerLeases,
+            )
+      } catch {
+        attachmentCleanup = {
+          status: "failed",
+          message:
+            "The note was recycled, but its attachments remain because ownership could not be confirmed.",
+        }
       }
     }
+    return { ...receipt, attachmentCleanup }
+  } finally {
+    const releases = await Promise.allSettled(leases.reverse().map((lease) => lease.release()))
+    if (releases.some(({ status }) => status === "rejected")) {
+      throw noteError("NOTE_FILE_COMMIT_UNCERTAIN", "Deletion lock cleanup could not be confirmed.")
+    }
   }
-  return { ...receipt, attachmentCleanup }
 }
 
 export const trashNote = trashManagedNote

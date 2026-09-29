@@ -8,7 +8,59 @@ import {
   type WorkspaceRepairReceipt,
   type WorkspaceRepairRequest,
 } from "../../shared/contracts"
-import { type CommandResult, type CommandRunner, systemCommandRunner } from "../lib/commandRunner"
+import { type CommandResult, type CommandRunner } from "../lib/commandRunner"
+import { createSystemBoundedCommandRunner, type BoundedCommandRunner } from "./publish"
+
+const startupCommandRunner = createSystemBoundedCommandRunner({ commandDeadlineMs: 15_000 })
+const repairCommandRunner = createSystemBoundedCommandRunner({ commandDeadlineMs: 10 * 60_000 })
+const startupOutputBytes = 512 * 1024
+const repairOutputBytes = 2 * 1024 * 1024
+
+function boundedInjectedRunner(
+  runner: CommandRunner,
+  maximumOutputBytes: number,
+  deadlineMs: number,
+): CommandRunner {
+  return {
+    async run(request) {
+      const controller = new AbortController()
+      const abort = (): void => controller.abort()
+      request.signal?.addEventListener("abort", abort, { once: true })
+      const timer = setTimeout(abort, deadlineMs)
+      try {
+        return await Promise.race([
+          (runner as BoundedCommandRunner).run({
+            ...request,
+            signal: controller.signal,
+            maxOutputBytes: maximumOutputBytes,
+          }),
+          new Promise<never>((_, reject) => {
+            controller.signal.addEventListener(
+              "abort",
+              () => reject(new Error("Workspace command did not finish safely.")),
+              { once: true },
+            )
+          }),
+        ])
+      } finally {
+        clearTimeout(timer)
+        request.signal?.removeEventListener("abort", abort)
+      }
+    },
+  }
+}
+
+function workspaceCommandRunner(
+  injected: CommandRunner | undefined,
+  production: BoundedCommandRunner,
+  maximumOutputBytes: number,
+  deadlineMs: number,
+): CommandRunner {
+  if (injected) return boundedInjectedRunner(injected, maximumOutputBytes, deadlineMs)
+  return {
+    run: (request) => production.run({ ...request, maxOutputBytes: maximumOutputBytes }),
+  }
+}
 
 export interface InspectWorkspaceOptions {
   readonly checkGit: boolean
@@ -518,7 +570,7 @@ export async function inspectWorkspace(
     options.checkGit && workspaceRoot.issues.length === 0
       ? await inspectGit(
           root,
-          options.runner ?? systemCommandRunner,
+          workspaceCommandRunner(options.runner, startupCommandRunner, startupOutputBytes, 15_000),
           options.checkRemote ?? false,
           options.online ?? (() => true),
         )
@@ -528,7 +580,11 @@ export async function inspectWorkspace(
     options.runtime &&
     workspaceRoot.issues.length === 0 &&
     issues.every((item) => item.code !== "PACKAGE_LOCK_MISSING")
-      ? await inspectDependencies(root, options.runtime, options.runner ?? systemCommandRunner)
+      ? await inspectDependencies(
+          root,
+          options.runtime,
+          workspaceCommandRunner(options.runner, startupCommandRunner, startupOutputBytes, 15_000),
+        )
       : []
   issues.push(...dependencyIssues)
   if (options.previewPortAvailable && workspaceRoot.issues.length === 0) {
@@ -544,10 +600,11 @@ export async function inspectWorkspace(
   }
   const git = options.checkGit && workspaceRoot.issues.length === 0 && gitIssues.length === 0
   const dependencies = dependencyIssues.length === 0
-  const previewPort = !issues.some((item) => item.code === "PREVIEW_PORT_UNAVAILABLE")
   const capabilities: WorkspaceCapabilities = {
     files,
-    preview: files && dependencies && previewPort,
+    // Preview startup chooses an available fallback port. Occupancy of the
+    // preferred port remains diagnostic information, not a lost capability.
+    preview: files && dependencies,
     git,
     publish: files && dependencies && git,
   }
@@ -581,7 +638,12 @@ export async function repairWorkspace(
   }
   let result: CommandResult
   try {
-    result = await (options.runner ?? systemCommandRunner).run({
+    result = await workspaceCommandRunner(
+      options.runner,
+      repairCommandRunner,
+      repairOutputBytes,
+      10 * 60_000,
+    ).run({
       executable: options.runtime.nodePath,
       args: [options.runtime.npmCliPath, "ci", "--no-audit", "--no-fund"],
       cwd: workspace.root,

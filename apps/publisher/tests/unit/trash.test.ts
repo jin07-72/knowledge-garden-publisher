@@ -3,7 +3,7 @@ import { tmpdir } from "node:os"
 import { join } from "node:path"
 import { afterEach, describe, expect, it, vi } from "vitest"
 import { createElectronTrashAdapter, trashManagedNote } from "../../src/main/services/trash"
-import { internalRecoveryKey } from "../../src/main/services/noteFiles"
+import { createNote, internalRecoveryKey } from "../../src/main/services/noteFiles"
 import { reconcileTrashRecovery } from "../../src/main/services/trashRecovery"
 
 const temporaryDirectories: string[] = []
@@ -163,6 +163,96 @@ describe("safe note trash", () => {
     )
     await expect(readFile(join(recycle, "original-1"), "utf8")).resolves.toBe("# Daily")
     await expect(readFile(join(recycle, "original-2", "chart.png"), "utf8")).resolves.toBe("chart")
+  })
+
+  it("restores staged attachments when another instance creates a same-slug owner", async () => {
+    const root = await garden()
+    await mkdir(join(root, "content", "reading"), { recursive: true })
+    const recycle = await mkdtemp(join(tmpdir(), "garden-owner-race-recycle-"))
+    temporaryDirectories.push(recycle)
+    let call = 0
+    const trashItem = vi.fn(async (target: string) => {
+      call += 1
+      await rename(target, join(recycle, `item-${call}`))
+    })
+
+    const receipt = await trashManagedNote(
+      {
+        workspace: root,
+        path: "content/life/daily.md",
+        trash: { trashItem },
+        isTracked: async () => false,
+      },
+      {
+        afterAttachmentStage: async () => {
+          await writeFile(join(root, "content", "reading", "daily.md"), "# New owner")
+        },
+      },
+    )
+
+    expect(receipt.attachmentCleanup).toMatchObject({ status: "retained-ambiguous" })
+    expect(trashItem).toHaveBeenCalledOnce()
+    await expect(
+      readFile(join(root, "content", "_assets", "daily", "chart.png"), "utf8"),
+    ).resolves.toBe("chart")
+  })
+
+  it("holds every same-slug note lease until attachment ownership cleanup finishes", async () => {
+    const root = await garden()
+    await mkdir(join(root, "content", "reading"), { recursive: true })
+    const recycle = await mkdtemp(join(tmpdir(), "garden-owner-lease-recycle-"))
+    temporaryDirectories.push(recycle)
+    let call = 0
+    let competingError: unknown
+
+    await trashManagedNote(
+      {
+        workspace: root,
+        path: "content/life/daily.md",
+        trash: {
+          trashItem: async (target) => {
+            call += 1
+            await rename(target, join(recycle, `item-${call}`))
+          },
+        },
+        isTracked: async () => false,
+      },
+      {
+        afterAttachmentStage: async () => {
+          try {
+            await createNote(
+              {
+                workspace: root,
+                visibility: "public",
+                domain: "reading",
+                slug: "daily",
+                title: "Competing owner",
+                date: "2026-09-29",
+                description: "Must wait for deletion",
+                tags: ["life"],
+              },
+              { lockWaitMs: 5, delay: async () => undefined },
+            )
+          } catch (error) {
+            competingError = error
+          }
+        },
+      },
+    )
+
+    expect(competingError).toMatchObject({ code: "NOTE_FILE_LOCKED" })
+    await expect(
+      createNote({
+        workspace: root,
+        visibility: "public",
+        domain: "reading",
+        slug: "daily",
+        title: "New owner",
+        date: "2026-09-29",
+        description: "Created after cleanup",
+        tags: ["life"],
+      }),
+    ).resolves.toMatchObject({ path: "content/reading/daily.md" })
   })
 
   it("refuses to restore an attachment tree whose signed contents were modified", async () => {
