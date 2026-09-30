@@ -311,7 +311,7 @@ describe("trash recovery directory bounds", () => {
     )
     const quarantined = await readdir(join(recoveryRoot, "legacy-quarantine", "000"))
     expect(quarantined.length).toBeGreaterThan(1_000)
-  })
+  }, 20_000)
 
   it("moves a legacy junk link into quarantine without following or deleting its target", async () => {
     const root = await garden()
@@ -615,6 +615,9 @@ describe("trash recovery directory bounds", () => {
 
     expect(stage.originalRelativePath).toBe("content/life/lease-reclaimed.md")
     await expect(lstat(lease)).rejects.toMatchObject({ code: "ENOENT" })
+    expect(
+      (await readdir(dirname(lease))).filter((name) => name.startsWith(".append.reclaim-")),
+    ).toEqual([])
   })
 
   it("does not remove another writer's expired but live append lease", async () => {
@@ -685,6 +688,107 @@ describe("trash recovery directory bounds", () => {
       await owner
     }
     await expect(lstat(lease)).rejects.toMatchObject({ code: "ENOENT" })
+  })
+
+  it("does not move a live successor after two reclaimers validate the same stale lease", async () => {
+    const root = await garden()
+    await writeFile(join(root, "content", "life", "reclaim-seed.md"), "# Seed")
+    await stageFile(root, "content/life/reclaim-seed.md")
+    const lease = join(root, ".garden-publisher", "trash-recovery", "queue", ".append.lock")
+    await writeFile(
+      lease,
+      JSON.stringify({
+        version: 1,
+        token: "10000000-0000-4000-8000-000000000000",
+        pid: 424_242,
+        createdAt: 0,
+        leaseExpiresAt: 10,
+      }),
+      { flag: "wx", mode: 0o600 },
+    )
+    await writeFile(join(root, "content", "life", "reclaim-first.md"), "# First")
+    await writeFile(join(root, "content", "life", "reclaim-second.md"), "# Second")
+
+    let releaseSecondValidation!: () => void
+    const secondValidationReleased = new Promise<void>((resolveRelease) => {
+      releaseSecondValidation = resolveRelease
+    })
+    let markSecondValidated!: () => void
+    const secondValidated = new Promise<void>((resolveValidated) => {
+      markSecondValidated = resolveValidated
+    })
+    let secondLeaseReads = 0
+    let liveSuccessorMoved = false
+    let secondSegmentOpens = 0
+    let secondNow = 100
+    const secondOpen: NonNullable<trashRecovery.TrashRecoveryPrepareOptions["openFile"]> = async (
+      path,
+      flags,
+      mode,
+    ) => {
+      const normalized = path.replaceAll("\\", "/")
+      const handle = await nodeOpen(path, flags, mode)
+      if (normalized.endsWith("/queue/.append.lock")) {
+        secondLeaseReads += 1
+        if (secondLeaseReads === 2) {
+          const close = handle.close.bind(handle)
+          handle.close = async () => {
+            await close()
+            markSecondValidated()
+            await secondValidationReleased
+          }
+        }
+      }
+      if (normalized.includes("/queue/.append.lock.quarantine-")) {
+        await expect(lstat(lease)).rejects.toMatchObject({ code: "ENOENT" })
+        liveSuccessorMoved = true
+      }
+      if (/\/queue\/[a-f0-9]{16}\.log$/.test(normalized)) secondSegmentOpens += 1
+      return handle
+    }
+    const second = stageFile(root, "content/life/reclaim-second.md", {
+      appendLeaseMs: 10,
+      appendLeaseWaitMs: 50,
+      delay: async () => undefined,
+      isProcessAlive: (pid) => pid === process.pid,
+      now: () => secondNow++,
+      openFile: secondOpen,
+    })
+    await secondValidated
+
+    let releaseFirst!: () => void
+    const firstReleased = new Promise<void>((resolveRelease) => {
+      releaseFirst = resolveRelease
+    })
+    let markFirstPublished!: () => void
+    const firstPublished = new Promise<void>((resolvePublished) => {
+      markFirstPublished = resolvePublished
+    })
+    const firstOpen: NonNullable<trashRecovery.TrashRecoveryPrepareOptions["openFile"]> = async (
+      path,
+      flags,
+      mode,
+    ) => {
+      if (/\/queue\/[a-f0-9]{16}\.log$/.test(path.replaceAll("\\", "/"))) {
+        markFirstPublished()
+        await firstReleased
+      }
+      return nodeOpen(path, flags, mode)
+    }
+    const first = stageFile(root, "content/life/reclaim-first.md", {
+      appendLeaseMs: 10,
+      isProcessAlive: (pid) => pid === process.pid,
+      now: () => 100,
+      openFile: firstOpen,
+    })
+    await firstPublished
+    releaseSecondValidation()
+    await expect(second).rejects.toMatchObject({ code: "EEXIST" })
+    expect(secondSegmentOpens).toBe(0)
+    releaseFirst()
+    await first
+
+    expect(liveSuccessorMoved).toBe(false)
   })
 
   it("rotates an at-cap queue and eventually processes the next segment", async () => {

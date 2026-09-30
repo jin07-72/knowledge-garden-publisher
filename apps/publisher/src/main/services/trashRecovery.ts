@@ -333,6 +333,109 @@ function recoveryQueueLeaseIsStale(
   return pid === undefined || recoveryProcessLiveness(options, pid) === false
 }
 
+function recoveryQueueReclaimPrefix(identity: string): string {
+  return `.append.reclaim-${createHash("sha256").update(identity).digest("hex")}-`
+}
+
+function recoveryQueueReclaimGeneration(name: string, prefix: string): number | undefined {
+  if (!name.startsWith(prefix) || !name.endsWith(".claim")) return undefined
+  const encoded = name.slice(prefix.length, -".claim".length)
+  if (!/^[a-f0-9]{8}$/.test(encoded)) return undefined
+  const generation = Number.parseInt(encoded, 16)
+  return Number.isSafeInteger(generation) ? generation : undefined
+}
+
+async function hasRecoveryQueueReclaimClaim(directory: string, identity: string): Promise<boolean> {
+  const prefix = recoveryQueueReclaimPrefix(identity)
+  return (await readBoundedDirectoryNames(directory, 10_000)).some(
+    (name) => recoveryQueueReclaimGeneration(name, prefix) !== undefined,
+  )
+}
+
+async function electRecoveryQueueReclaimer(
+  directory: string,
+  leaseIdentity: string,
+  options: TrashRecoveryPrepareOptions,
+  openFile: RecoveryFileOpener,
+  leaseMs: number,
+): Promise<readonly string[] | undefined> {
+  const prefix = recoveryQueueReclaimPrefix(leaseIdentity)
+  const generations = (await readBoundedDirectoryNames(directory, 10_000))
+    .map((name) => ({ name, generation: recoveryQueueReclaimGeneration(name, prefix) }))
+    .filter(
+      (entry): entry is { readonly name: string; readonly generation: number } =>
+        entry.generation !== undefined,
+    )
+    .sort((left, right) => left.generation - right.generation)
+  const latest = generations.at(-1)
+  if (latest !== undefined) {
+    const latestClaim = await inspectRecoveryQueueLease(
+      resolve(directory, latest.name),
+      directory,
+      openFile,
+    )
+    if (
+      latestClaim.kind !== "present" ||
+      !recoveryQueueLeaseIsStale(latestClaim, options, leaseMs)
+    ) {
+      return undefined
+    }
+  }
+  const generation = (latest?.generation ?? -1) + 1
+  if (generation > 0xffff_ffff) return undefined
+  const token = randomUUID()
+  const createdAt = (options.now ?? Date.now)()
+  const claim = resolve(directory, `${prefix}${generation.toString(16).padStart(8, "0")}.claim`)
+  const candidate = resolve(directory, `.append.reclaim-candidate-${token}`)
+  let handle
+  try {
+    handle = await openFile(
+      candidate,
+      process.platform === "win32"
+        ? "wx"
+        : constants.O_WRONLY | constants.O_CREAT | constants.O_EXCL | constants.O_NOFOLLOW,
+      0o600,
+    )
+    await handle.writeFile(
+      JSON.stringify({
+        version: 1,
+        token,
+        pid: process.pid,
+        createdAt,
+        leaseExpiresAt: createdAt + leaseMs,
+      } satisfies RecoveryQueueLease),
+    )
+    await handle.sync()
+    const candidateDetails = await handle.stat({ bigint: true })
+    if (!candidateDetails.isFile()) return undefined
+    const candidateIdentity = stableIdentity(candidateDetails)
+    await handle.close()
+    handle = undefined
+    try {
+      await link(candidate, claim)
+    } catch (error) {
+      if ((error as NodeJS.ErrnoException).code === "EEXIST") return undefined
+      throw error
+    }
+    const published = await inspectRecoveryQueueLease(claim, directory, openFile)
+    if (
+      published.kind !== "present" ||
+      published.identity !== candidateIdentity ||
+      published.owner?.token !== token
+    ) {
+      return undefined
+    }
+    await unlink(candidate)
+    await syncRecoveryDirectory(directory, openFile)
+    return [...generations.map((entry) => resolve(directory, entry.name)), claim]
+  } finally {
+    await handle?.close().catch(() => undefined)
+    await unlink(candidate).catch((error: NodeJS.ErrnoException) => {
+      if (error.code !== "ENOENT") throw error
+    })
+  }
+}
+
 async function reclaimStaleRecoveryQueueLease(
   lease: string,
   directory: string,
@@ -354,29 +457,34 @@ async function reclaimStaleRecoveryQueueLease(
   ) {
     return revalidated.kind === "missing"
   }
-  const quarantine = `${lease}.quarantine-${randomUUID()}`
-  try {
-    await rename(lease, quarantine)
-  } catch (error) {
-    return (error as NodeJS.ErrnoException).code === "ENOENT"
-  }
-  const moved = await inspectRecoveryQueueLease(quarantine, directory, openFile)
+  const reclaimClaims = await electRecoveryQueueReclaimer(
+    directory,
+    revalidated.identity,
+    options,
+    openFile,
+    leaseMs,
+  )
+  if (reclaimClaims === undefined) return false
+  const elected = await inspectRecoveryQueueLease(lease, directory, openFile)
+  let reclaimed = elected.kind === "missing"
   if (
-    moved.kind === "present" &&
-    moved.identity === revalidated.identity &&
-    moved.fingerprint === revalidated.fingerprint &&
-    recoveryQueueLeaseIsStale(moved, options, leaseMs)
+    elected.kind === "present" &&
+    elected.identity === revalidated.identity &&
+    elected.fingerprint === revalidated.fingerprint &&
+    recoveryQueueLeaseIsStale(elected, options, leaseMs)
   ) {
-    await unlink(quarantine)
-    return true
+    await unlink(lease)
+    reclaimed = true
   }
-  try {
-    await link(quarantine, lease)
-    await unlink(quarantine)
-  } catch {
-    // Never delete an object whose identity or liveness changed during quarantine.
+  // Older generations are removed first. The elected generation remains the
+  // barrier until the identity-bound action and every prior cleanup completes.
+  for (const claim of reclaimClaims) {
+    await unlink(claim).catch((error: NodeJS.ErrnoException) => {
+      if (error.code !== "ENOENT") throw error
+    })
   }
-  return false
+  await syncRecoveryDirectory(directory, openFile)
+  return reclaimed
 }
 
 async function syncRecoveryDirectory(
@@ -476,6 +584,11 @@ async function appendRecoveryQueue(
     const candidateIdentity = stableIdentity(candidateDetails)
     await candidateHandle.close()
     candidateHandle = undefined
+    if (await hasRecoveryQueueReclaimClaim(directory, candidateIdentity)) {
+      throw Object.assign(new Error("Trash recovery queue reclaim is in progress."), {
+        code: "EAGAIN",
+      })
+    }
     const deadline = createdAt + waitMs
     for (;;) {
       try {
@@ -498,6 +611,13 @@ async function appendRecoveryQueue(
       acquired.owner?.token !== token
     ) {
       throw new Error("Trash recovery queue lease is unsafe.")
+    }
+    if (await hasRecoveryQueueReclaimClaim(directory, candidateIdentity)) {
+      await unlink(lease)
+      leaseIdentity = undefined
+      throw Object.assign(new Error("Trash recovery queue reclaim won publication."), {
+        code: "EAGAIN",
+      })
     }
     await unlink(candidate)
     const names = await readBoundedDirectoryNames(directory, 10_000)
