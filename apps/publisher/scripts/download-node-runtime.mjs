@@ -13,6 +13,9 @@ export const RUNTIME_MANIFEST = ".garden-publisher-node-runtime.json"
 const NODE_BASE_URL = `https://nodejs.org/dist/v${NODE_VERSION}`
 const MAX_ARCHIVE_BYTES = 128 * 1024 * 1024
 const MAX_CHECKSUM_BYTES = 4 * 1024 * 1024
+const MAX_EXTRACTION_STDERR_BYTES = 16 * 1024
+const EXTRACT_ARCHIVE_SCRIPT =
+  "Add-Type -AssemblyName System.IO.Compression.FileSystem; [IO.Compression.ZipFile]::ExtractToDirectory($env:KGP_NODE_ARCHIVE_PATH, $env:KGP_NODE_EXTRACT_PATH)"
 
 function escapeRegExp(value) {
   return value.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")
@@ -109,33 +112,80 @@ async function responseBytes(response, maximumBytes, label) {
   return bytes
 }
 
+export function createExtractionRequest(archive, destination, environment = process.env) {
+  const systemRoot = environment.SystemRoot ?? environment.WINDIR ?? String.raw`C:\Windows`
+  const env = { SystemRoot: systemRoot }
+  for (const name of ["WINDIR", "TEMP", "TMP"]) {
+    if (environment[name] !== undefined) env[name] = environment[name]
+  }
+  env.KGP_NODE_ARCHIVE_PATH = archive
+  env.KGP_NODE_EXTRACT_PATH = destination
+
+  return {
+    executable: join(
+      systemRoot,
+      "System32",
+      "WindowsPowerShell",
+      "v1.0",
+      "powershell.exe",
+    ),
+    args: ["-NoLogo", "-NoProfile", "-NonInteractive", "-Command", EXTRACT_ARCHIVE_SCRIPT],
+    options: {
+      env,
+      shell: false,
+      windowsHide: true,
+      stdio: ["ignore", "ignore", "pipe"],
+    },
+  }
+}
+
 async function extractZip(archive, destination) {
-  const powershell = join(
-    process.env.SystemRoot ?? String.raw`C:\Windows`,
-    "System32",
-    "WindowsPowerShell",
-    "v1.0",
-    "powershell.exe",
-  )
-  const script =
-    "Add-Type -AssemblyName System.IO.Compression.FileSystem; [IO.Compression.ZipFile]::ExtractToDirectory($args[0], $args[1])"
+  const request = createExtractionRequest(archive, destination)
   await new Promise((resolvePromise, rejectPromise) => {
-    const child = spawn(
-      powershell,
-      ["-NoLogo", "-NoProfile", "-NonInteractive", "-Command", script, archive, destination],
-      {
-        windowsHide: true,
-        stdio: ["ignore", "ignore", "pipe"],
-      },
-    )
-    let stderr = ""
+    let child
+    try {
+      child = spawn(request.executable, request.args, request.options)
+    } catch (error) {
+      rejectPromise(new Error("Could not start Node runtime extraction.", { cause: error }))
+      return
+    }
+
+    let settled = false
+    let stderrBytes = 0
+    const stderrChunks = []
+    const finish = (error) => {
+      if (settled) return
+      settled = true
+      if (error) rejectPromise(error)
+      else resolvePromise()
+    }
+
     child.stderr.on("data", (chunk) => {
-      if (stderr.length < 16_384) stderr += String(chunk)
+      const bytes = Buffer.isBuffer(chunk) ? chunk : Buffer.from(String(chunk))
+      const remaining = MAX_EXTRACTION_STDERR_BYTES - stderrBytes
+      if (remaining <= 0) return
+      const captured = bytes.subarray(0, remaining)
+      stderrChunks.push(captured)
+      stderrBytes += captured.byteLength
     })
-    child.on("error", rejectPromise)
-    child.on("close", (code) => {
-      if (code === 0) resolvePromise()
-      else rejectPromise(new Error(`Node runtime extraction failed. ${stderr.trim()}`))
+    child.once("error", (error) => {
+      finish(new Error("Could not start Node runtime extraction.", { cause: error }))
+    })
+    child.once("close", (code, signal) => {
+      if (code === 0) {
+        finish()
+        return
+      }
+      const stderr = Buffer.concat(stderrChunks, stderrBytes).toString("utf8").trim()
+      const status =
+        code === null
+          ? signal
+            ? ` after signal ${signal}`
+            : " without an exit code"
+          : ` with exit code ${code}`
+      finish(
+        new Error(`Node runtime extraction failed${status}.${stderr ? ` ${stderr}` : ""}`),
+      )
     })
   })
 }
@@ -214,8 +264,10 @@ export async function downloadNodeRuntime({
 
   const lock = join(vendor, ".node-install.lock")
   await acquireLock(lock)
-  const token = randomUUID()
-  const stage = join(vendor, `.node-stage-${token}`)
+  const token = randomUUID().replaceAll("-", "")
+  // Keep this prefix compact: Windows PowerShell 5 still applies MAX_PATH while
+  // extracting Node's deeply nested npm files.
+  const stage = join(vendor, `.n-${token}`)
   const stale = join(vendor, `.node-stale-${token}`)
   try {
     if (await isVerifiedRuntime(target)) return target
@@ -239,7 +291,7 @@ export async function downloadNodeRuntime({
       throw new Error("The Node runtime archive contains an unexpected top-level path.")
     }
     const archive = join(stage, NODE_ARCHIVE)
-    const extracted = join(stage, "extracted")
+    const extracted = join(stage, "x")
     await writeFile(archive, archiveBytes, { flag: "wx" })
     await mkdir(extracted)
     await extractImpl(archive, extracted)

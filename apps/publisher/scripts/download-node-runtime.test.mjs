@@ -6,6 +6,7 @@ import { dirname, join } from "node:path"
 import { afterEach, describe, expect, it, vi } from "vitest"
 import {
   assertSafeArchiveEntries,
+  createExtractionRequest,
   downloadNodeRuntime,
   EXPECTED_NODE_ARCHIVE_SHA256,
   NODE_ARCHIVE,
@@ -99,6 +100,27 @@ describe("portable Node runtime download", () => {
     ]) {
       expect(() => assertSafeArchiveEntries([unsafe]), unsafe).toThrow(/unsafe archive entry/i)
     }
+  })
+
+  it("passes extraction paths only through dedicated environment variables", () => {
+    const archive = String.raw`C:\Garden Files\runtime $([boom]).zip`
+    const destination = String.raw`C:\Garden Files\stage; Remove-Item anything`
+    const request = createExtractionRequest(archive, destination, {
+      SystemRoot: String.raw`C:\Windows`,
+    })
+
+    expect(request.executable).toBe(
+      String.raw`C:\Windows\System32\WindowsPowerShell\v1.0\powershell.exe`,
+    )
+    expect(request.args.join(" ")).not.toContain(archive)
+    expect(request.args.join(" ")).not.toContain(destination)
+    expect(request.args.at(-1)).toContain("$env:KGP_NODE_ARCHIVE_PATH")
+    expect(request.args.at(-1)).toContain("$env:KGP_NODE_EXTRACT_PATH")
+    expect(request.options).toMatchObject({ shell: false, windowsHide: true })
+    expect(request.options.env).toMatchObject({
+      KGP_NODE_ARCHIVE_PATH: archive,
+      KGP_NODE_EXTRACT_PATH: destination,
+    })
   })
 
   it("reuses only a pinned runtime whose manifest and required file hashes match", async () => {
