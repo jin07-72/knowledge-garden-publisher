@@ -11,6 +11,11 @@ extraResources:
     to: node
     filter:
       - "**/*"
+      - "!node_modules{,/**/*}"
+  - from: vendor/node/node_modules
+    to: node/node_modules
+    filter:
+      - "**/*"
 win:
   target:
     - nsis

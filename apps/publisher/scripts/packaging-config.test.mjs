@@ -20,7 +20,18 @@ describe("Windows packaging configuration", () => {
       allowToChangeInstallationDirectory: true,
     })
     expect(config.extraResources).toContainEqual(
-      expect.objectContaining({ from: "vendor/node", to: "node", filter: ["**/*"] }),
+      expect.objectContaining({
+        from: "vendor/node",
+        to: "node",
+        filter: ["**/*", "!node_modules{,/**/*}"],
+      }),
+    )
+    expect(config.extraResources).toContainEqual(
+      expect.objectContaining({
+        from: "vendor/node/node_modules",
+        to: "node/node_modules",
+        filter: ["**/*"],
+      }),
     )
   })
 
