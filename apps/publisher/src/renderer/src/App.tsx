@@ -150,7 +150,13 @@ function PaneSeparator({
   )
 }
 
-export function PublisherApp({ api }: { readonly api: GardenApi }): React.JSX.Element {
+export function PublisherApp({
+  api,
+  diagnosticsReady = false,
+}: {
+  readonly api: GardenApi
+  readonly diagnosticsReady?: boolean
+}): React.JSX.Element {
   const [notes, setNotes] = useState<readonly NoteSummary[]>([])
   const [selectedPath, setSelectedPath] = useState<string>()
   const [document, setDocument] = useState<NoteDocument>()
@@ -627,7 +633,10 @@ export function PublisherApp({ api }: { readonly api: GardenApi }): React.JSX.El
   }
 
   return (
-    <main className="app-shell">
+    <main
+      className="app-shell"
+      data-workspace-diagnostics={diagnosticsReady ? "ready" : "checking"}
+    >
       <header className="topbar">
         <div className="brand-mark" aria-hidden="true">
           <BookOpen size={18} />
@@ -1006,7 +1015,7 @@ function PublisherStartup({ api }: { readonly api: GardenApi }): React.JSX.Eleme
             }}
           />
         ) : null}
-        <PublisherApp api={api} />
+        <PublisherApp api={api} diagnosticsReady={inspection?.ok === true} />
       </>
     )
   }

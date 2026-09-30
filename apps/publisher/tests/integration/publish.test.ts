@@ -49,7 +49,7 @@ async function fixture(): Promise<TemporaryGitRepository> {
   await put(
     repository.root,
     ".gitignore",
-    "node_modules/\nprivate/\n.garden-publisher/\napps/publisher/vendor/\n",
+    "node_modules/\nprivate/*\n!private/.gitkeep\n.garden-publisher/\napps/publisher/vendor/\n",
   )
   await put(
     repository.root,
@@ -64,6 +64,7 @@ async function fixture(): Promise<TemporaryGitRepository> {
   await put(repository.root, "content/technology/css-grid.md", "original grid\n")
   await put(repository.root, "content/life/weekly-review.md", "original weekly\n")
   await put(repository.root, "content/reading/delete-me.md", "delete me\n")
+  await put(repository.root, "private/.gitkeep", "")
   await mkdir(join(repository.root, "node_modules"), { recursive: true })
   await put(repository.root, "apps/publisher/vendor/node/node.exe", "test runtime")
   await put(
@@ -315,6 +316,21 @@ describe("production publication runtime", () => {
 })
 
 describe("exact-tree publication", () => {
+  it("preserves only the tracked private placeholder while rejecting private note content", async () => {
+    const repository = await fixture()
+    await put(repository.root, "content/technology/css-grid.md", "selected grid\n")
+
+    await expect(
+      publisher(repository).publish({ paths: ["content/technology/css-grid.md"] }),
+    ).resolves.toMatchObject({ pushed: true })
+    expect(
+      await output(repository.root, ["ls-tree", "-r", "--name-only", "origin/main", "private"]),
+    ).toBe("private/.gitkeep")
+
+    await expect(
+      publisher(repository).publish({ paths: ["private/life/journal.md"] }),
+    ).rejects.toMatchObject({ code: "PRIVATE_PATH" })
+  })
   it("commits and pushes only selected public paths while preserving unrelated and private edits", async () => {
     const repository = await fixture()
     await put(repository.root, "content/technology/css-grid.md", "selected grid\n")

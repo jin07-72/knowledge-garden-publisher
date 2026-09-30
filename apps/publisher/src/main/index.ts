@@ -28,6 +28,7 @@ import {
   type PublishProgressEvent,
 } from "./services/publish"
 import type { PreviewStatus, PublishProgress } from "../shared/contracts"
+import { resolveMainRuntimeFiles } from "./mainRuntime"
 
 let mainWindow: BrowserWindow | undefined
 let mainWindowTrust: RendererTrustPolicy | undefined
@@ -115,7 +116,7 @@ async function isTracked(workspace: string, path: string): Promise<boolean> {
 }
 
 function createWindow(): BrowserWindow {
-  const rendererFile = join(__dirname, "../renderer/index.html")
+  const { rendererFile, preloadFile } = resolveMainRuntimeFiles(import.meta.url)
   const trust = createRendererTrustPolicy(rendererFile, process.env.ELECTRON_RENDERER_URL)
   const window = new BrowserWindow({
     width: 1440,
@@ -126,7 +127,7 @@ function createWindow(): BrowserWindow {
       contextIsolation: true,
       nodeIntegration: false,
       sandbox: true,
-      preload: join(__dirname, "../preload/index.js"),
+      preload: preloadFile,
       additionalArguments: [trustedRendererArgument(trust.trustedUrl)],
     },
   })
@@ -200,7 +201,7 @@ app.whenReady().then(() => {
         ? join(process.resourcesPath, "node", "node_modules", "npm", "bin", "npm-cli.js")
         : join(app.getAppPath(), "vendor", "node", "node_modules", "npm", "bin", "npm-cli.js")
   const bundledRuntime =
-    !e2e && (app.isPackaged || (existsSync(runtimePath) && existsSync(npmCliPath)))
+    app.isPackaged || (existsSync(runtimePath) && existsSync(npmCliPath))
       ? { nodePath: runtimePath, npmCliPath }
       : undefined
   previewManager = e2e ? e2ePreview() : createProductionPreviewManager(runtimePath)
@@ -239,7 +240,7 @@ app.whenReady().then(() => {
     openExternal: (url) => shell.openExternal(url),
     ...(bundledRuntime ? { runtime: bundledRuntime } : {}),
     ...(e2e ? {} : { previewPortAvailable: () => isPreviewPortAvailable(8080) }),
-    online: () => net.isOnline(),
+    online: () => (e2e ? true : net.isOnline()),
     publisherFactory,
     ...(e2e && process.env.GARDEN_PUBLISHER_E2E_DEPLOYMENT === "success"
       ? { publishCompletionMessage: "部署成功" }

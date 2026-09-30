@@ -1,12 +1,15 @@
 import { spawn } from "node:child_process"
 import { createHash, randomUUID } from "node:crypto"
-import { access, lstat, mkdir, rename, rm, writeFile } from "node:fs/promises"
+import { access, lstat, mkdir, readFile, rename, rm, writeFile } from "node:fs/promises"
 import { constants } from "node:fs"
 import { dirname, join, resolve } from "node:path"
 import { fileURLToPath, pathToFileURL } from "node:url"
 
 export const NODE_VERSION = "22.16.0"
 export const NODE_ARCHIVE = `node-v${NODE_VERSION}-win-x64.zip`
+export const EXPECTED_NODE_ARCHIVE_SHA256 =
+  "21c2d9735c80b8f86dab19305aa6a9f6f59bbc808f68de3eef09d5832e3bfbbd"
+export const RUNTIME_MANIFEST = ".garden-publisher-node-runtime.json"
 const NODE_BASE_URL = `https://nodejs.org/dist/v${NODE_VERSION}`
 const MAX_ARCHIVE_BYTES = 128 * 1024 * 1024
 const MAX_CHECKSUM_BYTES = 4 * 1024 * 1024
@@ -137,13 +140,44 @@ async function extractZip(archive, destination) {
   })
 }
 
-async function isCompleteRuntime(root) {
+async function fileIdentity(path) {
+  const details = await lstat(path)
+  if (!details.isFile() || details.isSymbolicLink()) throw new Error("unsafe runtime file")
+  const bytes = await readFile(path)
+  return {
+    size: bytes.byteLength,
+    sha256: createHash("sha256").update(bytes).digest("hex"),
+  }
+}
+
+export async function isVerifiedRuntime(root) {
   try {
-    const [node, npm] = await Promise.all([
-      lstat(join(root, "node.exe")),
-      lstat(join(root, "node_modules", "npm", "bin", "npm-cli.js")),
+    const rootDetails = await lstat(root)
+    if (!rootDetails.isDirectory() || rootDetails.isSymbolicLink()) return false
+    const manifestPath = join(root, RUNTIME_MANIFEST)
+    const [manifestDetails, node, npm] = await Promise.all([
+      lstat(manifestPath),
+      fileIdentity(join(root, "node.exe")),
+      fileIdentity(join(root, "node_modules", "npm", "bin", "npm-cli.js")),
     ])
-    return node.isFile() && !node.isSymbolicLink() && npm.isFile() && !npm.isSymbolicLink()
+    if (
+      !manifestDetails.isFile() ||
+      manifestDetails.isSymbolicLink() ||
+      manifestDetails.size > 16_384
+    ) {
+      return false
+    }
+    const manifest = JSON.parse(await readFile(manifestPath, "utf8"))
+    return (
+      manifest?.schemaVersion === 1 &&
+      manifest?.nodeVersion === NODE_VERSION &&
+      manifest?.archive === NODE_ARCHIVE &&
+      manifest?.archiveSha256 === EXPECTED_NODE_ARCHIVE_SHA256 &&
+      manifest?.files?.["node.exe"]?.size === node.size &&
+      manifest?.files?.["node.exe"]?.sha256 === node.sha256 &&
+      manifest?.files?.["node_modules/npm/bin/npm-cli.js"]?.size === npm.size &&
+      manifest?.files?.["node_modules/npm/bin/npm-cli.js"]?.sha256 === npm.sha256
+    )
   } catch {
     return false
   }
@@ -164,15 +198,19 @@ async function acquireLock(path) {
   }
 }
 
-export async function downloadNodeRuntime({ fetchImpl = fetch } = {}) {
-  if (process.platform !== "win32") {
+export async function downloadNodeRuntime({
+  fetchImpl = fetch,
+  platform = process.platform,
+  publisherRoot = resolve(dirname(fileURLToPath(import.meta.url)), ".."),
+  extractImpl = extractZip,
+} = {}) {
+  if (platform !== "win32") {
     throw new Error("The bundled Node runtime downloader only supports Windows packaging.")
   }
-  const publisherRoot = resolve(dirname(fileURLToPath(import.meta.url)), "..")
   const vendor = join(publisherRoot, "vendor")
   const target = join(vendor, "node")
   await mkdir(vendor, { recursive: true })
-  if (await isCompleteRuntime(target)) return target
+  if (await isVerifiedRuntime(target)) return target
 
   const lock = join(vendor, ".node-install.lock")
   await acquireLock(lock)
@@ -180,7 +218,7 @@ export async function downloadNodeRuntime({ fetchImpl = fetch } = {}) {
   const stage = join(vendor, `.node-stage-${token}`)
   const stale = join(vendor, `.node-stale-${token}`)
   try {
-    if (await isCompleteRuntime(target)) return target
+    if (await isVerifiedRuntime(target)) return target
     await mkdir(stage)
     const [archiveResponse, checksumsResponse] = await Promise.all([
       fetchImpl(`${NODE_BASE_URL}/${NODE_ARCHIVE}`),
@@ -191,6 +229,9 @@ export async function downloadNodeRuntime({ fetchImpl = fetch } = {}) {
       responseBytes(checksumsResponse, MAX_CHECKSUM_BYTES, "Node checksums"),
     ])
     const expected = parseExpectedChecksum(checksumBytes.toString("utf8"), NODE_ARCHIVE)
+    if (expected !== EXPECTED_NODE_ARCHIVE_SHA256) {
+      throw new Error("SHASUMS256.txt does not match the pinned checksum for this Node archive.")
+    }
     verifySha256(archiveBytes, expected)
     const entries = readZipEntries(archiveBytes)
     const archiveRoot = `node-v${NODE_VERSION}-win-x64`
@@ -201,11 +242,31 @@ export async function downloadNodeRuntime({ fetchImpl = fetch } = {}) {
     const extracted = join(stage, "extracted")
     await writeFile(archive, archiveBytes, { flag: "wx" })
     await mkdir(extracted)
-    await extractZip(archive, extracted)
+    await extractImpl(archive, extracted)
     const prepared = join(extracted, archiveRoot)
-    if (!(await isCompleteRuntime(prepared))) {
+    const [nodeIdentity, npmIdentity] = await Promise.all([
+      fileIdentity(join(prepared, "node.exe")),
+      fileIdentity(join(prepared, "node_modules", "npm", "bin", "npm-cli.js")),
+    ]).catch(() => [])
+    if (!nodeIdentity || !npmIdentity) {
       throw new Error("The extracted Node runtime is incomplete.")
     }
+    await writeFile(
+      join(prepared, RUNTIME_MANIFEST),
+      `${JSON.stringify({
+        schemaVersion: 1,
+        nodeVersion: NODE_VERSION,
+        archive: NODE_ARCHIVE,
+        archiveSha256: expected,
+        files: {
+          "node.exe": nodeIdentity,
+          "node_modules/npm/bin/npm-cli.js": npmIdentity,
+        },
+      })}\n`,
+      { flag: "wx" },
+    )
+    if (!(await isVerifiedRuntime(prepared)))
+      throw new Error("The extracted Node runtime is incomplete.")
     let movedStale = false
     try {
       await access(target, constants.F_OK)

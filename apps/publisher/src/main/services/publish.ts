@@ -506,7 +506,7 @@ function normalizeSelection(paths: readonly string[]): readonly string[] {
       throw error("UNSAFE_PATH", "A selected publication path is unsafe.")
     }
     const lower = path.toLowerCase()
-    if (lower === "private" || lower.startsWith("private/")) {
+    if ((lower === "private" || lower.startsWith("private/")) && path !== "private/.gitkeep") {
       throw error("PRIVATE_PATH", "Private content cannot be published.")
     }
     if (
@@ -1559,7 +1559,7 @@ export class Publisher {
           )
         ).stdout,
       )
-      if (treePaths.some((path) => /^private(?:\/|$)/i.test(path))) {
+      if (treePaths.some((path) => /^private(?:\/|$)/i.test(path) && path !== "private/.gitkeep")) {
         throw error("PRIVATE_PATH", "The publication tree contains private content.")
       }
 
