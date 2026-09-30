@@ -540,9 +540,12 @@ async function inspectDependencies(
     ]
   }
   try {
+    // A clean Quartz install can intentionally omit optional peer tools. The
+    // lock/manifests above verify the complete installed tree; this command
+    // only needs to catch missing direct dependencies.
     const result = await runner.run({
       executable: runtime.nodePath,
-      args: [runtime.npmCliPath, "ls", "--all", "--ignore-scripts", "--json"],
+      args: [runtime.npmCliPath, "ls", "--depth=0", "--ignore-scripts", "--json"],
       cwd: root,
       env: { npm_config_audit: "false", npm_config_fund: "false" },
     })

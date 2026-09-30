@@ -1120,9 +1120,12 @@ export class Publisher {
     } catch {
       throw error("RUNTIME_MISSING", "The bundled publication runtime is unavailable.")
     }
+    // Quartz packages may declare optional peer tools that are absent after a
+    // valid npm ci. Direct dependencies are checked here; the isolated
+    // verify:site build below validates the runtime dependency graph.
     const request: VerifySiteRequest = {
       executable: runtime.nodeExecutable,
-      args: [runtime.npmCliPath, "ls", "--all", "--json", "--ignore-scripts"],
+      args: [runtime.npmCliPath, "ls", "--depth=0", "--json", "--ignore-scripts"],
       cwd: workspace,
       signal,
     }

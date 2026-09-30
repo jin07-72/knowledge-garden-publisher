@@ -227,7 +227,7 @@ describe("production publication runtime", () => {
     expect(runtimeRequests).toHaveLength(2)
     expect(runtimeRequests[0]).toMatchObject({
       executable: runtime.nodeExecutable,
-      args: [runtime.npmCliPath, "ls", "--all", "--json", "--ignore-scripts"],
+      args: [runtime.npmCliPath, "ls", "--depth=0", "--json", "--ignore-scripts"],
       cwd: repository.root,
     })
     expect(runtimeRequests[1]).toMatchObject({
@@ -301,7 +301,7 @@ describe("production publication runtime", () => {
       service.publish({ paths: ["content/technology/css-grid.md"] }),
     ).rejects.toMatchObject({ code: "VERIFY_FAILED" })
     expect(runtimeRequests.map((request) => request.args)).toEqual([
-      [runtime.npmCliPath, "ls", "--all", "--json", "--ignore-scripts"],
+      [runtime.npmCliPath, "ls", "--depth=0", "--json", "--ignore-scripts"],
       [runtime.npmCliPath, "run", "verify:site"],
     ])
     expect(await output(repository.root, ["rev-parse", "HEAD"])).toBe(beforeHead)

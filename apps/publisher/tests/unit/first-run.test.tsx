@@ -265,7 +265,13 @@ describe("first-run diagnostics", () => {
         runtime: { nodePath: "bundled-node.exe", npmCliPath: "bundled-npm-cli.js" },
       }),
     ).resolves.toMatchObject({ ok: true })
-    expect(runner.run).toHaveBeenCalledOnce()
+    expect(runner.run).toHaveBeenCalledWith(
+      expect.objectContaining({
+        executable: "bundled-node.exe",
+        args: ["bundled-npm-cli.js", "ls", "--depth=0", "--ignore-scripts", "--json"],
+        cwd: root,
+      }),
+    )
   })
 
   it("gates production renderer operations behind the startup inspection", async () => {
