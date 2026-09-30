@@ -355,9 +355,9 @@ describe("exact-tree publication", () => {
       "private secret\n",
     )
     expect(await output(repository.root, ["diff", "--cached", "--name-only"])).toBe("")
-    expect(
-      await output(repository.root, ["ls-tree", "-r", "--name-only", "HEAD", "private"]),
-    ).toBe("private/.gitkeep")
+    expect(await output(repository.root, ["ls-tree", "-r", "--name-only", "HEAD", "private"])).toBe(
+      "private/.gitkeep",
+    )
     expect(await output(repository.root, ["rev-parse", "HEAD^{tree}"])).toBe(result.tree)
     expect(await output(repository.root, ["rev-parse", "origin/main"])).toBe(result.commit)
     expect(phases).toEqual([

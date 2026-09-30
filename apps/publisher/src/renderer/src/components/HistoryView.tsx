@@ -205,24 +205,15 @@ export function HistoryView({
                   </div>
                 </dl>
                 <div className="history-links">
-                  <SafeLink
-                    href={deployments.liveSiteUrl}
-                    openExternal={openLink}
-                  >
+                  <SafeLink href={deployments.liveSiteUrl} openExternal={openLink}>
                     查看网站
                   </SafeLink>
                   {deployment?.url ? (
-                    <SafeLink
-                      href={deployment.url}
-                      openExternal={openLink}
-                    >
+                    <SafeLink href={deployment.url} openExternal={openLink}>
                       查看部署详情
                     </SafeLink>
                   ) : (
-                    <SafeLink
-                      href={deployments.actionsUrl}
-                      openExternal={openLink}
-                    >
+                    <SafeLink href={deployments.actionsUrl} openExternal={openLink}>
                       打开 GitHub Actions
                     </SafeLink>
                   )}
@@ -239,16 +230,10 @@ export function HistoryView({
       )}
 
       <footer className="history-fallback-links">
-        <SafeLink
-          href={deployments.actionsUrl}
-          openExternal={openLink}
-        >
+        <SafeLink href={deployments.actionsUrl} openExternal={openLink}>
           打开 GitHub Actions
         </SafeLink>
-        <SafeLink
-          href={deployments.liveSiteUrl}
-          openExternal={openLink}
-        >
+        <SafeLink href={deployments.liveSiteUrl} openExternal={openLink}>
           打开线上网站
         </SafeLink>
       </footer>

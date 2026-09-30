@@ -632,8 +632,7 @@ export async function inspectWorkspaceSafety(rootPath: string): Promise<Workspac
   const workspaceRoot = await canonicalWorkspaceRoot(rootPath)
   const root = workspaceRoot.root
   const issues = [...workspaceRoot.issues]
-  if (issues.length === 0)
-    issues.push(...(await inspectRequiredPaths(root, editingRequiredPaths)))
+  if (issues.length === 0) issues.push(...(await inspectRequiredPaths(root, editingRequiredPaths)))
   const files = issues.length === 0
   const capabilities: WorkspaceCapabilities = {
     files,

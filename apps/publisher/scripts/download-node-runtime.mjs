@@ -122,13 +122,7 @@ export function createExtractionRequest(archive, destination, environment = proc
   env.KGP_NODE_EXTRACT_PATH = destination
 
   return {
-    executable: join(
-      systemRoot,
-      "System32",
-      "WindowsPowerShell",
-      "v1.0",
-      "powershell.exe",
-    ),
+    executable: join(systemRoot, "System32", "WindowsPowerShell", "v1.0", "powershell.exe"),
     args: ["-NoLogo", "-NoProfile", "-NonInteractive", "-Command", EXTRACT_ARCHIVE_SCRIPT],
     options: {
       env,
@@ -183,9 +177,7 @@ async function extractZip(archive, destination) {
             ? ` after signal ${signal}`
             : " without an exit code"
           : ` with exit code ${code}`
-      finish(
-        new Error(`Node runtime extraction failed${status}.${stderr ? ` ${stderr}` : ""}`),
-      )
+      finish(new Error(`Node runtime extraction failed${status}.${stderr ? ` ${stderr}` : ""}`))
     })
   })
 }

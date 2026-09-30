@@ -5,10 +5,7 @@ import type {
   HistoryCancelRequest,
   HistoryRequest,
 } from "../../shared/contracts"
-import {
-  createSystemBoundedCommandRunner,
-  type BoundedCommandRunner,
-} from "./publish"
+import { createSystemBoundedCommandRunner, type BoundedCommandRunner } from "./publish"
 
 const DEFAULT_LIMIT = 20
 const MAX_LIMIT = 100
@@ -379,8 +376,7 @@ class DeploymentHistoryServiceImpl implements DeploymentHistoryService {
       controller.signal,
       (current) => {
         resolved = current
-        if (this.#resolutionGeneration === generation)
-          this.#currentRepository = current.repository
+        if (this.#resolutionGeneration === generation) this.#currentRepository = current.repository
       },
     ).catch(() => {
       if (!resolved) throw { code: "GIT_STATUS_FAILED", message: "无法识别 GitHub 仓库。" }

@@ -270,8 +270,7 @@ describe("deployment history", () => {
     const sha = "a".repeat(40)
     const runner = new FakeRunner(({ args }) => ({
       exitCode: 0,
-      stdout:
-        args[0] === "remote" ? "https://github.com/octocat/garden.git\n" : `${sha}\n`,
+      stdout: args[0] === "remote" ? "https://github.com/octocat/garden.git\n" : `${sha}\n`,
       stderr: "",
     }))
     const service = createDeploymentHistoryService({

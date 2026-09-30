@@ -4,18 +4,18 @@ import { join } from "node:path"
 import {
   runCommand,
   type CommandRequest,
-  type CommandResult
+  type CommandResult,
 } from "../../src/main/lib/commandRunner"
 import { removeTemporaryDirectory } from "./fs"
 
 function isolatedGitEnvironment(
   env?: Record<string, string | undefined>,
-  emptyGlobalConfig?: string
+  emptyGlobalConfig?: string,
 ): Record<string, string | undefined> {
   if (!emptyGlobalConfig) throw new Error("An isolated Git configuration path is required.")
   const sanitizedEnvironment: Record<string, string | undefined> = {
     ...env,
-    GIT_CONFIG_PARAMETERS: undefined
+    GIT_CONFIG_PARAMETERS: undefined,
   }
   for (const key of [...Object.keys(process.env), ...Object.keys(env ?? {})]) {
     if (/^GIT_CONFIG_(?:KEY|VALUE)_\d+$/.test(key)) {
@@ -26,20 +26,25 @@ function isolatedGitEnvironment(
     ...sanitizedEnvironment,
     GIT_CONFIG_NOSYSTEM: "1",
     GIT_CONFIG_GLOBAL: emptyGlobalConfig,
-    GIT_CONFIG_COUNT: "0"
+    GIT_CONFIG_COUNT: "0",
   }
 }
 
 export async function git(
   cwd: string,
   args: readonly string[],
-  env?: Record<string, string | undefined>
+  env?: Record<string, string | undefined>,
 ): Promise<CommandResult> {
   const configDirectory = await mkdtemp(join(tmpdir(), "garden-git-command-config-"))
   const emptyGlobalConfig = join(configDirectory, "empty-global.gitconfig")
   try {
     await writeFile(emptyGlobalConfig, "")
-    return await runCommand({ executable: "git", args, cwd, env: isolatedGitEnvironment(env, emptyGlobalConfig) })
+    return await runCommand({
+      executable: "git",
+      args,
+      cwd,
+      env: isolatedGitEnvironment(env, emptyGlobalConfig),
+    })
   } finally {
     await removeTemporaryDirectory(configDirectory)
   }
@@ -57,9 +62,10 @@ export interface GitFixtureDependencies {
 }
 
 export async function createTemporaryGitRepository(
-  dependencies: GitFixtureDependencies = {}
+  dependencies: GitFixtureDependencies = {},
 ): Promise<TemporaryGitRepository> {
-  const base = await (dependencies.createTempDirectory?.() ?? mkdtemp(join(tmpdir(), "garden-git-")))
+  const base = await (dependencies.createTempDirectory?.() ??
+    mkdtemp(join(tmpdir(), "garden-git-")))
   try {
     const root = join(base, "workspace")
     const remote = join(base, "origin.git")
@@ -74,7 +80,7 @@ export async function createTemporaryGitRepository(
       [root, ["init", "--initial-branch=main", "--object-format=sha1"]],
       [root, ["config", "user.name", "Garden Test"]],
       [root, ["config", "user.email", "garden-test@example.invalid"]],
-      [root, ["remote", "add", "origin", remote]]
+      [root, ["remote", "add", "origin", remote]],
     ] as const) {
       const result = await runGit({ executable: "git", args, cwd, env })
       if (result.exitCode !== 0) {
