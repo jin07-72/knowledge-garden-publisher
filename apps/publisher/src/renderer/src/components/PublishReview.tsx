@@ -9,6 +9,7 @@ interface PublishReviewProps {
   readonly error?: string
   readonly onClose: () => void
   readonly onRefresh: () => void
+  readonly onPublish?: (changeGroupIds: readonly string[]) => Promise<void>
 }
 
 const kindLabel: Record<ChangeKind, string> = {
@@ -31,9 +32,11 @@ export function PublishReview({
   error,
   onClose,
   onRefresh,
+  onPublish,
 }: PublishReviewProps): React.JSX.Element {
   const closeButton = useRef<HTMLButtonElement>(null)
   const [selected, setSelected] = useState<ReadonlySet<string>>(new Set())
+  const [publishing, setPublishing] = useState(false)
 
   useEffect(() => {
     setSelected(
@@ -165,17 +168,24 @@ export function PublishReview({
           <strong>
             {counts.notes} 篇文章，{counts.attachments} 个附件
           </strong>
-          <small id="publish-step-note">
-            验证并发布将在下一步开放；此处只确认选择，不会开始发布。
-          </small>
+          <small id="publish-step-note">只会验证并发布当前勾选的公开变化。</small>
         </div>
         <button
           type="button"
           className="primary-button"
-          disabled
+          disabled={
+            !onPublish || selected.size === 0 || publishing || Boolean(review?.blockedReason)
+          }
           aria-describedby="publish-step-note"
+          onClick={() => {
+            if (!onPublish || publishing) return
+            setPublishing(true)
+            void onPublish([...selected])
+              .catch(() => undefined)
+              .finally(() => setPublishing(false))
+          }}
         >
-          验证并发布
+          {publishing ? "正在验证…" : "验证并发布"}
         </button>
       </footer>
     </ModalShell>

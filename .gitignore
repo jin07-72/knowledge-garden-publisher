@@ -19,4 +19,6 @@ quartz/cli/tui/dist/
 apps/publisher/dist/
 apps/publisher/out/
 apps/publisher/release/
-apps/publisher/vendor/
+apps/publisher/vendor/node/
+apps/publisher/test-results/
+apps/publisher/playwright-report/

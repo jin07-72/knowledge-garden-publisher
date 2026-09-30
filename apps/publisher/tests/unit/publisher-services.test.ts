@@ -191,6 +191,66 @@ describe("publisher service wiring", () => {
     ])
   })
 
+  it("publishes only selected non-private change groups and relays completion", async () => {
+    const workspace = await garden()
+    const listeners = new Set<(progress: { phase: string; message: string }) => void>()
+    const publish = vi.fn(async ({ paths }: { paths: readonly string[] }) => {
+      expect(paths).toEqual(["content/life/daily.md"])
+      return { commit: "a".repeat(40), tree: "b".repeat(40), pushed: true as const }
+    })
+    const services = createPublisherServices({
+      workspace,
+      trash: { trashItem: async () => undefined },
+      isTracked: async () => false,
+      preview: preview(),
+      changeScanner: {
+        list: async () => ({
+          groups: [
+            {
+              id: "note:daily",
+              label: "Daily",
+              kind: "modified",
+              selection: "default",
+              description: "changed",
+              paths: ["content/life/daily.md"],
+              attachments: [],
+            },
+            {
+              id: "private:journal",
+              label: "Journal",
+              kind: "private",
+              selection: "locked",
+              description: "private",
+              paths: [],
+              attachments: [],
+            },
+          ],
+        }),
+        cancel: async () => undefined,
+      },
+      publisherFactory: (onProgress) => ({
+        publish,
+        cancel: async () => undefined,
+        dispose: async () => undefined,
+        emit: onProgress,
+      }),
+      publishCompletionMessage: "部署成功",
+    })
+    services.publish.subscribe((progress) => listeners.forEach((listener) => listener(progress)))
+    const progress: string[] = []
+    listeners.add((event) => progress.push(`${event.phase}:${event.message}`))
+
+    await expect(
+      services.publish.start({ changeGroupIds: ["private:journal"] }),
+    ).rejects.toMatchObject({ code: "INVALID_INPUT" })
+    await expect(
+      services.publish.start({ changeGroupIds: ["note:daily"], message: "Publish Daily" }),
+    ).resolves.toEqual({ operationId: expect.any(String) })
+    await vi.waitFor(() => expect(publish).toHaveBeenCalledOnce())
+    await vi.waitFor(() => expect(progress).toContain("complete:部署成功"))
+    await services.dispose()
+  })
+
   it("keeps IPC registered until preview disposal succeeds", async () => {
     const order: string[] = []
     const unregister = vi.fn(() => order.push("ipc"))

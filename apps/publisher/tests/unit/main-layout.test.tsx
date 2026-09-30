@@ -258,8 +258,7 @@ describe("publisher main layout", () => {
 
   it("reloads after recovered items and reports conflicts without a reload loop", async () => {
     let recoveryListener:
-      | ((update: { restored: readonly string[]; conflicts: readonly string[] }) => void)
-      | undefined
+      ((update: { restored: readonly string[]; conflicts: readonly string[] }) => void) | undefined
     vi.mocked(garden.notes.onRecovery).mockImplementation((listener) => {
       recoveryListener = listener
       return () => undefined
@@ -1142,9 +1141,10 @@ describe("publisher main layout", () => {
     expect(within(navigation).queryByRole("alert")).not.toBeInTheDocument()
   })
 
-  it("opens publish review for a successful change check without starting publication", async () => {
+  it("starts publication with the selected public changes", async () => {
     const user = userEvent.setup()
-    vi.mocked(garden.changes.list).mockResolvedValueOnce(
+    vi.mocked(garden.publish.start).mockResolvedValueOnce(ok({ operationId: "publish-1" }))
+    vi.mocked(garden.changes.list).mockResolvedValue(
       ok({
         groups: [
           {
@@ -1166,8 +1166,15 @@ describe("publisher main layout", () => {
     expect(publish).toBeEnabled()
     await user.click(publish)
     expect(screen.getByRole("dialog", { name: "检查并发布" })).toBeVisible()
-    expect(screen.getByRole("button", { name: "验证并发布" })).toBeDisabled()
-    expect(garden.publish.start).not.toHaveBeenCalled()
+    const confirm = screen.getByRole("button", { name: "验证并发布" })
+    await waitFor(() => expect(confirm).toBeEnabled())
+    await user.click(confirm)
+    await waitFor(() =>
+      expect(garden.publish.start).toHaveBeenCalledWith({ changeGroupIds: ["change-1"] }),
+    )
+    await waitFor(() =>
+      expect(screen.queryByRole("dialog", { name: "检查并发布" })).not.toBeInTheDocument(),
+    )
   })
 
   it("ignores pending bootstrap results after unmount without console errors", async () => {

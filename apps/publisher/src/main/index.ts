@@ -1,6 +1,6 @@
 import { app, BrowserWindow, ipcMain, net, shell } from "electron"
 import { existsSync } from "node:fs"
-import { join } from "node:path"
+import { isAbsolute, join, resolve } from "node:path"
 import { randomUUID } from "node:crypto"
 import { DEFAULT_GARDEN_PATH, IPC_CHANNELS } from "../shared/contracts"
 import { systemCommandRunner } from "./lib/commandRunner"
@@ -9,6 +9,7 @@ import {
   createPublisherCloseCoordinator,
   createPublisherServices,
   disposePublisherRuntime,
+  type PreviewServicePort,
   type PublisherRuntimeServices,
 } from "./publisherServices"
 import {
@@ -18,15 +19,20 @@ import {
   trustedRendererArgument,
   type RendererTrustPolicy,
 } from "./rendererTrust"
-import type { PreviewManager } from "./services/preview"
 import { createProductionPreviewManager } from "./services/previewRuntime"
 import { isPreviewPortAvailable } from "./services/previewRuntime"
 import { createElectronTrashAdapter } from "./services/trash"
+import {
+  createProductionPublisher,
+  createPublisherForTest,
+  type PublishProgressEvent,
+} from "./services/publish"
+import type { PreviewStatus, PublishProgress } from "../shared/contracts"
 
 let mainWindow: BrowserWindow | undefined
 let mainWindowTrust: RendererTrustPolicy | undefined
 let unregisterIpc: (() => void) | undefined
-let previewManager: PreviewManager | undefined
+let previewManager: (PreviewServicePort & { dispose(): Promise<void> }) | undefined
 let publisherServices: PublisherRuntimeServices | undefined
 
 let pendingClose:
@@ -146,27 +152,98 @@ function createWindow(): BrowserWindow {
   return window
 }
 
+function mapPublishProgress(progress: PublishProgressEvent): PublishProgress | undefined {
+  if (progress.phase === "complete") return undefined
+  const phase: PublishProgress["phase"] =
+    progress.phase === "update-local-ref"
+      ? "committing"
+      : progress.phase === "push" || progress.phase === "cleanup"
+        ? "pushing"
+        : "validating"
+  return { phase, message: progress.message }
+}
+
+function e2ePreview(): PreviewServicePort & { dispose(): Promise<void> } {
+  const status: PreviewStatus = {
+    state: "ready",
+    generation: 1,
+    port: 8080,
+    url: "http://127.0.0.1:8080",
+  }
+  return {
+    start: async () => status,
+    stop: async () => ({ state: "stopped", generation: 2 }),
+    getStatus: () => status,
+    subscribe: () => () => undefined,
+    dispose: async () => undefined,
+  }
+}
+
 app.whenReady().then(() => {
-  const runtimePath = app.isPackaged
-    ? join(process.resourcesPath, "node", "node.exe")
-    : join(app.getAppPath(), "vendor", "node", "node.exe")
-  const npmCliPath = app.isPackaged
-    ? join(process.resourcesPath, "node", "node_modules", "npm", "bin", "npm-cli.js")
-    : join(app.getAppPath(), "vendor", "node", "node_modules", "npm", "bin", "npm-cli.js")
+  const e2e = !app.isPackaged && process.env.GARDEN_PUBLISHER_E2E === "1"
+  const requestedWorkspace = process.env.GARDEN_PUBLISHER_E2E_WORKSPACE
+  const workspace =
+    e2e && requestedWorkspace && isAbsolute(requestedWorkspace)
+      ? resolve(requestedWorkspace)
+      : DEFAULT_GARDEN_PATH
+  const e2eRuntimeRoot = process.env.GARDEN_PUBLISHER_E2E_RUNTIME
+  const runtimePath =
+    e2e && e2eRuntimeRoot
+      ? join(resolve(e2eRuntimeRoot), "node.exe")
+      : app.isPackaged
+        ? join(process.resourcesPath, "node", "node.exe")
+        : join(app.getAppPath(), "vendor", "node", "node.exe")
+  const npmCliPath =
+    e2e && e2eRuntimeRoot
+      ? join(resolve(e2eRuntimeRoot), "node_modules", "npm", "bin", "npm-cli.js")
+      : app.isPackaged
+        ? join(process.resourcesPath, "node", "node_modules", "npm", "bin", "npm-cli.js")
+        : join(app.getAppPath(), "vendor", "node", "node_modules", "npm", "bin", "npm-cli.js")
   const bundledRuntime =
-    app.isPackaged || (existsSync(runtimePath) && existsSync(npmCliPath))
+    !e2e && (app.isPackaged || (existsSync(runtimePath) && existsSync(npmCliPath)))
       ? { nodePath: runtimePath, npmCliPath }
       : undefined
-  previewManager = createProductionPreviewManager(runtimePath)
+  previewManager = e2e ? e2ePreview() : createProductionPreviewManager(runtimePath)
+  const publisherFactory = (onProgress: (progress: PublishProgress) => void) => {
+    const relay = (progress: PublishProgressEvent): void => {
+      const mapped = mapPublishProgress(progress)
+      if (mapped) onProgress(mapped)
+    }
+    if (e2e && e2eRuntimeRoot) {
+      return createPublisherForTest({
+        workspace,
+        runtime: {
+          root: resolve(e2eRuntimeRoot),
+          nodeExecutable: runtimePath,
+          npmCliPath,
+          nodeModules: join(workspace, "node_modules"),
+        },
+        validateDependencies: async () => true,
+        verifySite: async () => ({ exitCode: 0 }),
+        onProgress: relay,
+      })
+    }
+    return createProductionPublisher({
+      workspace,
+      isPackaged: app.isPackaged,
+      resourcesPath: process.resourcesPath,
+      appPath: app.getAppPath(),
+      onProgress: relay,
+    })
+  }
   publisherServices = createPublisherServices({
-    workspace: DEFAULT_GARDEN_PATH,
+    workspace,
     trash: createElectronTrashAdapter(shell),
     isTracked,
     preview: previewManager,
     openExternal: (url) => shell.openExternal(url),
     ...(bundledRuntime ? { runtime: bundledRuntime } : {}),
-    previewPortAvailable: () => isPreviewPortAvailable(8080),
+    ...(e2e ? {} : { previewPortAvailable: () => isPreviewPortAvailable(8080) }),
     online: () => net.isOnline(),
+    publisherFactory,
+    ...(e2e && process.env.GARDEN_PUBLISHER_E2E_DEPLOYMENT === "success"
+      ? { publishCompletionMessage: "部署成功" }
+      : {}),
   })
   unregisterIpc = registerPublisherIpc({
     ipcMain,

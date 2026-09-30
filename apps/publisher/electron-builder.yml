@@ -1,0 +1,21 @@
+appId: io.github.jin07-72.knowledge-garden-publisher
+productName: Knowledge Garden Publisher
+icon: ../../quartz/static/icon.png
+directories:
+  output: release
+files:
+  - out/**/*
+  - package.json
+extraResources:
+  - from: vendor/node
+    to: node
+    filter:
+      - "**/*"
+win:
+  target:
+    - nsis
+nsis:
+  perMachine: false
+  oneClick: false
+  allowToChangeInstallationDirectory: true
+  artifactName: "Knowledge-Garden-Publisher-${version}-Setup.${ext}"

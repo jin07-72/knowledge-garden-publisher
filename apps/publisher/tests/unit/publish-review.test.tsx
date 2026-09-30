@@ -48,10 +48,19 @@ const review: ChangeReview = {
 afterEach(cleanup)
 
 describe("PublishReview", () => {
-  it("defaults public work on, locks private work, leaves config off, and counts attachments", async () => {
+  it("defaults public work on, locks private work, leaves config off, and submits selected ids", async () => {
     const user = userEvent.setup()
     const onClose = vi.fn()
-    render(<PublishReview review={review} state="ready" onClose={onClose} onRefresh={vi.fn()} />)
+    const onPublish = vi.fn(async () => undefined)
+    render(
+      <PublishReview
+        review={review}
+        state="ready"
+        onClose={onClose}
+        onRefresh={vi.fn()}
+        onPublish={onPublish}
+      />,
+    )
 
     const dialog = screen.getByRole("dialog", { name: "检查并发布" })
     const publicBox = within(dialog).getByRole("checkbox", { name: /修改.*CSS Grid/ })
@@ -69,11 +78,13 @@ describe("PublishReview", () => {
     expect(within(dialog).getByText("将从公开网站移除")).toBeVisible()
     expect(within(dialog).getByText("diagram.png")).toBeVisible()
     expect(within(dialog).getByText("2 篇文章，1 个附件")).toBeVisible()
-    expect(within(dialog).getByRole("button", { name: "验证并发布" })).toBeDisabled()
-    expect(within(dialog).getByText(/将在下一步开放/)).toBeVisible()
+    const publish = within(dialog).getByRole("button", { name: "验证并发布" })
+    expect(publish).toBeEnabled()
 
     await user.click(publicBox)
     expect(within(dialog).getByText("1 篇文章，0 个附件")).toBeVisible()
+    await user.click(publish)
+    expect(onPublish).toHaveBeenCalledWith(["note:retired"])
     await user.keyboard("{Escape}")
     expect(onClose).toHaveBeenCalledOnce()
   })

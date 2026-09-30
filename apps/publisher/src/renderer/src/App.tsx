@@ -358,9 +358,7 @@ export function PublisherApp({ api }: { readonly api: GardenApi }): React.JSX.El
         void loadNotes()
       }
       if (conflicts.length > 0) {
-        setTrashNotice(
-          `回收站恢复项与 ${conflicts[0]} 冲突；恢复副本仍安全保留在恢复区。`,
-        )
+        setTrashNotice(`回收站恢复项与 ${conflicts[0]} 冲突；恢复副本仍安全保留在恢复区。`)
       }
     })
     void loadNotes()
@@ -857,6 +855,18 @@ export function PublisherApp({ api }: { readonly api: GardenApi }): React.JSX.El
             setChangeReviewOpen(false)
           }}
           onRefresh={() => void loadChanges()}
+          onPublish={async (changeGroupIds) => {
+            const saved = (await markdownEditor.current?.flush()) ?? true
+            if (!saved) throw new Error("当前笔记保存失败，未开始发布。")
+            const result = await api.publish.start({ changeGroupIds })
+            if (!result.ok) {
+              const message = messageFor(result.error, "无法开始发布。")
+              setPublishMessage(message)
+              throw new Error(message)
+            }
+            setPublishMessage("正在验证所选公开变化…")
+            setChangeReviewOpen(false)
+          }}
         />
       ) : null}
 

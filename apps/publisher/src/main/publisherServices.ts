@@ -1,6 +1,8 @@
+import { randomUUID } from "node:crypto"
 import type {
   AppError,
   PreviewStatus,
+  PublishProgress,
   TrashAdapter,
   TrashRecoveryUpdate,
 } from "../shared/contracts"
@@ -62,6 +64,15 @@ export interface PublisherServiceDependencies {
     readonly restored?: readonly string[]
     readonly conflicts?: readonly string[]
   }>
+  readonly publisherFactory?: (onProgress: (progress: PublishProgress) => void) => {
+    publish(selection: {
+      readonly paths: readonly string[]
+      readonly message?: string
+    }): Promise<unknown>
+    cancel(): Promise<void>
+    dispose(): Promise<void>
+  }
+  readonly publishCompletionMessage?: string
 }
 
 export type PublisherRuntimeServices = PublisherIpcServices & { dispose(): Promise<void> }
@@ -80,6 +91,12 @@ export function createPublisherServices(
     dependencies.deploymentHistory ??
     createDeploymentHistoryService({ workspace, openExternal: dependencies.openExternal })
   const reject = async <T>(name: string): Promise<T> => Promise.reject(unavailable(name))
+  const publishListeners = new Set<(progress: PublishProgress) => void>()
+  const emitPublish = (progress: PublishProgress): void => {
+    for (const listener of publishListeners) listener(progress)
+  }
+  const publisher = dependencies.publisherFactory?.(emitPublish)
+  let activePublish: string | undefined
   const recoveryListeners = new Set<(update: TrashRecoveryUpdate) => void>()
   const reconcileTrash =
     dependencies.reconcileTrash ??
@@ -135,6 +152,7 @@ export function createPublisherServices(
         recoveryFlight,
         changeScanner.dispose?.() ?? changeScanner.cancel(),
         deploymentHistory.dispose(),
+        publisher?.dispose(),
       ])
     },
     workspace: {
@@ -190,9 +208,71 @@ export function createPublisherServices(
       cancel: () => changeScanner.cancel(),
     },
     publish: {
-      start: () => reject("Publishing"),
-      cancel: () => reject("Publishing"),
-      subscribe: () => () => undefined,
+      start: async (request) => {
+        if (!publisher) return reject("Publishing")
+        if (activePublish) {
+          throw {
+            code: "INVALID_INPUT",
+            message: "A publication is already running.",
+          } satisfies AppError
+        }
+        const review = await changeScanner.list()
+        const groups = request.changeGroupIds.map((id) =>
+          review.groups.find((group) => group.id === id),
+        )
+        if (
+          groups.some((group) => !group || group.selection === "locked" || group.kind === "private")
+        ) {
+          throw {
+            code: "INVALID_INPUT",
+            message: "The publication selection is invalid.",
+          } satisfies AppError
+        }
+        const paths = [
+          ...new Set(
+            groups
+              .flatMap((group) => group?.paths ?? [])
+              .filter((path) => !/^private(?:\/|$)/i.test(path)),
+          ),
+        ]
+        if (paths.length === 0) {
+          throw {
+            code: "INVALID_INPUT",
+            message: "The publication selection is empty.",
+          } satisfies AppError
+        }
+        const operationId = randomUUID()
+        activePublish = operationId
+        void publisher
+          .publish({ paths, ...(request.message ? { message: request.message } : {}) })
+          .then(
+            () =>
+              emitPublish({
+                phase: "complete",
+                message: dependencies.publishCompletionMessage ?? "发布成功，正在等待部署。",
+                percent: 100,
+              }),
+            () => emitPublish({ phase: "failed", message: "发布失败；本地编辑内容仍已保留。" }),
+          )
+          .finally(() => {
+            if (activePublish === operationId) activePublish = undefined
+          })
+        return { operationId }
+      },
+      cancel: async (request) => {
+        if (!publisher) return reject("Publishing")
+        if (activePublish !== request.operationId) {
+          throw {
+            code: "INVALID_INPUT",
+            message: "The publication operation is unavailable.",
+          } satisfies AppError
+        }
+        await publisher.cancel()
+      },
+      subscribe: (listener) => {
+        publishListeners.add(listener)
+        return () => publishListeners.delete(listener)
+      },
     },
     history: {
       git: (request) => deploymentHistory.git(request),
