@@ -284,13 +284,25 @@ describe("trash recovery directory bounds", () => {
     await writeFile(join(recoveryRoot, "0000-junk-inserted"), "inserted")
 
     const restored: string[] = []
+    let previousRemaining = (await readdir(recoveryRoot)).filter((name) =>
+      name.startsWith("0000-junk-"),
+    ).length
     for (let restart = 0; restart < 8 && restored.length === 0; restart += 1) {
       const pass = await trashRecovery.reconcileTrashRecoveryPass(
         root,
         () => internalRecoveryKey(root, false),
-        { openDirectory: sortedDirectory },
+        // Freeze the test clock so host contention cannot consume the pass budget.
+        { maximumElapsedMs: 10, now: () => 0, openDirectory: sortedDirectory },
       )
       restored.push(...pass.restored)
+      const remaining = (await readdir(recoveryRoot)).filter((name) =>
+        name.startsWith("0000-junk-"),
+      ).length
+      expect(remaining).toBeLessThanOrEqual(previousRemaining)
+      if (pass.restored.length === 0 && previousRemaining > 0) {
+        expect(remaining).toBeLessThan(previousRemaining)
+      }
+      previousRemaining = remaining
     }
 
     expect(restored).toContain("content/life/legacy-race.md")
@@ -394,6 +406,39 @@ describe("trash recovery directory bounds", () => {
     expect(repaired.restored).toContain("content/life/beta.md")
   })
 
+  it("reads a complete record across 64 KiB before advancing to the following segment", async () => {
+    const root = await garden()
+    await writeFile(join(root, "content", "life", "boundary-alpha.md"), "# Alpha")
+    await writeFile(join(root, "content", "life", "boundary-beta.md"), "# Beta")
+    await stageFile(root, "content/life/boundary-alpha.md")
+    await stageFile(root, "content/life/boundary-beta.md")
+    const queue = join(root, ".garden-publisher", "trash-recovery", "queue")
+    const firstSegment = join(queue, "0000000000000000.log")
+    const records = (await readFile(firstSegment, "utf8")).trimEnd().split("\n")
+    expect(records).toHaveLength(2)
+    await writeFile(
+      firstSegment,
+      Buffer.concat([Buffer.alloc(65_500, 0x0a), Buffer.from(`${records[0]}\n`)]),
+    )
+    await writeFile(join(queue, "0000000000000001.log"), `${records[1]}\n`)
+
+    const restored: string[] = []
+    for (let pass = 0; pass < 6 && restored.length < 2; pass += 1) {
+      const result = await trashRecovery.reconcileTrashRecoveryPass(
+        root,
+        () => internalRecoveryKey(root, false),
+        { now: () => 0 },
+      )
+      restored.push(...result.restored)
+    }
+
+    expect(restored.sort()).toEqual([
+      "content/life/boundary-alpha.md",
+      "content/life/boundary-beta.md",
+    ])
+    expect(new Set(restored).size).toBe(2)
+  })
+
   it("syncs a new queue file before its parent and propagates either sync failure", async () => {
     const root = await garden()
     await writeFile(join(root, "content", "life", "durable.md"), "# Durable")
@@ -435,6 +480,118 @@ describe("trash recovery directory bounds", () => {
     }).catch((error: unknown) => error)
     expect(events).toEqual(["file-sync"])
     expect(fileSyncFailure).toMatchObject({ message: "injected file sync failure" })
+  })
+
+  it("syncs the journal and transaction directory before publishing its queue record", async () => {
+    const root = await garden()
+    await writeFile(join(root, "content", "life", "journal-order.md"), "# Journal order")
+    const events: string[] = []
+    let failJournalSync = false
+    const openFile: NonNullable<trashRecovery.TrashRecoveryPrepareOptions["openFile"]> = async (
+      path,
+      flags,
+      mode,
+    ) => {
+      const handle = await nodeOpen(path, flags, mode)
+      const normalized = path.replaceAll("\\", "/")
+      const journal = /\/indexed-transactions\/[a-f0-9]{2}\/[a-f0-9-]{36}\/journal\.json$/.test(
+        normalized,
+      )
+      const transactionDirectory = /\/indexed-transactions\/[a-f0-9]{2}\/[a-f0-9-]{36}$/.test(
+        normalized,
+      )
+      const queueSegment = /\/queue\/[a-f0-9]{16}\.log$/.test(normalized)
+      if (!journal && !transactionDirectory && !queueSegment) return handle
+      const sync = handle.sync.bind(handle)
+      handle.sync = async () => {
+        const event = journal
+          ? "journal-file-sync"
+          : transactionDirectory
+            ? "transaction-directory-sync"
+            : "queue-file-sync"
+        events.push(event)
+        if (journal && failJournalSync) throw new Error("injected journal sync failure")
+        await sync()
+      }
+      return handle
+    }
+
+    await stageFile(root, "content/life/journal-order.md", { openFile })
+    const journalSync = events.indexOf("journal-file-sync")
+    const queueSync = events.indexOf("queue-file-sync")
+    expect(journalSync).toBeGreaterThanOrEqual(0)
+    expect(queueSync).toBeGreaterThan(journalSync)
+    expect(events.slice(journalSync + 1, queueSync)).toContain("transaction-directory-sync")
+
+    const failureRoot = await garden()
+    const original = join(failureRoot, "content", "life", "journal-failure.md")
+    await writeFile(original, "# Journal failure")
+    events.length = 0
+    failJournalSync = true
+    await expect(
+      stageFile(failureRoot, "content/life/journal-failure.md", { openFile }),
+    ).rejects.toThrow("injected journal sync failure")
+    expect(events).toContain("journal-file-sync")
+    expect(events).not.toContain("queue-file-sync")
+    await expect(readFile(original, "utf8")).resolves.toBe("# Journal failure")
+  })
+
+  it("does not remove another writer's active append lease after a contender times out", async () => {
+    const root = await garden()
+    await writeFile(join(root, "content", "life", "lease-owner.md"), "# Owner")
+    await writeFile(join(root, "content", "life", "lease-contender.md"), "# Contender")
+    let releaseOwner!: () => void
+    const ownerReleased = new Promise<void>((resolveRelease) => {
+      releaseOwner = resolveRelease
+    })
+    let ownerReachedSegment!: () => void
+    const ownerAtSegment = new Promise<void>((resolveReached) => {
+      ownerReachedSegment = resolveReached
+    })
+    const ownerOpen: NonNullable<trashRecovery.TrashRecoveryPrepareOptions["openFile"]> = async (
+      path,
+      flags,
+      mode,
+    ) => {
+      const normalized = path.replaceAll("\\", "/")
+      if (/\/queue\/[a-f0-9]{16}\.log$/.test(normalized)) {
+        ownerReachedSegment()
+        await ownerReleased
+      }
+      return nodeOpen(path, flags, mode)
+    }
+    const owner = stageFile(root, "content/life/lease-owner.md", { openFile: ownerOpen })
+    await ownerAtSegment
+    const lease = join(root, ".garden-publisher", "trash-recovery", "queue", ".append.lock")
+    await expect(lstat(lease)).resolves.toMatchObject({})
+
+    let leaseAttempts = 0
+    let contenderSegmentOpens = 0
+    const contenderOpen: NonNullable<
+      trashRecovery.TrashRecoveryPrepareOptions["openFile"]
+    > = async (path, flags, mode) => {
+      const normalized = path.replaceAll("\\", "/")
+      if (normalized.endsWith("/queue/.append.lock")) {
+        leaseAttempts += 1
+        throw Object.assign(new Error(leaseAttempts < 3 ? "busy" : "lease timeout"), {
+          code: leaseAttempts < 3 ? "EEXIST" : "ETIMEDOUT",
+        })
+      }
+      if (/\/queue\/[a-f0-9]{16}\.log$/.test(normalized)) contenderSegmentOpens += 1
+      return nodeOpen(path, flags, mode)
+    }
+
+    try {
+      await expect(
+        stageFile(root, "content/life/lease-contender.md", { openFile: contenderOpen }),
+      ).rejects.toMatchObject({ code: "ETIMEDOUT" })
+      expect(contenderSegmentOpens).toBe(0)
+      await expect(lstat(lease)).resolves.toMatchObject({})
+    } finally {
+      releaseOwner()
+      await owner
+    }
+    await expect(lstat(lease)).rejects.toMatchObject({ code: "ENOENT" })
   })
 
   it("rotates an at-cap queue and eventually processes the next segment", async () => {
@@ -508,6 +665,56 @@ describe("trash recovery directory bounds", () => {
     expect(completed.restored).toContain("content/_assets/rollback")
     await expect(lstat(stage.originalPath)).resolves.toMatchObject({})
   })
+
+  it.each([
+    {
+      kind: "file" as const,
+      relativePath: "content/life/retry-file.md",
+      create: async (root: string) => {
+        await writeFile(join(root, "content", "life", "retry-file.md"), "# Retry file")
+        return stageFile(root, "content/life/retry-file.md")
+      },
+    },
+    {
+      kind: "directory" as const,
+      relativePath: "content/_assets/retry-directory",
+      create: async (root: string) => {
+        await mkdir(join(root, "content", "_assets", "retry-directory"), { recursive: true })
+        return stageDirectory(root, "content/_assets/retry-directory")
+      },
+    },
+  ])(
+    "retries a rolled-back $kind after an ordinary post-mutation error",
+    async ({ relativePath, create }) => {
+      const root = await garden()
+      const stage = await create(root)
+      let injected = false
+      const ordinaryFailureAfterMutation = {
+        get aborted() {
+          if (!injected && existsSync(stage.originalPath)) {
+            injected = true
+            throw new Error("injected verification I/O failure")
+          }
+          return false
+        },
+      } as AbortSignal
+
+      const deferred = await trashRecovery.reconcileTrashRecoveryPass(
+        root,
+        () => internalRecoveryKey(root, false),
+        { signal: ordinaryFailureAfterMutation },
+      )
+      expect(deferred).toEqual({ restored: [], conflicts: [], pending: true })
+      await expect(lstat(stage.originalPath)).rejects.toMatchObject({ code: "ENOENT" })
+      await expect(lstat(stage.stagedPath)).resolves.toMatchObject({})
+
+      const completed = await trashRecovery.reconcileTrashRecoveryPass(root, () =>
+        internalRecoveryKey(root, false),
+      )
+      expect(completed.restored).toContain(relativePath)
+      expect(completed.conflicts).toEqual([])
+    },
+  )
 
   it("defers during attachment hashing without advancing or deleting the journal", async () => {
     const root = await garden()

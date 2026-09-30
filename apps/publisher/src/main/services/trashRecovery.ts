@@ -180,6 +180,41 @@ function queueSegmentSequence(name: string): number | undefined {
   return Number.isSafeInteger(sequence) ? sequence : undefined
 }
 
+async function syncRecoveryDirectory(
+  path: string,
+  openFile: RecoveryFileOpener = open,
+): Promise<void> {
+  const handle = await openFile(path, "r")
+  try {
+    await handle.sync().catch((error: NodeJS.ErrnoException) => {
+      if (
+        process.platform !== "win32" ||
+        (error.code !== "EPERM" && error.code !== "EINVAL" && error.code !== "ENOTSUP")
+      ) {
+        throw error
+      }
+    })
+  } finally {
+    await handle.close()
+  }
+}
+
+async function createRecoveryDirectory(
+  path: string,
+  parent: string,
+  openFile: RecoveryFileOpener,
+): Promise<void> {
+  let created = false
+  await mkdir(path, { mode: 0o700 })
+    .then(() => {
+      created = true
+    })
+    .catch((error: NodeJS.ErrnoException) => {
+      if (error.code !== "EEXIST") throw error
+    })
+  if (created) await syncRecoveryDirectory(parent, openFile)
+}
+
 async function appendRecoveryQueue(
   root: string,
   id: string,
@@ -208,6 +243,7 @@ async function appendRecoveryQueue(
   }
   const lease = resolve(directory, ".append.lock")
   let leaseHandle
+  let leaseIdentity: string | undefined
   try {
     for (let attempt = 0; ; attempt += 1) {
       try {
@@ -224,6 +260,22 @@ async function appendRecoveryQueue(
         await new Promise((resolveDelay) => setTimeout(resolveDelay, 10))
       }
     }
+    const [openedLease, leaseDetails, canonicalLease] = await Promise.all([
+      leaseHandle.stat({ bigint: true }),
+      lstat(lease, { bigint: true }),
+      realpath(lease),
+    ])
+    if (
+      !openedLease.isFile() ||
+      leaseDetails.isSymbolicLink() ||
+      !leaseDetails.isFile() ||
+      stableIdentity(openedLease) !== stableIdentity(leaseDetails) ||
+      !pathsEqual(canonicalLease, lease) ||
+      !isInside(directory, lease)
+    ) {
+      throw new Error("Trash recovery queue lease is unsafe.")
+    }
+    leaseIdentity = stableIdentity(openedLease)
     await leaseHandle.writeFile(`${process.pid}\n`)
     await leaseHandle.sync()
     const names = await readBoundedDirectoryNames(directory, 10_000)
@@ -306,23 +358,27 @@ async function appendRecoveryQueue(
       await handle.close().catch(() => undefined)
     }
     if (created) {
-      const parent = await openFile(directory, "r")
-      try {
-        await parent.sync().catch((error: NodeJS.ErrnoException) => {
-          if (
-            process.platform !== "win32" ||
-            (error.code !== "EPERM" && error.code !== "EINVAL" && error.code !== "ENOTSUP")
-          ) {
-            throw error
-          }
-        })
-      } finally {
-        await parent.close()
-      }
+      await syncRecoveryDirectory(directory, openFile)
     }
   } finally {
-    await leaseHandle?.close().catch(() => undefined)
-    await unlink(lease).catch(() => undefined)
+    if (leaseHandle) {
+      await leaseHandle.close().catch(() => undefined)
+      if (leaseIdentity !== undefined) {
+        try {
+          const leaseDetails = await lstat(lease, { bigint: true })
+          if (
+            !leaseDetails.isSymbolicLink() &&
+            leaseDetails.isFile() &&
+            stableIdentity(leaseDetails) === leaseIdentity &&
+            pathsEqual(await realpath(lease), lease)
+          ) {
+            await unlink(lease)
+          }
+        } catch (error) {
+          if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error
+        }
+      }
+    }
   }
 }
 
@@ -443,16 +499,13 @@ async function directoryDigest(root: string, control?: RecoveryTraversalControl)
 async function safeRecoveryRoot(
   workspaceInput: string,
   create: boolean,
+  openFile: RecoveryFileOpener = open,
 ): Promise<{ workspace: string; root: string }> {
   const workspace = await realpath(resolve(workspaceInput))
   const state = resolve(workspace, ".garden-publisher")
   const root = resolve(workspace, recoveryDirectory)
   if (create) {
-    try {
-      await mkdir(state, { mode: 0o700 })
-    } catch (error) {
-      if ((error as NodeJS.ErrnoException).code !== "EEXIST") throw error
-    }
+    await createRecoveryDirectory(state, workspace, openFile)
   }
   const [stateDetails, canonicalState] = await Promise.all([lstat(state), realpath(state)])
   if (
@@ -464,11 +517,7 @@ async function safeRecoveryRoot(
     throw new Error("Trash recovery storage is unsafe.")
   }
   if (create) {
-    try {
-      await mkdir(root, { mode: 0o700 })
-    } catch (error) {
-      if ((error as NodeJS.ErrnoException).code !== "EEXIST") throw error
-    }
+    await createRecoveryDirectory(root, state, openFile)
   }
   const [rootDetails, canonicalRoot] = await Promise.all([lstat(root), realpath(root)])
   if (
@@ -496,7 +545,8 @@ export async function prepareTrashRecovery(
   key: Buffer,
   options: TrashRecoveryPrepareOptions = {},
 ): Promise<TrashRecoveryStage> {
-  const { workspace, root } = await safeRecoveryRoot(workspaceInput, true)
+  const openFile = options.openFile ?? open
+  const { workspace, root } = await safeRecoveryRoot(workspaceInput, true, openFile)
   const normalized = originalRelativePath.replaceAll("\\", "/")
   const originalPath = resolve(originalPathInput)
   if (
@@ -512,12 +562,8 @@ export async function prepareTrashRecovery(
   const id = randomUUID()
   const transactions = resolve(root, indexedTransactionsDirectory)
   const shard = resolve(transactions, id.slice(0, 2))
-  await mkdir(transactions, { mode: 0o700 }).catch((error: NodeJS.ErrnoException) => {
-    if (error.code !== "EEXIST") throw error
-  })
-  await mkdir(shard, { mode: 0o700 }).catch((error: NodeJS.ErrnoException) => {
-    if (error.code !== "EEXIST") throw error
-  })
+  await createRecoveryDirectory(transactions, root, openFile)
+  await createRecoveryDirectory(shard, transactions, openFile)
   for (const directory of [transactions, shard]) {
     const [details, canonical] = await Promise.all([lstat(directory), realpath(directory)])
     if (
@@ -533,7 +579,14 @@ export async function prepareTrashRecovery(
   const stagedRelativePath = `items/${normalized}`
   const stagedPath = resolve(transactionPath, ...stagedRelativePath.split("/"))
   await mkdir(transactionPath, { mode: 0o700 })
-  await mkdir(dirname(stagedPath), { recursive: true, mode: 0o700 })
+  await syncRecoveryDirectory(shard, openFile)
+  let stagedParent = transactionPath
+  for (const segment of stagedRelativePath.split("/").slice(0, -1)) {
+    const child = resolve(stagedParent, segment)
+    await mkdir(child, { mode: 0o700 })
+    await syncRecoveryDirectory(stagedParent, openFile)
+    stagedParent = child
+  }
   const contentHash =
     kind === "directory" ? await directoryDigest(originalPath) : expectedContentHash!
   const unsigned: UnsignedTrashRecoveryJournal = {
@@ -546,15 +599,36 @@ export async function prepareTrashRecovery(
     expectedContentHash: contentHash,
   }
   const journal: TrashRecoveryJournal = { ...unsigned, integrity: journalIntegrity(key!, unsigned) }
-  // Publish the durable queue entry first. A concurrent recovery pass may observe an
-  // incomplete transaction, but the cyclic queue will revisit it. The opposite order
-  // could strand a complete journal forever if the process exited before queueing it.
-  await appendRecoveryQueue(root, id, key, options.openFile)
-  await writeFile(resolve(transactionPath, "journal.json"), JSON.stringify(journal), {
-    encoding: "utf8",
-    flag: "wx",
-    mode: 0o600,
-  })
+  const journalBytes = Buffer.from(JSON.stringify(journal), "utf8")
+  if (journalBytes.length > 64 * 1024) throw new Error("Trash recovery journal is too large.")
+  const journalPath = resolve(transactionPath, "journal.json")
+  const journalHandle = await openFile(
+    journalPath,
+    process.platform === "win32"
+      ? "wx"
+      : constants.O_WRONLY | constants.O_CREAT | constants.O_EXCL | constants.O_NOFOLLOW,
+    0o600,
+  )
+  try {
+    let written = 0
+    while (written < journalBytes.length) {
+      const result = await journalHandle.write(
+        journalBytes,
+        written,
+        journalBytes.length - written,
+        written,
+      )
+      if (result.bytesWritten === 0) throw new Error("Trash recovery journal write stalled.")
+      written += result.bytesWritten
+    }
+    await journalHandle.sync()
+  } finally {
+    await journalHandle.close()
+  }
+  await syncRecoveryDirectory(transactionPath, openFile)
+  // The original item is staged only after this durable journal has been published
+  // to the authenticated queue and prepareTrashRecovery returns to its caller.
+  await appendRecoveryQueue(root, id, key, openFile)
   return {
     id,
     workspace,
@@ -606,19 +680,22 @@ export async function restoreLocalTrashStage(
     if (stage.kind === "file") {
       await link(stage.stagedPath, stage.originalPath)
       mutation = "file-linked"
-      if (!(await matchesExpectedItem(stage.originalPath, stage, control))) return false
+      if (!(await inspectExpectedItem(stage.originalPath, stage, control))) return false
       await unlink(stage.stagedPath)
       mutation = undefined
     } else {
       await rename(stage.stagedPath, stage.originalPath)
       mutation = "directory-renamed"
-      if (!(await matchesExpectedItem(stage.originalPath, stage, control))) return false
+      if (!(await inspectExpectedItem(stage.originalPath, stage, control))) return false
       mutation = undefined
     }
     await rm(stage.transactionPath, { recursive: true }).catch(() => undefined)
     return true
   } catch (error) {
     if (error instanceof RecoveryPassDeferred) throw error
+    if (mutation !== undefined) {
+      throw new RecoveryPassDeferred("Trash recovery commit verification was deferred.")
+    }
     return false
   } finally {
     // A failed verification returns rather than throws; restore the staged shape in
@@ -713,33 +790,41 @@ function stableIdentity(details: BigIntStats): string {
   return `${details.dev}:${details.ino}:${details.birthtimeNs}`
 }
 
+async function inspectExpectedItem(
+  path: string,
+  expected: Pick<TrashRecoveryStage, "kind" | "expectedIdentity" | "expectedContentHash">,
+  control?: RecoveryTraversalControl,
+): Promise<boolean> {
+  assertRecoveryActive(control)
+  const details = await lstat(path, { bigint: true })
+  if (
+    details.isSymbolicLink() ||
+    (expected.kind === "file" ? !details.isFile() : !details.isDirectory()) ||
+    stableIdentity(details) !== expected.expectedIdentity
+  ) {
+    return false
+  }
+  const contentHash =
+    expected.kind === "file"
+      ? createHash("sha256")
+          .update(await readBoundedRegularFile(path, 16 * 1024 * 1024, control))
+          .digest("hex")
+      : await directoryDigest(path, control)
+  if (contentHash !== expected.expectedContentHash) return false
+  const after = await lstat(path, { bigint: true })
+  if (stableIdentity(after) !== stableIdentity(details) || after.mtimeNs !== details.mtimeNs) {
+    return false
+  }
+  return pathsEqual(await realpath(path), path)
+}
+
 async function matchesExpectedItem(
   path: string,
   expected: Pick<TrashRecoveryStage, "kind" | "expectedIdentity" | "expectedContentHash">,
   control?: RecoveryTraversalControl,
 ): Promise<boolean> {
   try {
-    assertRecoveryActive(control)
-    const details = await lstat(path, { bigint: true })
-    if (
-      details.isSymbolicLink() ||
-      (expected.kind === "file" ? !details.isFile() : !details.isDirectory()) ||
-      stableIdentity(details) !== expected.expectedIdentity
-    ) {
-      return false
-    }
-    const contentHash =
-      expected.kind === "file"
-        ? createHash("sha256")
-            .update(await readBoundedRegularFile(path, 16 * 1024 * 1024, control))
-            .digest("hex")
-        : await directoryDigest(path, control)
-    if (contentHash !== expected.expectedContentHash) return false
-    const after = await lstat(path, { bigint: true })
-    if (stableIdentity(after) !== stableIdentity(details) || after.mtimeNs !== details.mtimeNs) {
-      return false
-    }
-    return pathsEqual(await realpath(path), path)
+    return await inspectExpectedItem(path, expected, control)
   } catch (error) {
     if (error instanceof RecoveryPassDeferred) throw error
     return false
@@ -1036,7 +1121,8 @@ async function readRecoveryQueuePage(
     }
     const size = Number(details.size)
     const offset = offsetInput > size ? 0 : offsetInput
-    const buffer = Buffer.alloc(64 * 1024)
+    const pageBytes = 64 * 1024
+    const buffer = Buffer.alloc(pageBytes + recoveryQueueRecordBytes)
     assertRecoveryActive(control)
     const { bytesRead } = await handle.read(buffer, 0, buffer.length, offset)
     if (bytesRead === 0)
@@ -1048,9 +1134,23 @@ async function readRecoveryQueuePage(
         done: following === undefined,
       }
     const bytes = buffer.subarray(0, bytesRead)
-    const lastNewline = bytes.lastIndexOf(0x0a)
-    // A crash-torn tail is never interpreted as a complete authenticated record.
-    const consumed = lastNewline < 0 ? 0 : lastNewline + 1
+    const atEnd = offset + bytesRead >= size
+    let consumed: number
+    if (atEnd) {
+      const lastNewline = bytes.lastIndexOf(0x0a)
+      // Only bytes without a newline at the actual EOF are crash-torn.
+      consumed = lastNewline < 0 ? 0 : lastNewline + 1
+    } else {
+      const newlineAfterPage = bytes.indexOf(0x0a, pageBytes)
+      if (newlineAfterPage >= 0) {
+        consumed = newlineAfterPage + 1
+      } else {
+        const lastNewline = bytes.lastIndexOf(0x0a, pageBytes - 1)
+        // A line longer than the authenticated record bound is corrupt. Advance a
+        // bounded page if no record boundary exists so it cannot block later segments.
+        consumed = lastNewline < 0 ? Math.min(pageBytes, bytesRead) : lastNewline + 1
+      }
+    }
     const entries: RecoveryQueuePageEntry[] = []
     let lineOffset = 0
     for (const line of bytes.subarray(0, consumed).toString("utf8").split("\n")) {
@@ -1081,7 +1181,7 @@ async function readRecoveryQueuePage(
       lineOffset += lineBytes
     }
     const reachedTail = offset + consumed >= size
-    const hasIncompleteTail = consumed < bytesRead
+    const hasIncompleteTail = atEnd && consumed < bytesRead
     if (hasIncompleteTail && following === undefined) {
       return {
         entries,
