@@ -37,6 +37,9 @@ const recoveryQueueDirectory = "queue"
 const recoveryQueueSegmentBytes = 1024 * 1024
 const recoveryQueueRecordBytes = 512
 const recoveryQueueSegmentPattern = /^[a-f0-9]{16}\.log$/
+const recoveryQueueLeaseBytes = 1024
+const recoveryQueueLeaseMs = 60_000
+const recoveryQueueLeaseWaitMs = 2_000
 const recoveryCursorVersion = 1
 const shardPattern = /^[a-f0-9]{2}$/
 const recoveryDirectoryEntriesPerPass = 1_024
@@ -180,6 +183,202 @@ function queueSegmentSequence(name: string): number | undefined {
   return Number.isSafeInteger(sequence) ? sequence : undefined
 }
 
+interface RecoveryQueueLease {
+  readonly version: 1
+  readonly token: string
+  readonly pid: number
+  readonly createdAt: number
+  readonly leaseExpiresAt: number
+}
+
+interface RecoveryQueueLeaseInspection {
+  readonly kind: "present"
+  readonly identity: string
+  readonly fingerprint: string
+  readonly observedAt: number
+  readonly owner?: RecoveryQueueLease
+  readonly legacyPid?: number
+}
+
+function isRecoveryQueueLease(value: unknown): value is RecoveryQueueLease {
+  if (typeof value !== "object" || value === null) return false
+  const lease = value as Partial<RecoveryQueueLease>
+  return (
+    lease.version === 1 &&
+    typeof lease.token === "string" &&
+    /^[a-f0-9-]{16,128}$/i.test(lease.token) &&
+    typeof lease.pid === "number" &&
+    Number.isSafeInteger(lease.pid) &&
+    lease.pid > 0 &&
+    typeof lease.createdAt === "number" &&
+    Number.isFinite(lease.createdAt) &&
+    typeof lease.leaseExpiresAt === "number" &&
+    Number.isFinite(lease.leaseExpiresAt) &&
+    lease.createdAt < lease.leaseExpiresAt
+  )
+}
+
+function recoveryProcessLiveness(
+  options: TrashRecoveryPrepareOptions,
+  pid: number,
+): boolean | undefined {
+  if (options.isProcessAlive !== undefined) {
+    try {
+      return options.isProcessAlive(pid)
+    } catch {
+      return undefined
+    }
+  }
+  if (!Number.isSafeInteger(pid) || pid <= 0) return false
+  try {
+    process.kill(pid, 0)
+    return true
+  } catch (error) {
+    return (error as NodeJS.ErrnoException).code === "ESRCH" ? false : undefined
+  }
+}
+
+async function inspectRecoveryQueueLease(
+  path: string,
+  directory: string,
+  openFile: RecoveryFileOpener,
+): Promise<RecoveryQueueLeaseInspection | { readonly kind: "missing" | "unsafe" }> {
+  let handle
+  try {
+    handle = await openFile(
+      path,
+      process.platform === "win32" ? "r" : constants.O_RDONLY | constants.O_NOFOLLOW,
+    )
+    const [opened, pathDetails, canonical] = await Promise.all([
+      handle.stat({ bigint: true }),
+      lstat(path, { bigint: true }),
+      realpath(path),
+    ])
+    if (
+      !opened.isFile() ||
+      pathDetails.isSymbolicLink() ||
+      !pathDetails.isFile() ||
+      stableIdentity(opened) !== stableIdentity(pathDetails) ||
+      !pathsEqual(canonical, path) ||
+      !isInside(directory, path)
+    ) {
+      return { kind: "unsafe" }
+    }
+    const size = Number(opened.size)
+    let bytes = Buffer.alloc(0)
+    if (Number.isSafeInteger(size) && size >= 0 && size <= recoveryQueueLeaseBytes) {
+      bytes = Buffer.alloc(size)
+      let read = 0
+      while (read < size) {
+        const result = await handle.read(bytes, read, size - read, read)
+        if (result.bytesRead === 0) return { kind: "unsafe" }
+        read += result.bytesRead
+      }
+    }
+    const [openedAfter, pathAfter] = await Promise.all([
+      handle.stat({ bigint: true }),
+      lstat(path, { bigint: true }),
+    ])
+    if (
+      stableIdentity(openedAfter) !== stableIdentity(opened) ||
+      stableIdentity(pathAfter) !== stableIdentity(opened) ||
+      openedAfter.size !== opened.size
+    ) {
+      return { kind: "unsafe" }
+    }
+    let owner: RecoveryQueueLease | undefined
+    let legacyPid: number | undefined
+    if (bytes.length > 0) {
+      try {
+        const value: unknown = JSON.parse(bytes.toString("utf8"))
+        if (isRecoveryQueueLease(value)) owner = value
+        else if (Number.isSafeInteger(value) && Number(value) > 0) legacyPid = Number(value)
+      } catch {
+        // Invalid metadata is reclaimable only after the conservative file-age timeout.
+      }
+    }
+    return {
+      kind: "present",
+      identity: stableIdentity(opened),
+      fingerprint:
+        size <= recoveryQueueLeaseBytes
+          ? createHash("sha256").update(bytes).digest("hex")
+          : `oversize:${size}`,
+      observedAt: Math.max(
+        Number(opened.birthtimeMs),
+        Number(opened.ctimeMs),
+        Number(opened.mtimeMs),
+      ),
+      owner,
+      legacyPid,
+    }
+  } catch (error) {
+    return (error as NodeJS.ErrnoException).code === "ENOENT"
+      ? { kind: "missing" }
+      : { kind: "unsafe" }
+  } finally {
+    await handle?.close().catch(() => undefined)
+  }
+}
+
+function recoveryQueueLeaseIsStale(
+  inspection: RecoveryQueueLeaseInspection,
+  options: TrashRecoveryPrepareOptions,
+  leaseMs: number,
+): boolean {
+  const now = (options.now ?? Date.now)()
+  const expiresAt = inspection.owner?.leaseExpiresAt ?? inspection.observedAt + leaseMs
+  if (now < expiresAt) return false
+  const pid = inspection.owner?.pid ?? inspection.legacyPid
+  return pid === undefined || recoveryProcessLiveness(options, pid) === false
+}
+
+async function reclaimStaleRecoveryQueueLease(
+  lease: string,
+  directory: string,
+  options: TrashRecoveryPrepareOptions,
+  openFile: RecoveryFileOpener,
+  leaseMs: number,
+): Promise<boolean> {
+  const observed = await inspectRecoveryQueueLease(lease, directory, openFile)
+  if (observed.kind === "missing") return true
+  if (observed.kind !== "present" || !recoveryQueueLeaseIsStale(observed, options, leaseMs)) {
+    return false
+  }
+  const revalidated = await inspectRecoveryQueueLease(lease, directory, openFile)
+  if (
+    revalidated.kind !== "present" ||
+    revalidated.identity !== observed.identity ||
+    revalidated.fingerprint !== observed.fingerprint ||
+    !recoveryQueueLeaseIsStale(revalidated, options, leaseMs)
+  ) {
+    return revalidated.kind === "missing"
+  }
+  const quarantine = `${lease}.quarantine-${randomUUID()}`
+  try {
+    await rename(lease, quarantine)
+  } catch (error) {
+    return (error as NodeJS.ErrnoException).code === "ENOENT"
+  }
+  const moved = await inspectRecoveryQueueLease(quarantine, directory, openFile)
+  if (
+    moved.kind === "present" &&
+    moved.identity === revalidated.identity &&
+    moved.fingerprint === revalidated.fingerprint &&
+    recoveryQueueLeaseIsStale(moved, options, leaseMs)
+  ) {
+    await unlink(quarantine)
+    return true
+  }
+  try {
+    await link(quarantine, lease)
+    await unlink(quarantine)
+  } catch {
+    // Never delete an object whose identity or liveness changed during quarantine.
+  }
+  return false
+}
+
 async function syncRecoveryDirectory(
   path: string,
   openFile: RecoveryFileOpener = open,
@@ -219,8 +418,9 @@ async function appendRecoveryQueue(
   root: string,
   id: string,
   key: Buffer,
-  openFile: RecoveryFileOpener = open,
+  options: TrashRecoveryPrepareOptions = {},
 ): Promise<void> {
+  const openFile = options.openFile ?? open
   const record = Buffer.from(
     `${JSON.stringify({ version: 1, id, integrity: queueIntegrity(key, id) })}\n`,
     "utf8",
@@ -229,9 +429,7 @@ async function appendRecoveryQueue(
     throw new Error("Trash recovery queue record is too large.")
   }
   const directory = resolve(root, recoveryQueueDirectory)
-  await mkdir(directory, { mode: 0o700 }).catch((error: NodeJS.ErrnoException) => {
-    if (error.code !== "EEXIST") throw error
-  })
+  await createRecoveryDirectory(directory, root, openFile)
   const directoryDetails = await lstat(directory)
   if (
     directoryDetails.isSymbolicLink() ||
@@ -242,42 +440,66 @@ async function appendRecoveryQueue(
     throw new Error("Trash recovery queue is unsafe.")
   }
   const lease = resolve(directory, ".append.lock")
-  let leaseHandle
+  const leaseMs = Math.max(1, options.appendLeaseMs ?? recoveryQueueLeaseMs)
+  const waitMs = Math.max(1, options.appendLeaseWaitMs ?? recoveryQueueLeaseWaitMs)
+  const now = options.now ?? Date.now
+  const delay =
+    options.delay ??
+    ((milliseconds: number) => new Promise<void>((done) => setTimeout(done, milliseconds)))
+  const token = randomUUID()
+  const createdAt = now()
+  const leaseBytes = Buffer.from(
+    JSON.stringify({
+      version: 1,
+      token,
+      pid: process.pid,
+      createdAt,
+      leaseExpiresAt: createdAt + leaseMs,
+    } satisfies RecoveryQueueLease),
+    "utf8",
+  )
+  const candidate = resolve(directory, `.append.candidate-${token}`)
   let leaseIdentity: string | undefined
+  let candidateHandle
   try {
-    for (let attempt = 0; ; attempt += 1) {
+    candidateHandle = await openFile(
+      candidate,
+      process.platform === "win32"
+        ? "wx"
+        : constants.O_WRONLY | constants.O_CREAT | constants.O_EXCL | constants.O_NOFOLLOW,
+      0o600,
+    )
+    await candidateHandle.writeFile(leaseBytes)
+    await candidateHandle.sync()
+    const candidateDetails = await candidateHandle.stat({ bigint: true })
+    if (!candidateDetails.isFile()) throw new Error("Trash recovery queue lease is unsafe.")
+    const candidateIdentity = stableIdentity(candidateDetails)
+    await candidateHandle.close()
+    candidateHandle = undefined
+    const deadline = createdAt + waitMs
+    for (;;) {
       try {
-        leaseHandle = await openFile(
-          lease,
-          process.platform === "win32"
-            ? "wx"
-            : constants.O_WRONLY | constants.O_CREAT | constants.O_EXCL | constants.O_NOFOLLOW,
-          0o600,
-        )
+        await link(candidate, lease)
+        leaseIdentity = candidateIdentity
         break
       } catch (error) {
-        if ((error as NodeJS.ErrnoException).code !== "EEXIST" || attempt >= 200) throw error
-        await new Promise((resolveDelay) => setTimeout(resolveDelay, 10))
+        if ((error as NodeJS.ErrnoException).code !== "EEXIST") throw error
+        if (await reclaimStaleRecoveryQueueLease(lease, directory, options, openFile, leaseMs)) {
+          continue
+        }
+        if (now() >= deadline) throw error
+        await delay(10)
       }
     }
-    const [openedLease, leaseDetails, canonicalLease] = await Promise.all([
-      leaseHandle.stat({ bigint: true }),
-      lstat(lease, { bigint: true }),
-      realpath(lease),
-    ])
+    const acquired = await inspectRecoveryQueueLease(lease, directory, openFile)
     if (
-      !openedLease.isFile() ||
-      leaseDetails.isSymbolicLink() ||
-      !leaseDetails.isFile() ||
-      stableIdentity(openedLease) !== stableIdentity(leaseDetails) ||
-      !pathsEqual(canonicalLease, lease) ||
-      !isInside(directory, lease)
+      acquired.kind !== "present" ||
+      acquired.identity !== leaseIdentity ||
+      acquired.owner?.token !== token
     ) {
       throw new Error("Trash recovery queue lease is unsafe.")
     }
-    leaseIdentity = stableIdentity(openedLease)
-    await leaseHandle.writeFile(`${process.pid}\n`)
-    await leaseHandle.sync()
+    await unlink(candidate)
     const names = await readBoundedDirectoryNames(directory, 10_000)
     const segments = names
       .map((name) => ({ name, sequence: queueSegmentSequence(name) }))
@@ -361,22 +583,22 @@ async function appendRecoveryQueue(
       await syncRecoveryDirectory(directory, openFile)
     }
   } finally {
-    if (leaseHandle) {
-      await leaseHandle.close().catch(() => undefined)
-      if (leaseIdentity !== undefined) {
-        try {
-          const leaseDetails = await lstat(lease, { bigint: true })
-          if (
-            !leaseDetails.isSymbolicLink() &&
-            leaseDetails.isFile() &&
-            stableIdentity(leaseDetails) === leaseIdentity &&
-            pathsEqual(await realpath(lease), lease)
-          ) {
-            await unlink(lease)
-          }
-        } catch (error) {
-          if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error
+    await candidateHandle?.close().catch(() => undefined)
+    await unlink(candidate).catch((error: NodeJS.ErrnoException) => {
+      if (error.code !== "ENOENT") throw error
+    })
+    if (leaseIdentity !== undefined) {
+      try {
+        const current = await inspectRecoveryQueueLease(lease, directory, openFile)
+        if (
+          current.kind === "present" &&
+          current.identity === leaseIdentity &&
+          current.owner?.token === token
+        ) {
+          await unlink(lease)
         }
+      } catch (error) {
+        if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error
       }
     }
   }
@@ -533,6 +755,11 @@ async function safeRecoveryRoot(
 
 export interface TrashRecoveryPrepareOptions {
   readonly openFile?: RecoveryFileOpener
+  readonly appendLeaseMs?: number
+  readonly appendLeaseWaitMs?: number
+  readonly delay?: (milliseconds: number) => Promise<void>
+  readonly isProcessAlive?: (pid: number) => boolean | undefined
+  readonly now?: () => number
 }
 
 export async function prepareTrashRecovery(
@@ -628,7 +855,7 @@ export async function prepareTrashRecovery(
   await syncRecoveryDirectory(transactionPath, openFile)
   // The original item is staged only after this durable journal has been published
   // to the authenticated queue and prepareTrashRecovery returns to its caller.
-  await appendRecoveryQueue(root, id, key, openFile)
+  await appendRecoveryQueue(root, id, key, options)
   return {
     id,
     workspace,

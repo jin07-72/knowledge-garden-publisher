@@ -256,11 +256,11 @@ describe("trash recovery directory bounds", () => {
 
   it("shrinks legacy work across deadlines and mutations until an old journal is found", async () => {
     const root = await garden()
+    const recoveryRoot = join(root, ".garden-publisher", "trash-recovery")
     await writeFile(join(root, "content", "life", "legacy-race.md"), "# Legacy race")
     const staged = await recycleAndRestore(root, "content/life/legacy-race.md")
     const transaction = dirname(dirname(dirname(dirname(staged))))
     const id = transaction.split(/[\\/]/).at(-1)!
-    const recoveryRoot = join(root, ".garden-publisher", "trash-recovery")
     await rename(transaction, join(recoveryRoot, id))
     for (let index = 0; index < 1_100; index += 1) {
       await writeFile(
@@ -482,6 +482,57 @@ describe("trash recovery directory bounds", () => {
     expect(fileSyncFailure).toMatchObject({ message: "injected file sync failure" })
   })
 
+  it("syncs a newly created queue through its recovery parent before publishing records", async () => {
+    const root = await garden()
+    const original = join(root, "content", "life", "durable-queue.md")
+    const queue = join(root, ".garden-publisher", "trash-recovery", "queue")
+    await writeFile(original, "# Durable queue")
+    const events: string[] = []
+    let failRecoveryParentSync = false
+    const openFile: NonNullable<trashRecovery.TrashRecoveryPrepareOptions["openFile"]> = async (
+      path,
+      flags,
+      mode,
+    ) => {
+      const handle = await nodeOpen(path, flags, mode)
+      const normalized = path.replaceAll("\\", "/")
+      const recoveryParent =
+        normalized.endsWith("/.garden-publisher/trash-recovery") && existsSync(join(path, "queue"))
+      const queueDirectory = normalized.endsWith("/.garden-publisher/trash-recovery/queue")
+      const queueSegment = /\/queue\/[a-f0-9]{16}\.log$/.test(normalized)
+      if (!recoveryParent && !queueDirectory && !queueSegment) return handle
+      const sync = handle.sync.bind(handle)
+      handle.sync = async () => {
+        const event = recoveryParent
+          ? "recovery-parent-sync"
+          : queueSegment
+            ? "queue-file-sync"
+            : "queue-directory-sync"
+        events.push(event)
+        if (recoveryParent && failRecoveryParentSync) {
+          throw new Error("injected recovery parent sync failure")
+        }
+        await sync()
+      }
+      return handle
+    }
+
+    await stageFile(root, "content/life/durable-queue.md", { openFile })
+    expect(events).toEqual(["recovery-parent-sync", "queue-file-sync", "queue-directory-sync"])
+
+    const failureRoot = await garden()
+    const failureOriginal = join(failureRoot, "content", "life", "durable-queue-failure.md")
+    await writeFile(failureOriginal, "# Durable queue failure")
+    events.length = 0
+    failRecoveryParentSync = true
+    await expect(
+      stageFile(failureRoot, "content/life/durable-queue-failure.md", { openFile }),
+    ).rejects.toThrow("injected recovery parent sync failure")
+    await expect(readFile(failureOriginal, "utf8")).resolves.toBe("# Durable queue failure")
+    const failureQueue = join(failureRoot, ".garden-publisher", "trash-recovery", "queue")
+    expect((await readdir(failureQueue)).filter((name) => name.endsWith(".log"))).toEqual([])
+  })
+
   it("syncs the journal and transaction directory before publishing its queue record", async () => {
     const root = await garden()
     await writeFile(join(root, "content", "life", "journal-order.md"), "# Journal order")
@@ -536,7 +587,37 @@ describe("trash recovery directory bounds", () => {
     await expect(readFile(original, "utf8")).resolves.toBe("# Journal failure")
   })
 
-  it("does not remove another writer's active append lease after a contender times out", async () => {
+  it("reclaims a crashed append owner only after its durable lease expires", async () => {
+    const root = await garden()
+    await writeFile(join(root, "content", "life", "lease-seed.md"), "# Seed")
+    await stageFile(root, "content/life/lease-seed.md")
+    const lease = join(root, ".garden-publisher", "trash-recovery", "queue", ".append.lock")
+    await writeFile(
+      lease,
+      JSON.stringify({
+        version: 1,
+        token: "00000000-0000-4000-8000-000000000000",
+        pid: 424_242,
+        createdAt: 0,
+        leaseExpiresAt: 10,
+      }),
+      { flag: "wx", mode: 0o600 },
+    )
+    await writeFile(join(root, "content", "life", "lease-reclaimed.md"), "# Reclaimed")
+
+    const stage = await stageFile(root, "content/life/lease-reclaimed.md", {
+      appendLeaseMs: 10,
+      appendLeaseWaitMs: 10,
+      delay: async () => undefined,
+      isProcessAlive: (pid) => (pid === 424_242 ? false : true),
+      now: () => 100,
+    })
+
+    expect(stage.originalRelativePath).toBe("content/life/lease-reclaimed.md")
+    await expect(lstat(lease)).rejects.toMatchObject({ code: "ENOENT" })
+  })
+
+  it("does not remove another writer's expired but live append lease", async () => {
     const root = await garden()
     await writeFile(join(root, "content", "life", "lease-owner.md"), "# Owner")
     await writeFile(join(root, "content", "life", "lease-contender.md"), "# Contender")
@@ -560,31 +641,43 @@ describe("trash recovery directory bounds", () => {
       }
       return nodeOpen(path, flags, mode)
     }
-    const owner = stageFile(root, "content/life/lease-owner.md", { openFile: ownerOpen })
+    const owner = stageFile(root, "content/life/lease-owner.md", {
+      appendLeaseMs: 1,
+      now: () => 0,
+      openFile: ownerOpen,
+    })
     await ownerAtSegment
     const lease = join(root, ".garden-publisher", "trash-recovery", "queue", ".append.lock")
     await expect(lstat(lease)).resolves.toMatchObject({})
+    const metadata: unknown = JSON.parse(await readFile(lease, "utf8"))
+    expect(metadata).toMatchObject({
+      version: 1,
+      pid: process.pid,
+      leaseExpiresAt: expect.any(Number),
+      token: expect.any(String),
+    })
 
-    let leaseAttempts = 0
     let contenderSegmentOpens = 0
     const contenderOpen: NonNullable<
       trashRecovery.TrashRecoveryPrepareOptions["openFile"]
     > = async (path, flags, mode) => {
       const normalized = path.replaceAll("\\", "/")
-      if (normalized.endsWith("/queue/.append.lock")) {
-        leaseAttempts += 1
-        throw Object.assign(new Error(leaseAttempts < 3 ? "busy" : "lease timeout"), {
-          code: leaseAttempts < 3 ? "EEXIST" : "ETIMEDOUT",
-        })
-      }
       if (/\/queue\/[a-f0-9]{16}\.log$/.test(normalized)) contenderSegmentOpens += 1
       return nodeOpen(path, flags, mode)
     }
 
     try {
+      let contenderNow = 100
       await expect(
-        stageFile(root, "content/life/lease-contender.md", { openFile: contenderOpen }),
-      ).rejects.toMatchObject({ code: "ETIMEDOUT" })
+        stageFile(root, "content/life/lease-contender.md", {
+          appendLeaseMs: 1,
+          appendLeaseWaitMs: 2,
+          delay: async () => undefined,
+          isProcessAlive: (pid) => pid === process.pid,
+          now: () => contenderNow++,
+          openFile: contenderOpen,
+        }),
+      ).rejects.toMatchObject({ code: "EEXIST" })
       expect(contenderSegmentOpens).toBe(0)
       await expect(lstat(lease)).resolves.toMatchObject({})
     } finally {

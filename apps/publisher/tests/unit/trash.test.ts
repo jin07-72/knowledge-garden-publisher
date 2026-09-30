@@ -71,7 +71,10 @@ describe("safe note trash", () => {
     await rename(join(recycle, "item-1"), trashItem.mock.calls[0]![0])
     await rename(join(recycle, "item-2"), trashItem.mock.calls[1]![0])
     await expect(
-      reconcileTrashRecovery(root, () => internalRecoveryKey(root, false)),
+      reconcileTrashRecovery(root, () => internalRecoveryKey(root, false), {
+        maximumElapsedMs: 5_000,
+        now: () => 0,
+      }),
     ).resolves.toEqual({
       restored: expect.arrayContaining(["content/life/daily.md", "content/_assets/daily"]),
       conflicts: [],
