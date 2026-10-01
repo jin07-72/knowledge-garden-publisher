@@ -67,6 +67,16 @@ export interface BlogImportService {
   install(path: string, signal?: AbortSignal): Promise<BlogCandidateInspection>
 }
 
+export interface BlogImportDependencies {
+  readonly gitExecutable: string
+  readonly nodePath: string
+  readonly npmCliPath: string
+  readonly runner: BoundedCommandRunner
+  readonly inspect: typeof inspectBlogCandidate
+  readonly onProgress: (progress: BlogImportProgress) => void
+  readonly afterParentCapturedBeforeMkdir?: () => Promise<void>
+}
+
 export interface BlogImportErrorShape {
   readonly code: string
   readonly message: string
@@ -101,7 +111,10 @@ function pathsEqual(left: string, right: string): boolean {
   return process.platform === "win32" ? left.toLowerCase() === right.toLowerCase() : left === right
 }
 
-async function reserveCloneTarget(path: string): Promise<ReservedBlogTarget> {
+async function reserveCloneTarget(
+  path: string,
+  afterParentCapturedBeforeMkdir?: () => Promise<void>,
+): Promise<ReservedBlogTarget> {
   const displayPath = resolve(path)
   const parent = dirname(displayPath)
   let parentIdentity: ParentIdentity
@@ -114,9 +127,11 @@ async function reserveCloneTarget(path: string): Promise<ReservedBlogTarget> {
     throw importError("DESTINATION_INVALID", "The selected destination parent folder is unavailable.", displayPath)
   }
   try {
+    await afterParentCapturedBeforeMkdir?.()
     await assertParentIdentity(parentIdentity, displayPath)
     await mkdir(displayPath)
   } catch (error) {
+    if (error instanceof BlogImportError) throw error
     if ((error as NodeJS.ErrnoException).code === "EEXIST") {
       throw importError("DESTINATION_EXISTS", "Choose a destination that does not already exist.", displayPath)
     }
@@ -338,14 +353,7 @@ export async function inspectBlogCandidate(
   return { valid: true, canonicalPath: root, needsInstall: dependencyIssues.length > 0 }
 }
 
-export function createBlogImportService(dependencies: {
-  readonly gitExecutable: string
-  readonly nodePath: string
-  readonly npmCliPath: string
-  readonly runner: BoundedCommandRunner
-  readonly inspect: typeof inspectBlogCandidate
-  readonly onProgress: (progress: BlogImportProgress) => void
-}): BlogImportService {
+export function createBlogImportService(dependencies: BlogImportDependencies): BlogImportService {
   let active = false
   let terminationUncertain = false
 
@@ -504,7 +512,10 @@ export function createBlogImportService(dependencies: {
   return {
     clone: (request, signal) => runOperation(signal, async (operationSignal) => {
       const repository = parseGitHubRepository(request.url)
-      const target = await reserveCloneTarget(request.destination)
+      const target = await reserveCloneTarget(
+        request.destination,
+        dependencies.afterParentCapturedBeforeMkdir,
+      )
       emit("cloning", target.canonicalPath)
       let clone: { readonly exitCode: number }
       try {

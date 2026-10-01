@@ -192,6 +192,7 @@ describe("createBlogImportService", () => {
     readonly runner: CommandRunner
     readonly inspect?: typeof inspectBlogCandidate
     readonly progress: string[]
+    readonly afterParentCapturedBeforeMkdir?: () => Promise<void>
   }) {
     return {
       gitExecutable: "git.exe",
@@ -199,6 +200,7 @@ describe("createBlogImportService", () => {
       runner: createBoundedCommandRunnerForTest(options.runner),
       inspect: options.inspect ?? (async (path: string) => valid(path)),
       onProgress: ({ phase }: { phase: string }) => options.progress.push(phase),
+      afterParentCapturedBeforeMkdir: options.afterParentCapturedBeforeMkdir,
     }
   }
 
@@ -450,6 +452,88 @@ describe("createBlogImportService", () => {
       code: "IMPORT_UNAVAILABLE",
     })
     expect(calls).toBe(1)
+  })
+
+  it("poisons the service when npm termination is uncertain", async () => {
+    const parent = await temporaryDirectory()
+    const destination = join(parent, "quartz")
+    let calls = 0
+    const service = createBlogImportService(serviceDependencies({
+      runner: { run: async ({ args }) => {
+        calls += 1
+        if (args[0] !== "clone") throw new PublishCommandFailure("raw npm termination", true)
+        return { exitCode: 0, stdout: "", stderr: "" }
+      } },
+      progress: [],
+    }))
+
+    await expect(service.clone({ url: "https://github.com/openai/quartz", destination, name: "Quartz" })).rejects.toMatchObject({
+      code: "IMPORT_UNAVAILABLE",
+      message: expect.not.stringContaining("raw npm termination"),
+    })
+    await expect(service.install(join(parent, "second"))).rejects.toMatchObject({ code: "IMPORT_UNAVAILABLE" })
+    expect(calls).toBe(2)
+  })
+
+  it("propagates uncertain Git inspection through standalone and service preflight", async () => {
+    const root = await temporaryDirectory()
+    await createCandidate(root)
+    const uncertain = createBoundedCommandRunnerForTest({
+      run: async () => { throw new PublishCommandFailure("raw git termination", true) },
+    })
+    await expect(inspectBlogCandidate(root, { runner: uncertain })).rejects.toMatchObject({ terminationUncertain: true })
+    let calls = 0
+    const service = createBlogImportService(serviceDependencies({
+      runner: createBoundedCommandRunnerForTest({ run: async () => { calls += 1; throw new PublishCommandFailure("raw git termination", true) } }),
+      inspect: inspectBlogCandidate,
+      progress: [],
+    }))
+
+    await expect(service.install(root)).rejects.toMatchObject({ code: "IMPORT_UNAVAILABLE", message: expect.not.stringContaining("raw git termination") })
+    await expect(service.install(join(root, "second"))).rejects.toMatchObject({ code: "IMPORT_UNAVAILABLE" })
+    expect(calls).toBe(1)
+  })
+
+  it("poisons the service when final inspection reports uncertain termination", async () => {
+    const parent = await temporaryDirectory()
+    const destination = join(parent, "quartz")
+    const phases: string[] = []
+    let inspections = 0
+    let calls = 0
+    const service = createBlogImportService(serviceDependencies({
+      runner: { run: async () => { calls += 1; return { exitCode: 0, stdout: "", stderr: "" } } },
+      inspect: async (path) => {
+        inspections += 1
+        if (inspections === 1) return valid(path)
+        throw new PublishCommandFailure("raw final termination", true)
+      },
+      progress: phases,
+    }))
+
+    await expect(service.clone({ url: "https://github.com/openai/quartz", destination, name: "Quartz" })).rejects.toMatchObject({ code: "IMPORT_UNAVAILABLE", message: expect.not.stringContaining("raw final termination") })
+    expect(phases).toEqual(["cloning", "installing", "validating"])
+    await expect(service.clone({ url: "https://github.com/openai/quartz", destination: join(parent, "second"), name: "Quartz" })).rejects.toMatchObject({ code: "IMPORT_UNAVAILABLE" })
+    expect(calls).toBe(2)
+  })
+
+  it("rejects a parent replacement between baseline capture and target reservation", async () => {
+    const root = await temporaryDirectory()
+    const parent = join(root, "parent")
+    const moved = join(root, "moved")
+    const destination = join(parent, "quartz")
+    await mkdir(parent)
+    let calls = 0
+    const service = createBlogImportService(serviceDependencies({
+      runner: { run: async () => { calls += 1; return { exitCode: 0, stdout: "", stderr: "" } } },
+      afterParentCapturedBeforeMkdir: async () => {
+        await rename(parent, moved)
+        await mkdir(parent)
+      },
+      progress: [],
+    }))
+
+    await expect(service.clone({ url: "https://github.com/openai/quartz", destination, name: "Quartz" })).rejects.toMatchObject({ code: "TARGET_CHANGED", path: destination })
+    expect(calls).toBe(0)
   })
 
   it("uses the canonical ancestor directory when the requested parent is a link", async ({ skip }) => {
