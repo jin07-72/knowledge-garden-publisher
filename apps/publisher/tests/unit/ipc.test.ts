@@ -197,6 +197,26 @@ describe("secure publisher IPC", () => {
     expect(servicePorts.calls.blogsRename).toHaveBeenCalledOnce()
   })
 
+  it("fails closed instead of exposing a registry record with a relative display path", async () => {
+    const { ipc, servicePorts } = setup()
+    servicePorts.calls.blogsList.mockResolvedValueOnce({
+      version: 1,
+      activeBlogId: "11111111-1111-4111-8111-111111111111",
+      blogs: [{
+        id: "11111111-1111-4111-8111-111111111111",
+        name: "Quartz",
+        path: "relative\\quartz",
+        canonicalPath: String.raw`C:\\Blogs\\quartz`,
+        createdAt: "2026-10-01T00:00:00.000Z",
+        lastOpenedAt: "2026-10-01T00:00:00.000Z",
+      }],
+    })
+    await expect(ipc.invoke(IPC_CHANNELS.requests.blogsList, trustedEvent)).resolves.toEqual({
+      ok: false,
+      error: { code: "INTERNAL_ERROR", message: "The application could not complete the request." },
+    })
+  })
+
   it("keeps the finite blog channel allowlist safe until the optional service is wired", async () => {
     const ipc = new FakeIpcMain()
     const servicePorts = services()

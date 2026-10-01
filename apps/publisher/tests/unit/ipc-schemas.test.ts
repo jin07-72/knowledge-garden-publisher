@@ -192,6 +192,29 @@ describe("IPC success schemas", () => {
     expect(blogSwitchRequestSchema.safeParse({ id }).success).toBe(true)
   })
 
+  it("fails closed when blog response paths or names are unsafe", () => {
+    const responsePaths = [
+      "relative\\quartz",
+      "/tmp/quartz",
+      "C:\\bad\u0001path",
+      "C:\\bad\u0085path",
+      `C:\\${"界".repeat(400)}`,
+    ]
+    const registrySchema = IPC_SUCCESS_SCHEMAS[IPC_CHANNELS.requests.blogsList]
+    const candidateSchema = IPC_SUCCESS_SCHEMAS[IPC_CHANNELS.requests.blogsChooseLocal]
+    const receiptSchema = IPC_SUCCESS_SCHEMAS[IPC_CHANNELS.requests.blogsClone]
+    for (const path of responsePaths) {
+      expect(registrySchema.safeParse({ ...blogRegistry, blogs: [{ ...blog, path }] }).success, path).toBe(false)
+      expect(registrySchema.safeParse({ ...blogRegistry, blogs: [{ ...blog, canonicalPath: path }] }).success, path).toBe(false)
+      expect(candidateSchema.safeParse({ path, inspection: { valid: true, canonicalPath: String.raw`C:\\Blogs\\quartz`, needsInstall: false } }).success, path).toBe(false)
+      expect(candidateSchema.safeParse({ path: String.raw`C:\\Blogs\\quartz`, inspection: { valid: true, canonicalPath: path, needsInstall: false } }).success, path).toBe(false)
+      expect(receiptSchema.safeParse({ canonicalPath: path, owner: "openai", repository: "quartz" }).success, path).toBe(false)
+    }
+    for (const name of [" ", "bad\u0001name", "bad\u0085name", "x".repeat(81)]) {
+      expect(registrySchema.safeParse({ ...blogRegistry, blogs: [{ ...blog, name }] }).success, name).toBe(false)
+    }
+  })
+
   it("rejects unsafe blog request fields and unknown keys", () => {
     const id = "11111111-1111-4111-8111-111111111111"
     const absolutePath = String.raw`C:\\Blogs\\quartz`

@@ -17,11 +17,11 @@ export interface BlogRegistry {
 }
 
 const identifierSchema = z.string().uuid()
-const nameSchema = z
+const nameInputSchema = z
   .string()
-  .min(1)
-  .max(160)
-  .refine((value) => value.trim().length > 0 && !/[\u0000-\u001f\u007f]/.test(value), "Invalid blog name")
+  .max(80)
+  .refine((value) => value.trim().length > 0 && !/[\u0000-\u001f\u007f-\u009f]/.test(value), "Invalid blog name")
+const nameSchema = nameInputSchema.refine((value) => value === value.trim(), "Blog names must be trimmed")
 const pathSchema = z.string().min(1).max(16_384).refine((value) => !value.includes("\u0000"), "Invalid path")
 const timestampSchema = z.string().datetime({ offset: true })
 const leaseSchema = z
@@ -103,7 +103,7 @@ function canonicalKey(path: string): string {
 }
 
 function validName(name: string): string {
-  const parsed = nameSchema.safeParse(name)
+  const parsed = nameInputSchema.safeParse(name)
   if (!parsed.success) throw new Error("Invalid blog name")
   return name.trim()
 }
@@ -390,7 +390,7 @@ export function createBlogRegistry(options: {
       blogs: [
         {
           id,
-          name: basename(location.path) || "Knowledge Garden",
+          name: validName((basename(location.path) || "Knowledge Garden").slice(0, 80)),
           path: location.path,
           canonicalPath: location.canonicalPath,
           createdAt,

@@ -28,7 +28,7 @@ export const markdownSchema = z
   .string()
   .refine((value) => utf8ByteLength(value) <= MAX_MARKDOWN_UTF8_BYTES)
 
-const controlCharacterPattern = /[\u0000-\u001f\u007f]/
+const controlCharacterPattern = /[\u0000-\u001f\u007f-\u009f]/
 const windowsAbsolutePathPattern = /^(?:[A-Za-z]:[\\/]|\\\\[^\\/]+[\\/][^\\/]+)/
 const blogPathSchema = z
   .string()
@@ -273,9 +273,9 @@ export const publishProgressSchema = z
 const blogRecordSchema = z
   .object({
     id: blogIdSchema,
-    name: z.string().min(1).max(80).refine((value) => !controlCharacterPattern.test(value)),
-    path: z.string().min(1).max(1_024).refine((value) => !controlCharacterPattern.test(value)),
-    canonicalPath: z.string().min(1).max(1_024).refine((value) => !controlCharacterPattern.test(value)),
+    name: blogNameSchema,
+    path: blogPathSchema,
+    canonicalPath: blogPathSchema,
     createdAt: z.string().datetime(),
     lastOpenedAt: z.string().datetime(),
   })
@@ -284,14 +284,14 @@ const blogRegistryViewSchema = z
   .object({ version: z.literal(1), activeBlogId: blogIdSchema, blogs: z.array(blogRecordSchema).min(1).max(1_000) })
   .strip()
 const blogCandidateInspectionSchema = z.discriminatedUnion("valid", [
-  z.object({ valid: z.literal(true), canonicalPath: z.string().min(1).max(1_024), needsInstall: z.boolean() }).strip(),
+  z.object({ valid: z.literal(true), canonicalPath: blogPathSchema, needsInstall: z.boolean() }).strip(),
   z.object({ valid: z.literal(false), code: z.string().min(1).max(128), message: z.string().min(1).max(1_000) }).strip(),
 ])
 const blogCandidateSelectionSchema = z
-  .object({ path: z.string().min(1).max(1_024), inspection: blogCandidateInspectionSchema })
+  .object({ path: blogPathSchema, inspection: blogCandidateInspectionSchema })
   .strip()
 const blogImportReceiptSchema = z
-  .object({ canonicalPath: z.string().min(1).max(1_024), owner: z.string().min(1).max(39), repository: z.string().min(1).max(100) })
+  .object({ canonicalPath: blogPathSchema, owner: z.string().min(1).max(39), repository: z.string().min(1).max(100) })
   .strip()
 export const blogImportProgressSchema = z
   .object({ phase: z.enum(["cloning", "installing", "validating", "complete"]), message: z.string().min(1).max(1_000) })

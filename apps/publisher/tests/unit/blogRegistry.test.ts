@@ -34,6 +34,18 @@ function createRegistry(file: string, legacyPath: string) {
 }
 
 describe("blog registry", () => {
+  it("normalizes persisted names and rejects names outside the renderer-safe boundary", async () => {
+    const directory = await createDirectory("garden-blog-registry-state-")
+    const legacyPath = await createGarden("legacy")
+    const secondPath = await createGarden("second")
+    const registry = createRegistry(join(directory, "blogs.v1.json"), legacyPath)
+    const added = await registry.add({ name: "  Second  ", path: secondPath })
+    expect(added.blogs[1]).toMatchObject({ name: "Second" })
+    for (const name of ["", "   ", "bad\u0001name", "bad\u0085name", "x".repeat(81)]) {
+      await expect(registry.rename(added.blogs[1]!.id, name)).rejects.toThrow("Invalid blog name")
+    }
+  })
+
   it("migrates the legacy garden as the first active blog", async () => {
     const directory = await createDirectory("garden-blog-registry-state-")
     const legacyPath = await createGarden("legacy")
