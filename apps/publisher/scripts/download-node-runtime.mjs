@@ -9,6 +9,8 @@ export const NODE_VERSION = "22.16.0"
 export const NODE_ARCHIVE = `node-v${NODE_VERSION}-win-x64.zip`
 export const EXPECTED_NODE_ARCHIVE_SHA256 =
   "21c2d9735c80b8f86dab19305aa6a9f6f59bbc808f68de3eef09d5832e3bfbbd"
+export const EXPECTED_RUNTIME_TREE_SHA256 =
+  "ab523006bc86ba461c6d541638cf5c5a633e4ba25473dd16057e8133ff44a660"
 export const RUNTIME_MANIFEST = ".garden-publisher-node-runtime.json"
 const NODE_BASE_URL = `https://nodejs.org/dist/v${NODE_VERSION}`
 const MAX_ARCHIVE_BYTES = 128 * 1024 * 1024
@@ -248,7 +250,23 @@ function identitiesMatch(expected, actual) {
   })
 }
 
-export async function isVerifiedRuntime(root) {
+export function runtimeTreeSha256(files) {
+  const hash = createHash("sha256")
+  for (const path of Object.keys(files).sort()) {
+    const identity = files[path]
+    hash.update(String(Buffer.byteLength(path)))
+    hash.update(":")
+    hash.update(path)
+    hash.update(":")
+    hash.update(String(identity.size))
+    hash.update(":")
+    hash.update(identity.sha256)
+    hash.update("\n")
+  }
+  return hash.digest("hex")
+}
+
+export async function isVerifiedRuntime(root, expectedTreeSha256 = EXPECTED_RUNTIME_TREE_SHA256) {
   try {
     const rootDetails = await lstat(root)
     if (!rootDetails.isDirectory() || rootDetails.isSymbolicLink()) return false
@@ -270,7 +288,8 @@ export async function isVerifiedRuntime(root) {
       manifest?.archiveSha256 === EXPECTED_NODE_ARCHIVE_SHA256 &&
       Object.hasOwn(files, "node.exe") &&
       Object.hasOwn(files, "node_modules/npm/bin/npm-cli.js") &&
-      identitiesMatch(manifest?.files, files)
+      identitiesMatch(manifest?.files, files) &&
+      runtimeTreeSha256(files) === expectedTreeSha256
     )
   } catch {
     return false
@@ -297,6 +316,7 @@ export async function downloadNodeRuntime({
   platform = process.platform,
   publisherRoot = resolve(dirname(fileURLToPath(import.meta.url)), ".."),
   extractImpl = extractZip,
+  expectedRuntimeTreeSha256 = EXPECTED_RUNTIME_TREE_SHA256,
 } = {}) {
   if (platform !== "win32") {
     throw new Error("The bundled Node runtime downloader only supports Windows packaging.")
@@ -304,7 +324,7 @@ export async function downloadNodeRuntime({
   const vendor = join(publisherRoot, "vendor")
   const target = join(vendor, "node")
   await mkdir(vendor, { recursive: true })
-  if (await isVerifiedRuntime(target)) return target
+  if (await isVerifiedRuntime(target, expectedRuntimeTreeSha256)) return target
 
   const lock = join(vendor, ".node-install.lock")
   await acquireLock(lock)
@@ -314,7 +334,7 @@ export async function downloadNodeRuntime({
   const stage = join(vendor, `.n-${token}`)
   const stale = join(vendor, `.node-stale-${token}`)
   try {
-    if (await isVerifiedRuntime(target)) return target
+    if (await isVerifiedRuntime(target, expectedRuntimeTreeSha256)) return target
     await mkdir(stage)
     const [archiveResponse, checksumsResponse] = await Promise.all([
       fetchImpl(`${NODE_BASE_URL}/${NODE_ARCHIVE}`),
@@ -344,7 +364,8 @@ export async function downloadNodeRuntime({
     if (
       !files ||
       !Object.hasOwn(files, "node.exe") ||
-      !Object.hasOwn(files, "node_modules/npm/bin/npm-cli.js")
+      !Object.hasOwn(files, "node_modules/npm/bin/npm-cli.js") ||
+      runtimeTreeSha256(files) !== expectedRuntimeTreeSha256
     ) {
       throw new Error("The extracted Node runtime is incomplete.")
     }
@@ -359,7 +380,7 @@ export async function downloadNodeRuntime({
       })}\n`,
       { flag: "wx" },
     )
-    if (!(await isVerifiedRuntime(prepared)))
+    if (!(await isVerifiedRuntime(prepared, expectedRuntimeTreeSha256)))
       throw new Error("The extracted Node runtime is incomplete.")
     let movedStale = false
     try {

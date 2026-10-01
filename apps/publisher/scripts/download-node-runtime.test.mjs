@@ -13,6 +13,7 @@ import {
   NODE_VERSION,
   parseExpectedChecksum,
   RUNTIME_MANIFEST,
+  runtimeTreeSha256,
   verifySha256,
 } from "./download-node-runtime.mjs"
 
@@ -28,6 +29,7 @@ async function runtimeFixture({
   version = NODE_VERSION,
   tamper = false,
   tamperDependency = false,
+  forgeManifest = false,
 } = {}) {
   const publisherRoot = await mkdtemp(join(tmpdir(), "node-runtime-reuse-"))
   temporaryDirectories.push(publisherRoot)
@@ -40,9 +42,33 @@ async function runtimeFixture({
   const nodeBytes = Buffer.from("verified node")
   const npmBytes = Buffer.from("verified npm")
   const dependencyBytes = Buffer.from("verified dependency")
+  const writtenDependencyBytes = tamperDependency
+    ? Buffer.from("tampered dependency")
+    : dependencyBytes
   await writeFile(nodePath, tamper ? "tampered node" : nodeBytes)
   await writeFile(npmPath, npmBytes)
-  await writeFile(dependencyPath, tamperDependency ? "tampered dependency" : dependencyBytes)
+  await writeFile(dependencyPath, writtenDependencyBytes)
+  const expectedFiles = {
+    "node.exe": {
+      size: nodeBytes.byteLength,
+      sha256: createHash("sha256").update(nodeBytes).digest("hex"),
+    },
+    "node_modules/npm/bin/npm-cli.js": {
+      size: npmBytes.byteLength,
+      sha256: createHash("sha256").update(npmBytes).digest("hex"),
+    },
+    "node_modules/npm/node_modules/example/index.js": {
+      size: dependencyBytes.byteLength,
+      sha256: createHash("sha256").update(dependencyBytes).digest("hex"),
+    },
+  }
+  const manifestFiles = structuredClone(expectedFiles)
+  if (forgeManifest) {
+    manifestFiles["node_modules/npm/node_modules/example/index.js"] = {
+      size: writtenDependencyBytes.byteLength,
+      sha256: createHash("sha256").update(writtenDependencyBytes).digest("hex"),
+    }
+  }
   await writeFile(
     join(runtime, RUNTIME_MANIFEST),
     JSON.stringify({
@@ -50,23 +76,10 @@ async function runtimeFixture({
       nodeVersion: version,
       archive: NODE_ARCHIVE,
       archiveSha256: EXPECTED_NODE_ARCHIVE_SHA256,
-      files: {
-        "node.exe": {
-          size: nodeBytes.byteLength,
-          sha256: createHash("sha256").update(nodeBytes).digest("hex"),
-        },
-        "node_modules/npm/bin/npm-cli.js": {
-          size: npmBytes.byteLength,
-          sha256: createHash("sha256").update(npmBytes).digest("hex"),
-        },
-        "node_modules/npm/node_modules/example/index.js": {
-          size: dependencyBytes.byteLength,
-          sha256: createHash("sha256").update(dependencyBytes).digest("hex"),
-        },
-      },
+      files: manifestFiles,
     }),
   )
-  return { publisherRoot, runtime }
+  return { publisherRoot, runtime, expectedRuntimeTreeSha256: runtimeTreeSha256(expectedFiles) }
 }
 
 describe("portable Node runtime download", () => {
@@ -139,7 +152,12 @@ describe("portable Node runtime download", () => {
     const fixture = await runtimeFixture()
     const fetchImpl = vi.fn()
     await expect(
-      downloadNodeRuntime({ platform: "win32", publisherRoot: fixture.publisherRoot, fetchImpl }),
+      downloadNodeRuntime({
+        platform: "win32",
+        publisherRoot: fixture.publisherRoot,
+        fetchImpl,
+        expectedRuntimeTreeSha256: fixture.expectedRuntimeTreeSha256,
+      }),
     ).resolves.toBe(fixture.runtime)
     expect(fetchImpl).not.toHaveBeenCalled()
   })
@@ -148,6 +166,10 @@ describe("portable Node runtime download", () => {
     ["stale version", { version: "22.15.0" }],
     ["tampered node", { tamper: true }],
     ["tampered transitive npm module", { tamperDependency: true }],
+    [
+      "tampered transitive npm module with a forged manifest",
+      { tamperDependency: true, forgeManifest: true },
+    ],
   ])("redownloads instead of reusing a %s runtime", async (_label, options) => {
     const fixture = await runtimeFixture(options)
     const fetchImpl = vi.fn(async () => ({
@@ -157,7 +179,12 @@ describe("portable Node runtime download", () => {
       arrayBuffer: async () => Buffer.from("not the pinned archive"),
     }))
     await expect(
-      downloadNodeRuntime({ platform: "win32", publisherRoot: fixture.publisherRoot, fetchImpl }),
+      downloadNodeRuntime({
+        platform: "win32",
+        publisherRoot: fixture.publisherRoot,
+        fetchImpl,
+        expectedRuntimeTreeSha256: fixture.expectedRuntimeTreeSha256,
+      }),
     ).rejects.toThrow(/checksum|SHASUM/i)
     expect(fetchImpl).toHaveBeenCalledTimes(2)
   })
