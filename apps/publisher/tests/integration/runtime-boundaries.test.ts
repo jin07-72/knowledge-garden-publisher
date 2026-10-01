@@ -7,6 +7,56 @@ import { trustedRendererArgument } from "../../src/main/rendererTrust"
 const publisherRoot = process.cwd()
 const electronVite = "node_modules/electron-vite/bin/electron-vite.js"
 
+function maskStringsAndComments(source: string): string {
+  let masked = ""
+  for (let index = 0; index < source.length;) {
+    const character = source[index]!
+    const next = source[index + 1]
+    if (character === "/" && next === "/") {
+      while (index < source.length && source[index] !== "\n") {
+        masked += " "
+        index += 1
+      }
+      continue
+    }
+    if (character === "/" && next === "*") {
+      masked += "  "
+      index += 2
+      while (index < source.length && !(source[index] === "*" && source[index + 1] === "/")) {
+        masked += source[index] === "\n" ? "\n" : " "
+        index += 1
+      }
+      if (index < source.length) {
+        masked += "  "
+        index += 2
+      }
+      continue
+    }
+    if (character === '"' || character === "'" || character === "`") {
+      const quote = character
+      masked += quote
+      index += 1
+      while (index < source.length) {
+        const current = source[index]!
+        masked += current === "\n" ? "\n" : " "
+        index += 1
+        if (current === "\\" && index < source.length) {
+          masked += source[index] === "\n" ? "\n" : " "
+          index += 1
+        } else if (current === quote) break
+      }
+      continue
+    }
+    masked += character
+    index += 1
+  }
+  return masked
+}
+
+function hasStaticEsmDeclaration(source: string): boolean {
+  return /(?:^|[;}\n])\s*(?:import\s*(?:["']|[\w*$\s{},]+\bfrom\s*["'])|export\s*(?:default\b|(?:const|let|var|function|class)\b|\{|\*))/.test(maskStringsAndComments(source))
+}
+
 describe("production runtime boundaries", () => {
   let mainOutput: string
   let preloadOutput: string
@@ -25,8 +75,24 @@ describe("production runtime boundaries", () => {
     expect(mainOutput).toMatch(/(?:from|require)\s*\(?\s*["']electron["']/)
   })
 
+  it("detects static ESM declarations without matching channel strings, comments, or property names", () => {
+    for (const source of [
+      'const channel = "garden:blogs:cancel-import";',
+      'const event = "garden:event:blogs-import-progress";',
+      "// export is documentation only\nconst api = { import: false, export: false };",
+      'const text = "export default false"; const value = { import: true };',
+      "const text = `\nexport default false\n`;",
+    ]) expect(hasStaticEsmDeclaration(source), source).toBe(false)
+    for (const source of [
+      'import { api } from "garden";',
+      'import"garden";const api=1;',
+      'const api=1;export{api};',
+      'export default function api() {}',
+    ]) expect(hasStaticEsmDeclaration(source), source).toBe(true)
+  })
+
   it("emits the sandbox preload as a CommonJS script", () => {
-    expect(preloadOutput).not.toMatch(/\b(?:import|export)\b/)
+    expect(hasStaticEsmDeclaration(preloadOutput)).toBe(false)
     const required: string[] = []
     const exposed: Array<[string, unknown]> = []
     const electron = {

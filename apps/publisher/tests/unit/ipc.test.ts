@@ -240,7 +240,9 @@ describe("secure publisher IPC", () => {
       expect(JSON.stringify(result)).not.toContain("token")
     }
     const { ipc, servicePorts } = setup()
-    servicePorts.calls.blogsClone.mockRejectedValueOnce(new Error("secret"))
+    servicePorts.calls.blogsClone.mockRejectedValueOnce(
+      new BlogImportError("UNMAPPED" as BlogImportErrorCode, "secret"),
+    )
     await expect(
       ipc.invoke(IPC_CHANNELS.requests.blogsClone, trustedEvent, {
         url: "https://github.com/openai/quartz",
@@ -283,8 +285,6 @@ describe("secure publisher IPC", () => {
     const ipc = new FakeIpcMain()
     const servicePorts = services()
     const eventTargets = vi.fn((): readonly IpcEventTarget[] => [])
-    const untrustedSend = vi.fn()
-    const untrustedTarget: IpcEventTarget = { id: 999, isDestroyed: () => false, send: untrustedSend }
     registerPublisherIpc({
       ipcMain: ipc,
       services: servicePorts,
@@ -293,7 +293,6 @@ describe("secure publisher IPC", () => {
     })
     servicePorts.emitBlogProgress({ phase: "cloning", message: "Cloning blog." })
     expect(eventTargets).toHaveBeenCalledOnce()
-    expect(untrustedTarget.send).not.toHaveBeenCalled()
   })
   it("registers only the explicit request allowlist", () => {
     const { ipc, dispose } = setup()
