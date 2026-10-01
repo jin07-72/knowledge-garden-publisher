@@ -1,6 +1,6 @@
-import { mkdir, readFile, realpath, rename, unlink, writeFile } from "node:fs/promises"
+import { link, mkdir, open, readFile, realpath, rename, unlink } from "node:fs/promises"
 import { randomUUID } from "node:crypto"
-import { basename, dirname, join } from "node:path"
+import { basename, dirname, join, resolve } from "node:path"
 import { z } from "zod"
 
 export interface BlogRecord {
@@ -35,6 +35,30 @@ const nameSchema = z
   .refine((value) => value.trim().length > 0 && !/[\u0000-\u001f\u007f]/.test(value), "Invalid blog name")
 const pathSchema = z.string().min(1).max(16_384).refine((value) => !value.includes("\u0000"), "Invalid path")
 const timestampSchema = z.string().datetime({ offset: true })
+const leaseSchema = z
+  .object({
+    version: z.literal(1),
+    token: z.string().uuid(),
+    pid: z.number().int().positive(),
+    expiresAt: z.number().finite(),
+  })
+  .strict()
+
+interface RegistryFileHandle {
+  writeFile(data: string): Promise<void>
+  sync(): Promise<void>
+  close(): Promise<void>
+}
+
+interface RegistryFileSystem {
+  readonly open?: (path: string, flags: "r" | "wx", mode?: number) => Promise<RegistryFileHandle>
+}
+
+type RegistryOpen = NonNullable<RegistryFileSystem["open"]>
+
+const registryFileQueues = new Map<string, Promise<void>>()
+const registryLeaseMs = 1_000
+const registryLeaseWaitMs = 10_000
 
 const blogRecordSchema = z
   .object({
@@ -104,46 +128,232 @@ function isMissingFile(error: unknown): boolean {
   return typeof error === "object" && error !== null && "code" in error && error.code === "ENOENT"
 }
 
+function isAlreadyExists(error: unknown): boolean {
+  return typeof error === "object" && error !== null && "code" in error && error.code === "EEXIST"
+}
+
+function isProcessAlive(pid: number): boolean {
+  try {
+    process.kill(pid, 0)
+    return true
+  } catch (error) {
+    return (error as NodeJS.ErrnoException).code !== "ESRCH"
+  }
+}
+
+function delay(milliseconds: number): Promise<void> {
+  return new Promise((done) => setTimeout(done, milliseconds))
+}
+
+function registryFileKey(file: string): string {
+  return resolve(file).toLocaleLowerCase("en-US")
+}
+
+async function canonicalRegistryFile(file: string): Promise<string> {
+  const absolute = resolve(file)
+  try {
+    return await realpath(absolute)
+  } catch (error) {
+    if (!isMissingFile(error)) throw error
+  }
+
+  const directory = dirname(absolute)
+  await mkdir(directory, { recursive: true })
+  return join(await realpath(directory), basename(absolute))
+}
+
+function runForRegistryFile<T>(file: string, operation: () => Promise<T>): Promise<T> {
+  const key = registryFileKey(file)
+  const previous = registryFileQueues.get(key) ?? Promise.resolve()
+  const result = previous.then(operation, operation)
+  const tail = result.then(
+    () => undefined,
+    () => undefined,
+  )
+  registryFileQueues.set(key, tail)
+  void tail.then(() => {
+    if (registryFileQueues.get(key) === tail) registryFileQueues.delete(key)
+  })
+  return result
+}
+
+async function syncDirectory(directory: string, openFile: RegistryOpen = open): Promise<void> {
+  let handle: RegistryFileHandle | undefined
+  try {
+    handle = await openFile(directory, "r")
+    await handle.sync()
+  } catch (error) {
+    if (
+      process.platform === "win32" &&
+      ["EINVAL", "EISDIR", "EPERM", "ENOTSUP"].includes((error as NodeJS.ErrnoException).code ?? "")
+    )
+      return
+    throw error
+  } finally {
+    await handle?.close().catch(() => undefined)
+  }
+}
+
+async function lockIsStale(lock: string): Promise<boolean> {
+  let source: string
+  try {
+    source = await readFile(lock, "utf8")
+  } catch (error) {
+    if (isMissingFile(error)) return false
+    throw error
+  }
+
+  try {
+    const lease = leaseSchema.safeParse(JSON.parse(source))
+    if (lease.success) return Date.now() >= lease.data.expiresAt && !isProcessAlive(lease.data.pid)
+  } catch {
+    // Leases are published only after their candidate file is fully synced. An
+    // unrecognized lock is therefore never reclaimed by this registry.
+  }
+  return false
+}
+
+async function hasReclaimClaim(claim: string): Promise<boolean> {
+  try {
+    await readFile(claim, "utf8")
+  } catch (error) {
+    if (isMissingFile(error)) return false
+    throw error
+  }
+
+  if (!await lockIsStale(claim)) return true
+  await unlink(claim).catch((error: NodeJS.ErrnoException) => {
+    if (error.code !== "ENOENT") throw error
+  })
+  return false
+}
+
+async function createLease(lock: string, openFile: RegistryOpen): Promise<string> {
+  const token = randomUUID()
+  const candidate = `${lock}.candidate-${token}`
+  let handle: RegistryFileHandle | undefined
+  let createdCandidate = false
+  try {
+    handle = await openFile(candidate, "wx", 0o600)
+    createdCandidate = true
+    await handle.writeFile(
+      JSON.stringify({ version: 1, token, pid: process.pid, expiresAt: Date.now() + registryLeaseMs }),
+    )
+    await handle.sync()
+    await handle.close()
+    handle = undefined
+    await link(candidate, lock)
+    return token
+  } catch (error) {
+    await handle?.close().catch(() => undefined)
+    throw error
+  } finally {
+    if (createdCandidate) await unlink(candidate).catch(() => undefined)
+  }
+}
+
+async function acquireLease(file: string, openFile: RegistryOpen): Promise<{ readonly lock: string; readonly token: string }> {
+  const directory = dirname(file)
+  const lock = join(directory, `.${basename(file)}.lock`)
+  const reclaim = `${lock}.reclaim`
+  const deadline = Date.now() + registryLeaseWaitMs
+  await mkdir(directory, { recursive: true })
+
+  for (;;) {
+    if (await hasReclaimClaim(reclaim)) {
+      if (Date.now() >= deadline) throw new Error("Blog registry is locked")
+      await delay(10)
+      continue
+    }
+
+    try {
+      return { lock, token: await createLease(lock, openFile) }
+    } catch (error) {
+      if (!isAlreadyExists(error)) throw error
+    }
+
+    if (!(await lockIsStale(lock))) {
+      if (Date.now() >= deadline) throw new Error("Blog registry is locked")
+      await delay(10)
+      continue
+    }
+
+    let reclaimToken: string | undefined
+    let claimed = false
+    try {
+      reclaimToken = await createLease(reclaim, openFile)
+      claimed = true
+      if (await lockIsStale(lock)) await unlink(lock)
+    } catch (error) {
+      if (!isAlreadyExists(error)) throw error
+    } finally {
+      if (claimed) await releaseLease(reclaim, reclaimToken!)
+    }
+  }
+}
+
+async function releaseLease(lock: string, token: string): Promise<void> {
+  try {
+    const lease = leaseSchema.safeParse(JSON.parse(await readFile(lock, "utf8")))
+    if (lease.success && lease.data.token === token) await unlink(lock)
+  } catch (error) {
+    if (!isMissingFile(error)) throw error
+  }
+}
+
 export function createBlogRegistry(options: {
   readonly file: string
   readonly legacyPath: string
   readonly now?: () => Date
   readonly uuid?: () => string
+  readonly fileSystem?: RegistryFileSystem
 }): BlogRegistry {
   const now = options.now ?? (() => new Date())
   const uuid = options.uuid ?? randomUUID
-  let operationQueue: Promise<void> = Promise.resolve()
+  const openFile = options.fileSystem?.open ?? open
 
   const timestamp = () => now().toISOString()
 
-  function runExclusive<T>(operation: () => Promise<T>): Promise<T> {
-    const result = operationQueue.then(operation, operation)
-    operationQueue = result.then(
-      () => undefined,
-      () => undefined,
-    )
-    return result
+  function runExclusive<T>(operation: (file: string) => Promise<T>): Promise<T> {
+    return canonicalRegistryFile(options.file).then((file) => runForRegistryFile(file, async () => {
+      const lease = await acquireLease(file, openFile)
+      try {
+        return await operation(file)
+      } finally {
+        await releaseLease(lease.lock, lease.token)
+      }
+    }))
   }
 
   async function canonicalize(path: string): Promise<{ readonly path: string; readonly canonicalPath: string }> {
     return { path, canonicalPath: await realpath(path) }
   }
 
-  async function persist(state: BlogRegistryState): Promise<void> {
-    const directory = dirname(options.file)
-    const temporary = join(directory, `.${basename(options.file)}.${randomUUID()}.tmp`)
+  async function persist(file: string, state: BlogRegistryState): Promise<void> {
+    const directory = dirname(file)
+    const temporary = join(directory, `.${basename(file)}.${randomUUID()}.tmp`)
     await mkdir(directory, { recursive: true })
+    let handle: RegistryFileHandle | undefined
+    let createdTemporary = false
+    let published = false
 
     try {
-      await writeFile(temporary, JSON.stringify(state), { encoding: "utf8", mode: 0o600 })
-      await rename(temporary, options.file)
-    } catch (error) {
-      await unlink(temporary).catch(() => undefined)
-      throw error
+      handle = await openFile(temporary, "wx", 0o600)
+      createdTemporary = true
+      await handle.writeFile(JSON.stringify(state))
+      await handle.sync()
+      await handle.close()
+      handle = undefined
+      await rename(temporary, file)
+      published = true
+      await syncDirectory(directory, openFile)
+    } finally {
+      await handle?.close().catch(() => undefined)
+      if (createdTemporary && !published) await unlink(temporary).catch(() => undefined)
     }
   }
 
-  async function migrateLegacy(): Promise<BlogRegistryState> {
+  async function migrateLegacy(file: string): Promise<BlogRegistryState> {
     const location = await canonicalize(options.legacyPath)
     const createdAt = timestamp()
     const id = validIdentifier(uuid())
@@ -161,25 +371,31 @@ export function createBlogRegistry(options: {
         },
       ],
     }
-    await persist(migrated)
+    await persist(file, migrated)
     return migrated
   }
 
-  async function readState(): Promise<BlogRegistryState> {
+  async function readState(file: string): Promise<BlogRegistryState> {
     let source: string
     try {
-      source = await readFile(options.file, "utf8")
+      source = await readFile(file, "utf8")
     } catch (error) {
-      if (isMissingFile(error)) return migrateLegacy()
+      if (isMissingFile(error)) return migrateLegacy(file)
       throw error
     }
 
     try {
       const parsed = registryStateSchema.safeParse(JSON.parse(source))
       if (!parsed.success) throw parsed.error
+      await Promise.all(
+        parsed.data.blogs.map(async (blog) => {
+          if (canonicalKey(await realpath(blog.path)) !== canonicalKey(blog.canonicalPath))
+            throw new Error("Stored canonical path does not match display path")
+        }),
+      )
       return parsed.data
     } catch (error) {
-      throw new BlogRegistryInvalidError(options.file, error)
+      throw new BlogRegistryInvalidError(file, error)
     }
   }
 
@@ -194,8 +410,8 @@ export function createBlogRegistry(options: {
     load: () => runExclusive(readState),
 
     async add(input) {
-      return runExclusive(async () => {
-        const state = await readState()
+      return runExclusive(async (file) => {
+        const state = await readState(file)
         const name = validName(input.name)
         const location = await canonicalize(input.path)
         if (state.blogs.some((blog) => canonicalKey(blog.canonicalPath) === canonicalKey(location.canonicalPath))) {
@@ -216,27 +432,27 @@ export function createBlogRegistry(options: {
           lastOpenedAt: createdAt,
         }
         const next: BlogRegistryState = { ...state, blogs: [...state.blogs, added] }
-        await persist(next)
+        await persist(file, next)
         return next
       })
     },
 
     async rename(id, name) {
-      return runExclusive(async () => {
-        const state = await readState()
+      return runExclusive(async (file) => {
+        const state = await readState(file)
         const blog = await requireBlog(state, id)
         const next: BlogRegistryState = {
           ...state,
           blogs: state.blogs.map((candidate) => (candidate.id === blog.id ? { ...candidate, name: validName(name) } : candidate)),
         }
-        await persist(next)
+        await persist(file, next)
         return next
       })
     },
 
     async activate(id) {
-      return runExclusive(async () => {
-        const state = await readState()
+      return runExclusive(async (file) => {
+        const state = await readState(file)
         const blog = await requireBlog(state, id)
         const next: BlogRegistryState = {
           ...state,
@@ -245,14 +461,14 @@ export function createBlogRegistry(options: {
             candidate.id === blog.id ? { ...candidate, lastOpenedAt: timestamp() } : candidate,
           ),
         }
-        await persist(next)
+        await persist(file, next)
         return next
       })
     },
 
     async remove(id) {
-      return runExclusive(async () => {
-        const state = await readState()
+      return runExclusive(async (file) => {
+        const state = await readState(file)
         const blog = await requireBlog(state, id)
         if (blog.id === state.activeBlogId) throw new Error("Cannot remove the active blog")
 
@@ -260,14 +476,14 @@ export function createBlogRegistry(options: {
           ...state,
           blogs: state.blogs.filter((candidate) => candidate.id !== blog.id),
         }
-        await persist(next)
+        await persist(file, next)
         return next
       })
     },
 
     async relocate(id, path) {
-      return runExclusive(async () => {
-        const state = await readState()
+      return runExclusive(async (file) => {
+        const state = await readState(file)
         const blog = await requireBlog(state, id)
         const location = await canonicalize(path)
         if (
@@ -285,7 +501,7 @@ export function createBlogRegistry(options: {
             candidate.id === blog.id ? { ...candidate, ...location } : candidate,
           ),
         }
-        await persist(next)
+        await persist(file, next)
         return next
       })
     },

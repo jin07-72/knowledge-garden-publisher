@@ -1,4 +1,4 @@
-import { mkdir, mkdtemp, readFile, readdir, realpath, rm, stat, writeFile } from "node:fs/promises"
+import { mkdir, mkdtemp, open as openFile, readFile, readdir, realpath, rm, stat, writeFile } from "node:fs/promises"
 import { tmpdir } from "node:os"
 import { basename, join, relative } from "node:path"
 import { afterEach, describe, expect, it } from "vitest"
@@ -81,6 +81,100 @@ describe("blog registry", () => {
     })
   })
 
+  it("serializes concurrent registrations from separate registry instances", async () => {
+    const directory = await createDirectory("garden-blog-registry-state-")
+    const legacyPath = await createGarden("legacy")
+    const secondPath = await createGarden("second")
+    const thirdPath = await createGarden("third")
+    const file = join(directory, "blogs.v1.json")
+    let identifier = 0
+    const uuid = () => `00000000-0000-4000-8000-${String(++identifier).padStart(12, "0")}`
+    const first = createBlogRegistry({ file, legacyPath, now: () => new Date("2026-10-01T00:00:00.000Z"), uuid })
+    const second = createBlogRegistry({ file, legacyPath, now: () => new Date("2026-10-01T00:00:00.000Z"), uuid })
+    await first.load()
+
+    await Promise.all([
+      first.add({ name: "Second", path: secondPath }),
+      second.add({ name: "Third", path: thirdPath }),
+    ])
+
+    const state = await first.load()
+    expect(state.blogs).toHaveLength(3)
+    expect(state.blogs.map((blog) => blog.path)).toEqual(expect.arrayContaining([legacyPath, secondPath, thirdPath]))
+  })
+
+  it("retains the previous registry when syncing a temporary write fails", async () => {
+    const directory = await createDirectory("garden-blog-registry-state-")
+    const legacyPath = await createGarden("legacy")
+    const secondPath = await createGarden("second")
+    const file = join(directory, "blogs.v1.json")
+    let failTemporarySync = false
+    let identifier = 0
+    const fileSystem = {
+      open: async (path: string, flags: "r" | "wx", mode?: number) => {
+        const handle = await openFile(path, flags, mode)
+        if (!failTemporarySync || flags !== "wx" || !path.endsWith(".tmp")) return handle
+        return {
+          writeFile: handle.writeFile.bind(handle),
+          sync: async () => {
+            throw new Error("simulated sync failure")
+          },
+          close: handle.close.bind(handle),
+        }
+      },
+    }
+    const registryOptions: Parameters<typeof createBlogRegistry>[0] & { readonly fileSystem: typeof fileSystem } = {
+      file,
+      legacyPath,
+      now: () => new Date("2026-10-01T00:00:00.000Z"),
+      uuid: () => `00000000-0000-4000-8000-${String(++identifier).padStart(12, "0")}`,
+      fileSystem,
+    }
+    const registry = createBlogRegistry(registryOptions)
+    await registry.load()
+    const previous = await readFile(file, "utf8")
+    failTemporarySync = true
+
+    await expect(registry.add({ name: "Second", path: secondPath })).rejects.toThrow("simulated sync failure")
+    await expect(readFile(file, "utf8")).resolves.toBe(previous)
+    await expect(readdir(directory)).resolves.toEqual([basename(file)])
+  })
+
+  it("does not delete a temporary file it failed to create exclusively", async () => {
+    const directory = await createDirectory("garden-blog-registry-state-")
+    const legacyPath = await createGarden("legacy")
+    const secondPath = await createGarden("second")
+    const file = join(directory, "blogs.v1.json")
+    let failTemporaryOpen = false
+    let foreignTemporary: string | undefined
+    let identifier = 0
+    const fileSystem = {
+      open: async (path: string, flags: "r" | "wx", mode?: number) => {
+        if (failTemporaryOpen && flags === "wx" && path.endsWith(".tmp")) {
+          await writeFile(path, "foreign temporary data")
+          foreignTemporary = path
+          throw Object.assign(new Error("temporary already exists"), { code: "EEXIST" })
+        }
+        return openFile(path, flags, mode)
+      },
+    }
+    const registryOptions: Parameters<typeof createBlogRegistry>[0] & { readonly fileSystem: typeof fileSystem } = {
+      file,
+      legacyPath,
+      now: () => new Date("2026-10-01T00:00:00.000Z"),
+      uuid: () => `00000000-0000-4000-8000-${String(++identifier).padStart(12, "0")}`,
+      fileSystem,
+    }
+    const registry = createBlogRegistry(registryOptions)
+    await registry.load()
+    const previous = await readFile(file, "utf8")
+    failTemporaryOpen = true
+
+    await expect(registry.add({ name: "Second", path: secondPath })).rejects.toMatchObject({ code: "EEXIST" })
+    await expect(readFile(file, "utf8")).resolves.toBe(previous)
+    await expect(readFile(foreignTemporary!, "utf8")).resolves.toBe("foreign temporary data")
+  })
+
   it("preserves a relative display path while storing its real canonical path", async () => {
     const directory = await createDirectory("garden-blog-registry-state-")
     const legacyPath = await createGarden("legacy")
@@ -149,6 +243,31 @@ describe("blog registry", () => {
 
     await expect(registry.load()).rejects.toMatchObject({ code: "BLOG_REGISTRY_INVALID", path: file })
     await expect(readFile(file, "utf8")).resolves.toBe("{broken")
+  })
+
+  it("rejects a schema-valid canonical path that no longer matches the display path", async () => {
+    const directory = await createDirectory("garden-blog-registry-state-")
+    const legacyPath = await createGarden("legacy")
+    const unrelatedPath = await createGarden("unrelated")
+    const file = join(directory, "blogs.v1.json")
+    const source = JSON.stringify({
+      version: 1,
+      activeBlogId: "00000000-0000-4000-8000-000000000001",
+      blogs: [
+        {
+          id: "00000000-0000-4000-8000-000000000001",
+          name: "Legacy",
+          path: legacyPath,
+          canonicalPath: await realpath(unrelatedPath),
+          createdAt: "2026-10-01T00:00:00.000Z",
+          lastOpenedAt: "2026-10-01T00:00:00.000Z",
+        },
+      ],
+    })
+    await writeFile(file, source)
+
+    await expect(createRegistry(file, legacyPath).load()).rejects.toMatchObject({ code: "BLOG_REGISTRY_INVALID", path: file })
+    await expect(readFile(file, "utf8")).resolves.toBe(source)
   })
 
   it("rejects persisted registry data with duplicate ids", async () => {
