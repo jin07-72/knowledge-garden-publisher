@@ -42,6 +42,12 @@ const blogNameSchema = z
   .refine((value) => value.trim().length > 0)
   .refine((value) => !controlCharacterPattern.test(value))
   .transform((value) => value.trim())
+const blogResponseNameSchema = z
+  .string()
+  .max(80)
+  .refine((value) => value.trim().length > 0)
+  .refine((value) => value === value.trim())
+  .refine((value) => !controlCharacterPattern.test(value))
 const blogIdSchema = z.string().uuid()
 const blogUrlSchema = z
   .string()
@@ -273,7 +279,7 @@ export const publishProgressSchema = z
 const blogRecordSchema = z
   .object({
     id: blogIdSchema,
-    name: blogNameSchema,
+    name: blogResponseNameSchema,
     path: blogPathSchema,
     canonicalPath: blogPathSchema,
     createdAt: z.string().datetime(),

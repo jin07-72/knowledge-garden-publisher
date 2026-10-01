@@ -2,6 +2,7 @@ import { z } from "zod"
 import {
   IPC_CHANNELS,
   MANAGED_NOTE_PATH_PATTERN,
+  type AppError,
   type BlogAddLocalRequest,
   type BlogCandidateInspection,
   type BlogCandidateSelection,
@@ -63,6 +64,7 @@ import {
   publishProgressSchema,
   trashRecoveryUpdateSchema,
 } from "../shared/ipcSchemas"
+import { BlogImportError, type BlogImportErrorCode } from "./services/blogImport"
 
 type RequestHandler = (event: unknown, request?: unknown) => Promise<unknown>
 
@@ -250,7 +252,24 @@ function serviceUnavailable(): never {
   throw { code: "SERVICE_UNAVAILABLE", message: "Blog management is not available." }
 }
 
-function serializeFailure(error: unknown): IpcResult<never> {
+const blogImportFailureMap: Readonly<Record<BlogImportErrorCode, AppError>> = {
+  DESTINATION_EXISTS: { code: "BLOG_DESTINATION_EXISTS", message: "The destination already exists." },
+  DESTINATION_INVALID: { code: "BLOG_DESTINATION_INVALID", message: "The selected destination is unavailable." },
+  TARGET_CHANGED: { code: "BLOG_TARGET_CHANGED", message: "The selected destination changed unexpectedly." },
+  IMPORT_ACTIVE: { code: "BLOG_IMPORT_ACTIVE", message: "Another blog import is already running." },
+  CANCELLED: { code: "BLOG_IMPORT_CANCELLED", message: "Blog import was cancelled." },
+  CLONE_FAILED: { code: "BLOG_CLONE_FAILED", message: "Git could not clone the blog repository." },
+  INSTALL_FAILED: { code: "BLOG_INSTALL_FAILED", message: "Blog dependencies could not be installed." },
+  VALIDATION_FAILED: { code: "BLOG_VALIDATION_FAILED", message: "The blog could not be validated." },
+  IMPORT_UNAVAILABLE: { code: "BLOG_IMPORT_UNAVAILABLE", message: "Blog import requires an application restart." },
+  INVALID_REPOSITORY_URL: { code: "INVALID_INPUT", message: "The request is invalid." },
+}
+
+function serializeFailure(error: unknown, isBlogImportChannel = false): IpcResult<never> {
+  if (isBlogImportChannel && error instanceof BlogImportError) {
+    const mapped = blogImportFailureMap[error.code]
+    if (mapped) return { ok: false, error: mapped }
+  }
   try {
     const parsed = appErrorSchema.safeParse(error)
     if (parsed.success) return { ok: false, error: parsed.data }
@@ -300,7 +319,10 @@ function secureHandler<Input, Output>(
       if (!output.success) return serializeFailure(undefined)
       return { ok: true, value: output.data as Output }
     } catch (error) {
-      return serializeFailure(error)
+      return serializeFailure(
+        error,
+        channel.startsWith("garden:blogs:"),
+      )
     }
   }
 }

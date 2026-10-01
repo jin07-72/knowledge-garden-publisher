@@ -12,6 +12,7 @@ import {
   type IpcMainPort,
   type PublisherIpcServices,
 } from "../../src/main/ipc"
+import { BlogImportError, type BlogImportErrorCode } from "../../src/main/services/blogImport"
 import { createGardenApi, type IpcRendererPort } from "../../src/preload/gardenApi"
 
 type Handler = (event: unknown, request?: unknown) => Promise<unknown>
@@ -217,6 +218,41 @@ describe("secure publisher IPC", () => {
     })
   })
 
+  it("maps typed blog import failures to bounded public errors without disclosing internals", async () => {
+    const cases: readonly [string, string, unknown, BlogImportErrorCode, string, string][] = [
+      [IPC_CHANNELS.requests.blogsClone, "blogsClone", { url: "https://github.com/openai/quartz", destination: String.raw`C:\\Blogs\\quartz`, name: "Quartz" }, "DESTINATION_EXISTS", "BLOG_DESTINATION_EXISTS", "The destination already exists."],
+      [IPC_CHANNELS.requests.blogsClone, "blogsClone", { url: "https://github.com/openai/quartz", destination: String.raw`C:\\Blogs\\quartz`, name: "Quartz" }, "IMPORT_ACTIVE", "BLOG_IMPORT_ACTIVE", "Another blog import is already running."],
+      [IPC_CHANNELS.requests.blogsClone, "blogsClone", { url: "https://github.com/openai/quartz", destination: String.raw`C:\\Blogs\\quartz`, name: "Quartz" }, "CANCELLED", "BLOG_IMPORT_CANCELLED", "Blog import was cancelled."],
+      [IPC_CHANNELS.requests.blogsClone, "blogsClone", { url: "https://github.com/openai/quartz", destination: String.raw`C:\\Blogs\\quartz`, name: "Quartz" }, "CLONE_FAILED", "BLOG_CLONE_FAILED", "Git could not clone the blog repository."],
+      [IPC_CHANNELS.requests.blogsInstall, "blogsInstall", { path: String.raw`C:\\Blogs\\quartz` }, "INSTALL_FAILED", "BLOG_INSTALL_FAILED", "Blog dependencies could not be installed."],
+      [IPC_CHANNELS.requests.blogsInstall, "blogsInstall", { path: String.raw`C:\\Blogs\\quartz` }, "VALIDATION_FAILED", "BLOG_VALIDATION_FAILED", "The blog could not be validated."],
+      [IPC_CHANNELS.requests.blogsClone, "blogsClone", { url: "https://github.com/openai/quartz", destination: String.raw`C:\\Blogs\\quartz`, name: "Quartz" }, "IMPORT_UNAVAILABLE", "BLOG_IMPORT_UNAVAILABLE", "Blog import requires an application restart."],
+      [IPC_CHANNELS.requests.blogsClone, "blogsClone", { url: "https://github.com/openai/quartz", destination: String.raw`C:\\Blogs\\quartz`, name: "Quartz" }, "INVALID_REPOSITORY_URL", "INVALID_INPUT", "The request is invalid."],
+    ]
+    for (const [channel, call, request, internalCode, code, message] of cases) {
+      const { ipc, servicePorts } = setup()
+      servicePorts.calls[call].mockRejectedValueOnce(
+        new BlogImportError(internalCode, "secret https://user:token@github.com/openai/quartz", String.raw`C:\\secret`),
+      )
+      const result = await ipc.invoke(channel, trustedEvent, request)
+      expect(result).toEqual({ ok: false, error: { code, message } })
+      expect(JSON.stringify(result)).not.toContain("secret")
+      expect(JSON.stringify(result)).not.toContain("token")
+    }
+    const { ipc, servicePorts } = setup()
+    servicePorts.calls.blogsClone.mockRejectedValueOnce(new Error("secret"))
+    await expect(
+      ipc.invoke(IPC_CHANNELS.requests.blogsClone, trustedEvent, {
+        url: "https://github.com/openai/quartz",
+        destination: String.raw`C:\\Blogs\\quartz`,
+        name: "Quartz",
+      }),
+    ).resolves.toEqual({
+      ok: false,
+      error: { code: "INTERNAL_ERROR", message: "The application could not complete the request." },
+    })
+  })
+
   it("keeps the finite blog channel allowlist safe until the optional service is wired", async () => {
     const ipc = new FakeIpcMain()
     const servicePorts = services()
@@ -241,6 +277,23 @@ describe("secure publisher IPC", () => {
     expect(sent).toEqual([[IPC_CHANNELS.events.blogsImportProgress, { phase: "cloning", message: "Cloning blog." }]])
     dispose()
     expect(servicePorts.blogSubscriptions()).toBe(0)
+  })
+
+  it("does not emit blog progress when the trusted target provider returns no targets", () => {
+    const ipc = new FakeIpcMain()
+    const servicePorts = services()
+    const eventTargets = vi.fn((): readonly IpcEventTarget[] => [])
+    const untrustedSend = vi.fn()
+    const untrustedTarget: IpcEventTarget = { id: 999, isDestroyed: () => false, send: untrustedSend }
+    registerPublisherIpc({
+      ipcMain: ipc,
+      services: servicePorts,
+      isTrustedSender: () => true,
+      eventTargets,
+    })
+    servicePorts.emitBlogProgress({ phase: "cloning", message: "Cloning blog." })
+    expect(eventTargets).toHaveBeenCalledOnce()
+    expect(untrustedTarget.send).not.toHaveBeenCalled()
   })
   it("registers only the explicit request allowlist", () => {
     const { ipc, dispose } = setup()

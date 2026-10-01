@@ -210,7 +210,7 @@ describe("IPC success schemas", () => {
       expect(candidateSchema.safeParse({ path: String.raw`C:\\Blogs\\quartz`, inspection: { valid: true, canonicalPath: path, needsInstall: false } }).success, path).toBe(false)
       expect(receiptSchema.safeParse({ canonicalPath: path, owner: "openai", repository: "quartz" }).success, path).toBe(false)
     }
-    for (const name of [" ", "bad\u0001name", "bad\u0085name", "x".repeat(81)]) {
+    for (const name of [" ", " Quartz ", "bad\u0001name", "bad\u0085name", "x".repeat(81)]) {
       expect(registrySchema.safeParse({ ...blogRegistry, blogs: [{ ...blog, name }] }).success, name).toBe(false)
     }
   })

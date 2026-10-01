@@ -66,15 +66,30 @@ export interface BlogImportDependencies {
   readonly afterParentCapturedBeforeMkdir?: () => Promise<void>
 }
 
+export const BLOG_IMPORT_ERROR_CODES = [
+  "DESTINATION_INVALID",
+  "DESTINATION_EXISTS",
+  "TARGET_CHANGED",
+  "INVALID_REPOSITORY_URL",
+  "IMPORT_UNAVAILABLE",
+  "IMPORT_ACTIVE",
+  "CANCELLED",
+  "VALIDATION_FAILED",
+  "INSTALL_FAILED",
+  "CLONE_FAILED",
+] as const
+
+export type BlogImportErrorCode = (typeof BLOG_IMPORT_ERROR_CODES)[number]
+
 export interface BlogImportErrorShape {
-  readonly code: string
+  readonly code: BlogImportErrorCode
   readonly message: string
   readonly path?: string
 }
 
-class BlogImportError extends Error implements BlogImportErrorShape {
+export class BlogImportError extends Error implements BlogImportErrorShape {
   constructor(
-    readonly code: string,
+    readonly code: BlogImportErrorCode,
     message: string,
     readonly path?: string,
   ) {
@@ -83,7 +98,7 @@ class BlogImportError extends Error implements BlogImportErrorShape {
   }
 }
 
-function importError(code: string, message: string, path?: string): BlogImportError {
+function importError(code: BlogImportErrorCode, message: string, path?: string): BlogImportError {
   return new BlogImportError(code, message, path)
 }
 
