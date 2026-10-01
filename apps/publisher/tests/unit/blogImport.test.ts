@@ -203,7 +203,7 @@ describe("createBlogImportService", () => {
     }
     const service = createBlogImportService(serviceDependencies({ runner, progress: phases }))
 
-    await expect(service.clone({ repositoryUrl: "https://github.com/openai/quartz.git", destination })).resolves.toMatchObject({ path: destination, owner: "openai", repository: "quartz" })
+    await expect(service.clone({ url: "https://github.com/openai/quartz.git", destination, name: "Quartz" })).resolves.toMatchObject({ canonicalPath: destination, owner: "openai", repository: "quartz" })
 
     expect(requests).toEqual([
       expect.objectContaining({
@@ -234,7 +234,7 @@ describe("createBlogImportService", () => {
       progress: [],
     }))
 
-    await expect(service.clone({ repositoryUrl: "https://github.com/openai/quartz", destination })).rejects.toMatchObject({ code: "DESTINATION_EXISTS", path: destination })
+    await expect(service.clone({ url: "https://github.com/openai/quartz", destination, name: "Quartz" })).rejects.toMatchObject({ code: "DESTINATION_EXISTS", path: destination })
     expect(called).toBe(false)
   })
 
@@ -257,7 +257,7 @@ describe("createBlogImportService", () => {
       progress: phases,
     }))
 
-    await expect(service.clone({ repositoryUrl: "https://github.com/openai/quartz", destination })).rejects.toMatchObject({ code: "CLONE_FAILED", path: destination, message: expect.not.stringContaining("sensitive") })
+    await expect(service.clone({ url: "https://github.com/openai/quartz", destination, name: "Quartz" })).rejects.toMatchObject({ code: "CLONE_FAILED", path: destination, message: expect.not.stringContaining("sensitive") })
     expect((await lstat(join(destination, "partial-clone.txt"))).isFile()).toBe(true)
     expect(inspections).toBe(0)
     expect(phases).toEqual(["cloning"])
@@ -273,7 +273,7 @@ describe("createBlogImportService", () => {
       progress: [],
     }))
 
-    await expect(service.clone({ repositoryUrl: "https://github.com/openai/quartz", destination })).rejects.toMatchObject({ code: "INSTALL_FAILED" })
+    await expect(service.clone({ url: "https://github.com/openai/quartz", destination, name: "Quartz" })).rejects.toMatchObject({ code: "INSTALL_FAILED" })
     expect(inspections).toBe(1)
   })
 
@@ -287,8 +287,84 @@ describe("createBlogImportService", () => {
       progress: phases,
     }))
 
-    await expect(service.clone({ repositoryUrl: "https://github.com/openai/quartz", destination })).rejects.toMatchObject({ code: "VALIDATION_FAILED" })
+    await expect(service.clone({ url: "https://github.com/openai/quartz", destination, name: "Quartz" })).rejects.toMatchObject({ code: "VALIDATION_FAILED" })
     expect(phases).toEqual(["cloning", "installing", "validating"])
+  })
+
+  it("maps final inspector output to a safe validation error", async () => {
+    const parent = await temporaryDirectory()
+    const destination = join(parent, "quartz")
+    const phases: string[] = []
+    let inspections = 0
+    const service = createBlogImportService(serviceDependencies({
+      runner: { run: async () => ({ exitCode: 0, stdout: "", stderr: "" }) },
+      inspect: async (path) => {
+        inspections += 1
+        if (inspections === 1) return valid(path)
+        throw new Error("raw final inspector secret")
+      },
+      progress: phases,
+    }))
+
+    await expect(service.clone({ url: "https://github.com/openai/quartz", destination, name: "Quartz" })).rejects.toMatchObject({
+      code: "VALIDATION_FAILED",
+      message: expect.not.stringContaining("raw final inspector secret"),
+    })
+    expect(phases).toEqual(["cloning", "installing", "validating"])
+  })
+
+  it("maps cancellation during final validation to CANCELLED without completion", async () => {
+    const parent = await temporaryDirectory()
+    const destination = join(parent, "quartz")
+    const controller = new AbortController()
+    const phases: string[] = []
+    let inspections = 0
+    let beginFinalInspection!: () => void
+    const finalInspectionStarted = new Promise<void>((resolve) => { beginFinalInspection = resolve })
+    const service = createBlogImportService(serviceDependencies({
+      runner: { run: async () => ({ exitCode: 0, stdout: "", stderr: "" }) },
+      inspect: async (path) => {
+        inspections += 1
+        if (inspections === 1) return valid(path)
+        return new Promise<BlogCandidateInspection>(() => {
+          beginFinalInspection()
+        })
+      },
+      progress: phases,
+    }))
+    const operation = service.clone({ url: "https://github.com/openai/quartz", destination, name: "Quartz" }, controller.signal)
+    await finalInspectionStarted
+    controller.abort()
+
+    await expect(Promise.race([
+      operation.then(
+        () => ({ code: "UNEXPECTED_SUCCESS" }),
+        (error: unknown) => error,
+      ),
+      new Promise((resolve) => setTimeout(() => resolve({ code: "TIMEOUT" }), 100)),
+    ])).resolves.toMatchObject({ code: "CANCELLED" })
+    expect(phases).toEqual(["cloning", "installing", "validating"])
+  })
+
+  it("accepts the planned clone request and returns the final canonical path", async () => {
+    const parent = await temporaryDirectory()
+    const destination = join(parent, "quartz")
+    const canonicalPath = join(parent, "canonical-quartz")
+    let inspections = 0
+    const service = createBlogImportService(serviceDependencies({
+      runner: { run: async () => ({ exitCode: 0, stdout: "", stderr: "" }) },
+      inspect: async (path) => {
+        inspections += 1
+        return { valid: true, canonicalPath: inspections === 1 ? path : canonicalPath, needsInstall: false }
+      },
+      progress: [],
+    }))
+
+    await expect(service.clone({ url: "https://github.com/openai/quartz", destination, name: "Quartz" })).resolves.toMatchObject({
+      canonicalPath,
+      owner: "openai",
+      repository: "quartz",
+    })
   })
 
   it("passes cancellation to the active command and stops later phases", async () => {
@@ -306,7 +382,7 @@ describe("createBlogImportService", () => {
       },
       progress: phases,
     }))
-    const operation = service.clone({ repositoryUrl: "https://github.com/openai/quartz", destination }, controller.signal)
+    const operation = service.clone({ url: "https://github.com/openai/quartz", destination, name: "Quartz" }, controller.signal)
     await new Promise((resolve) => setTimeout(resolve, 0))
     controller.abort()
 
@@ -327,10 +403,10 @@ describe("createBlogImportService", () => {
       runner: { run: async () => firstCommand },
       progress: [],
     }))
-    const first = service.clone({ repositoryUrl: "https://github.com/openai/quartz", destination: firstDestination })
+    const first = service.clone({ url: "https://github.com/openai/quartz", destination: firstDestination, name: "Quartz" })
     await new Promise((resolve) => setTimeout(resolve, 0))
 
-    await expect(service.clone({ repositoryUrl: "https://github.com/openai/quartz", destination: secondDestination })).rejects.toMatchObject({ code: "IMPORT_ACTIVE" })
+    await expect(service.clone({ url: "https://github.com/openai/quartz", destination: secondDestination, name: "Quartz" })).rejects.toMatchObject({ code: "IMPORT_ACTIVE" })
     release()
     await expect(first).rejects.toMatchObject({ code: "CLONE_FAILED" })
   })

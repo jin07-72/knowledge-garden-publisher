@@ -20,6 +20,8 @@ export type BlogCandidateInspection =
   | { readonly valid: true; readonly canonicalPath: string; readonly needsInstall: boolean }
   | { readonly valid: false; readonly code: string; readonly message: string }
 
+type ValidBlogCandidateInspection = Extract<BlogCandidateInspection, { readonly valid: true }>
+
 export type BlogImportPhase = "cloning" | "installing" | "validating" | "complete"
 
 export interface BlogImportProgress {
@@ -28,12 +30,13 @@ export interface BlogImportProgress {
 }
 
 export interface BlogCloneRequest {
-  readonly repositoryUrl: string
+  readonly url: string
   readonly destination: string
+  readonly name: string
 }
 
 export interface BlogImportReceipt {
-  readonly path: string
+  readonly canonicalPath: string
   readonly owner: string
   readonly repository: string
 }
@@ -241,12 +244,53 @@ export function createBlogImportService(dependencies: {
     if (signal.aborted) throw importError("CANCELLED", "Blog import was cancelled.")
   }
   const emit = (phase: BlogImportPhase, path: string): void => dependencies.onProgress({ phase, path })
+  const inspectWithCancellation = (
+    path: string,
+    signal: AbortSignal,
+  ): Promise<BlogCandidateInspection> =>
+    new Promise((resolveInspection, rejectInspection) => {
+      let settled = false
+      const cleanup = (): void => signal.removeEventListener("abort", cancel)
+      const reject = (error: unknown): void => {
+        if (settled) return
+        settled = true
+        cleanup()
+        rejectInspection(error)
+      }
+      const resolve = (inspection: BlogCandidateInspection): void => {
+        if (settled) return
+        settled = true
+        cleanup()
+        resolveInspection(inspection)
+      }
+      const cancel = (): void => reject(importError("CANCELLED", "Blog import was cancelled.", path))
+      signal.addEventListener("abort", cancel, { once: true })
+      if (signal.aborted) {
+        cancel()
+        return
+      }
+      void Promise.resolve()
+        .then(() => dependencies.inspect(path, { runner: dependencies.runner }))
+        .then(
+          (inspection) => {
+            if (signal.aborted) cancel()
+            else resolve(inspection)
+          },
+          (error: unknown) => {
+            if (signal.aborted) cancel()
+            else reject(error)
+          },
+        )
+    })
 
-  const installAt = async (path: string, signal: AbortSignal): Promise<BlogCandidateInspection> => {
+  const installAt = async (
+    path: string,
+    signal: AbortSignal,
+  ): Promise<ValidBlogCandidateInspection> => {
     assertNotCancelled(signal)
     let preflight: BlogCandidateInspection
     try {
-      preflight = await dependencies.inspect(path, { runner: dependencies.runner })
+      preflight = await inspectWithCancellation(path, signal)
     } catch {
       if (signal.aborted) throw importError("CANCELLED", "Blog import was cancelled.", path)
       throw importError("VALIDATION_FAILED", "The selected blog could not be validated.", path)
@@ -272,7 +316,13 @@ export function createBlogImportService(dependencies: {
     assertNotCancelled(signal)
     if (result.exitCode !== 0) throw importError("INSTALL_FAILED", "npm could not install blog dependencies.", path)
     emit("validating", path)
-    const inspection = await dependencies.inspect(path, { runner: dependencies.runner })
+    let inspection: BlogCandidateInspection
+    try {
+      inspection = await inspectWithCancellation(path, signal)
+    } catch {
+      if (signal.aborted) throw importError("CANCELLED", "Blog import was cancelled.", path)
+      throw importError("VALIDATION_FAILED", "The imported blog could not be validated.", path)
+    }
     assertNotCancelled(signal)
     if (!inspection.valid) {
       throw importError("VALIDATION_FAILED", "The imported blog could not be validated.", path)
@@ -285,7 +335,7 @@ export function createBlogImportService(dependencies: {
 
   return {
     clone: (request, signal) => runOperation(signal, async (operationSignal) => {
-      const repository = parseGitHubRepository(request.repositoryUrl)
+      const repository = parseGitHubRepository(request.url)
       const destination = resolve(request.destination)
       const parent = dirname(destination)
       try {
@@ -319,9 +369,13 @@ export function createBlogImportService(dependencies: {
       }
       assertNotCancelled(operationSignal)
       if (clone.exitCode !== 0) throw importError("CLONE_FAILED", "Git could not clone the blog repository.", destination)
-      await installAt(destination, operationSignal)
+      const inspection = await installAt(destination, operationSignal)
       emit("complete", destination)
-      return { path: destination, owner: repository.owner, repository: repository.repository }
+      return {
+        canonicalPath: inspection.canonicalPath,
+        owner: repository.owner,
+        repository: repository.repository,
+      }
     }),
     install: (path, signal) => runOperation(signal, async (operationSignal) => {
       const destination = resolve(path)
