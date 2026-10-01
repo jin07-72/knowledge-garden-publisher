@@ -1,0 +1,362 @@
+import { lstat, mkdir, mkdtemp, rm, writeFile } from "node:fs/promises"
+import { tmpdir } from "node:os"
+import { join } from "node:path"
+import { afterEach, describe, expect, it } from "vitest"
+import type { CommandRunner } from "../../src/main/lib/commandRunner"
+import {
+  createBlogImportService,
+  inspectBlogCandidate,
+  parseGitHubRepository,
+  type BlogCandidateInspection,
+} from "../../src/main/services/blogImport"
+
+const temporaryDirectories: string[] = []
+
+afterEach(async () => {
+  await Promise.all(temporaryDirectories.splice(0).map((path) => rm(path, { force: true, recursive: true })))
+})
+
+async function temporaryDirectory(prefix = "blog-import-"): Promise<string> {
+  const path = await mkdtemp(join(tmpdir(), prefix))
+  temporaryDirectories.push(path)
+  return path
+}
+
+async function createCandidate(root: string, installed = true): Promise<void> {
+  await mkdir(join(root, "content"), { recursive: true })
+  await mkdir(join(root, "quartz"), { recursive: true })
+  await writeFile(join(root, "package.json"), '{"name":"garden"}')
+  await writeFile(join(root, "package-lock.json"), '{"lockfileVersion":3,"packages":{}}')
+  await writeFile(join(root, "quartz", "bootstrap-cli.mjs"), "")
+  if (installed) {
+    await mkdir(join(root, "node_modules"), { recursive: true })
+    await writeFile(join(root, "node_modules", ".package-lock.json"), '{"lockfileVersion":3,"packages":{}}')
+  }
+}
+
+function gitRunner(root: string, requests: Parameters<CommandRunner["run"]>[0][] = []): CommandRunner {
+  return {
+    run: async (request) => {
+      requests.push(request)
+      if (request.args[0] === "rev-parse") return { exitCode: 0, stdout: `${root}\n`, stderr: "" }
+      if (request.args[0] === "remote" && request.args.length === 1)
+        return { exitCode: 0, stdout: "origin\n", stderr: "" }
+      if (request.args[0] === "remote") return { exitCode: 0, stdout: "git@github.com:owner/repository.git\n", stderr: "" }
+      if (request.args[0] === "status") return { exitCode: 0, stdout: "", stderr: "" }
+      if (request.args[1] === "ls") return { exitCode: 0, stdout: "{}", stderr: "" }
+      return { exitCode: 0, stdout: "", stderr: "" }
+    },
+  }
+}
+
+const runtime = { nodePath: "bundled-node.exe", npmCliPath: "npm-cli.js" }
+
+describe("parseGitHubRepository", () => {
+  it.each([
+    ["https://github.com/openai/quartz", "https://github.com/openai/quartz", "openai", "quartz"],
+    ["https://github.com/openai/quartz.git", "https://github.com/openai/quartz.git", "openai", "quartz"],
+    ["git@github.com:openai/quartz", "git@github.com:openai/quartz", "openai", "quartz"],
+    ["git@github.com:openai/quartz.git", "git@github.com:openai/quartz.git", "openai", "quartz"],
+  ])("normalizes accepted GitHub repository URL %s", (value, url, owner, repository) => {
+    expect(parseGitHubRepository(value)).toEqual({ url, owner, repository })
+  })
+
+  it.each([
+    "http://github.com/openai/quartz",
+    "https://gitlab.com/openai/quartz",
+    "file:///tmp/quartz",
+    "https://user:secret@github.com/openai/quartz",
+    "https://github.com/openai/quartz?token=secret",
+    "https://github.com/openai/quartz#readme",
+    "https://github.com/openai/quartz/extra",
+    "https://github.com/openai/../quartz",
+    "https://github.com/-owner/quartz",
+    "https://github.com/openai/-quartz",
+    "git@github.com:openai/quartz --upload-pack=evil",
+    "--config=evil",
+    "git@github.com:openai/quartz.git?token=secret",
+    `https://github.com/${"a".repeat(100)}/quartz`,
+  ])("rejects unsafe repository URL %s", (value) => {
+    expect(() => parseGitHubRepository(value)).toThrow(/GitHub repository/i)
+  })
+})
+
+describe("inspectBlogCandidate", () => {
+  it("accepts a complete Quartz Git candidate", async () => {
+    const root = await temporaryDirectory()
+    await createCandidate(root)
+
+    await expect(inspectBlogCandidate(root, { runner: gitRunner(root) })).resolves.toMatchObject({
+      valid: true,
+      canonicalPath: root,
+      needsInstall: false,
+    })
+  })
+
+  it("accepts missing installed dependencies but marks installation required", async () => {
+    const root = await temporaryDirectory()
+    await createCandidate(root, false)
+
+    await expect(inspectBlogCandidate(root, { runner: gitRunner(root) })).resolves.toMatchObject({
+      valid: true,
+      canonicalPath: root,
+      needsInstall: true,
+    })
+  })
+
+  it("accepts mismatched installed dependencies but marks installation required", async () => {
+    const root = await temporaryDirectory()
+    await createCandidate(root)
+    await writeFile(
+      join(root, "package-lock.json"),
+      '{"lockfileVersion":3,"packages":{"node_modules/example":{"version":"1.0.0"}}}',
+    )
+
+    await expect(inspectBlogCandidate(root, { runner: gitRunner(root) })).resolves.toMatchObject({
+      valid: true,
+      canonicalPath: root,
+      needsInstall: true,
+    })
+  })
+
+  it.each([
+    ["package.json", "PACKAGE_JSON_MISSING"],
+    ["quartz/bootstrap-cli.mjs", "QUARTZ_BOOTSTRAP_MISSING"],
+    ["content", "CONTENT_MISSING"],
+  ])("rejects a candidate missing %s", async (relativePath, code) => {
+    const root = await temporaryDirectory()
+    await createCandidate(root)
+    await rm(join(root, relativePath), { force: true, recursive: true })
+
+    await expect(inspectBlogCandidate(root, { runner: gitRunner(root) })).resolves.toMatchObject({
+      valid: false,
+      code,
+    })
+  })
+
+  it("rejects a directory that is not a Git repository or has no origin", async () => {
+    const root = await temporaryDirectory()
+    await createCandidate(root)
+    const noGit: CommandRunner = { run: async () => ({ exitCode: 1, stdout: "", stderr: "raw secret" }) }
+    const noOrigin: CommandRunner = {
+      run: async ({ args }) => {
+        if (args[0] === "rev-parse") return { exitCode: 0, stdout: `${root}\n`, stderr: "" }
+        if (args[0] === "remote") return { exitCode: 0, stdout: "", stderr: "" }
+        return { exitCode: 0, stdout: "", stderr: "" }
+      },
+    }
+
+    await expect(inspectBlogCandidate(root, { runner: noGit })).resolves.toMatchObject({ valid: false, code: "GIT_NOT_REPOSITORY" })
+    await expect(inspectBlogCandidate(root, { runner: noOrigin })).resolves.toMatchObject({ valid: false, code: "GIT_ORIGIN_MISSING" })
+  })
+
+  it("rejects a repository whose origin URL cannot be read", async () => {
+    const root = await temporaryDirectory()
+    await createCandidate(root)
+    const blankOrigin: CommandRunner = {
+      run: async ({ args }) => {
+        if (args[0] === "rev-parse") return { exitCode: 0, stdout: `${root}\n`, stderr: "" }
+        if (args[0] === "remote" && args.length === 1) return { exitCode: 0, stdout: "origin\n", stderr: "" }
+        if (args[0] === "remote") return { exitCode: 0, stdout: "\n", stderr: "raw origin URL" }
+        if (args[1] === "ls") return { exitCode: 0, stdout: "{}", stderr: "" }
+        return { exitCode: 0, stdout: "", stderr: "" }
+      },
+    }
+
+    await expect(inspectBlogCandidate(root, { runner: blankOrigin })).resolves.toMatchObject({
+      valid: false,
+      code: "GIT_ORIGIN_FAILED",
+      message: expect.not.stringContaining("raw origin"),
+    })
+  })
+})
+
+describe("createBlogImportService", () => {
+  function valid(path: string): BlogCandidateInspection {
+    return { valid: true, canonicalPath: path, needsInstall: false }
+  }
+
+  function serviceDependencies(options: {
+    readonly runner: CommandRunner
+    readonly inspect?: typeof inspectBlogCandidate
+    readonly progress: string[]
+  }) {
+    return {
+      gitExecutable: "git.exe",
+      ...runtime,
+      runner: options.runner,
+      inspect: options.inspect ?? (async (path: string) => valid(path)),
+      onProgress: ({ phase }: { phase: string }) => options.progress.push(phase),
+    }
+  }
+
+  it("clones with literal Git and npm arguments then emits safe ordered phases", async () => {
+    const parent = await temporaryDirectory()
+    const destination = join(parent, "quartz")
+    const requests: Parameters<CommandRunner["run"]>[0][] = []
+    const phases: string[] = []
+    const runner: CommandRunner = {
+      run: async (request) => {
+        requests.push(request)
+        return { exitCode: 0, stdout: "raw clone output", stderr: "raw npm output" }
+      },
+    }
+    const service = createBlogImportService(serviceDependencies({ runner, progress: phases }))
+
+    await expect(service.clone({ repositoryUrl: "https://github.com/openai/quartz.git", destination })).resolves.toMatchObject({ path: destination, owner: "openai", repository: "quartz" })
+
+    expect(requests).toEqual([
+      expect.objectContaining({
+        executable: "git.exe",
+        args: ["clone", "--", "https://github.com/openai/quartz.git", destination],
+        cwd: parent,
+        env: { GIT_TERMINAL_PROMPT: "1" },
+        signal: expect.any(AbortSignal),
+      }),
+      expect.objectContaining({
+        executable: "bundled-node.exe",
+        args: ["npm-cli.js", "ci", "--no-audit", "--no-fund"],
+        cwd: destination,
+        env: { npm_config_audit: "false", npm_config_fund: "false" },
+        signal: expect.any(AbortSignal),
+      }),
+    ])
+    expect(phases).toEqual(["cloning", "installing", "validating", "complete"])
+  })
+
+  it("refuses to clone into an existing destination before starting Git", async () => {
+    const parent = await temporaryDirectory()
+    const destination = join(parent, "existing")
+    await mkdir(destination)
+    let called = false
+    const service = createBlogImportService(serviceDependencies({
+      runner: { run: async () => { called = true; return { exitCode: 0, stdout: "", stderr: "" } } },
+      progress: [],
+    }))
+
+    await expect(service.clone({ repositoryUrl: "https://github.com/openai/quartz", destination })).rejects.toMatchObject({ code: "DESTINATION_EXISTS", path: destination })
+    expect(called).toBe(false)
+  })
+
+  it("preserves the clone destination and skips install after Git fails", async () => {
+    const parent = await temporaryDirectory()
+    const destination = join(parent, "partial-clone")
+    const phases: string[] = []
+    let inspections = 0
+    const service = createBlogImportService(serviceDependencies({
+      runner: {
+        run: async ({ args }) => {
+          if (args[0] === "clone") {
+            await mkdir(destination)
+            await writeFile(join(destination, "partial-clone.txt"), "preserve me")
+          }
+          return { exitCode: 1, stdout: "sensitive raw output", stderr: "https://user:secret@example.invalid" }
+        },
+      },
+      inspect: async (path) => { inspections += 1; return valid(path) },
+      progress: phases,
+    }))
+
+    await expect(service.clone({ repositoryUrl: "https://github.com/openai/quartz", destination })).rejects.toMatchObject({ code: "CLONE_FAILED", path: destination, message: expect.not.stringContaining("sensitive") })
+    expect((await lstat(join(destination, "partial-clone.txt"))).isFile()).toBe(true)
+    expect(inspections).toBe(0)
+    expect(phases).toEqual(["cloning"])
+  })
+
+  it("stops before final validation when npm install fails", async () => {
+    const parent = await temporaryDirectory()
+    const destination = join(parent, "quartz")
+    let inspections = 0
+    const service = createBlogImportService(serviceDependencies({
+      runner: { run: async ({ args }) => ({ exitCode: args[0] === "clone" ? 0 : 1, stdout: "", stderr: "" }) },
+      inspect: async (path) => { inspections += 1; return valid(path) },
+      progress: [],
+    }))
+
+    await expect(service.clone({ repositoryUrl: "https://github.com/openai/quartz", destination })).rejects.toMatchObject({ code: "INSTALL_FAILED" })
+    expect(inspections).toBe(1)
+  })
+
+  it("does not report completion when final validation requires installation", async () => {
+    const parent = await temporaryDirectory()
+    const destination = join(parent, "quartz")
+    const phases: string[] = []
+    const service = createBlogImportService(serviceDependencies({
+      runner: { run: async () => ({ exitCode: 0, stdout: "", stderr: "" }) },
+      inspect: async (path) => ({ valid: true, canonicalPath: path, needsInstall: true }),
+      progress: phases,
+    }))
+
+    await expect(service.clone({ repositoryUrl: "https://github.com/openai/quartz", destination })).rejects.toMatchObject({ code: "VALIDATION_FAILED" })
+    expect(phases).toEqual(["cloning", "installing", "validating"])
+  })
+
+  it("passes cancellation to the active command and stops later phases", async () => {
+    const parent = await temporaryDirectory()
+    const destination = join(parent, "quartz")
+    const controller = new AbortController()
+    const phases: string[] = []
+    let commandSignal: AbortSignal | undefined
+    const service = createBlogImportService(serviceDependencies({
+      runner: {
+        run: async ({ signal }) => new Promise((_, reject) => {
+          commandSignal = signal
+          signal?.addEventListener("abort", () => reject(new Error("cancelled")), { once: true })
+        }),
+      },
+      progress: phases,
+    }))
+    const operation = service.clone({ repositoryUrl: "https://github.com/openai/quartz", destination }, controller.signal)
+    await new Promise((resolve) => setTimeout(resolve, 0))
+    controller.abort()
+
+    await expect(operation).rejects.toMatchObject({ code: "CANCELLED" })
+    expect(commandSignal?.aborted).toBe(true)
+    expect(phases).toEqual(["cloning"])
+  })
+
+  it("rejects a second operation while another import command is active", async () => {
+    const parent = await temporaryDirectory()
+    const firstDestination = join(parent, "first")
+    const secondDestination = join(parent, "second")
+    let release!: () => void
+    const firstCommand = new Promise<{ exitCode: number; stdout: string; stderr: string }>((resolve) => {
+      release = () => resolve({ exitCode: 1, stdout: "", stderr: "" })
+    })
+    const service = createBlogImportService(serviceDependencies({
+      runner: { run: async () => firstCommand },
+      progress: [],
+    }))
+    const first = service.clone({ repositoryUrl: "https://github.com/openai/quartz", destination: firstDestination })
+    await new Promise((resolve) => setTimeout(resolve, 0))
+
+    await expect(service.clone({ repositoryUrl: "https://github.com/openai/quartz", destination: secondDestination })).rejects.toMatchObject({ code: "IMPORT_ACTIVE" })
+    release()
+    await expect(first).rejects.toMatchObject({ code: "CLONE_FAILED" })
+  })
+
+  it("installs in place then returns the final inspection", async () => {
+    const root = await temporaryDirectory()
+    const requests: Parameters<CommandRunner["run"]>[0][] = []
+    const service = createBlogImportService(serviceDependencies({
+      runner: { run: async (request) => { requests.push(request); return { exitCode: 0, stdout: "", stderr: "" } } },
+      progress: [],
+    }))
+
+    await expect(service.install(root)).resolves.toEqual(valid(root))
+    expect(requests).toEqual([expect.objectContaining({ cwd: root, args: ["npm-cli.js", "ci", "--no-audit", "--no-fund"] })])
+  })
+
+  it("does not run npm when the install path fails candidate preflight", async () => {
+    const root = await temporaryDirectory()
+    let runnerCalls = 0
+    const service = createBlogImportService(serviceDependencies({
+      runner: { run: async () => { runnerCalls += 1; return { exitCode: 0, stdout: "", stderr: "" } } },
+      inspect: async () => ({ valid: false, code: "CONTENT_MISSING", message: "The content directory is required." }),
+      progress: [],
+    }))
+
+    await expect(service.install(root)).rejects.toMatchObject({ code: "VALIDATION_FAILED", path: root })
+    expect(runnerCalls).toBe(0)
+  })
+})

@@ -366,11 +366,8 @@ async function inspectGit(
   return issues
 }
 
-async function inspectDependencies(
-  root: string,
-  runtime: BundledNpmRuntime,
-  runner: CommandRunner,
-): Promise<WorkspaceIssue[]> {
+/** Checks the on-disk npm install state without running a package manager command. */
+export async function inspectWorkspaceDependencyState(root: string): Promise<WorkspaceIssue[]> {
   const dependencyIssue = (
     code: "DEPENDENCIES_MISSING" | "DEPENDENCIES_INVALID",
     message: string,
@@ -539,6 +536,20 @@ async function inspectDependencies(
       dependencyIssue("DEPENDENCIES_INVALID", "Installed dependency state could not be verified."),
     ]
   }
+  return []
+}
+
+async function inspectDependencies(
+  root: string,
+  runtime: BundledNpmRuntime,
+  runner: CommandRunner,
+): Promise<WorkspaceIssue[]> {
+  const dependencyIssues = await inspectWorkspaceDependencyState(root)
+  if (dependencyIssues.length > 0) return dependencyIssues
+  const dependencyIssue = (
+    code: "DEPENDENCIES_MISSING" | "DEPENDENCIES_INVALID",
+    message: string,
+  ): WorkspaceIssue => issue(code, message, undefined, "install-dependencies")
   try {
     // A clean Quartz install can intentionally omit optional peer tools. The
     // lock/manifests above verify the complete installed tree; this command
