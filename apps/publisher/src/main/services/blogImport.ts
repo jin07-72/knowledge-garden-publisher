@@ -98,8 +98,13 @@ function importError(code: string, message: string, path?: string): BlogImportEr
   return new BlogImportError(code, message, path)
 }
 
+function terminationUncertainFailure(error: unknown): PublishCommandFailure | undefined {
+  return error instanceof PublishCommandFailure && error.terminationUncertain ? error : undefined
+}
+
 function rethrowTerminationUncertain(error: unknown): void {
-  if (error instanceof PublishCommandFailure && error.terminationUncertain) throw error
+  const uncertain = terminationUncertainFailure(error)
+  if (uncertain) throw uncertain
 }
 
 function pathInside(root: string, candidate: string): boolean {
@@ -422,6 +427,11 @@ export function createBlogImportService(dependencies: BlogImportDependencies): B
             else resolve(inspection)
           },
           (error: unknown) => {
+            const uncertain = terminationUncertainFailure(error)
+            if (uncertain) {
+              reject(uncertain)
+              return
+            }
             if (cancelled || signal.aborted) reject(importError("CANCELLED", "Blog import was cancelled.", path))
             else reject(error)
           },

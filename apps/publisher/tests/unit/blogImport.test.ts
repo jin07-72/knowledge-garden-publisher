@@ -516,6 +516,38 @@ describe("createBlogImportService", () => {
     expect(calls).toBe(2)
   })
 
+  it("preserves delayed final-inspection termination uncertainty after cancellation", async () => {
+    const parent = await temporaryDirectory()
+    const destination = join(parent, "quartz")
+    const controller = new AbortController()
+    let inspections = 0
+    let rejectFinal!: (error: Error) => void
+    let finalStarted!: () => void
+    const started = new Promise<void>((resolve) => { finalStarted = resolve })
+    let runnerCalls = 0
+    const service = createBlogImportService(serviceDependencies({
+      runner: { run: async () => { runnerCalls += 1; return { exitCode: 0, stdout: "", stderr: "" } } },
+      inspect: async (path) => {
+        inspections += 1
+        if (inspections === 1) return valid(path)
+        return new Promise<BlogCandidateInspection>((_resolve, reject) => {
+          rejectFinal = reject
+          finalStarted()
+        })
+      },
+      progress: [],
+    }))
+    const first = service.clone({ url: "https://github.com/openai/quartz", destination, name: "Quartz" }, controller.signal)
+    await started
+    controller.abort()
+    rejectFinal(new PublishCommandFailure("raw delayed termination", true))
+
+    await expect(first).rejects.toMatchObject({ code: "IMPORT_UNAVAILABLE", message: expect.not.stringContaining("raw delayed termination") })
+    await expect(service.clone({ url: "https://github.com/openai/quartz", destination: join(parent, "second"), name: "Quartz" })).rejects.toMatchObject({ code: "IMPORT_UNAVAILABLE" })
+    expect(runnerCalls).toBe(2)
+    expect(inspections).toBe(2)
+  })
+
   it("rejects a parent replacement between baseline capture and target reservation", async () => {
     const root = await temporaryDirectory()
     const parent = join(root, "parent")
