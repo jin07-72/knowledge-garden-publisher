@@ -361,6 +361,30 @@ describe("blog registry", () => {
     await expect(readFile(file, "utf8")).resolves.toBe(source)
   })
 
+  it("rejects an unavailable canonical path when its absolute display path still exists", async () => {
+    const directory = await createDirectory("garden-blog-registry-state-")
+    const legacyPath = await createGarden("legacy")
+    const file = join(directory, "blogs.v1.json")
+    const source = JSON.stringify({
+      version: 1,
+      activeBlogId: "00000000-0000-4000-8000-000000000001",
+      blogs: [
+        {
+          id: "00000000-0000-4000-8000-000000000001",
+          name: "Legacy",
+          path: legacyPath,
+          canonicalPath: join(directory, "missing-workspace"),
+          createdAt: "2026-10-01T00:00:00.000Z",
+          lastOpenedAt: "2026-10-01T00:00:00.000Z",
+        },
+      ],
+    })
+    await writeFile(file, source)
+
+    await expect(createRegistry(file, legacyPath).load()).rejects.toMatchObject({ code: "BLOG_REGISTRY_INVALID", path: file })
+    await expect(readFile(file, "utf8")).resolves.toBe(source)
+  })
+
   it("rejects persisted registry data with duplicate ids", async () => {
     const directory = await createDirectory("garden-blog-registry-state-")
     const legacyPath = await createGarden("legacy")

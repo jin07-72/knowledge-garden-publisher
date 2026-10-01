@@ -299,6 +299,12 @@ async function acquireLease(file: string, openFile: RegistryOpen): Promise<{ rea
     try {
       return { lock, token: await createLease(lock, openFile) }
     } catch (error) {
+      if (isMissingFile(error)) {
+        if (Date.now() >= deadline) throw new Error("Blog registry is locked")
+        await mkdir(directory, { recursive: true })
+        await delay(10)
+        continue
+      }
       if (!isAlreadyExists(error)) throw error
     }
 
@@ -421,24 +427,25 @@ export function createBlogRegistry(options: {
       if (!parsed.success) throw parsed.error
       await Promise.all(
         parsed.data.blogs.map(async (blog) => {
+          // `path` is display-only and may be relative. An available absolute
+          // display path is nevertheless strong evidence that its canonical
+          // locator must still resolve to the same workspace.
+          const displayTarget = isAbsolute(blog.path)
+            ? await realpath(blog.path).catch((error: unknown) => {
+                if (isUnavailablePath(error)) return undefined
+                throw error
+              })
+            : undefined
           const canonicalTarget = await realpath(blog.canonicalPath).catch((error: unknown) => {
             if (isUnavailablePath(error)) return undefined
             throw error
           })
+          if (displayTarget !== undefined && canonicalTarget === undefined)
+            throw new Error("Stored canonical path is unavailable while display path exists")
           if (canonicalTarget !== undefined && canonicalKey(canonicalTarget) !== canonicalKey(blog.canonicalPath))
             throw new Error("Stored canonical path does not match its target")
-
-          // `path` is the caller's display value and can be relative, so it is
-          // never resolved at load time. Only an available absolute display path
-          // is cross-checked against the canonical locator.
-          if (canonicalTarget !== undefined && isAbsolute(blog.path)) {
-            const displayTarget = await realpath(blog.path).catch((error: unknown) => {
-              if (isUnavailablePath(error)) return undefined
-              throw error
-            })
-            if (displayTarget !== undefined && canonicalKey(displayTarget) !== canonicalKey(canonicalTarget))
-              throw new Error("Stored canonical path does not match display path")
-          }
+          if (displayTarget !== undefined && canonicalKey(displayTarget) !== canonicalKey(canonicalTarget!))
+            throw new Error("Stored canonical path does not match display path")
         }),
       )
       return parsed.data
