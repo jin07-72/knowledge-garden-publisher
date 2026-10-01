@@ -3,7 +3,11 @@ import { tmpdir } from "node:os"
 import { join } from "node:path"
 import { afterEach, describe, expect, it } from "vitest"
 import type { CommandRunner } from "../../src/main/lib/commandRunner"
-import { createBoundedCommandRunnerForTest, type BoundedCommandRunner } from "../../src/main/services/publish"
+import {
+  createBoundedCommandRunnerForTest,
+  PublishCommandFailure,
+  type BoundedCommandRunner,
+} from "../../src/main/services/publish"
 import {
   createBlogImportService,
   inspectBlogCandidate,
@@ -51,6 +55,13 @@ function gitRunner(root: string, requests: Parameters<CommandRunner["run"]>[0][]
 }
 
 const runtime = { nodePath: "bundled-node.exe", npmCliPath: "npm-cli.js" }
+
+const genericRunnerForTypeTest: CommandRunner = {
+  run: async () => ({ exitCode: 0, stdout: "", stderr: "" }),
+}
+// @ts-expect-error A generic runner cannot claim the bounded process-tree capability.
+const rejectedBoundedRunner: BoundedCommandRunner = genericRunnerForTypeTest
+void rejectedBoundedRunner
 
 describe("parseGitHubRepository", () => {
   it.each([
@@ -384,6 +395,61 @@ describe("createBlogImportService", () => {
     await expect(service.clone({ url: "https://github.com/openai/quartz", destination, name: "Quartz" })).rejects.toMatchObject({ code: "TARGET_CHANGED", path: destination })
     expect(requests).toHaveLength(1)
     expect((await lstat(destination)).isDirectory()).toBe(true)
+  })
+
+  it("rejects a target moved into a replacement parent before npm", async () => {
+    const root = await temporaryDirectory()
+    const parent = join(root, "parent")
+    const movedParent = join(root, "moved-parent")
+    const destination = join(parent, "quartz")
+    await mkdir(parent)
+    const requests: Parameters<CommandRunner["run"]>[0][] = []
+    const service = createBlogImportService(serviceDependencies({
+      runner: {
+        run: async (request) => {
+          requests.push(request)
+          if (request.args[0] === "clone") {
+            await rename(parent, movedParent)
+            await mkdir(parent)
+            await rename(join(movedParent, "quartz"), destination)
+          }
+          return { exitCode: 0, stdout: "", stderr: "" }
+        },
+      },
+      progress: [],
+    }))
+
+    await expect(service.clone({ url: "https://github.com/openai/quartz", destination, name: "Quartz" })).rejects.toMatchObject({
+      code: "TARGET_CHANGED",
+      path: destination,
+    })
+    expect(requests).toHaveLength(1)
+    expect((await lstat(destination)).isDirectory()).toBe(true)
+  })
+
+  it("poisons the service after unconfirmed process termination", async () => {
+    const parent = await temporaryDirectory()
+    const firstDestination = join(parent, "first")
+    const secondDestination = join(parent, "second")
+    let calls = 0
+    const service = createBlogImportService(serviceDependencies({
+      runner: {
+        run: async () => {
+          calls += 1
+          throw new PublishCommandFailure("raw process details", true)
+        },
+      },
+      progress: [],
+    }))
+
+    await expect(service.clone({ url: "https://github.com/openai/quartz", destination: firstDestination, name: "Quartz" })).rejects.toMatchObject({
+      code: "IMPORT_UNAVAILABLE",
+      message: expect.not.stringContaining("raw process details"),
+    })
+    await expect(service.clone({ url: "https://github.com/openai/quartz", destination: secondDestination, name: "Quartz" })).rejects.toMatchObject({
+      code: "IMPORT_UNAVAILABLE",
+    })
+    expect(calls).toBe(1)
   })
 
   it("uses the canonical ancestor directory when the requested parent is a link", async ({ skip }) => {
