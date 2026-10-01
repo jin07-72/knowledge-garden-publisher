@@ -1,4 +1,4 @@
-import { mkdir, mkdtemp, open as openFile, readFile, readdir, realpath, rm, stat, writeFile } from "node:fs/promises"
+import { mkdir, mkdtemp, open as openFile, readFile, readdir, realpath, rm, stat, utimes, writeFile } from "node:fs/promises"
 import { tmpdir } from "node:os"
 import { basename, join, relative } from "node:path"
 import { afterEach, describe, expect, it } from "vitest"
@@ -63,6 +63,21 @@ describe("blog registry", () => {
     await expect(readdir(directory)).resolves.toEqual([basename(file)])
   })
 
+  it("cleans only recognized stale registry candidate and temporary files after acquiring its lease", async () => {
+    const directory = await createDirectory("garden-blog-registry-state-")
+    const legacyPath = await createGarden("legacy")
+    const file = join(directory, "blogs.v1.json")
+    const candidate = join(directory, ".blogs.v1.json.lock.candidate-00000000-0000-4000-8000-000000000001")
+    const temporary = join(directory, ".blogs.v1.json.00000000-0000-4000-8000-000000000001.tmp")
+    await Promise.all([writeFile(candidate, "stale"), writeFile(temporary, "stale")])
+    const stale = new Date(Date.now() - 2_000)
+    await Promise.all([utimes(candidate, stale, stale), utimes(temporary, stale, stale)])
+
+    await createRegistry(file, legacyPath).load()
+
+    await expect(readdir(directory)).resolves.toEqual([basename(file)])
+  })
+
   it("serializes concurrent registrations so neither update is lost", async () => {
     const directory = await createDirectory("garden-blog-registry-state-")
     const legacyPath = await createGarden("legacy")
@@ -76,9 +91,9 @@ describe("blog registry", () => {
       registry.add({ name: "Third", path: thirdPath }),
     ])
 
-    await expect(registry.load()).resolves.toMatchObject({
-      blogs: [{ path: legacyPath }, { path: secondPath }, { path: thirdPath }],
-    })
+    const state = await registry.load()
+    expect(state.blogs).toHaveLength(3)
+    expect(state.blogs.map((blog) => blog.path)).toEqual(expect.arrayContaining([legacyPath, secondPath, thirdPath]))
   })
 
   it("serializes concurrent registrations from separate registry instances", async () => {
@@ -175,6 +190,37 @@ describe("blog registry", () => {
     await expect(readFile(foreignTemporary!, "utf8")).resolves.toBe("foreign temporary data")
   })
 
+  it("retains the previous registry when replacing its temporary file fails", async () => {
+    const directory = await createDirectory("garden-blog-registry-state-")
+    const legacyPath = await createGarden("legacy")
+    const secondPath = await createGarden("second")
+    const file = join(directory, "blogs.v1.json")
+    let failReplacement = false
+    let identifier = 0
+    const fileSystem = {
+      rename: async (source: string, destination: string) => {
+        if (failReplacement && source.endsWith(".tmp")) throw new Error("simulated rename failure")
+        const { rename } = await import("node:fs/promises")
+        await rename(source, destination)
+      },
+    }
+    const registryOptions: Parameters<typeof createBlogRegistry>[0] & { readonly fileSystem: typeof fileSystem } = {
+      file,
+      legacyPath,
+      now: () => new Date("2026-10-01T00:00:00.000Z"),
+      uuid: () => `00000000-0000-4000-8000-${String(++identifier).padStart(12, "0")}`,
+      fileSystem,
+    }
+    const registry = createBlogRegistry(registryOptions)
+    await registry.load()
+    const previous = await readFile(file, "utf8")
+    failReplacement = true
+
+    await expect(registry.add({ name: "Second", path: secondPath })).rejects.toThrow("simulated rename failure")
+    await expect(readFile(file, "utf8")).resolves.toBe(previous)
+    await expect(readdir(directory)).resolves.toEqual([basename(file)])
+  })
+
   it("preserves a relative display path while storing its real canonical path", async () => {
     const directory = await createDirectory("garden-blog-registry-state-")
     const legacyPath = await createGarden("legacy")
@@ -185,6 +231,51 @@ describe("blog registry", () => {
     const state = await registry.add({ name: "Second", path: relativePath })
 
     expect(state.blogs[1]).toMatchObject({ path: relativePath, canonicalPath: await realpath(relativePath) })
+  })
+
+  it("keeps a missing inactive workspace registered so it can be removed", async () => {
+    const directory = await createDirectory("garden-blog-registry-state-")
+    const legacyPath = await createGarden("legacy")
+    const secondPath = await createGarden("second")
+    const registry = createRegistry(join(directory, "blogs.v1.json"), legacyPath)
+    const added = await registry.add({ name: "Second", path: secondPath })
+    const second = added.blogs[1]!
+    await rm(secondPath, { recursive: true })
+
+    await expect(registry.load()).resolves.toMatchObject({ blogs: [{ path: legacyPath }, { id: second.id, path: secondPath }] })
+    await expect(registry.remove(second.id)).resolves.toMatchObject({ blogs: [{ path: legacyPath }] })
+  })
+
+  it("relocates a missing inactive workspace to a new available directory", async () => {
+    const directory = await createDirectory("garden-blog-registry-state-")
+    const legacyPath = await createGarden("legacy")
+    const secondPath = await createGarden("second")
+    const replacementPath = await createGarden("replacement")
+    const registry = createRegistry(join(directory, "blogs.v1.json"), legacyPath)
+    const added = await registry.add({ name: "Second", path: secondPath })
+    const second = added.blogs[1]!
+    await rm(secondPath, { recursive: true })
+
+    await expect(registry.relocate(second.id, replacementPath)).resolves.toMatchObject({
+      blogs: [{ path: legacyPath }, { id: second.id, path: replacementPath, canonicalPath: await realpath(replacementPath) }],
+    })
+  })
+
+  it("does not resolve persisted relative display paths against a later working directory", async () => {
+    const directory = await createDirectory("garden-blog-registry-state-")
+    const legacyPath = await createGarden("legacy")
+    const secondPath = await createGarden("second")
+    const relativePath = relative(process.cwd(), secondPath)
+    const registry = createRegistry(join(directory, "blogs.v1.json"), legacyPath)
+    await registry.add({ name: "Second", path: relativePath })
+    const originalWorkingDirectory = process.cwd()
+
+    try {
+      process.chdir(directory)
+      await expect(registry.load()).resolves.toMatchObject({ blogs: [{ path: legacyPath }, { path: relativePath }] })
+    } finally {
+      process.chdir(originalWorkingDirectory)
+    }
   })
 
   it("returns the existing state when the canonical path differs only by Windows casing", async () => {

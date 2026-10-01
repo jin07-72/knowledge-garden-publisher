@@ -1,6 +1,6 @@
-import { link, mkdir, open, readFile, realpath, rename, unlink } from "node:fs/promises"
+import { link, lstat, mkdir, open, readFile, readdir, realpath, rename, unlink } from "node:fs/promises"
 import { randomUUID } from "node:crypto"
-import { basename, dirname, join, resolve } from "node:path"
+import { basename, dirname, isAbsolute, join, resolve } from "node:path"
 import { z } from "zod"
 
 export interface BlogRecord {
@@ -52,6 +52,7 @@ interface RegistryFileHandle {
 
 interface RegistryFileSystem {
   readonly open?: (path: string, flags: "r" | "wx", mode?: number) => Promise<RegistryFileHandle>
+  readonly rename?: (source: string, destination: string) => Promise<void>
 }
 
 type RegistryOpen = NonNullable<RegistryFileSystem["open"]>
@@ -65,7 +66,7 @@ const blogRecordSchema = z
     id: identifierSchema,
     name: nameSchema,
     path: pathSchema,
-    canonicalPath: pathSchema,
+    canonicalPath: pathSchema.refine(isAbsolute, "Canonical path must be absolute"),
     createdAt: timestampSchema,
     lastOpenedAt: timestampSchema,
   })
@@ -132,6 +133,10 @@ function isAlreadyExists(error: unknown): boolean {
   return typeof error === "object" && error !== null && "code" in error && error.code === "EEXIST"
 }
 
+function isUnavailablePath(error: unknown): boolean {
+  return typeof error === "object" && error !== null && "code" in error && (error.code === "ENOENT" || error.code === "ENOTDIR")
+}
+
 function isProcessAlive(pid: number): boolean {
   try {
     process.kill(pid, 0)
@@ -147,6 +152,31 @@ function delay(milliseconds: number): Promise<void> {
 
 function registryFileKey(file: string): string {
   return resolve(file).toLocaleLowerCase("en-US")
+}
+
+function escapedPattern(value: string): string {
+  return value.replace(/[.*+?^${}()|[\]\\]/g, "\\$&")
+}
+
+async function cleanupStaleArtifacts(file: string): Promise<void> {
+  const directory = dirname(file)
+  const filename = escapedPattern(basename(file))
+  const artifact = new RegExp(
+    `^\\.${filename}(?:\\.lock(?:\\.reclaim)?\\.candidate-[0-9a-f-]{36}|\\.[0-9a-f-]{36}\\.tmp)$`,
+    "i",
+  )
+  const staleBefore = Date.now() - registryLeaseMs
+
+  for (const name of await readdir(directory)) {
+    if (!artifact.test(name)) continue
+    const path = join(directory, name)
+    try {
+      const details = await lstat(path)
+      if (details.isFile() && details.mtimeMs <= staleBefore) await unlink(path)
+    } catch (error) {
+      if (!isMissingFile(error)) throw error
+    }
+  }
 }
 
 async function canonicalRegistryFile(file: string): Promise<string> {
@@ -311,6 +341,7 @@ export function createBlogRegistry(options: {
   const now = options.now ?? (() => new Date())
   const uuid = options.uuid ?? randomUUID
   const openFile = options.fileSystem?.open ?? open
+  const renameFile = options.fileSystem?.rename ?? rename
 
   const timestamp = () => now().toISOString()
 
@@ -318,6 +349,7 @@ export function createBlogRegistry(options: {
     return canonicalRegistryFile(options.file).then((file) => runForRegistryFile(file, async () => {
       const lease = await acquireLease(file, openFile)
       try {
+        await cleanupStaleArtifacts(file)
         return await operation(file)
       } finally {
         await releaseLease(lease.lock, lease.token)
@@ -344,7 +376,7 @@ export function createBlogRegistry(options: {
       await handle.sync()
       await handle.close()
       handle = undefined
-      await rename(temporary, file)
+      await renameFile(temporary, file)
       published = true
       await syncDirectory(directory, openFile)
     } finally {
@@ -389,8 +421,24 @@ export function createBlogRegistry(options: {
       if (!parsed.success) throw parsed.error
       await Promise.all(
         parsed.data.blogs.map(async (blog) => {
-          if (canonicalKey(await realpath(blog.path)) !== canonicalKey(blog.canonicalPath))
-            throw new Error("Stored canonical path does not match display path")
+          const canonicalTarget = await realpath(blog.canonicalPath).catch((error: unknown) => {
+            if (isUnavailablePath(error)) return undefined
+            throw error
+          })
+          if (canonicalTarget !== undefined && canonicalKey(canonicalTarget) !== canonicalKey(blog.canonicalPath))
+            throw new Error("Stored canonical path does not match its target")
+
+          // `path` is the caller's display value and can be relative, so it is
+          // never resolved at load time. Only an available absolute display path
+          // is cross-checked against the canonical locator.
+          if (canonicalTarget !== undefined && isAbsolute(blog.path)) {
+            const displayTarget = await realpath(blog.path).catch((error: unknown) => {
+              if (isUnavailablePath(error)) return undefined
+              throw error
+            })
+            if (displayTarget !== undefined && canonicalKey(displayTarget) !== canonicalKey(canonicalTarget))
+              throw new Error("Stored canonical path does not match display path")
+          }
         }),
       )
       return parsed.data
