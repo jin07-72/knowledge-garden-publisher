@@ -2,6 +2,7 @@ import { describe, expect, it, vi } from "vitest"
 import {
   IPC_CHANNELS,
   type AppError,
+  type BlogImportProgress,
   type PreviewStatus,
   type PublishProgress,
 } from "../../src/shared/contracts"
@@ -39,8 +40,10 @@ function services(): PublisherIpcServices & {
   emitPreview(status: PreviewStatus): void
   emitPublish(progress: PublishProgress): void
   emitRecovery(update: { restored: readonly string[]; conflicts: readonly string[] }): void
+  emitBlogProgress(progress: BlogImportProgress): void
   previewSubscriptions(): number
   publishSubscriptions(): number
+  blogSubscriptions(): number
 } {
   const calls = new Proxy<Record<string, ReturnType<typeof vi.fn>>>({} as never, {
     get(target, key: string) {
@@ -54,6 +57,7 @@ function services(): PublisherIpcServices & {
   const recoveryListeners = new Set<
     (update: { restored: readonly string[]; conflicts: readonly string[] }) => void
   >()
+  const blogListeners = new Set<(progress: BlogImportProgress) => void>()
 
   return {
     calls,
@@ -104,6 +108,23 @@ function services(): PublisherIpcServices & {
       cancel: call("historyCancel"),
       openLink: call("historyOpenLink"),
     },
+    blogs: {
+      list: call("blogsList"),
+      chooseLocal: call("blogsChooseLocal"),
+      addLocal: call("blogsAddLocal"),
+      clone: call("blogsClone"),
+      cancelImport: call("blogsCancelImport"),
+      install: call("blogsInstall"),
+      rename: call("blogsRename"),
+      relocate: call("blogsRelocate"),
+      remove: call("blogsRemove"),
+      openFolder: call("blogsOpenFolder"),
+      switch: call("blogsSwitch"),
+      subscribeProgress(listener) {
+        blogListeners.add(listener)
+        return () => blogListeners.delete(listener)
+      },
+    },
     emitPreview(status) {
       for (const listener of previewListeners) listener(status)
     },
@@ -113,8 +134,12 @@ function services(): PublisherIpcServices & {
     emitRecovery(update) {
       for (const listener of recoveryListeners) listener(update)
     },
+    emitBlogProgress(progress) {
+      for (const listener of blogListeners) listener(progress)
+    },
     previewSubscriptions: () => previewListeners.size,
     publishSubscriptions: () => publishListeners.size,
+    blogSubscriptions: () => blogListeners.size,
   }
 }
 
@@ -143,6 +168,60 @@ function setup() {
 }
 
 describe("secure publisher IPC", () => {
+  it("routes validated blog requests and rejects untrusted senders before the service", async () => {
+    const { ipc, servicePorts } = setup()
+    const id = "11111111-1111-4111-8111-111111111111"
+    const request = { id, name: "Renamed" }
+    const value = {
+      version: 1,
+      activeBlogId: id,
+      blogs: [{
+        id,
+        name: "Renamed",
+        path: String.raw`C:\\Blogs\\quartz`,
+        canonicalPath: String.raw`C:\\Blogs\\quartz`,
+        createdAt: "2026-10-01T00:00:00.000Z",
+        lastOpenedAt: "2026-10-01T00:00:00.000Z",
+      }],
+    }
+    servicePorts.calls.blogsRename.mockResolvedValueOnce(value)
+    await expect(ipc.invoke(IPC_CHANNELS.requests.blogsRename, trustedEvent, request)).resolves.toEqual({
+      ok: true,
+      value,
+    })
+    expect(servicePorts.calls.blogsRename).toHaveBeenCalledWith(request)
+    await expect(ipc.invoke(IPC_CHANNELS.requests.blogsRename, { sender: { isDestroyed: () => false } }, request)).resolves.toMatchObject({
+      ok: false,
+      error: { code: "IPC_UNAUTHORIZED" },
+    })
+    expect(servicePorts.calls.blogsRename).toHaveBeenCalledOnce()
+  })
+
+  it("keeps the finite blog channel allowlist safe until the optional service is wired", async () => {
+    const ipc = new FakeIpcMain()
+    const servicePorts = services()
+    delete (servicePorts as { blogs?: unknown }).blogs
+    registerPublisherIpc({
+      ipcMain: ipc,
+      services: servicePorts,
+      isTrustedSender: (event) => event === trustedEvent,
+      eventTargets: () => [],
+    })
+    await expect(ipc.invoke(IPC_CHANNELS.requests.blogsList, trustedEvent)).resolves.toEqual({
+      ok: false,
+      error: { code: "SERVICE_UNAVAILABLE", message: "Blog management is not available." },
+    })
+  })
+
+  it("forwards only validated blog progress and cleans the blog subscription", () => {
+    const { servicePorts, sent, dispose } = setup()
+    expect(servicePorts.blogSubscriptions()).toBe(1)
+    servicePorts.emitBlogProgress({ phase: "cloning", message: "Cloning blog.", stdout: "secret" } as never)
+    servicePorts.emitBlogProgress({ phase: "cloning", message: "Cloning blog." })
+    expect(sent).toEqual([[IPC_CHANNELS.events.blogsImportProgress, { phase: "cloning", message: "Cloning blog." }]])
+    dispose()
+    expect(servicePorts.blogSubscriptions()).toBe(0)
+  })
   it("registers only the explicit request allowlist", () => {
     const { ipc, dispose } = setup()
     expect([...ipc.handlers.keys()].sort()).toEqual(
@@ -202,6 +281,17 @@ describe("secure publisher IPC", () => {
       [IPC_CHANNELS.requests.historyGit, { requestId: "../bad" }, "historyGit"],
       [IPC_CHANNELS.requests.historyDeployments, { limit: 101 }, "historyDeployments"],
       [IPC_CHANNELS.requests.historyCancel, { requestId: "../bad" }, "historyCancel"],
+      [IPC_CHANNELS.requests.blogsList, {}, "blogsList"],
+      [IPC_CHANNELS.requests.blogsChooseLocal, {}, "blogsChooseLocal"],
+      [IPC_CHANNELS.requests.blogsAddLocal, { path: "relative\\quartz", name: "Quartz", extra: true }, "blogsAddLocal"],
+      [IPC_CHANNELS.requests.blogsClone, { url: "https://github.com/openai/quartz?token=secret", destination: String.raw`C:\\Blogs\\quartz`, name: "Quartz", extra: true }, "blogsClone"],
+      [IPC_CHANNELS.requests.blogsCancelImport, {}, "blogsCancelImport"],
+      [IPC_CHANNELS.requests.blogsInstall, { path: "relative\\quartz", extra: true }, "blogsInstall"],
+      [IPC_CHANNELS.requests.blogsRename, { id: "not-a-uuid", name: "Quartz", extra: true }, "blogsRename"],
+      [IPC_CHANNELS.requests.blogsRelocate, { id: "not-a-uuid", path: "relative\\quartz", extra: true }, "blogsRelocate"],
+      [IPC_CHANNELS.requests.blogsRemove, { id: "not-a-uuid", extra: true }, "blogsRemove"],
+      [IPC_CHANNELS.requests.blogsOpenFolder, { id: "not-a-uuid", extra: true }, "blogsOpenFolder"],
+      [IPC_CHANNELS.requests.blogsSwitch, { id: "not-a-uuid", extra: true }, "blogsSwitch"],
     ]
 
     for (const [channel, request, call] of invalidRequests) {
@@ -291,6 +381,32 @@ describe("secure publisher IPC", () => {
       error: { code: "IPC_UNAUTHORIZED", message: "This application window is not authorized." },
     })
     expect(servicePorts.calls.notesList).not.toHaveBeenCalled()
+  })
+
+  it("rejects every blog channel before service dispatch for an untrusted sender", async () => {
+    const { ipc, servicePorts } = setup()
+    const id = "11111111-1111-4111-8111-111111111111"
+    const destination = String.raw`C:\\Blogs\\quartz`
+    const calls: readonly [string, unknown, string][] = [
+      [IPC_CHANNELS.requests.blogsList, undefined, "blogsList"],
+      [IPC_CHANNELS.requests.blogsChooseLocal, undefined, "blogsChooseLocal"],
+      [IPC_CHANNELS.requests.blogsAddLocal, { path: destination, name: "Quartz" }, "blogsAddLocal"],
+      [IPC_CHANNELS.requests.blogsClone, { url: "https://github.com/openai/quartz", destination, name: "Quartz" }, "blogsClone"],
+      [IPC_CHANNELS.requests.blogsCancelImport, undefined, "blogsCancelImport"],
+      [IPC_CHANNELS.requests.blogsInstall, { path: destination }, "blogsInstall"],
+      [IPC_CHANNELS.requests.blogsRename, { id, name: "Quartz" }, "blogsRename"],
+      [IPC_CHANNELS.requests.blogsRelocate, { id, path: destination }, "blogsRelocate"],
+      [IPC_CHANNELS.requests.blogsRemove, { id }, "blogsRemove"],
+      [IPC_CHANNELS.requests.blogsOpenFolder, { id }, "blogsOpenFolder"],
+      [IPC_CHANNELS.requests.blogsSwitch, { id }, "blogsSwitch"],
+    ]
+    for (const [channel, request, call] of calls) {
+      await expect(ipc.invoke(channel, { sender: { isDestroyed: () => false } }, request)).resolves.toMatchObject({
+        ok: false,
+        error: { code: "IPC_UNAUTHORIZED" },
+      })
+      expect(servicePorts.calls[call]).not.toHaveBeenCalled()
+    }
   })
 
   it("fails closed when sender authorization races with destruction", async () => {
@@ -579,13 +695,28 @@ describe("preload garden API", () => {
     expect(api).not.toHaveProperty("shell")
     expect(api).not.toHaveProperty("exec")
     expect(Object.keys(api).sort()).toEqual(
-      ["changes", "history", "lifecycle", "notes", "preview", "publish", "workspace"].sort(),
+      ["blogs", "changes", "history", "lifecycle", "notes", "preview", "publish", "workspace"].sort(),
     )
   })
 
   it("maps each method to its one allowlisted channel", async () => {
     const ipc = new FakeIpcRenderer()
     const api = createGardenApi(ipc)
+    await api.blogs.list()
+    await api.blogs.chooseLocal()
+    await api.blogs.addLocal({ path: String.raw`C:\\Blogs\\quartz`, name: "Quartz" })
+    await api.blogs.clone({
+      url: "https://github.com/openai/quartz",
+      destination: String.raw`C:\\Blogs\\quartz`,
+      name: "Quartz",
+    })
+    await api.blogs.cancelImport()
+    await api.blogs.install({ path: String.raw`C:\\Blogs\\quartz` })
+    await api.blogs.rename({ id: "11111111-1111-4111-8111-111111111111", name: "Quartz" })
+    await api.blogs.relocate({ id: "11111111-1111-4111-8111-111111111111", path: String.raw`C:\\Blogs\\moved` })
+    await api.blogs.remove({ id: "11111111-1111-4111-8111-111111111111" })
+    await api.blogs.openFolder({ id: "11111111-1111-4111-8111-111111111111" })
+    await api.blogs.switch({ id: "11111111-1111-4111-8111-111111111111" })
     await api.workspace.inspectSafety()
     await api.workspace.inspect()
     await api.workspace.repair({ action: "install-dependencies" })
@@ -638,7 +769,7 @@ describe("preload garden API", () => {
       success: true,
     })
 
-    expect(ipc.invokes.map(([channel]) => channel)).toEqual(Object.values(IPC_CHANNELS.requests))
+    expect(ipc.invokes.map(([channel]) => channel).sort()).toEqual(Object.values(IPC_CHANNELS.requests).sort())
   })
 
   it("replaces malformed main-process envelopes with a fixed internal error", async () => {
@@ -697,6 +828,17 @@ describe("preload garden API", () => {
     ipc.emit(IPC_CHANNELS.events.previewProgress, { state: "ready", generation: 1 })
     expect(first).toHaveBeenCalledTimes(1)
     expect(second).toHaveBeenCalledTimes(2)
+  })
+
+  it("validates blog progress before dispatching and unsubscribes its wrapped listener", () => {
+    const ipc = new FakeIpcRenderer()
+    const listener = vi.fn()
+    const unsubscribe = createGardenApi(ipc).blogs.onImportProgress(listener)
+    ipc.emit(IPC_CHANNELS.events.blogsImportProgress, { phase: "cloning", message: "Cloning blog.", stdout: "secret" })
+    ipc.emit(IPC_CHANNELS.events.blogsImportProgress, { phase: "cloning", message: "Cloning blog." })
+    unsubscribe()
+    ipc.emit(IPC_CHANNELS.events.blogsImportProgress, { phase: "complete", message: "Blog import complete." })
+    expect(listener).toHaveBeenCalledExactlyOnceWith({ phase: "cloning", message: "Cloning blog." })
   })
 
   it("validates lifecycle events and removes their wrapped listeners", () => {

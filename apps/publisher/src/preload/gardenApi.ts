@@ -1,5 +1,17 @@
 import {
   IPC_CHANNELS,
+  type BlogAddLocalRequest,
+  type BlogCandidateInspection,
+  type BlogCandidateSelection,
+  type BlogCloneRequest,
+  type BlogIdRequest,
+  type BlogImportProgress,
+  type BlogImportReceipt,
+  type BlogPathRequest,
+  type BlogRegistryView,
+  type BlogRelocateRequest,
+  type BlogRenameRequest,
+  type BlogSwitchRequest,
   type GardenApi,
   type ChangeReview,
   type BeforeCloseRequest,
@@ -38,6 +50,7 @@ import {
 import {
   IPC_SUCCESS_SCHEMAS,
   beforeCloseSchema,
+  blogImportProgressSchema,
   closeBlockedSchema,
   ipcResultSchema,
   previewProgressSchema,
@@ -107,6 +120,30 @@ function subscription<T>(
 
 /** Builds the only renderer-facing capability object. No Electron primitive escapes this closure. */
 export function createGardenApi(ipc: IpcRendererPort): GardenApi {
+  const blogs = Object.freeze({
+    list: () => invoke<BlogRegistryView>(ipc, IPC_CHANNELS.requests.blogsList),
+    chooseLocal: () =>
+      invoke<BlogCandidateSelection | undefined>(ipc, IPC_CHANNELS.requests.blogsChooseLocal),
+    addLocal: (request: BlogAddLocalRequest) =>
+      invoke<BlogRegistryView>(ipc, IPC_CHANNELS.requests.blogsAddLocal, request),
+    clone: (request: BlogCloneRequest) =>
+      invoke<BlogImportReceipt>(ipc, IPC_CHANNELS.requests.blogsClone, request),
+    cancelImport: () => invoke<void>(ipc, IPC_CHANNELS.requests.blogsCancelImport),
+    install: (request: BlogPathRequest) =>
+      invoke<BlogCandidateInspection>(ipc, IPC_CHANNELS.requests.blogsInstall, request),
+    rename: (request: BlogRenameRequest) =>
+      invoke<BlogRegistryView>(ipc, IPC_CHANNELS.requests.blogsRename, request),
+    relocate: (request: BlogRelocateRequest) =>
+      invoke<BlogRegistryView>(ipc, IPC_CHANNELS.requests.blogsRelocate, request),
+    remove: (request: BlogIdRequest) =>
+      invoke<BlogRegistryView>(ipc, IPC_CHANNELS.requests.blogsRemove, request),
+    openFolder: (request: BlogIdRequest) =>
+      invoke<void>(ipc, IPC_CHANNELS.requests.blogsOpenFolder, request),
+    switch: (request: BlogSwitchRequest) =>
+      invoke<void>(ipc, IPC_CHANNELS.requests.blogsSwitch, request),
+    onImportProgress: (listener: (progress: BlogImportProgress) => void) =>
+      subscription(ipc, IPC_CHANNELS.events.blogsImportProgress, blogImportProgressSchema, listener),
+  })
   const lifecycle = Object.freeze({
     acknowledgeClose: (request: CloseAckRequest) =>
       invoke<void>(ipc, IPC_CHANNELS.requests.lifecycleCloseAck, request),
@@ -179,5 +216,5 @@ export function createGardenApi(ipc: IpcRendererPort): GardenApi {
     openLink: (request: HistoryLinkRequest) =>
       invoke<void>(ipc, IPC_CHANNELS.requests.historyOpenLink, request),
   })
-  return Object.freeze({ lifecycle, workspace, notes, preview, changes, publish, history })
+  return Object.freeze({ blogs, lifecycle, workspace, notes, preview, changes, publish, history })
 }

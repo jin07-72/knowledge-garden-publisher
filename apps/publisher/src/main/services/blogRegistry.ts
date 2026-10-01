@@ -2,21 +2,10 @@ import { link, lstat, mkdir, open, readFile, readdir, realpath, rename, unlink }
 import { randomUUID } from "node:crypto"
 import { basename, dirname, isAbsolute, join, resolve } from "node:path"
 import { z } from "zod"
+import type { BlogRecord, BlogRegistryView } from "../../shared/contracts"
 
-export interface BlogRecord {
-  readonly id: string
-  readonly name: string
-  readonly path: string
-  readonly canonicalPath: string
-  readonly createdAt: string
-  readonly lastOpenedAt: string
-}
-
-export interface BlogRegistryState {
-  readonly version: 1
-  readonly activeBlogId: string
-  readonly blogs: readonly BlogRecord[]
-}
+export type { BlogRecord } from "../../shared/contracts"
+export type BlogRegistryState = BlogRegistryView
 
 export interface BlogRegistry {
   load(): Promise<BlogRegistryState>

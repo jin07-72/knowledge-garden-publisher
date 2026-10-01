@@ -1,5 +1,11 @@
 import { z } from "zod"
-import { APP_ERROR_CODES, IPC_CHANNELS, type AppError, type IpcResult } from "./contracts"
+import {
+  APP_ERROR_CODES,
+  IPC_CHANNELS,
+  parseGitHubRepositoryUrl,
+  type AppError,
+  type IpcResult,
+} from "./contracts"
 
 export const MAX_MARKDOWN_UTF8_BYTES = 16 * 1024 * 1024
 export function utf8ByteLength(value: string): number {
@@ -21,6 +27,39 @@ export function utf8ByteLength(value: string): number {
 export const markdownSchema = z
   .string()
   .refine((value) => utf8ByteLength(value) <= MAX_MARKDOWN_UTF8_BYTES)
+
+const controlCharacterPattern = /[\u0000-\u001f\u007f]/
+const windowsAbsolutePathPattern = /^(?:[A-Za-z]:[\\/]|\\\\[^\\/]+[\\/][^\\/]+)/
+const blogPathSchema = z
+  .string()
+  .min(1)
+  .refine((value) => utf8ByteLength(value) <= 1_024)
+  .refine((value) => windowsAbsolutePathPattern.test(value))
+  .refine((value) => !controlCharacterPattern.test(value))
+const blogNameSchema = z
+  .string()
+  .max(80)
+  .refine((value) => value.trim().length > 0)
+  .refine((value) => !controlCharacterPattern.test(value))
+  .transform((value) => value.trim())
+const blogIdSchema = z.string().uuid()
+const blogUrlSchema = z
+  .string()
+  .min(1)
+  .refine((value) => utf8ByteLength(value) <= 2_048)
+  .refine((value) => parseGitHubRepositoryUrl(value) !== undefined)
+
+export const blogIdRequestSchema = z.object({ id: blogIdSchema }).strict()
+export const blogPathRequestSchema = z.object({ path: blogPathSchema }).strict()
+export const blogAddLocalRequestSchema = z
+  .object({ path: blogPathSchema, name: blogNameSchema })
+  .strict()
+export const blogCloneRequestSchema = z
+  .object({ url: blogUrlSchema, destination: blogPathSchema, name: blogNameSchema })
+  .strict()
+export const blogRenameRequestSchema = z.object({ id: blogIdSchema, name: blogNameSchema }).strict()
+export const blogRelocateRequestSchema = z.object({ id: blogIdSchema, path: blogPathSchema }).strict()
+export const blogSwitchRequestSchema = blogIdRequestSchema
 
 export const appErrorSchema = z
   .object({
@@ -231,6 +270,33 @@ export const publishProgressSchema = z
   })
   .strip()
 
+const blogRecordSchema = z
+  .object({
+    id: blogIdSchema,
+    name: z.string().min(1).max(80).refine((value) => !controlCharacterPattern.test(value)),
+    path: z.string().min(1).max(1_024).refine((value) => !controlCharacterPattern.test(value)),
+    canonicalPath: z.string().min(1).max(1_024).refine((value) => !controlCharacterPattern.test(value)),
+    createdAt: z.string().datetime(),
+    lastOpenedAt: z.string().datetime(),
+  })
+  .strip()
+const blogRegistryViewSchema = z
+  .object({ version: z.literal(1), activeBlogId: blogIdSchema, blogs: z.array(blogRecordSchema).min(1).max(1_000) })
+  .strip()
+const blogCandidateInspectionSchema = z.discriminatedUnion("valid", [
+  z.object({ valid: z.literal(true), canonicalPath: z.string().min(1).max(1_024), needsInstall: z.boolean() }).strip(),
+  z.object({ valid: z.literal(false), code: z.string().min(1).max(128), message: z.string().min(1).max(1_000) }).strip(),
+])
+const blogCandidateSelectionSchema = z
+  .object({ path: z.string().min(1).max(1_024), inspection: blogCandidateInspectionSchema })
+  .strip()
+const blogImportReceiptSchema = z
+  .object({ canonicalPath: z.string().min(1).max(1_024), owner: z.string().min(1).max(39), repository: z.string().min(1).max(100) })
+  .strip()
+export const blogImportProgressSchema = z
+  .object({ phase: z.enum(["cloning", "installing", "validating", "complete"]), message: z.string().min(1).max(1_000) })
+  .strict()
+
 export const previewProgressSchema = previewStatusSchema
 export const beforeCloseSchema = z.object({ requestId: z.string().uuid() }).strict()
 export const closeBlockedSchema = z.object({ message: z.string().min(1).max(1_000) }).strict()
@@ -269,6 +335,17 @@ export const IPC_SUCCESS_SCHEMAS = {
   [IPC_CHANNELS.requests.historyCancel]: z.undefined(),
   [IPC_CHANNELS.requests.historyOpenLink]: z.undefined(),
   [IPC_CHANNELS.requests.lifecycleCloseAck]: z.undefined(),
+  [IPC_CHANNELS.requests.blogsList]: blogRegistryViewSchema,
+  [IPC_CHANNELS.requests.blogsChooseLocal]: blogCandidateSelectionSchema.optional(),
+  [IPC_CHANNELS.requests.blogsAddLocal]: blogRegistryViewSchema,
+  [IPC_CHANNELS.requests.blogsClone]: blogImportReceiptSchema,
+  [IPC_CHANNELS.requests.blogsCancelImport]: z.undefined(),
+  [IPC_CHANNELS.requests.blogsInstall]: blogCandidateInspectionSchema,
+  [IPC_CHANNELS.requests.blogsRename]: blogRegistryViewSchema,
+  [IPC_CHANNELS.requests.blogsRelocate]: blogRegistryViewSchema,
+  [IPC_CHANNELS.requests.blogsRemove]: blogRegistryViewSchema,
+  [IPC_CHANNELS.requests.blogsOpenFolder]: z.undefined(),
+  [IPC_CHANNELS.requests.blogsSwitch]: z.undefined(),
 } satisfies Record<RequestChannel, z.ZodType>
 
 export function ipcResultSchema<T>(success: z.ZodType<T>): z.ZodType<IpcResult<T>> {

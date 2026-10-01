@@ -259,6 +259,104 @@ export interface PreviewStatus {
   readonly error?: AppError
 }
 
+export interface BlogRecord {
+  readonly id: string
+  readonly name: string
+  readonly path: string
+  readonly canonicalPath: string
+  readonly createdAt: string
+  readonly lastOpenedAt: string
+}
+
+export interface BlogRegistryView {
+  readonly version: 1
+  readonly activeBlogId: string
+  readonly blogs: readonly BlogRecord[]
+}
+
+export type BlogCandidateInspection =
+  | { readonly valid: true; readonly canonicalPath: string; readonly needsInstall: boolean }
+  | { readonly valid: false; readonly code: string; readonly message: string }
+
+export interface BlogCandidateSelection {
+  readonly path: string
+  readonly inspection: BlogCandidateInspection
+}
+
+export interface BlogIdRequest {
+  readonly id: string
+}
+
+export interface BlogPathRequest {
+  readonly path: string
+}
+
+export interface BlogAddLocalRequest extends BlogPathRequest {
+  readonly name: string
+}
+
+export interface BlogCloneRequest {
+  readonly url: string
+  readonly destination: string
+  readonly name: string
+}
+
+export interface GitHubRepository {
+  readonly url: string
+  readonly owner: string
+  readonly repository: string
+}
+
+const GITHUB_OWNER_PATTERN = "[A-Za-z0-9](?:[A-Za-z0-9-]{0,37}[A-Za-z0-9])?"
+const GITHUB_REPOSITORY_PATTERN = "[A-Za-z0-9](?:[A-Za-z0-9._-]{0,98}[A-Za-z0-9])?"
+const GITHUB_HTTPS_REPOSITORY = new RegExp(
+  `^https://github\\.com/(${GITHUB_OWNER_PATTERN})/(${GITHUB_REPOSITORY_PATTERN})(?:\\.git)?$`,
+)
+const GITHUB_SSH_REPOSITORY = new RegExp(
+  `^git@github\\.com:(${GITHUB_OWNER_PATTERN})/(${GITHUB_REPOSITORY_PATTERN})(?:\\.git)?$`,
+)
+
+/** Parses only literal GitHub clone URLs which are safe as one Git argument. */
+export function parseGitHubRepositoryUrl(value: string): GitHubRepository | undefined {
+  if (
+    typeof value !== "string" ||
+    value.length === 0 ||
+    new TextEncoder().encode(value).byteLength > 2_048 ||
+    value !== value.trim() ||
+    /[\u0000-\u001f\u007f\s]/.test(value)
+  ) return undefined
+  const match = GITHUB_HTTPS_REPOSITORY.exec(value) ?? GITHUB_SSH_REPOSITORY.exec(value)
+  if (!match) return undefined
+  const [, owner, matchedRepository] = match
+  const repository = matchedRepository.endsWith(".git")
+    ? matchedRepository.slice(0, -".git".length)
+    : matchedRepository
+  return repository && repository !== "." && repository !== ".."
+    ? { url: value, owner, repository }
+    : undefined
+}
+
+export interface BlogImportReceipt {
+  readonly canonicalPath: string
+  readonly owner: string
+  readonly repository: string
+}
+
+export interface BlogRenameRequest extends BlogIdRequest {
+  readonly name: string
+}
+
+export interface BlogRelocateRequest extends BlogIdRequest, BlogPathRequest {}
+
+export interface BlogSwitchRequest extends BlogIdRequest {}
+
+export type BlogImportPhase = "cloning" | "installing" | "validating" | "complete"
+
+export interface BlogImportProgress {
+  readonly phase: BlogImportPhase
+  readonly message: string
+}
+
 export const IPC_CHANNELS = {
   requests: {
     workspaceInspectSafety: "garden:workspace:inspect-safety",
@@ -286,6 +384,17 @@ export const IPC_CHANNELS = {
     historyCancel: "garden:history:cancel",
     historyOpenLink: "garden:history:open-link",
     lifecycleCloseAck: "garden:lifecycle:close-ack",
+    blogsList: "garden:blogs:list",
+    blogsChooseLocal: "garden:blogs:choose-local",
+    blogsAddLocal: "garden:blogs:add-local",
+    blogsClone: "garden:blogs:clone",
+    blogsCancelImport: "garden:blogs:cancel-import",
+    blogsInstall: "garden:blogs:install",
+    blogsRename: "garden:blogs:rename",
+    blogsRelocate: "garden:blogs:relocate",
+    blogsRemove: "garden:blogs:remove",
+    blogsOpenFolder: "garden:blogs:open-folder",
+    blogsSwitch: "garden:blogs:switch",
   },
   events: {
     notesRecovery: "garden:event:notes-recovery",
@@ -293,6 +402,7 @@ export const IPC_CHANNELS = {
     publishProgress: "garden:event:publish-progress",
     beforeClose: "garden:event:before-close",
     closeBlocked: "garden:event:close-blocked",
+    blogsImportProgress: "garden:event:blogs-import-progress",
   },
 } as const
 
@@ -421,6 +531,20 @@ export interface GitCommit {
 export type Unsubscribe = () => void
 
 export interface GardenApi {
+  readonly blogs: {
+    list(): Promise<IpcResult<BlogRegistryView>>
+    chooseLocal(): Promise<IpcResult<BlogCandidateSelection | undefined>>
+    addLocal(request: BlogAddLocalRequest): Promise<IpcResult<BlogRegistryView>>
+    clone(request: BlogCloneRequest): Promise<IpcResult<BlogImportReceipt>>
+    cancelImport(): Promise<IpcResult<void>>
+    install(request: BlogPathRequest): Promise<IpcResult<BlogCandidateInspection>>
+    rename(request: BlogRenameRequest): Promise<IpcResult<BlogRegistryView>>
+    relocate(request: BlogRelocateRequest): Promise<IpcResult<BlogRegistryView>>
+    remove(request: BlogIdRequest): Promise<IpcResult<BlogRegistryView>>
+    openFolder(request: BlogIdRequest): Promise<IpcResult<void>>
+    switch(request: BlogSwitchRequest): Promise<IpcResult<void>>
+    onImportProgress(listener: (progress: BlogImportProgress) => void): Unsubscribe
+  }
   readonly lifecycle: {
     acknowledgeClose(request: CloseAckRequest): Promise<IpcResult<void>>
     onBeforeClose(listener: (request: BeforeCloseRequest) => void): Unsubscribe

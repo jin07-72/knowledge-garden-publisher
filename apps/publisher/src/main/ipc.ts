@@ -2,6 +2,18 @@ import { z } from "zod"
 import {
   IPC_CHANNELS,
   MANAGED_NOTE_PATH_PATTERN,
+  type BlogAddLocalRequest,
+  type BlogCandidateInspection,
+  type BlogCandidateSelection,
+  type BlogCloneRequest,
+  type BlogIdRequest,
+  type BlogImportProgress,
+  type BlogImportReceipt,
+  type BlogPathRequest,
+  type BlogRegistryView,
+  type BlogRelocateRequest,
+  type BlogRenameRequest,
+  type BlogSwitchRequest,
   type ChangeReview,
   type CloseAckRequest,
   type DeploymentHistory,
@@ -38,6 +50,14 @@ import {
 import {
   IPC_SUCCESS_SCHEMAS,
   appErrorSchema,
+  blogAddLocalRequestSchema,
+  blogCloneRequestSchema,
+  blogIdRequestSchema,
+  blogImportProgressSchema,
+  blogPathRequestSchema,
+  blogRelocateRequestSchema,
+  blogRenameRequestSchema,
+  blogSwitchRequestSchema,
   markdownSchema,
   previewProgressSchema,
   publishProgressSchema,
@@ -98,6 +118,20 @@ export interface PublisherIpcServices {
     deployments(request: HistoryRequest): Promise<DeploymentHistory>
     cancel(request: HistoryCancelRequest): Promise<void>
     openLink(request: HistoryLinkRequest): Promise<void>
+  }
+  readonly blogs?: {
+    list(): Promise<BlogRegistryView>
+    chooseLocal(): Promise<BlogCandidateSelection | undefined>
+    addLocal(request: BlogAddLocalRequest): Promise<BlogRegistryView>
+    clone(request: BlogCloneRequest): Promise<BlogImportReceipt>
+    cancelImport(): Promise<void>
+    install(request: BlogPathRequest): Promise<BlogCandidateInspection>
+    rename(request: BlogRenameRequest): Promise<BlogRegistryView>
+    relocate(request: BlogRelocateRequest): Promise<BlogRegistryView>
+    remove(request: BlogIdRequest): Promise<BlogRegistryView>
+    openFolder(request: BlogIdRequest): Promise<void>
+    switch(request: BlogSwitchRequest): Promise<void>
+    subscribeProgress(listener: (progress: BlogImportProgress) => void): () => void
   }
 }
 
@@ -212,6 +246,10 @@ function unauthorized(): IpcResult<never> {
   }
 }
 
+function serviceUnavailable(): never {
+  throw { code: "SERVICE_UNAVAILABLE", message: "Blog management is not available." }
+}
+
 function serializeFailure(error: unknown): IpcResult<never> {
   try {
     const parsed = appErrorSchema.safeParse(error)
@@ -271,6 +309,17 @@ function secureHandler<Input, Output>(
 export function registerPublisherIpc(options: RegisterPublisherIpcOptions): () => void {
   const { ipcMain, services, isTrustedSender, eventTargets } = options
   const handlers: ReadonlyArray<readonly [string, RequestHandler]> = [
+    [IPC_CHANNELS.requests.blogsList, secureHandler(IPC_CHANNELS.requests.blogsList, noRequestSchema, isTrustedSender, () => services.blogs?.list() ?? serviceUnavailable())],
+    [IPC_CHANNELS.requests.blogsChooseLocal, secureHandler(IPC_CHANNELS.requests.blogsChooseLocal, noRequestSchema, isTrustedSender, () => services.blogs?.chooseLocal() ?? serviceUnavailable())],
+    [IPC_CHANNELS.requests.blogsAddLocal, secureHandler(IPC_CHANNELS.requests.blogsAddLocal, blogAddLocalRequestSchema, isTrustedSender, (request) => services.blogs?.addLocal(request) ?? serviceUnavailable())],
+    [IPC_CHANNELS.requests.blogsClone, secureHandler(IPC_CHANNELS.requests.blogsClone, blogCloneRequestSchema, isTrustedSender, (request) => services.blogs?.clone(request) ?? serviceUnavailable())],
+    [IPC_CHANNELS.requests.blogsCancelImport, secureHandler(IPC_CHANNELS.requests.blogsCancelImport, noRequestSchema, isTrustedSender, () => services.blogs?.cancelImport() ?? serviceUnavailable())],
+    [IPC_CHANNELS.requests.blogsInstall, secureHandler(IPC_CHANNELS.requests.blogsInstall, blogPathRequestSchema, isTrustedSender, (request) => services.blogs?.install(request) ?? serviceUnavailable())],
+    [IPC_CHANNELS.requests.blogsRename, secureHandler(IPC_CHANNELS.requests.blogsRename, blogRenameRequestSchema, isTrustedSender, (request) => services.blogs?.rename(request) ?? serviceUnavailable())],
+    [IPC_CHANNELS.requests.blogsRelocate, secureHandler(IPC_CHANNELS.requests.blogsRelocate, blogRelocateRequestSchema, isTrustedSender, (request) => services.blogs?.relocate(request) ?? serviceUnavailable())],
+    [IPC_CHANNELS.requests.blogsRemove, secureHandler(IPC_CHANNELS.requests.blogsRemove, blogIdRequestSchema, isTrustedSender, (request) => services.blogs?.remove(request) ?? serviceUnavailable())],
+    [IPC_CHANNELS.requests.blogsOpenFolder, secureHandler(IPC_CHANNELS.requests.blogsOpenFolder, blogIdRequestSchema, isTrustedSender, (request) => services.blogs?.openFolder(request) ?? serviceUnavailable())],
+    [IPC_CHANNELS.requests.blogsSwitch, secureHandler(IPC_CHANNELS.requests.blogsSwitch, blogSwitchRequestSchema, isTrustedSender, (request) => services.blogs?.switch(request) ?? serviceUnavailable())],
     [
       IPC_CHANNELS.requests.workspaceInspectSafety,
       secureHandler(
@@ -519,6 +568,13 @@ export function registerPublisherIpc(options: RegisterPublisherIpcOptions): () =
         broadcast(IPC_CHANNELS.events.publishProgress, publishProgressSchema, progress),
       ),
     )
+    if (services.blogs) {
+      subscriptions.push(
+        services.blogs.subscribeProgress((progress) =>
+          broadcast(IPC_CHANNELS.events.blogsImportProgress, blogImportProgressSchema, progress),
+        ),
+      )
+    }
   } catch (error) {
     bestEffortCleanup([
       ...registered.map((channel) => () => ipcMain.removeHandler(channel)),

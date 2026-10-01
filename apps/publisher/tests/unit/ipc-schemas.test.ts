@@ -1,6 +1,17 @@
 import { describe, expect, it } from "vitest"
 import { IPC_CHANNELS } from "../../src/shared/contracts"
-import { IPC_SUCCESS_SCHEMAS, utf8ByteLength } from "../../src/shared/ipcSchemas"
+import {
+  IPC_SUCCESS_SCHEMAS,
+  blogAddLocalRequestSchema,
+  blogCloneRequestSchema,
+  blogIdRequestSchema,
+  blogImportProgressSchema,
+  blogPathRequestSchema,
+  blogRelocateRequestSchema,
+  blogRenameRequestSchema,
+  blogSwitchRequestSchema,
+  utf8ByteLength,
+} from "../../src/shared/ipcSchemas"
 
 const privateField = { privateSource: "must-not-cross" }
 const capabilities = { files: true, preview: true, git: false, publish: false }
@@ -31,6 +42,17 @@ const transaction = {
   ...privateField,
 }
 const preview = { state: "stopped", generation: 0, ...privateField }
+const blogId = "11111111-1111-4111-8111-111111111111"
+const blog = {
+  id: blogId,
+  name: "Quartz",
+  path: String.raw`C:\\Blogs\\quartz`,
+  canonicalPath: String.raw`C:\\Blogs\\quartz`,
+  createdAt: "2026-10-01T00:00:00.000Z",
+  lastOpenedAt: "2026-10-01T00:00:00.000Z",
+  ...privateField,
+}
+const blogRegistry = { version: 1, activeBlogId: blogId, blogs: [blog], ...privateField }
 
 const validByChannel: Record<string, unknown> = {
   [IPC_CHANNELS.requests.workspaceInspectSafety]: {
@@ -126,9 +148,86 @@ const validByChannel: Record<string, unknown> = {
   [IPC_CHANNELS.requests.historyCancel]: undefined,
   [IPC_CHANNELS.requests.historyOpenLink]: undefined,
   [IPC_CHANNELS.requests.lifecycleCloseAck]: undefined,
+  [IPC_CHANNELS.requests.blogsList]: blogRegistry,
+  [IPC_CHANNELS.requests.blogsChooseLocal]: {
+    path: String.raw`C:\\Blogs\\quartz`,
+    inspection: { valid: true, canonicalPath: String.raw`C:\\Blogs\\quartz`, needsInstall: false },
+    ...privateField,
+  },
+  [IPC_CHANNELS.requests.blogsAddLocal]: blogRegistry,
+  [IPC_CHANNELS.requests.blogsClone]: {
+    canonicalPath: String.raw`C:\\Blogs\\quartz`,
+    owner: "openai",
+    repository: "quartz",
+    ...privateField,
+  },
+  [IPC_CHANNELS.requests.blogsCancelImport]: undefined,
+  [IPC_CHANNELS.requests.blogsInstall]: {
+    valid: true,
+    canonicalPath: String.raw`C:\\Blogs\\quartz`,
+    needsInstall: false,
+    ...privateField,
+  },
+  [IPC_CHANNELS.requests.blogsRename]: blogRegistry,
+  [IPC_CHANNELS.requests.blogsRelocate]: blogRegistry,
+  [IPC_CHANNELS.requests.blogsRemove]: blogRegistry,
+  [IPC_CHANNELS.requests.blogsOpenFolder]: undefined,
+  [IPC_CHANNELS.requests.blogsSwitch]: undefined,
 }
 
 describe("IPC success schemas", () => {
+  it("strictly validates safe blog management requests", () => {
+    const id = "11111111-1111-4111-8111-111111111111"
+    const absolutePath = String.raw`C:\\Blogs\\quartz`
+    expect(blogIdRequestSchema.safeParse({ id }).success).toBe(true)
+    expect(blogPathRequestSchema.safeParse({ path: absolutePath }).success).toBe(true)
+    expect(blogAddLocalRequestSchema.safeParse({ path: absolutePath, name: "Quartz" }).success).toBe(true)
+    expect(blogCloneRequestSchema.safeParse({
+      url: "https://github.com/openai/quartz.git",
+      destination: absolutePath,
+      name: "Quartz",
+    }).success).toBe(true)
+    expect(blogRenameRequestSchema.safeParse({ id, name: "Renamed" }).success).toBe(true)
+    expect(blogRelocateRequestSchema.safeParse({ id, path: absolutePath }).success).toBe(true)
+    expect(blogSwitchRequestSchema.safeParse({ id }).success).toBe(true)
+  })
+
+  it("rejects unsafe blog request fields and unknown keys", () => {
+    const id = "11111111-1111-4111-8111-111111111111"
+    const absolutePath = String.raw`C:\\Blogs\\quartz`
+    for (const name of ["", "   ", "bad\u0000name", "bad\nname", "x".repeat(81)]) {
+      expect(blogAddLocalRequestSchema.safeParse({ path: absolutePath, name }).success, name).toBe(false)
+    }
+    for (const path of ["relative\\quartz", ".\\quartz", "C:\\bad\u0000path", "C:\\bad\npath", `C:\\${"x".repeat(1_025)}`]) {
+      expect(blogPathRequestSchema.safeParse({ path }).success, path).toBe(false)
+    }
+    for (const url of [
+      "http://github.com/openai/quartz",
+      "https://gitlab.com/openai/quartz",
+      "https://user:secret@github.com/openai/quartz",
+      "https://github.com/openai/quartz?token=secret",
+      "https://github.com/openai/quartz#readme",
+      "https://github.com/openai/quartz/extra",
+      `https://github.com/openai/${"x".repeat(2_049)}`,
+    ]) {
+      expect(blogCloneRequestSchema.safeParse({ url, destination: absolutePath, name: "Quartz" }).success, url).toBe(false)
+    }
+    for (const [schema, request] of [
+      [blogIdRequestSchema, { id, extra: true }],
+      [blogPathRequestSchema, { path: absolutePath, extra: true }],
+      [blogAddLocalRequestSchema, { path: absolutePath, name: "Quartz", extra: true }],
+      [blogCloneRequestSchema, { url: "https://github.com/openai/quartz", destination: absolutePath, name: "Quartz", extra: true }],
+      [blogRenameRequestSchema, { id, name: "Quartz", extra: true }],
+      [blogRelocateRequestSchema, { id, path: absolutePath, extra: true }],
+      [blogSwitchRequestSchema, { id, extra: true }],
+    ] as const) expect(schema.safeParse(request).success).toBe(false)
+  })
+
+  it("allows only bounded application-generated blog progress", () => {
+    expect(blogImportProgressSchema.safeParse({ phase: "cloning", message: "Cloning blog." }).success).toBe(true)
+    expect(blogImportProgressSchema.safeParse({ phase: "cloning", message: "x".repeat(1_001) }).success).toBe(false)
+    expect(blogImportProgressSchema.safeParse({ phase: "cloning", message: "Cloning", stdout: "secret" }).success).toBe(false)
+  })
   it("matches Node UTF-8 byte length for BMP, surrogate pairs, and isolated surrogates", () => {
     const samples = ["", "ASCII", "中文", "😀", "\ud800", "\udc00", "a\ud800b", "\ud83d\ude00"]
     let seed = 0x5eed1234

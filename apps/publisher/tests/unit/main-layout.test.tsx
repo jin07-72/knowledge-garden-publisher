@@ -9,6 +9,9 @@ import { App as StartupApp, PublisherApp } from "../../src/renderer/src/App"
 import { shanghaiCalendarDate } from "../../src/renderer/src/components/NoteSidebar"
 import type {
   ChangeReview,
+  BlogCandidateInspection,
+  BlogImportReceipt,
+  BlogRegistryView,
   DeploymentHistory,
   GardenApi,
   GitCommit,
@@ -106,6 +109,20 @@ function createGardenMock(): GardenApi {
   }
 
   return {
+    blogs: {
+      list: vi.fn(async () => unavailable<BlogRegistryView>("博客服务将在后续任务中提供。")),
+      chooseLocal: vi.fn(async () => ok(undefined)),
+      addLocal: vi.fn(async () => unavailable<BlogRegistryView>("博客服务将在后续任务中提供。")),
+      clone: vi.fn(async () => unavailable<BlogImportReceipt>("博客服务将在后续任务中提供。")),
+      cancelImport: vi.fn(async () => ok(undefined)),
+      install: vi.fn(async () => unavailable<BlogCandidateInspection>("博客服务将在后续任务中提供。")),
+      rename: vi.fn(async () => unavailable<BlogRegistryView>("博客服务将在后续任务中提供。")),
+      relocate: vi.fn(async () => unavailable<BlogRegistryView>("博客服务将在后续任务中提供。")),
+      remove: vi.fn(async () => unavailable<BlogRegistryView>("博客服务将在后续任务中提供。")),
+      openFolder: vi.fn(async () => ok(undefined)),
+      switch: vi.fn(async () => ok(undefined)),
+      onImportProgress: vi.fn(() => () => undefined),
+    },
     lifecycle: {
       acknowledgeClose: vi.fn(async () => ok(undefined)),
       onBeforeClose: vi.fn(() => () => undefined),

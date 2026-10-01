@@ -6,24 +6,32 @@ import {
   createSystemBoundedCommandRunner,
 } from "./publish"
 import { inspectWorkspaceDependencyState } from "./workspace"
+import {
+  parseGitHubRepositoryUrl,
+  type BlogCandidateInspection,
+  type BlogCloneRequest,
+  type BlogImportPhase,
+  type BlogImportProgress,
+  type BlogImportReceipt,
+  type GitHubRepository,
+} from "../../shared/contracts"
 
-const maximumRepositoryUrlLength = 1_024
+const maximumRepositoryUrlLength = 2_048
 const importOutputBytes = 2 * 1024 * 1024
 const gitReadEnvironment = { GIT_OPTIONAL_LOCKS: "0" } as const
 
-export interface GitHubRepository {
-  readonly url: string
-  readonly owner: string
-  readonly repository: string
-}
+export type {
+  BlogCandidateInspection,
+  BlogCloneRequest,
+  BlogImportPhase,
+  BlogImportProgress,
+  BlogImportReceipt,
+  GitHubRepository,
+} from "../../shared/contracts"
 
 export interface BlogCandidateDependencies {
   readonly runner?: BoundedCommandRunner
 }
-
-export type BlogCandidateInspection =
-  | { readonly valid: true; readonly canonicalPath: string; readonly needsInstall: boolean }
-  | { readonly valid: false; readonly code: string; readonly message: string }
 
 type ValidBlogCandidateInspection = Extract<BlogCandidateInspection, { readonly valid: true }>
 
@@ -41,25 +49,6 @@ interface ParentIdentity {
   readonly canonicalPath: string
   readonly device: bigint
   readonly inode: bigint
-}
-
-export type BlogImportPhase = "cloning" | "installing" | "validating" | "complete"
-
-export interface BlogImportProgress {
-  readonly phase: BlogImportPhase
-  readonly path: string
-}
-
-export interface BlogCloneRequest {
-  readonly url: string
-  readonly destination: string
-  readonly name: string
-}
-
-export interface BlogImportReceipt {
-  readonly canonicalPath: string
-  readonly owner: string
-  readonly repository: string
 }
 
 export interface BlogImportService {
@@ -219,38 +208,17 @@ function invalidCandidate(code: string, message: string): BlogCandidateInspectio
   return { valid: false, code, message }
 }
 
-const ownerPattern = "[A-Za-z0-9](?:[A-Za-z0-9-]{0,37}[A-Za-z0-9])?"
-const repositoryPattern = "[A-Za-z0-9](?:[A-Za-z0-9._-]{0,98}[A-Za-z0-9])?"
-const httpsRepositoryPattern = new RegExp(
-  `^https://github\\.com/(${ownerPattern})/(${repositoryPattern})(?:\\.git)?$`,
-)
-const sshRepositoryPattern = new RegExp(
-  `^git@github\\.com:(${ownerPattern})/(${repositoryPattern})(?:\\.git)?$`,
-)
-
 /** Parses only literal GitHub clone URLs that can safely occupy one Git argument. */
 export function parseGitHubRepository(value: string): GitHubRepository {
   if (
     typeof value !== "string" ||
     value.length === 0 ||
     value.length > maximumRepositoryUrlLength ||
-    value !== value.trim() ||
-    /[\u0000-\u001f\u007f\s]/.test(value)
+    !parseGitHubRepositoryUrl(value)
   ) {
     throw importError("INVALID_REPOSITORY_URL", "Enter a valid GitHub repository URL.")
   }
-  const match = httpsRepositoryPattern.exec(value) ?? sshRepositoryPattern.exec(value)
-  if (!match) {
-    throw importError("INVALID_REPOSITORY_URL", "Enter a valid GitHub repository URL.")
-  }
-  const [, owner, matchedRepository] = match
-  const repository = matchedRepository.endsWith(".git")
-    ? matchedRepository.slice(0, -".git".length)
-    : matchedRepository
-  if (!repository || repository === "." || repository === "..") {
-    throw importError("INVALID_REPOSITORY_URL", "Enter a valid GitHub repository URL.")
-  }
-  return { url: value, owner, repository }
+  return parseGitHubRepositoryUrl(value)!
 }
 
 async function inspectRequiredCandidatePath(
@@ -390,7 +358,10 @@ export function createBlogImportService(dependencies: BlogImportDependencies): B
   const assertNotCancelled = (signal: AbortSignal): void => {
     if (signal.aborted) throw importError("CANCELLED", "Blog import was cancelled.")
   }
-  const emit = (phase: BlogImportPhase, path: string): void => dependencies.onProgress({ phase, path })
+  const emit = (phase: BlogImportPhase): void => dependencies.onProgress({
+    phase,
+    message: phase === "complete" ? "Blog import complete." : `Blog import ${phase}.`,
+  })
   const inspectWithCancellation = (
     path: string,
     signal: AbortSignal,
@@ -477,7 +448,7 @@ export function createBlogImportService(dependencies: BlogImportDependencies): B
       if (error instanceof BlogImportError) throw error
       throw importError("TARGET_CHANGED", "The blog destination changed unexpectedly.", path)
     }
-    emit("installing", target.canonicalPath)
+    emit("installing")
     let result: { readonly exitCode: number }
     try {
       result = await dependencies.runner.run({
@@ -496,7 +467,7 @@ export function createBlogImportService(dependencies: BlogImportDependencies): B
     assertNotCancelled(signal)
     if (result.exitCode !== 0) throw importError("INSTALL_FAILED", "npm could not install blog dependencies.", path)
     await assertTarget(target)
-    emit("validating", target.canonicalPath)
+    emit("validating")
     let inspection: BlogCandidateInspection
     try {
       inspection = await inspectWithCancellation(target.canonicalPath, signal)
@@ -526,7 +497,7 @@ export function createBlogImportService(dependencies: BlogImportDependencies): B
         request.destination,
         dependencies.afterParentCapturedBeforeMkdir,
       )
-      emit("cloning", target.canonicalPath)
+      emit("cloning")
       let clone: { readonly exitCode: number }
       try {
         clone = await dependencies.runner.run({
@@ -546,7 +517,7 @@ export function createBlogImportService(dependencies: BlogImportDependencies): B
       if (clone.exitCode !== 0) throw importError("CLONE_FAILED", "Git could not clone the blog repository.", target.displayPath)
       await assertTarget(target)
       const inspection = await installAt(target.canonicalPath, operationSignal, target)
-      emit("complete", target.canonicalPath)
+      emit("complete")
       return {
         canonicalPath: inspection.canonicalPath,
         owner: repository.owner,
@@ -555,7 +526,7 @@ export function createBlogImportService(dependencies: BlogImportDependencies): B
     }),
     install: (path, signal) => runOperation(signal, async (operationSignal) => {
       const inspection = await installAt(resolve(path), operationSignal)
-      emit("complete", inspection.canonicalPath)
+      emit("complete")
       return inspection
     }),
   }
