@@ -1,6 +1,6 @@
 import { spawn } from "node:child_process"
 import { createHash, randomUUID } from "node:crypto"
-import { access, lstat, mkdir, readFile, rename, rm, writeFile } from "node:fs/promises"
+import { access, lstat, mkdir, readFile, readdir, rename, rm, writeFile } from "node:fs/promises"
 import { constants } from "node:fs"
 import { dirname, join, resolve } from "node:path"
 import { fileURLToPath, pathToFileURL } from "node:url"
@@ -14,6 +14,9 @@ const NODE_BASE_URL = `https://nodejs.org/dist/v${NODE_VERSION}`
 const MAX_ARCHIVE_BYTES = 128 * 1024 * 1024
 const MAX_CHECKSUM_BYTES = 4 * 1024 * 1024
 const MAX_EXTRACTION_STDERR_BYTES = 16 * 1024
+const MAX_RUNTIME_FILES = 20_000
+const MAX_RUNTIME_BYTES = 512 * 1024 * 1024
+const MAX_MANIFEST_BYTES = 8 * 1024 * 1024
 const EXTRACT_ARCHIVE_SCRIPT =
   "Add-Type -AssemblyName System.IO.Compression.FileSystem; [IO.Compression.ZipFile]::ExtractToDirectory($env:KGP_NODE_ARCHIVE_PATH, $env:KGP_NODE_EXTRACT_PATH)"
 
@@ -192,33 +195,82 @@ async function fileIdentity(path) {
   }
 }
 
+async function runtimeFileIdentities(root) {
+  const files = Object.create(null)
+  const pending = [{ absolute: root, relative: "" }]
+  let count = 0
+  let totalBytes = 0
+  while (pending.length > 0) {
+    const directory = pending.pop()
+    const entries = await readdir(directory.absolute, { withFileTypes: true })
+    entries.sort((left, right) => left.name.localeCompare(right.name))
+    for (const entry of entries) {
+      const relative = directory.relative ? `${directory.relative}/${entry.name}` : entry.name
+      if (relative === RUNTIME_MANIFEST) continue
+      const absolute = join(directory.absolute, entry.name)
+      const details = await lstat(absolute)
+      if (details.isSymbolicLink()) throw new Error("unsafe runtime component")
+      if (details.isDirectory()) {
+        pending.push({ absolute, relative })
+        continue
+      }
+      if (!details.isFile()) throw new Error("unsafe runtime component")
+      count += 1
+      totalBytes += details.size
+      if (count > MAX_RUNTIME_FILES || totalBytes > MAX_RUNTIME_BYTES) {
+        throw new Error("runtime tree is too large")
+      }
+      files[relative] = await fileIdentity(absolute)
+    }
+  }
+  return files
+}
+
+function identitiesMatch(expected, actual) {
+  if (!expected || typeof expected !== "object" || Array.isArray(expected)) return false
+  const expectedKeys = Object.keys(expected).sort()
+  const actualKeys = Object.keys(actual).sort()
+  if (
+    expectedKeys.length !== actualKeys.length ||
+    expectedKeys.some((path, index) => path !== actualKeys[index])
+  ) {
+    return false
+  }
+  return expectedKeys.every((path) => {
+    const identity = expected[path]
+    return (
+      identity !== null &&
+      typeof identity === "object" &&
+      !Array.isArray(identity) &&
+      identity.size === actual[path].size &&
+      identity.sha256 === actual[path].sha256
+    )
+  })
+}
+
 export async function isVerifiedRuntime(root) {
   try {
     const rootDetails = await lstat(root)
     if (!rootDetails.isDirectory() || rootDetails.isSymbolicLink()) return false
     const manifestPath = join(root, RUNTIME_MANIFEST)
-    const [manifestDetails, node, npm] = await Promise.all([
-      lstat(manifestPath),
-      fileIdentity(join(root, "node.exe")),
-      fileIdentity(join(root, "node_modules", "npm", "bin", "npm-cli.js")),
-    ])
+    const manifestDetails = await lstat(manifestPath)
     if (
       !manifestDetails.isFile() ||
       manifestDetails.isSymbolicLink() ||
-      manifestDetails.size > 16_384
+      manifestDetails.size > MAX_MANIFEST_BYTES
     ) {
       return false
     }
     const manifest = JSON.parse(await readFile(manifestPath, "utf8"))
+    const files = await runtimeFileIdentities(root)
     return (
-      manifest?.schemaVersion === 1 &&
+      manifest?.schemaVersion === 2 &&
       manifest?.nodeVersion === NODE_VERSION &&
       manifest?.archive === NODE_ARCHIVE &&
       manifest?.archiveSha256 === EXPECTED_NODE_ARCHIVE_SHA256 &&
-      manifest?.files?.["node.exe"]?.size === node.size &&
-      manifest?.files?.["node.exe"]?.sha256 === node.sha256 &&
-      manifest?.files?.["node_modules/npm/bin/npm-cli.js"]?.size === npm.size &&
-      manifest?.files?.["node_modules/npm/bin/npm-cli.js"]?.sha256 === npm.sha256
+      Object.hasOwn(files, "node.exe") &&
+      Object.hasOwn(files, "node_modules/npm/bin/npm-cli.js") &&
+      identitiesMatch(manifest?.files, files)
     )
   } catch {
     return false
@@ -288,24 +340,22 @@ export async function downloadNodeRuntime({
     await mkdir(extracted)
     await extractImpl(archive, extracted)
     const prepared = join(extracted, archiveRoot)
-    const [nodeIdentity, npmIdentity] = await Promise.all([
-      fileIdentity(join(prepared, "node.exe")),
-      fileIdentity(join(prepared, "node_modules", "npm", "bin", "npm-cli.js")),
-    ]).catch(() => [])
-    if (!nodeIdentity || !npmIdentity) {
+    const files = await runtimeFileIdentities(prepared).catch(() => undefined)
+    if (
+      !files ||
+      !Object.hasOwn(files, "node.exe") ||
+      !Object.hasOwn(files, "node_modules/npm/bin/npm-cli.js")
+    ) {
       throw new Error("The extracted Node runtime is incomplete.")
     }
     await writeFile(
       join(prepared, RUNTIME_MANIFEST),
       `${JSON.stringify({
-        schemaVersion: 1,
+        schemaVersion: 2,
         nodeVersion: NODE_VERSION,
         archive: NODE_ARCHIVE,
         archiveSha256: expected,
-        files: {
-          "node.exe": nodeIdentity,
-          "node_modules/npm/bin/npm-cli.js": npmIdentity,
-        },
+        files,
       })}\n`,
       { flag: "wx" },
     )

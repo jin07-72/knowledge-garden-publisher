@@ -24,21 +24,29 @@ afterEach(async () => {
   )
 })
 
-async function runtimeFixture({ version = NODE_VERSION, tamper = false } = {}) {
+async function runtimeFixture({
+  version = NODE_VERSION,
+  tamper = false,
+  tamperDependency = false,
+} = {}) {
   const publisherRoot = await mkdtemp(join(tmpdir(), "node-runtime-reuse-"))
   temporaryDirectories.push(publisherRoot)
   const runtime = join(publisherRoot, "vendor", "node")
   const nodePath = join(runtime, "node.exe")
   const npmPath = join(runtime, "node_modules", "npm", "bin", "npm-cli.js")
+  const dependencyPath = join(runtime, "node_modules", "npm", "node_modules", "example", "index.js")
   await mkdir(dirname(npmPath), { recursive: true })
+  await mkdir(dirname(dependencyPath), { recursive: true })
   const nodeBytes = Buffer.from("verified node")
   const npmBytes = Buffer.from("verified npm")
+  const dependencyBytes = Buffer.from("verified dependency")
   await writeFile(nodePath, tamper ? "tampered node" : nodeBytes)
   await writeFile(npmPath, npmBytes)
+  await writeFile(dependencyPath, tamperDependency ? "tampered dependency" : dependencyBytes)
   await writeFile(
     join(runtime, RUNTIME_MANIFEST),
     JSON.stringify({
-      schemaVersion: 1,
+      schemaVersion: 2,
       nodeVersion: version,
       archive: NODE_ARCHIVE,
       archiveSha256: EXPECTED_NODE_ARCHIVE_SHA256,
@@ -50,6 +58,10 @@ async function runtimeFixture({ version = NODE_VERSION, tamper = false } = {}) {
         "node_modules/npm/bin/npm-cli.js": {
           size: npmBytes.byteLength,
           sha256: createHash("sha256").update(npmBytes).digest("hex"),
+        },
+        "node_modules/npm/node_modules/example/index.js": {
+          size: dependencyBytes.byteLength,
+          sha256: createHash("sha256").update(dependencyBytes).digest("hex"),
         },
       },
     }),
@@ -135,6 +147,7 @@ describe("portable Node runtime download", () => {
   it.each([
     ["stale version", { version: "22.15.0" }],
     ["tampered node", { tamper: true }],
+    ["tampered transitive npm module", { tamperDependency: true }],
   ])("redownloads instead of reusing a %s runtime", async (_label, options) => {
     const fixture = await runtimeFixture(options)
     const fetchImpl = vi.fn(async () => ({
