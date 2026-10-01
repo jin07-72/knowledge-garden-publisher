@@ -37,6 +37,12 @@ interface ReservedBlogTarget {
   readonly parentInode: bigint
 }
 
+interface ParentIdentity {
+  readonly canonicalPath: string
+  readonly device: bigint
+  readonly inode: bigint
+}
+
 export type BlogImportPhase = "cloning" | "installing" | "validating" | "complete"
 
 export interface BlogImportProgress {
@@ -82,6 +88,10 @@ function importError(code: string, message: string, path?: string): BlogImportEr
   return new BlogImportError(code, message, path)
 }
 
+function rethrowTerminationUncertain(error: unknown): void {
+  if (error instanceof PublishCommandFailure && error.terminationUncertain) throw error
+}
+
 function pathInside(root: string, candidate: string): boolean {
   const pathFromRoot = relative(root, candidate)
   return pathFromRoot === "" || (!pathFromRoot.startsWith("..") && !isAbsolute(pathFromRoot))
@@ -94,15 +104,17 @@ function pathsEqual(left: string, right: string): boolean {
 async function reserveCloneTarget(path: string): Promise<ReservedBlogTarget> {
   const displayPath = resolve(path)
   const parent = dirname(displayPath)
-  let canonicalParent: string
+  let parentIdentity: ParentIdentity
   try {
-    canonicalParent = await realpath(parent)
-    const parentDetails = await lstat(canonicalParent, { bigint: true })
+    const canonicalPath = await realpath(parent)
+    const parentDetails = await lstat(canonicalPath, { bigint: true })
     if (!parentDetails.isDirectory()) throw new Error("not a directory")
+    parentIdentity = { canonicalPath, device: parentDetails.dev, inode: parentDetails.ino }
   } catch {
     throw importError("DESTINATION_INVALID", "The selected destination parent folder is unavailable.", displayPath)
   }
   try {
+    await assertParentIdentity(parentIdentity, displayPath)
     await mkdir(displayPath)
   } catch (error) {
     if ((error as NodeJS.ErrnoException).code === "EEXIST") {
@@ -110,39 +122,53 @@ async function reserveCloneTarget(path: string): Promise<ReservedBlogTarget> {
     }
     throw importError("DESTINATION_INVALID", "The selected destination cannot be reserved.", displayPath)
   }
-  return await captureTarget(displayPath, canonicalParent, displayPath)
+  await assertParentIdentity(parentIdentity, displayPath)
+  return await captureTarget(displayPath, parentIdentity, displayPath)
+}
+
+async function assertParentIdentity(parent: ParentIdentity, displayPath: string): Promise<void> {
+  const canonicalPath = await realpath(parent.canonicalPath).catch(() => undefined)
+  const details = await lstat(parent.canonicalPath, { bigint: true }).catch(() => undefined)
+  if (
+    !canonicalPath ||
+    !details ||
+    details.isSymbolicLink() ||
+    !details.isDirectory() ||
+    !pathsEqual(canonicalPath, parent.canonicalPath) ||
+    details.dev !== parent.device ||
+    details.ino !== parent.inode
+  ) {
+    throw importError("TARGET_CHANGED", "The blog destination changed unexpectedly.", displayPath)
+  }
 }
 
 async function captureTarget(
   path: string,
-  canonicalParent: string,
+  parent: ParentIdentity,
   displayPath: string,
 ): Promise<ReservedBlogTarget> {
   const canonicalPath = await realpath(path).catch(() => undefined)
-  const parentDetails = await lstat(canonicalParent, { bigint: true }).catch(() => undefined)
+  await assertParentIdentity(parent, displayPath)
   const details = await lstat(path, { bigint: true }).catch(() => undefined)
-  const expectedPath = resolve(canonicalParent, basename(path))
+  const expectedPath = resolve(parent.canonicalPath, basename(path))
   if (
     !canonicalPath ||
     !details ||
-    !parentDetails ||
-    parentDetails.isSymbolicLink() ||
-    !parentDetails.isDirectory() ||
     details.isSymbolicLink() ||
     !details.isDirectory() ||
     !pathsEqual(canonicalPath, expectedPath) ||
-    !pathInside(canonicalParent, canonicalPath)
+    !pathInside(parent.canonicalPath, canonicalPath)
   ) {
     throw importError("TARGET_CHANGED", "The blog destination changed unexpectedly.", displayPath)
   }
   return {
     displayPath,
-    canonicalParent,
+    canonicalParent: parent.canonicalPath,
     canonicalPath,
     device: details.dev,
     inode: details.ino,
-    parentDevice: parentDetails.dev,
-    parentInode: parentDetails.ino,
+    parentDevice: parent.device,
+    parentInode: parent.inode,
   }
 }
 
@@ -239,7 +265,8 @@ async function inspectCandidateGit(root: string, runner: BoundedCommandRunner): 
       env: gitReadEnvironment,
       maxOutputBytes: importOutputBytes,
     })
-  } catch {
+  } catch (error) {
+    rethrowTerminationUncertain(error)
     return invalidCandidate("GIT_UNAVAILABLE", "Git is unavailable for this blog folder.")
   }
   if (topLevel.exitCode !== 0) return invalidCandidate("GIT_NOT_REPOSITORY", "The selected folder is not a Git repository.")
@@ -272,7 +299,8 @@ async function inspectCandidateGit(root: string, runner: BoundedCommandRunner): 
     if (origin.exitCode !== 0 || origin.stdout.trim() === "") {
       return invalidCandidate("GIT_ORIGIN_FAILED", "Could not read the origin remote.")
     }
-  } catch {
+  } catch (error) {
+    rethrowTerminationUncertain(error)
     return invalidCandidate("GIT_UNAVAILABLE", "Git is unavailable for this blog folder.")
   }
   return undefined
@@ -402,7 +430,7 @@ export function createBlogImportService(dependencies: {
     try {
       preflight = await inspectWithCancellation(path, signal)
     } catch (error) {
-      if (error instanceof PublishCommandFailure && error.terminationUncertain) throw error
+      rethrowTerminationUncertain(error)
       if (signal.aborted) throw importError("CANCELLED", "Blog import was cancelled.", path)
       throw importError("VALIDATION_FAILED", "The selected blog could not be validated.", path)
     }
@@ -412,7 +440,17 @@ export function createBlogImportService(dependencies: {
     }
     let target: ReservedBlogTarget
     try {
-      target = reserved ?? await captureTarget(preflight.canonicalPath, dirname(preflight.canonicalPath), path)
+      if (reserved) {
+        target = reserved
+      } else {
+        const canonicalPath = dirname(preflight.canonicalPath)
+        const details = await lstat(canonicalPath, { bigint: true })
+        target = await captureTarget(
+          preflight.canonicalPath,
+          { canonicalPath, device: details.dev, inode: details.ino },
+          path,
+        )
+      }
       if (!pathsEqual(preflight.canonicalPath, target.canonicalPath)) {
         throw importError("TARGET_CHANGED", "The blog destination changed unexpectedly.", target.displayPath)
       }
@@ -432,7 +470,8 @@ export function createBlogImportService(dependencies: {
         signal,
         maxOutputBytes: importOutputBytes,
       })
-    } catch {
+    } catch (error) {
+      rethrowTerminationUncertain(error)
       if (signal.aborted) throw importError("CANCELLED", "Blog import was cancelled.", path)
       throw importError("INSTALL_FAILED", "npm could not install blog dependencies.", path)
     }
@@ -443,7 +482,8 @@ export function createBlogImportService(dependencies: {
     let inspection: BlogCandidateInspection
     try {
       inspection = await inspectWithCancellation(target.canonicalPath, signal)
-    } catch {
+    } catch (error) {
+      rethrowTerminationUncertain(error)
       if (signal.aborted) throw importError("CANCELLED", "Blog import was cancelled.", path)
       throw importError("VALIDATION_FAILED", "The imported blog could not be validated.", path)
     }
@@ -477,7 +517,7 @@ export function createBlogImportService(dependencies: {
           maxOutputBytes: importOutputBytes,
         })
       } catch (error) {
-        if (error instanceof PublishCommandFailure && error.terminationUncertain) throw error
+        rethrowTerminationUncertain(error)
         if (operationSignal.aborted) throw importError("CANCELLED", "Blog import was cancelled.", target.displayPath)
         throw importError("CLONE_FAILED", "Git could not clone the blog repository.", target.displayPath)
       }
