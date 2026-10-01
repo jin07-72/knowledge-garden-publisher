@@ -1,7 +1,10 @@
 import { lstat, mkdir, realpath } from "node:fs/promises"
 import { basename, dirname, isAbsolute, relative, resolve } from "node:path"
-import { type CommandRunner, systemCommandRunner } from "../lib/commandRunner"
-import { type BoundedCommandRunner } from "./publish"
+import {
+  PublishCommandFailure,
+  type BoundedCommandRunner,
+  createSystemBoundedCommandRunner,
+} from "./publish"
 import { inspectWorkspaceDependencyState } from "./workspace"
 
 const maximumRepositoryUrlLength = 1_024
@@ -15,7 +18,7 @@ export interface GitHubRepository {
 }
 
 export interface BlogCandidateDependencies {
-  readonly runner?: CommandRunner
+  readonly runner?: BoundedCommandRunner
 }
 
 export type BlogCandidateInspection =
@@ -30,6 +33,8 @@ interface ReservedBlogTarget {
   readonly canonicalPath: string
   readonly device: bigint
   readonly inode: bigint
+  readonly parentDevice: bigint
+  readonly parentInode: bigint
 }
 
 export type BlogImportPhase = "cloning" | "installing" | "validating" | "complete"
@@ -92,7 +97,7 @@ async function reserveCloneTarget(path: string): Promise<ReservedBlogTarget> {
   let canonicalParent: string
   try {
     canonicalParent = await realpath(parent)
-    const parentDetails = await lstat(canonicalParent)
+    const parentDetails = await lstat(canonicalParent, { bigint: true })
     if (!parentDetails.isDirectory()) throw new Error("not a directory")
   } catch {
     throw importError("DESTINATION_INVALID", "The selected destination parent folder is unavailable.", displayPath)
@@ -114,11 +119,15 @@ async function captureTarget(
   displayPath: string,
 ): Promise<ReservedBlogTarget> {
   const canonicalPath = await realpath(path).catch(() => undefined)
+  const parentDetails = await lstat(canonicalParent, { bigint: true }).catch(() => undefined)
   const details = await lstat(path, { bigint: true }).catch(() => undefined)
   const expectedPath = resolve(canonicalParent, basename(path))
   if (
     !canonicalPath ||
     !details ||
+    !parentDetails ||
+    parentDetails.isSymbolicLink() ||
+    !parentDetails.isDirectory() ||
     details.isSymbolicLink() ||
     !details.isDirectory() ||
     !pathsEqual(canonicalPath, expectedPath) ||
@@ -132,15 +141,23 @@ async function captureTarget(
     canonicalPath,
     device: details.dev,
     inode: details.ino,
+    parentDevice: parentDetails.dev,
+    parentInode: parentDetails.ino,
   }
 }
 
 async function assertTarget(target: ReservedBlogTarget): Promise<void> {
   const details = await lstat(target.canonicalPath, { bigint: true }).catch(() => undefined)
   const canonicalPath = await realpath(target.canonicalPath).catch(() => undefined)
+  const parentDetails = await lstat(target.canonicalParent, { bigint: true }).catch(() => undefined)
   if (
     !details ||
     !canonicalPath ||
+    !parentDetails ||
+    parentDetails.isSymbolicLink() ||
+    !parentDetails.isDirectory() ||
+    parentDetails.dev !== target.parentDevice ||
+    parentDetails.ino !== target.parentInode ||
     details.isSymbolicLink() ||
     !details.isDirectory() ||
     details.dev !== target.device ||
@@ -212,7 +229,7 @@ async function inspectRequiredCandidatePath(
   return undefined
 }
 
-async function inspectCandidateGit(root: string, runner: CommandRunner): Promise<BlogCandidateInspection | undefined> {
+async function inspectCandidateGit(root: string, runner: BoundedCommandRunner): Promise<BlogCandidateInspection | undefined> {
   let topLevel: { readonly exitCode: number; readonly stdout: string }
   try {
     topLevel = await runner.run({
@@ -220,6 +237,7 @@ async function inspectCandidateGit(root: string, runner: CommandRunner): Promise
       args: ["rev-parse", "--show-toplevel"],
       cwd: root,
       env: gitReadEnvironment,
+      maxOutputBytes: importOutputBytes,
     })
   } catch {
     return invalidCandidate("GIT_UNAVAILABLE", "Git is unavailable for this blog folder.")
@@ -238,6 +256,7 @@ async function inspectCandidateGit(root: string, runner: CommandRunner): Promise
       args: ["remote"],
       cwd: root,
       env: gitReadEnvironment,
+      maxOutputBytes: importOutputBytes,
     })
     if (remotes.exitCode !== 0) return invalidCandidate("GIT_ORIGIN_FAILED", "Could not inspect Git remotes.")
     if (!remotes.stdout.split(/\r?\n/).some((remote) => remote === "origin")) {
@@ -248,6 +267,7 @@ async function inspectCandidateGit(root: string, runner: CommandRunner): Promise
       args: ["remote", "get-url", "origin"],
       cwd: root,
       env: gitReadEnvironment,
+      maxOutputBytes: importOutputBytes,
     })
     if (origin.exitCode !== 0 || origin.stdout.trim() === "") {
       return invalidCandidate("GIT_ORIGIN_FAILED", "Could not read the origin remote.")
@@ -284,7 +304,7 @@ export async function inspectBlogCandidate(
     const invalid = await inspectRequiredCandidatePath(root, relativePath, expected, code, message)
     if (invalid) return invalid
   }
-  const gitInvalid = await inspectCandidateGit(root, dependencies.runner ?? systemCommandRunner)
+  const gitInvalid = await inspectCandidateGit(root, dependencies.runner ?? createSystemBoundedCommandRunner({ commandDeadlineMs: 15_000 }))
   if (gitInvalid) return gitInvalid
   const dependencyIssues = await inspectWorkspaceDependencyState(root)
   return { valid: true, canonicalPath: root, needsInstall: dependencyIssues.length > 0 }
@@ -299,8 +319,12 @@ export function createBlogImportService(dependencies: {
   readonly onProgress: (progress: BlogImportProgress) => void
 }): BlogImportService {
   let active = false
+  let terminationUncertain = false
 
   const runOperation = async <T>(signal: AbortSignal | undefined, operation: (operationSignal: AbortSignal) => Promise<T>): Promise<T> => {
+    if (terminationUncertain) {
+      throw importError("IMPORT_UNAVAILABLE", "A previous import command may still be running; restart the app.")
+    }
     if (active) throw importError("IMPORT_ACTIVE", "Another blog import is already running.")
     active = true
     const controller = new AbortController()
@@ -310,6 +334,12 @@ export function createBlogImportService(dependencies: {
     try {
       if (controller.signal.aborted) throw importError("CANCELLED", "Blog import was cancelled.")
       return await operation(controller.signal)
+    } catch (error) {
+      if (error instanceof PublishCommandFailure && error.terminationUncertain) {
+        terminationUncertain = true
+        throw importError("IMPORT_UNAVAILABLE", "A command termination could not be confirmed; restart the app.")
+      }
+      throw error
     } finally {
       signal?.removeEventListener("abort", cancel)
       active = false
@@ -371,7 +401,8 @@ export function createBlogImportService(dependencies: {
     let preflight: BlogCandidateInspection
     try {
       preflight = await inspectWithCancellation(path, signal)
-    } catch {
+    } catch (error) {
+      if (error instanceof PublishCommandFailure && error.terminationUncertain) throw error
       if (signal.aborted) throw importError("CANCELLED", "Blog import was cancelled.", path)
       throw importError("VALIDATION_FAILED", "The selected blog could not be validated.", path)
     }
@@ -445,7 +476,8 @@ export function createBlogImportService(dependencies: {
           signal: operationSignal,
           maxOutputBytes: importOutputBytes,
         })
-      } catch {
+      } catch (error) {
+        if (error instanceof PublishCommandFailure && error.terminationUncertain) throw error
         if (operationSignal.aborted) throw importError("CANCELLED", "Blog import was cancelled.", target.displayPath)
         throw importError("CLONE_FAILED", "Git could not clone the blog repository.", target.displayPath)
       }

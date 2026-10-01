@@ -231,8 +231,19 @@ export interface BoundedCommandRequest extends CommandRequest {
   readonly maxOutputBytes?: number
 }
 
-export interface BoundedCommandRunner extends CommandRunner {
+export const boundedCommandRunnerCapability: unique symbol = Symbol("bounded-command-runner")
+
+export interface BoundedCommandRunner {
+  readonly [boundedCommandRunnerCapability]: true
   run(request: BoundedCommandRequest): Promise<CommandResult>
+}
+
+/** Test-only adapter; production callers must use a process-tree bounded factory. */
+export function createBoundedCommandRunnerForTest(runner: CommandRunner): BoundedCommandRunner {
+  return {
+    [boundedCommandRunnerCapability]: true,
+    run: (request) => runner.run(request),
+  }
 }
 
 export type PublishCommandSpawner = (
@@ -247,7 +258,7 @@ export type PublishCommandSpawner = (
   },
 ) => PublishCommandProcess
 
-class PublishCommandFailure extends Error {
+export class PublishCommandFailure extends Error {
   readonly name = "PublishCommandFailure"
 
   constructor(
@@ -339,6 +350,7 @@ export function createBoundedPublishCommandRunner(options: {
   readonly terminationDeadlineMs?: number
 }): BoundedCommandRunner {
   return {
+    [boundedCommandRunnerCapability]: true,
     run(request) {
       if (request.signal?.aborted) {
         return Promise.reject(new PublishCommandFailure("Publication command was cancelled."))

@@ -8,6 +8,8 @@ import {
 } from "../../src/main/lib/commandRunner"
 import {
   createBoundedPublishCommandRunner,
+  createBoundedCommandRunnerForTest,
+  boundedCommandRunnerCapability,
   type BoundedCommandRequest,
   type PublishCommandProcess,
 } from "../../src/main/services/publish"
@@ -18,6 +20,7 @@ import {
 } from "../../src/main/services/deployments"
 
 class FakeRunner implements CommandRunner {
+  readonly [boundedCommandRunnerCapability] = true as const
   readonly requests: CommandRequest[] = []
 
   constructor(private readonly runCommand: (request: CommandRequest) => CommandResult) {}
@@ -171,7 +174,7 @@ describe("deployment history", () => {
       stdout: `${"a".repeat(40)}\0${"2026-09-27T10:00:00+08:00"}\0Publish note\0Ada\0`,
       stderr: "",
     }))
-    const service = createDeploymentHistoryService({ workspace: "C:\\garden", runner })
+    const service = createDeploymentHistoryService({ workspace: "C:\\garden", runner: createBoundedCommandRunnerForTest(runner) })
 
     await expect(service.git({ limit: 2 })).resolves.toEqual([
       {
@@ -387,7 +390,10 @@ describe("deployment history", () => {
           }),
       ),
     }
-    const service = createDeploymentHistoryService({ workspace: "C:\\garden", runner })
+    const service = createDeploymentHistoryService({
+      workspace: "C:\\garden",
+      runner: createBoundedCommandRunnerForTest(runner),
+    })
     const first = service.git({ limit: 20, requestId: "history-first" }).catch((error) => error)
     const second = service.git({ limit: 20, requestId: "history-second" }).catch((error) => error)
     await vi.waitFor(() => expect(requests).toHaveLength(2))

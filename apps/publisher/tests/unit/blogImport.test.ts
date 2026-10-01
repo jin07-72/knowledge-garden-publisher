@@ -3,6 +3,7 @@ import { tmpdir } from "node:os"
 import { join } from "node:path"
 import { afterEach, describe, expect, it } from "vitest"
 import type { CommandRunner } from "../../src/main/lib/commandRunner"
+import { createBoundedCommandRunnerForTest, type BoundedCommandRunner } from "../../src/main/services/publish"
 import {
   createBlogImportService,
   inspectBlogCandidate,
@@ -34,8 +35,8 @@ async function createCandidate(root: string, installed = true): Promise<void> {
   }
 }
 
-function gitRunner(root: string, requests: Parameters<CommandRunner["run"]>[0][] = []): CommandRunner {
-  return {
+function gitRunner(root: string, requests: Parameters<CommandRunner["run"]>[0][] = []): BoundedCommandRunner {
+  return createBoundedCommandRunnerForTest({
     run: async (request) => {
       requests.push(request)
       if (request.args[0] === "rev-parse") return { exitCode: 0, stdout: `${root}\n`, stderr: "" }
@@ -46,7 +47,7 @@ function gitRunner(root: string, requests: Parameters<CommandRunner["run"]>[0][]
       if (request.args[1] === "ls") return { exitCode: 0, stdout: "{}", stderr: "" }
       return { exitCode: 0, stdout: "", stderr: "" }
     },
-  }
+  })
 }
 
 const runtime = { nodePath: "bundled-node.exe", npmCliPath: "npm-cli.js" }
@@ -146,8 +147,8 @@ describe("inspectBlogCandidate", () => {
       },
     }
 
-    await expect(inspectBlogCandidate(root, { runner: noGit })).resolves.toMatchObject({ valid: false, code: "GIT_NOT_REPOSITORY" })
-    await expect(inspectBlogCandidate(root, { runner: noOrigin })).resolves.toMatchObject({ valid: false, code: "GIT_ORIGIN_MISSING" })
+    await expect(inspectBlogCandidate(root, { runner: createBoundedCommandRunnerForTest(noGit) })).resolves.toMatchObject({ valid: false, code: "GIT_NOT_REPOSITORY" })
+    await expect(inspectBlogCandidate(root, { runner: createBoundedCommandRunnerForTest(noOrigin) })).resolves.toMatchObject({ valid: false, code: "GIT_ORIGIN_MISSING" })
   })
 
   it("rejects a repository whose origin URL cannot be read", async () => {
@@ -163,7 +164,7 @@ describe("inspectBlogCandidate", () => {
       },
     }
 
-    await expect(inspectBlogCandidate(root, { runner: blankOrigin })).resolves.toMatchObject({
+    await expect(inspectBlogCandidate(root, { runner: createBoundedCommandRunnerForTest(blankOrigin) })).resolves.toMatchObject({
       valid: false,
       code: "GIT_ORIGIN_FAILED",
       message: expect.not.stringContaining("raw origin"),
@@ -184,7 +185,7 @@ describe("createBlogImportService", () => {
     return {
       gitExecutable: "git.exe",
       ...runtime,
-      runner: options.runner,
+      runner: createBoundedCommandRunnerForTest(options.runner),
       inspect: options.inspect ?? (async (path: string) => valid(path)),
       onProgress: ({ phase }: { phase: string }) => options.progress.push(phase),
     }
