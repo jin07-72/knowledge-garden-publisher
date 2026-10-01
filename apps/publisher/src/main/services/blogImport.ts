@@ -1,9 +1,11 @@
-import { lstat, realpath } from "node:fs/promises"
-import { dirname, isAbsolute, relative, resolve } from "node:path"
+import { lstat, mkdir, realpath } from "node:fs/promises"
+import { basename, dirname, isAbsolute, relative, resolve } from "node:path"
 import { type CommandRunner, systemCommandRunner } from "../lib/commandRunner"
+import { type BoundedCommandRunner } from "./publish"
 import { inspectWorkspaceDependencyState } from "./workspace"
 
 const maximumRepositoryUrlLength = 1_024
+const importOutputBytes = 2 * 1024 * 1024
 const gitReadEnvironment = { GIT_OPTIONAL_LOCKS: "0" } as const
 
 export interface GitHubRepository {
@@ -21,6 +23,14 @@ export type BlogCandidateInspection =
   | { readonly valid: false; readonly code: string; readonly message: string }
 
 type ValidBlogCandidateInspection = Extract<BlogCandidateInspection, { readonly valid: true }>
+
+interface ReservedBlogTarget {
+  readonly displayPath: string
+  readonly canonicalParent: string
+  readonly canonicalPath: string
+  readonly device: bigint
+  readonly inode: bigint
+}
 
 export type BlogImportPhase = "cloning" | "installing" | "validating" | "complete"
 
@@ -74,6 +84,72 @@ function pathInside(root: string, candidate: string): boolean {
 
 function pathsEqual(left: string, right: string): boolean {
   return process.platform === "win32" ? left.toLowerCase() === right.toLowerCase() : left === right
+}
+
+async function reserveCloneTarget(path: string): Promise<ReservedBlogTarget> {
+  const displayPath = resolve(path)
+  const parent = dirname(displayPath)
+  let canonicalParent: string
+  try {
+    canonicalParent = await realpath(parent)
+    const parentDetails = await lstat(canonicalParent)
+    if (!parentDetails.isDirectory()) throw new Error("not a directory")
+  } catch {
+    throw importError("DESTINATION_INVALID", "The selected destination parent folder is unavailable.", displayPath)
+  }
+  try {
+    await mkdir(displayPath)
+  } catch (error) {
+    if ((error as NodeJS.ErrnoException).code === "EEXIST") {
+      throw importError("DESTINATION_EXISTS", "Choose a destination that does not already exist.", displayPath)
+    }
+    throw importError("DESTINATION_INVALID", "The selected destination cannot be reserved.", displayPath)
+  }
+  return await captureTarget(displayPath, canonicalParent, displayPath)
+}
+
+async function captureTarget(
+  path: string,
+  canonicalParent: string,
+  displayPath: string,
+): Promise<ReservedBlogTarget> {
+  const canonicalPath = await realpath(path).catch(() => undefined)
+  const details = await lstat(path, { bigint: true }).catch(() => undefined)
+  const expectedPath = resolve(canonicalParent, basename(path))
+  if (
+    !canonicalPath ||
+    !details ||
+    details.isSymbolicLink() ||
+    !details.isDirectory() ||
+    !pathsEqual(canonicalPath, expectedPath) ||
+    !pathInside(canonicalParent, canonicalPath)
+  ) {
+    throw importError("TARGET_CHANGED", "The blog destination changed unexpectedly.", displayPath)
+  }
+  return {
+    displayPath,
+    canonicalParent,
+    canonicalPath,
+    device: details.dev,
+    inode: details.ino,
+  }
+}
+
+async function assertTarget(target: ReservedBlogTarget): Promise<void> {
+  const details = await lstat(target.canonicalPath, { bigint: true }).catch(() => undefined)
+  const canonicalPath = await realpath(target.canonicalPath).catch(() => undefined)
+  if (
+    !details ||
+    !canonicalPath ||
+    details.isSymbolicLink() ||
+    !details.isDirectory() ||
+    details.dev !== target.device ||
+    details.ino !== target.inode ||
+    !pathsEqual(canonicalPath, target.canonicalPath) ||
+    !pathInside(target.canonicalParent, canonicalPath)
+  ) {
+    throw importError("TARGET_CHANGED", "The blog destination changed unexpectedly.", target.displayPath)
+  }
 }
 
 function invalidCandidate(code: string, message: string): BlogCandidateInspection {
@@ -218,7 +294,7 @@ export function createBlogImportService(dependencies: {
   readonly gitExecutable: string
   readonly nodePath: string
   readonly npmCliPath: string
-  readonly runner: CommandRunner
+  readonly runner: BoundedCommandRunner
   readonly inspect: typeof inspectBlogCandidate
   readonly onProgress: (progress: BlogImportProgress) => void
 }): BlogImportService {
@@ -263,21 +339,24 @@ export function createBlogImportService(dependencies: {
         cleanup()
         resolveInspection(inspection)
       }
-      const cancel = (): void => reject(importError("CANCELLED", "Blog import was cancelled.", path))
+      let cancelled = false
+      const cancel = (): void => {
+        cancelled = true
+      }
       signal.addEventListener("abort", cancel, { once: true })
       if (signal.aborted) {
-        cancel()
+        reject(importError("CANCELLED", "Blog import was cancelled.", path))
         return
       }
       void Promise.resolve()
         .then(() => dependencies.inspect(path, { runner: dependencies.runner }))
         .then(
           (inspection) => {
-            if (signal.aborted) cancel()
+            if (cancelled || signal.aborted) reject(importError("CANCELLED", "Blog import was cancelled.", path))
             else resolve(inspection)
           },
           (error: unknown) => {
-            if (signal.aborted) cancel()
+            if (cancelled || signal.aborted) reject(importError("CANCELLED", "Blog import was cancelled.", path))
             else reject(error)
           },
         )
@@ -286,6 +365,7 @@ export function createBlogImportService(dependencies: {
   const installAt = async (
     path: string,
     signal: AbortSignal,
+    reserved?: ReservedBlogTarget,
   ): Promise<ValidBlogCandidateInspection> => {
     assertNotCancelled(signal)
     let preflight: BlogCandidateInspection
@@ -299,15 +379,27 @@ export function createBlogImportService(dependencies: {
     if (!preflight.valid) {
       throw importError("VALIDATION_FAILED", "The selected blog could not be validated.", path)
     }
-    emit("installing", path)
+    let target: ReservedBlogTarget
+    try {
+      target = reserved ?? await captureTarget(preflight.canonicalPath, dirname(preflight.canonicalPath), path)
+      if (!pathsEqual(preflight.canonicalPath, target.canonicalPath)) {
+        throw importError("TARGET_CHANGED", "The blog destination changed unexpectedly.", target.displayPath)
+      }
+      await assertTarget(target)
+    } catch (error) {
+      if (error instanceof BlogImportError) throw error
+      throw importError("TARGET_CHANGED", "The blog destination changed unexpectedly.", path)
+    }
+    emit("installing", target.canonicalPath)
     let result: { readonly exitCode: number }
     try {
       result = await dependencies.runner.run({
         executable: dependencies.nodePath,
         args: [dependencies.npmCliPath, "ci", "--no-audit", "--no-fund"],
-        cwd: path,
+        cwd: target.canonicalPath,
         env: { npm_config_audit: "false", npm_config_fund: "false" },
         signal,
+        maxOutputBytes: importOutputBytes,
       })
     } catch {
       if (signal.aborted) throw importError("CANCELLED", "Blog import was cancelled.", path)
@@ -315,10 +407,11 @@ export function createBlogImportService(dependencies: {
     }
     assertNotCancelled(signal)
     if (result.exitCode !== 0) throw importError("INSTALL_FAILED", "npm could not install blog dependencies.", path)
-    emit("validating", path)
+    await assertTarget(target)
+    emit("validating", target.canonicalPath)
     let inspection: BlogCandidateInspection
     try {
-      inspection = await inspectWithCancellation(path, signal)
+      inspection = await inspectWithCancellation(target.canonicalPath, signal)
     } catch {
       if (signal.aborted) throw importError("CANCELLED", "Blog import was cancelled.", path)
       throw importError("VALIDATION_FAILED", "The imported blog could not be validated.", path)
@@ -330,47 +423,37 @@ export function createBlogImportService(dependencies: {
     if (inspection.needsInstall) {
       throw importError("VALIDATION_FAILED", "The imported blog could not be validated.", path)
     }
+    if (!pathsEqual(inspection.canonicalPath, target.canonicalPath)) {
+      throw importError("TARGET_CHANGED", "The blog destination changed unexpectedly.", target.displayPath)
+    }
+    await assertTarget(target)
     return inspection
   }
 
   return {
     clone: (request, signal) => runOperation(signal, async (operationSignal) => {
       const repository = parseGitHubRepository(request.url)
-      const destination = resolve(request.destination)
-      const parent = dirname(destination)
-      try {
-        await lstat(destination)
-        throw importError("DESTINATION_EXISTS", "Choose a destination that does not already exist.", destination)
-      } catch (caught) {
-        if (caught instanceof BlogImportError) throw caught
-        if ((caught as NodeJS.ErrnoException).code !== "ENOENT") {
-          throw importError("DESTINATION_INVALID", "The selected destination cannot be used.", destination)
-        }
-      }
-      try {
-        const parentDetails = await lstat(parent)
-        if (!parentDetails.isDirectory()) throw new Error("not a directory")
-      } catch {
-        throw importError("DESTINATION_INVALID", "The selected destination parent folder is unavailable.", destination)
-      }
-      emit("cloning", destination)
+      const target = await reserveCloneTarget(request.destination)
+      emit("cloning", target.canonicalPath)
       let clone: { readonly exitCode: number }
       try {
         clone = await dependencies.runner.run({
           executable: dependencies.gitExecutable,
-          args: ["clone", "--", repository.url, destination],
-          cwd: parent,
+          args: ["clone", "--", repository.url, "."],
+          cwd: target.canonicalPath,
           env: { GIT_TERMINAL_PROMPT: "1" },
           signal: operationSignal,
+          maxOutputBytes: importOutputBytes,
         })
       } catch {
-        if (operationSignal.aborted) throw importError("CANCELLED", "Blog import was cancelled.", destination)
-        throw importError("CLONE_FAILED", "Git could not clone the blog repository.", destination)
+        if (operationSignal.aborted) throw importError("CANCELLED", "Blog import was cancelled.", target.displayPath)
+        throw importError("CLONE_FAILED", "Git could not clone the blog repository.", target.displayPath)
       }
       assertNotCancelled(operationSignal)
-      if (clone.exitCode !== 0) throw importError("CLONE_FAILED", "Git could not clone the blog repository.", destination)
-      const inspection = await installAt(destination, operationSignal)
-      emit("complete", destination)
+      if (clone.exitCode !== 0) throw importError("CLONE_FAILED", "Git could not clone the blog repository.", target.displayPath)
+      await assertTarget(target)
+      const inspection = await installAt(target.canonicalPath, operationSignal, target)
+      emit("complete", target.canonicalPath)
       return {
         canonicalPath: inspection.canonicalPath,
         owner: repository.owner,
@@ -378,9 +461,8 @@ export function createBlogImportService(dependencies: {
       }
     }),
     install: (path, signal) => runOperation(signal, async (operationSignal) => {
-      const destination = resolve(path)
-      const inspection = await installAt(destination, operationSignal)
-      emit("complete", destination)
+      const inspection = await installAt(resolve(path), operationSignal)
+      emit("complete", inspection.canonicalPath)
       return inspection
     }),
   }
