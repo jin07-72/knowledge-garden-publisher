@@ -1,6 +1,6 @@
 import { mkdir, readFile, realpath, rename, unlink, writeFile } from "node:fs/promises"
 import { randomUUID } from "node:crypto"
-import { basename, dirname, join, resolve } from "node:path"
+import { basename, dirname, join } from "node:path"
 import { z } from "zod"
 
 export interface BlogRecord {
@@ -126,8 +126,7 @@ export function createBlogRegistry(options: {
   }
 
   async function canonicalize(path: string): Promise<{ readonly path: string; readonly canonicalPath: string }> {
-    const displayPath = resolve(path)
-    return { path: displayPath, canonicalPath: await realpath(displayPath) }
+    return { path, canonicalPath: await realpath(path) }
   }
 
   async function persist(state: BlogRegistryState): Promise<void> {

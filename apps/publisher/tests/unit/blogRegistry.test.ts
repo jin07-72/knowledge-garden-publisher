@@ -1,6 +1,6 @@
 import { mkdir, mkdtemp, readFile, readdir, realpath, rm, stat, writeFile } from "node:fs/promises"
 import { tmpdir } from "node:os"
-import { basename, join } from "node:path"
+import { basename, join, relative } from "node:path"
 import { afterEach, describe, expect, it } from "vitest"
 import { createBlogRegistry } from "../../src/main/services/blogRegistry"
 
@@ -79,6 +79,18 @@ describe("blog registry", () => {
     await expect(registry.load()).resolves.toMatchObject({
       blogs: [{ path: legacyPath }, { path: secondPath }, { path: thirdPath }],
     })
+  })
+
+  it("preserves a relative display path while storing its real canonical path", async () => {
+    const directory = await createDirectory("garden-blog-registry-state-")
+    const legacyPath = await createGarden("legacy")
+    const secondPath = await createGarden("second")
+    const relativePath = relative(process.cwd(), secondPath)
+    const registry = createRegistry(join(directory, "blogs.v1.json"), legacyPath)
+
+    const state = await registry.add({ name: "Second", path: relativePath })
+
+    expect(state.blogs[1]).toMatchObject({ path: relativePath, canonicalPath: await realpath(relativePath) })
   })
 
   it("returns the existing state when the canonical path differs only by Windows casing", async () => {
