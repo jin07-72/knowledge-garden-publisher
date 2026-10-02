@@ -1,13 +1,31 @@
 // @vitest-environment node
-import { describe, expect, it, vi } from "vitest"
+import { mkdir, mkdtemp, rm, writeFile } from "node:fs/promises"
+import { tmpdir } from "node:os"
+import { join } from "node:path"
+import { afterEach, describe, expect, it, vi } from "vitest"
 import {
   createBlogManagementAdapter,
   createBlogRuntime,
   resolveBlogRegistryFile,
+  resolveE2eCloneSource,
 } from "../../src/main/blogRuntime"
 import type { BlogRecord, BlogRegistryView } from "../../src/shared/contracts"
 import { BlogImportError } from "../../src/main/services/blogImport"
 import { createPublisherCloseCoordinator } from "../../src/main/publisherServices"
+
+const temporaryDirectories: string[] = []
+
+afterEach(async () => {
+  await Promise.all(
+    temporaryDirectories.splice(0).map((path) => rm(path, { force: true, recursive: true })),
+  )
+})
+
+async function temporaryDirectory(): Promise<string> {
+  const path = await mkdtemp(join(tmpdir(), "blog-runtime-"))
+  temporaryDirectories.push(path)
+  return path
+}
 
 const first: BlogRecord = {
   id: "11111111-1111-4111-8111-111111111111",
@@ -267,6 +285,38 @@ describe("blog runtime", () => {
         override: String.raw`C:\temp\blogs.json`,
       }),
     ).toBe(String.raw`C:\Users\me\AppData\Publisher\blogs.json`)
+  })
+})
+
+describe("E2E clone source", () => {
+  it("accepts an existing absolute local Git source only in unpackaged E2E mode", async () => {
+    const root = await temporaryDirectory()
+    const source = join(root, "fixture.git")
+    await mkdir(source)
+
+    expect(resolveE2eCloneSource({ isPackaged: false, e2e: true, override: source })).toBe(source)
+    expect(resolveE2eCloneSource({ isPackaged: true, e2e: true, override: source })).toBeUndefined()
+    expect(
+      resolveE2eCloneSource({ isPackaged: false, e2e: false, override: source }),
+    ).toBeUndefined()
+  })
+
+  it("rejects missing, relative, and non-directory override paths", async () => {
+    const root = await temporaryDirectory()
+    const file = join(root, "fixture.bundle")
+    await writeFile(file, "not a repository directory")
+
+    expect(
+      resolveE2eCloneSource({ isPackaged: false, e2e: true, override: "fixture.git" }),
+    ).toBeUndefined()
+    expect(
+      resolveE2eCloneSource({
+        isPackaged: false,
+        e2e: true,
+        override: join(root, "missing.git"),
+      }),
+    ).toBeUndefined()
+    expect(resolveE2eCloneSource({ isPackaged: false, e2e: true, override: file })).toBeUndefined()
   })
 })
 

@@ -193,6 +193,11 @@ describe("createBlogImportService", () => {
     readonly inspect?: typeof inspectBlogCandidate
     readonly progress: string[]
     readonly afterParentCapturedBeforeMkdir?: () => Promise<void>
+    readonly cloneSource?: (repository: {
+      readonly url: string
+      readonly owner: string
+      readonly repository: string
+    }) => string | undefined
   }) {
     return {
       gitExecutable: "git.exe",
@@ -201,6 +206,7 @@ describe("createBlogImportService", () => {
       inspect: options.inspect ?? (async (path: string) => valid(path)),
       onProgress: ({ phase }: { phase: string }) => options.progress.push(phase),
       afterParentCapturedBeforeMkdir: options.afterParentCapturedBeforeMkdir,
+      cloneSource: options.cloneSource,
     }
   }
 
@@ -238,6 +244,65 @@ describe("createBlogImportService", () => {
       }),
     ])
     expect(phases).toEqual(["cloning", "installing", "validating", "complete"])
+  })
+
+  it("resolves an internal clone source only after validating the public GitHub URL", async () => {
+    const parent = await temporaryDirectory()
+    const destination = join(parent, "quartz")
+    const localSource = join(parent, "fixture.git")
+    const requests: Parameters<CommandRunner["run"]>[0][] = []
+    const resolvedRepositories: unknown[] = []
+    const service = createBlogImportService(serviceDependencies({
+      runner: {
+        run: async (request) => {
+          requests.push(request)
+          return { exitCode: 0, stdout: "", stderr: "" }
+        },
+      },
+      progress: [],
+      cloneSource: (repository) => {
+        resolvedRepositories.push(repository)
+        return localSource
+      },
+    }))
+
+    await expect(service.clone({
+      url: "https://github.com/openai/quartz.git",
+      destination,
+      name: "Quartz",
+    })).resolves.toMatchObject({ owner: "openai", repository: "quartz" })
+    expect(resolvedRepositories).toEqual([{
+      url: "https://github.com/openai/quartz.git",
+      owner: "openai",
+      repository: "quartz",
+    }])
+    expect(requests[0]?.args).toEqual(["clone", "--", localSource, "."])
+  })
+
+  it("never resolves an internal clone source for an invalid public URL", async () => {
+    const parent = await temporaryDirectory()
+    let resolved = false
+    let ran = false
+    const service = createBlogImportService(serviceDependencies({
+      runner: {
+        run: async () => {
+          ran = true
+          return { exitCode: 0, stdout: "", stderr: "" }
+        },
+      },
+      progress: [],
+      cloneSource: () => {
+        resolved = true
+        return join(parent, "fixture.git")
+      },
+    }))
+
+    await expect(service.clone({
+      url: "file:///secret/repository",
+      destination: join(parent, "clone"),
+    })).rejects.toMatchObject({ code: "INVALID_REPOSITORY_URL" })
+    expect(resolved).toBe(false)
+    expect(ran).toBe(false)
   })
 
   it("refuses to clone into an existing destination before starting Git", async () => {

@@ -9,6 +9,7 @@ import {
   createBlogManagementAdapter,
   createBlogRuntime,
   resolveBlogRegistryFile,
+  resolveE2eCloneSource,
 } from "./blogRuntime"
 import {
   createPublisherCloseCoordinator,
@@ -261,7 +262,11 @@ app.whenReady().then(async () => {
       previewManager = undefined
       publisherServices = undefined
     },
-    relaunch: () => app.relaunch(),
+    relaunch: () => {
+      // Playwright owns the next application process so it can preserve and
+      // observe the isolated registry without leaving an unmanaged child.
+      if (!e2e) app.relaunch()
+    },
     quit: () => app.quit(),
   })
   blogManagement = createBlogManagementAdapter({
@@ -269,6 +274,12 @@ app.whenReady().then(async () => {
     importer: () => importer,
     inspect: (path) => inspectBlogCandidate(path, { runner: importRunner }),
     chooseDirectory: async () => {
+      const e2eSelection = resolveE2eCloneSource({
+        isPackaged: app.isPackaged,
+        e2e,
+        override: process.env.GARDEN_PUBLISHER_E2E_CHOOSE_LOCAL,
+      })
+      if (e2eSelection) return e2eSelection
       const selection = await dialog.showOpenDialog({ properties: ["openDirectory"] })
       return selection.canceled ? undefined : selection.filePaths[0]
     },
@@ -286,6 +297,12 @@ app.whenReady().then(async () => {
     runner: importRunner,
     inspect: inspectBlogCandidate,
     onProgress: blogManagement.emitProgress,
+    cloneSource: () =>
+      resolveE2eCloneSource({
+        isPackaged: app.isPackaged,
+        e2e,
+        override: process.env.GARDEN_PUBLISHER_E2E_CLONE_SOURCE,
+      }),
   })
   const isTrustedSender = (event: unknown): boolean => {
     const window = mainWindow
@@ -389,7 +406,6 @@ app.whenReady().then(async () => {
     console.error("The active blog runtime could not start; opening blog recovery.")
   }
   createWindow()
-
 })
 
 app.on("before-quit", (event) => {

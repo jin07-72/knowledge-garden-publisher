@@ -204,6 +204,31 @@ describe("App blog orchestration", () => {
     expect(api.blogs.chooseLocal).toHaveBeenCalledTimes(2)
   })
 
+  it("acknowledges close requests while corrupt-registry recovery has no editor", async () => {
+    const api = gardenApi()
+    let beforeClose: ((request: { readonly requestId: string }) => void) | undefined
+    vi.mocked(api.blogs.list).mockResolvedValue({
+      ok: false,
+      error: { code: "INTERNAL_ERROR", message: "博客列表需要恢复。" },
+    })
+    vi.mocked(api.lifecycle.onBeforeClose).mockImplementation((listener) => {
+      beforeClose = listener
+      return () => undefined
+    })
+    Object.defineProperty(window, "garden", { configurable: true, value: api })
+
+    render(<App />)
+    await screen.findByRole("dialog", { name: "博客恢复" })
+    act(() => beforeClose?.({ requestId: "recover-close" }))
+
+    await waitFor(() =>
+      expect(api.lifecycle.acknowledgeClose).toHaveBeenCalledWith({
+        requestId: "recover-close",
+        success: true,
+      }),
+    )
+  })
+
   it("shows actionable recovery for an unavailable active blog without starting workspace services", async () => {
     const user = userEvent.setup()
     const api = gardenApi()

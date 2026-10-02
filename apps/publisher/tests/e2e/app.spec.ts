@@ -2,7 +2,13 @@ import { _electron as electron, expect, test } from "@playwright/test"
 import { execFile } from "node:child_process"
 import { copyFile, mkdir, readFile, writeFile } from "node:fs/promises"
 import { dirname, join, resolve } from "node:path"
-import { createTemporaryGitRepository, git } from "../helpers/git"
+import { createQuartzGardenFixture, createTemporaryGitRepository, git } from "../helpers/git"
+import {
+  createE2eRuntime,
+  createTemporaryDirectory,
+  exists,
+  removeTemporaryDirectory,
+} from "../helpers/fs"
 
 const publisherRoot = resolve(import.meta.dirname, "../..")
 
@@ -78,6 +84,7 @@ test("edits, changes visibility, and publishes only the selected public note", a
       writeGardenFile(repository.root, "content/life/beta.md", note("Beta", "original beta")),
       writeGardenFile(repository.root, "content/life/gamma.md", note("Gamma", "original gamma")),
       writeGardenFile(repository.root, "scripts/validate-content.mjs", "process.exit(0)\n"),
+      writeGardenFile(repository.root, "quartz/bootstrap-cli.mjs", ""),
       writeGardenFile(repository.root, "private/.gitkeep", ""),
       writeGardenFile(
         repository.root,
@@ -132,6 +139,7 @@ test("edits, changes visibility, and publishes only the selected public note", a
         GARDEN_PUBLISHER_E2E: "1",
         GARDEN_PUBLISHER_E2E_WORKSPACE: repository.root,
         GARDEN_PUBLISHER_E2E_RUNTIME: runtimeRoot,
+        GARDEN_PUBLISHER_E2E_REGISTRY: join(runtimeRoot, "blogs.json"),
         GARDEN_PUBLISHER_E2E_DEPLOYMENT: "success",
       },
     })
@@ -213,5 +221,188 @@ test("edits, changes visibility, and publishes only the selected public note", a
     if (!(await bounded(repository.cleanup(), 10_000))) {
       throw new Error("The temporary E2E garden could not be cleaned up within 10 seconds.")
     }
+  }
+})
+
+test("manages independent blogs across safe application restarts", async () => {
+  const first = await createQuartzGardenFixture({
+    directoryName: "Knowledge Garden",
+    noteTitle: "First Garden Note",
+    noteBody: "first garden only",
+  })
+  const second = await createQuartzGardenFixture({
+    directoryName: "Second Garden",
+    noteTitle: "Second Garden Note",
+    noteBody: "second garden only",
+  })
+  const stateRoot = await createTemporaryDirectory("garden-publisher-e2e-state-")
+  const registry = join(stateRoot, "blogs.json")
+  const runtimeRoot = await createE2eRuntime(stateRoot)
+  const environment = {
+    ...process.env,
+    GARDEN_PUBLISHER_E2E: "1",
+    GARDEN_PUBLISHER_E2E_WORKSPACE: first.root,
+    GARDEN_PUBLISHER_E2E_RUNTIME: runtimeRoot,
+    GARDEN_PUBLISHER_E2E_REGISTRY: registry,
+    GARDEN_PUBLISHER_E2E_CHOOSE_LOCAL: second.root,
+  }
+  let application: Awaited<ReturnType<typeof electron.launch>> | undefined
+  try {
+    application = await electron.launch({ args: ["."], cwd: publisherRoot, env: environment })
+    let page = await application.firstWindow()
+    await expect(page.locator('main[data-workspace-diagnostics="ready"]')).toBeVisible()
+    await expect(page.getByRole("button", { name: "切换博客：Knowledge Garden" })).toBeVisible()
+    await expect(page.getByRole("button", { name: /First Garden Note，公开/ })).toBeVisible()
+
+    await page.getByRole("button", { name: "切换博客：Knowledge Garden" }).click()
+    await page.getByRole("menuitem", { name: "添加本地博客" }).click()
+    const local = page.getByRole("region", { name: "添加本地博客" })
+    await expect(local.locator("code")).toContainText(second.root)
+    await local.getByLabel("显示名称").fill("Second Garden")
+    await local.getByRole("button", { name: "添加此博客" }).click()
+    await expect(page.getByRole("article", { name: "Second Garden" })).toBeVisible()
+    await page.getByRole("button", { name: "关闭博客管理" }).click()
+
+    await page.getByRole("button", { name: /First Garden Note，公开/ }).click()
+    const editor = page.locator(".cm-content")
+    await editor.click()
+    await page.keyboard.press("Control+End")
+    await page.keyboard.type("\npending switch save")
+
+    const closed = application.waitForEvent("close")
+    await page.getByRole("button", { name: "切换博客：Knowledge Garden" }).click()
+    await page.getByRole("menuitemradio", { name: /Second Garden/ }).click()
+    await closed
+    application = undefined
+    expect(await readFile(join(first.root, first.notePath), "utf8")).toContain(
+      "pending switch save",
+    )
+
+    application = await electron.launch({ args: ["."], cwd: publisherRoot, env: environment })
+    page = await application.firstWindow()
+    await expect(page.locator('main[data-workspace-diagnostics="ready"]')).toBeVisible()
+    await expect(page.getByRole("button", { name: "切换博客：Second Garden" })).toBeVisible()
+    await expect(page.getByRole("button", { name: /Second Garden Note，公开/ })).toBeVisible()
+    await expect(page.getByRole("button", { name: /First Garden Note，公开/ })).toHaveCount(0)
+
+    await closeApplication(application)
+    application = await electron.launch({ args: ["."], cwd: publisherRoot, env: environment })
+    page = await application.firstWindow()
+    await expect(page.getByRole("button", { name: "切换博客：Second Garden" })).toBeVisible()
+
+    await page.getByRole("button", { name: "切换博客：Second Garden" }).click()
+    await page.getByRole("menuitem", { name: "管理博客" }).click()
+    await page.getByRole("button", { name: "从列表移除 Knowledge Garden" }).click()
+    await page.getByRole("button", { name: "确认移除 Knowledge Garden" }).click()
+    await expect(page.getByRole("article", { name: "Knowledge Garden" })).toHaveCount(0)
+    expect(await exists(first.root)).toBe(true)
+    expect(await readFile(join(first.root, first.notePath), "utf8")).toContain(
+      "pending switch save",
+    )
+    await page.getByRole("button", { name: "关闭博客管理" }).click()
+
+    await page.setViewportSize({ width: 620, height: 760 })
+    const switcher = page.getByRole("button", { name: "切换博客：Second Garden" })
+    await expect(switcher).toBeVisible()
+    await expect(switcher.locator("strong")).toHaveText("Second Garden")
+    await expect(switcher.locator("small")).toBeHidden()
+  } finally {
+    await closeApplication(application)
+    await Promise.all([first.cleanup(), second.cleanup()])
+    await removeTemporaryDirectory(stateRoot)
+  }
+})
+
+test("clones a validated GitHub request from a local E2E bare repository", async () => {
+  const active = await createQuartzGardenFixture({
+    directoryName: "Knowledge Garden",
+    noteTitle: "Active Note",
+    noteBody: "active garden",
+  })
+  const cloneSource = await createQuartzGardenFixture({
+    directoryName: "Clone Source",
+    noteTitle: "Cloned Note",
+    noteBody: "cloned without a network",
+  })
+  const stateRoot = await createTemporaryDirectory("garden-publisher-e2e-clone-")
+  const destination = join(stateRoot, "Cloned Garden")
+  const runtimeRoot = await createE2eRuntime(stateRoot)
+  let application: Awaited<ReturnType<typeof electron.launch>> | undefined
+  try {
+    application = await electron.launch({
+      args: ["."],
+      cwd: publisherRoot,
+      env: {
+        ...process.env,
+        GARDEN_PUBLISHER_E2E: "1",
+        GARDEN_PUBLISHER_E2E_WORKSPACE: active.root,
+        GARDEN_PUBLISHER_E2E_RUNTIME: runtimeRoot,
+        GARDEN_PUBLISHER_E2E_REGISTRY: join(stateRoot, "blogs.json"),
+        GARDEN_PUBLISHER_E2E_CLONE_SOURCE: cloneSource.remote,
+      },
+    })
+    const page = await application.firstWindow()
+    await expect(page.locator('main[data-workspace-diagnostics="ready"]')).toBeVisible()
+    await page.getByRole("button", { name: "切换博客：Knowledge Garden" }).click()
+    await page.getByRole("menuitem", { name: "从 GitHub 下载" }).click()
+    const clone = page.getByRole("region", { name: "从 GitHub 下载" })
+    await clone.getByLabel("GitHub 仓库地址").fill("https://github.com/example/cloned-garden.git")
+    await clone.getByLabel("保存位置").fill(destination)
+    await clone.getByLabel("显示名称（可选）").fill("Cloned Garden")
+    await clone.getByRole("button", { name: "开始下载" }).click()
+
+    await expect(page.getByRole("article", { name: "Cloned Garden" })).toBeVisible()
+    expect(await readFile(join(destination, cloneSource.notePath), "utf8")).toContain(
+      "cloned without a network",
+    )
+    await expect(page.locator("body")).not.toContainText(cloneSource.remote)
+  } finally {
+    await closeApplication(application)
+    await Promise.all([active.cleanup(), cloneSource.cleanup()])
+    await removeTemporaryDirectory(stateRoot)
+  }
+})
+
+test("recovers a corrupt registry through the local blog chooser", async () => {
+  const garden = await createQuartzGardenFixture({
+    directoryName: "Recovered Garden",
+    noteTitle: "Recovered Note",
+    noteBody: "registry recovery",
+  })
+  const stateRoot = await createTemporaryDirectory("garden-publisher-e2e-recovery-")
+  const registry = join(stateRoot, "blogs.json")
+  const runtimeRoot = await createE2eRuntime(stateRoot)
+  await writeFile(registry, "{broken registry")
+  const environment = {
+    ...process.env,
+    GARDEN_PUBLISHER_E2E: "1",
+    GARDEN_PUBLISHER_E2E_WORKSPACE: garden.root,
+    GARDEN_PUBLISHER_E2E_RUNTIME: runtimeRoot,
+    GARDEN_PUBLISHER_E2E_REGISTRY: registry,
+    GARDEN_PUBLISHER_E2E_CHOOSE_LOCAL: garden.root,
+  }
+  let application: Awaited<ReturnType<typeof electron.launch>> | undefined
+  try {
+    application = await electron.launch({ args: ["."], cwd: publisherRoot, env: environment })
+    let page = await application.firstWindow()
+    const recovery = page.getByRole("dialog", { name: "博客恢复" })
+    await expect(recovery).toBeVisible()
+    await recovery.getByRole("button", { name: "选择文件夹" }).click()
+    await expect(recovery.locator("code")).toContainText(garden.root)
+    await recovery.getByLabel("显示名称").fill("Recovered Garden")
+    const closed = application.waitForEvent("close")
+    await recovery.getByRole("button", { name: "恢复此博客" }).click()
+    await closed
+    application = undefined
+
+    application = await electron.launch({ args: ["."], cwd: publisherRoot, env: environment })
+    page = await application.firstWindow()
+    await expect(page.locator('main[data-workspace-diagnostics="ready"]')).toBeVisible()
+    await expect(page.getByRole("button", { name: "切换博客：Recovered Garden" })).toBeVisible()
+    await expect(page.getByRole("button", { name: /Recovered Note，公开/ })).toBeVisible()
+  } finally {
+    await closeApplication(application)
+    await garden.cleanup()
+    await removeTemporaryDirectory(stateRoot)
   }
 })

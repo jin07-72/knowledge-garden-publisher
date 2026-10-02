@@ -64,6 +64,7 @@ export interface BlogImportDependencies {
   readonly inspect: typeof inspectBlogCandidate
   readonly onProgress: (progress: BlogImportProgress) => void
   readonly afterParentCapturedBeforeMkdir?: () => Promise<void>
+  readonly cloneSource?: (repository: GitHubRepository) => string | undefined
 }
 
 export const BLOG_IMPORT_ERROR_CODES = [
@@ -508,6 +509,7 @@ export function createBlogImportService(dependencies: BlogImportDependencies): B
   return {
     clone: (request, signal) => runOperation(signal, async (operationSignal) => {
       const repository = parseGitHubRepository(request.url)
+      const cloneSource = dependencies.cloneSource?.(repository) ?? repository.url
       const target = await reserveCloneTarget(
         request.destination,
         dependencies.afterParentCapturedBeforeMkdir,
@@ -517,7 +519,7 @@ export function createBlogImportService(dependencies: BlogImportDependencies): B
       try {
         clone = await dependencies.runner.run({
           executable: dependencies.gitExecutable,
-          args: ["clone", "--", repository.url, "."],
+          args: ["clone", "--", cloneSource, "."],
           cwd: target.canonicalPath,
           env: { GIT_TERMINAL_PROMPT: "1" },
           signal: operationSignal,

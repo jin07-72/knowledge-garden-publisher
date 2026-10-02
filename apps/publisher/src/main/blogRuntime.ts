@@ -1,4 +1,5 @@
 import { isAbsolute, join, resolve } from "node:path"
+import { realpathSync, statSync } from "node:fs"
 import { parseGitHubRepositoryUrl } from "../shared/contracts"
 import type {
   BlogCloneRequest,
@@ -145,6 +146,22 @@ export function resolveBlogRegistryFile(options: {
     return resolve(options.override)
   }
   return join(options.userDataPath, "blogs.json")
+}
+
+export function resolveE2eCloneSource(options: {
+  readonly isPackaged: boolean
+  readonly e2e: boolean
+  readonly override?: string
+}): string | undefined {
+  if (options.isPackaged || !options.e2e || !options.override || !isAbsolute(options.override)) {
+    return undefined
+  }
+  try {
+    const source = realpathSync(options.override)
+    return statSync(source).isDirectory() ? source : undefined
+  } catch {
+    return undefined
+  }
 }
 
 export interface BlogManagementServices {

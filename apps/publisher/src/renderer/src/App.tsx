@@ -1264,6 +1264,13 @@ function BlogRecovery({
       mounted.current = false
     }
   }, [])
+  useEffect(
+    () =>
+      api.lifecycle.onBeforeClose(({ requestId }) => {
+        void api.lifecycle.acknowledgeClose({ requestId, success: true })
+      }),
+    [api],
+  )
 
   const run = (operation: () => Promise<void>): void => {
     if (busy.current) return
@@ -1388,6 +1395,13 @@ function CorruptRegistryRecovery({
       mounted.current = false
     }
   }, [])
+  useEffect(
+    () =>
+      api.lifecycle.onBeforeClose(({ requestId }) => {
+        void api.lifecycle.acknowledgeClose({ requestId, success: true })
+      }),
+    [api],
+  )
 
   const run = (operation: () => Promise<void>): void => {
     if (busy.current) return
