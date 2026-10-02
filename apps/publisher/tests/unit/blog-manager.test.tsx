@@ -240,6 +240,24 @@ describe("BlogManager", () => {
     expect(props.onRemove).toHaveBeenCalledWith("study")
   })
 
+  it("cancels only the removal confirmation on Escape and restores its trigger", async () => {
+    const user = userEvent.setup()
+    const props = managerProps()
+    render(<BlogManager {...props} />)
+    const manager = screen.getByRole("dialog", { name: "管理博客" })
+    const study = within(manager).getByRole("article", { name: /Study Garden/ })
+    const remove = within(study).getByRole("button", { name: "从列表移除 Study Garden" })
+    await user.click(remove)
+    expect(within(manager).getByRole("alertdialog", { name: "确认移除 Study Garden" })).toBeVisible()
+
+    await user.keyboard("{Escape}")
+
+    expect(screen.getByRole("dialog", { name: "管理博客" })).toBeVisible()
+    expect(screen.queryByRole("alertdialog")).not.toBeInTheDocument()
+    expect(props.onClose).not.toHaveBeenCalled()
+    expect(within(study).getByRole("button", { name: "从列表移除 Study Garden" })).toHaveFocus()
+  })
+
   it("shows a valid local candidate and emits an add intent", async () => {
     const user = userEvent.setup()
     const props = managerProps({

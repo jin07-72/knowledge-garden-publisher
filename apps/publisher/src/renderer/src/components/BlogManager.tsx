@@ -507,6 +507,12 @@ function RemoveConfirmation({
       role="alertdialog"
       aria-labelledby={titleId}
       aria-describedby={descriptionId}
+      onKeyDown={(event) => {
+        if (event.key !== "Escape" || busy) return
+        event.preventDefault()
+        event.stopPropagation()
+        onCancel()
+      }}
     >
       <strong id={titleId}>确认移除 {name}</strong>
       <div id={descriptionId}>
