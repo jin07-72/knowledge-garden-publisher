@@ -288,6 +288,10 @@ export interface BlogRegistryView {
   readonly blogs: readonly BlogRecord[]
 }
 
+export interface BlogRegistryStatus extends BlogRegistryView {
+  readonly activeAvailability: "available" | "unavailable"
+}
+
 export type BlogCandidateInspection =
   | { readonly valid: true; readonly canonicalPath: string; readonly needsInstall: boolean }
   | { readonly valid: false; readonly code: string; readonly message: string }
@@ -549,7 +553,7 @@ export type Unsubscribe = () => void
 
 export interface GardenApi {
   readonly blogs: {
-    list(): Promise<IpcResult<BlogRegistryView>>
+    list(): Promise<IpcResult<BlogRegistryStatus>>
     chooseLocal(): Promise<IpcResult<BlogCandidateSelection | undefined>>
     addLocal(request: BlogAddLocalRequest): Promise<IpcResult<BlogRegistryView>>
     clone(request: BlogCloneRequest): Promise<IpcResult<BlogImportReceipt>>

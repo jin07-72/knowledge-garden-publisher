@@ -15,6 +15,7 @@ import type {
   BlogCandidateInspection,
   BlogImportReceipt,
   BlogRegistryView,
+  BlogRegistryStatus,
   DeploymentHistory,
   GardenApi,
   GitCommit,
@@ -102,8 +103,9 @@ function deferred<T>(): {
   }
 }
 
-const testRegistry: BlogRegistryView = {
+const testRegistry: BlogRegistryStatus = {
   version: 1,
+  activeAvailability: "available",
   activeBlogId: "00000000-0000-4000-8000-000000000000",
   blogs: [
     {

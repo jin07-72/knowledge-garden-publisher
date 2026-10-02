@@ -360,6 +360,7 @@ describe("secure publisher IPC", () => {
     const { ipc, servicePorts } = setup()
     servicePorts.calls.blogsList.mockResolvedValueOnce({
       version: 1,
+      activeAvailability: "available",
       activeBlogId: "11111111-1111-4111-8111-111111111111",
       blogs: [
         {

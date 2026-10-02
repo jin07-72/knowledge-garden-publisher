@@ -10,6 +10,7 @@ import type {
   BlogPathRequest,
   BlogRecord,
   BlogRegistryView,
+  BlogRegistryStatus,
   BlogRelocateRequest,
   BlogRenameRequest,
   BlogSwitchRequest,
@@ -130,7 +131,7 @@ export function resolveBlogRegistryFile(options: {
 }
 
 export interface BlogManagementServices {
-  list(): Promise<BlogRegistryView>
+  list(): Promise<BlogRegistryStatus>
   chooseLocal(): Promise<
     { readonly path: string; readonly inspection: BlogCandidateInspection } | undefined
   >
@@ -254,7 +255,22 @@ export function createBlogManagementAdapter(dependencies: {
       for (const listener of listeners) listener(progress)
     },
     services: {
-      list: () => dependencies.registry.load(),
+      async list() {
+        const state = await dependencies.registry.load()
+        const active = state.blogs.find((blog) => blog.id === state.activeBlogId)
+        let available = false
+        if (active) {
+          try {
+            const inspection = await dependencies.inspect(active.canonicalPath)
+            available =
+              inspection.valid &&
+              samePath(resolve(inspection.canonicalPath), resolve(active.canonicalPath))
+          } catch {
+            // Availability is intentionally coarse; inspection errors never cross the IPC boundary.
+          }
+        }
+        return { ...state, activeAvailability: available ? "available" : "unavailable" }
+      },
       async chooseLocal() {
         const path = await dependencies.chooseDirectory()
         if (!path) return undefined

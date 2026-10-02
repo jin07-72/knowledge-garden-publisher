@@ -211,6 +211,44 @@ describe("blog runtime", () => {
 })
 
 describe("blog management adapter", () => {
+  it("reports active workspace availability without exposing inspection failures", async () => {
+    const registry = {
+      load: vi.fn(async () => state()),
+      add: vi.fn(async () => state()),
+      rename: vi.fn(async () => state()),
+      activate: vi.fn(async () => state()),
+      remove: vi.fn(async () => state()),
+      relocate: vi.fn(async () => state()),
+    }
+    const inspect = vi
+      .fn()
+      .mockResolvedValueOnce({ valid: false, code: "SECRET_PATH_ERROR", message: "C:\\secret" })
+      .mockRejectedValueOnce(new Error("C:\\secret"))
+      .mockResolvedValueOnce({
+        valid: true,
+        canonicalPath: first.canonicalPath,
+        needsInstall: false,
+      })
+    const adapter = createBlogManagementAdapter({
+      registry,
+      importer: { clone: vi.fn(), install: vi.fn() },
+      inspect,
+      chooseDirectory: vi.fn(),
+      openFolder: vi.fn(),
+      switchTo: vi.fn(),
+    })
+
+    await expect(adapter.services.list()).resolves.toMatchObject({
+      activeAvailability: "unavailable",
+    })
+    await expect(adapter.services.list()).resolves.toMatchObject({
+      activeAvailability: "unavailable",
+    })
+    await expect(adapter.services.list()).resolves.toMatchObject({
+      activeAvailability: "available",
+    })
+  })
+
   it("keeps registry management available without constructing workspace services", async () => {
     const registry = {
       load: vi.fn(async () => state()),
@@ -229,7 +267,10 @@ describe("blog management adapter", () => {
       switchTo: vi.fn(),
     })
 
-    await expect(adapter.services.list()).resolves.toEqual(state())
+    await expect(adapter.services.list()).resolves.toEqual({
+      ...state(),
+      activeAvailability: "unavailable",
+    })
     await expect(adapter.services.chooseLocal()).resolves.toBeUndefined()
     expect(adapter.services.subscribeProgress(vi.fn())).toEqual(expect.any(Function))
   })

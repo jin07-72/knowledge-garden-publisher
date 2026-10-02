@@ -5,14 +5,16 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest"
 import { App } from "../../src/renderer/src/App"
 import type {
   BlogRegistryView,
+  BlogRegistryStatus,
   GardenApi,
   IpcResult,
   PreviewStatus,
   WorkspaceInspection,
 } from "../../src/shared/contracts"
 
-const registry: BlogRegistryView = {
+const registry: BlogRegistryStatus = {
   version: 1,
+  activeAvailability: "available",
   activeBlogId: "legacy",
   blogs: [
     {
@@ -135,8 +137,44 @@ afterEach(() => {
 })
 
 describe("App blog orchestration", () => {
+  it("shows actionable recovery for an unavailable active blog without starting workspace services", async () => {
+    const user = userEvent.setup()
+    const api = gardenApi()
+    const unavailable = { ...registry, activeAvailability: "unavailable" as const }
+    vi.mocked(api.blogs.list).mockResolvedValue(ok(unavailable))
+    vi.mocked(api.blogs.chooseLocal).mockResolvedValue(
+      ok({
+        path: String.raw`E:\Recovered\garden`,
+        inspection: {
+          valid: true,
+          canonicalPath: String.raw`E:\Recovered\garden`,
+          needsInstall: false,
+        },
+      }),
+    )
+    vi.mocked(api.blogs.relocate).mockResolvedValue(ok(registry))
+    Object.defineProperty(window, "garden", { configurable: true, value: api })
+
+    render(<App />)
+
+    expect(await screen.findByRole("dialog", { name: "博客恢复" })).toBeVisible()
+    expect(api.workspace.inspectSafety).not.toHaveBeenCalled()
+    expect(api.notes.list).not.toHaveBeenCalled()
+    expect(api.preview.status).not.toHaveBeenCalled()
+    await user.click(screen.getByRole("button", { name: "重新定位 Knowledge Garden" }))
+    await user.click(await screen.findByRole("button", { name: "更新博客位置" }))
+    await waitFor(() =>
+      expect(api.blogs.relocate).toHaveBeenCalledWith({
+        id: "legacy",
+        path: String.raw`E:\Recovered\garden`,
+      }),
+    )
+    expect(api.blogs.switch).toHaveBeenCalledWith({ id: "legacy", editorSaved: true })
+    expect(api.workspace.inspectSafety).not.toHaveBeenCalled()
+  })
+
   it("loads the blog registry before publisher startup and shows the migrated legacy blog", async () => {
-    const pending = deferred<IpcResult<BlogRegistryView>>()
+    const pending = deferred<IpcResult<BlogRegistryStatus>>()
     const api = gardenApi()
     vi.mocked(api.blogs.list).mockReturnValueOnce(pending.promise)
     Object.defineProperty(window, "garden", { configurable: true, value: api })

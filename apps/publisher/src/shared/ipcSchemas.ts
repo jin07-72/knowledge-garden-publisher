@@ -306,6 +306,9 @@ const blogRegistryViewSchema = z
     blogs: z.array(blogRecordSchema).min(1).max(1_000),
   })
   .strip()
+const blogRegistryStatusSchema = blogRegistryViewSchema.extend({
+  activeAvailability: z.enum(["available", "unavailable"]),
+})
 const blogCandidateInspectionSchema = z.discriminatedUnion("valid", [
   z
     .object({ valid: z.literal(true), canonicalPath: blogPathSchema, needsInstall: z.boolean() })
@@ -373,7 +376,7 @@ export const IPC_SUCCESS_SCHEMAS = {
   [IPC_CHANNELS.requests.historyCancel]: z.undefined(),
   [IPC_CHANNELS.requests.historyOpenLink]: z.undefined(),
   [IPC_CHANNELS.requests.lifecycleCloseAck]: z.undefined(),
-  [IPC_CHANNELS.requests.blogsList]: blogRegistryViewSchema,
+  [IPC_CHANNELS.requests.blogsList]: blogRegistryStatusSchema,
   [IPC_CHANNELS.requests.blogsChooseLocal]: blogCandidateSelectionSchema.optional(),
   [IPC_CHANNELS.requests.blogsAddLocal]: blogRegistryViewSchema,
   [IPC_CHANNELS.requests.blogsClone]: blogImportReceiptSchema,

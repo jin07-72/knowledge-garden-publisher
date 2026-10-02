@@ -12,6 +12,7 @@ import {
   type BlogImportReceipt,
   type BlogPathRequest,
   type BlogRegistryView,
+  type BlogRegistryStatus,
   type BlogRelocateRequest,
   type BlogRenameRequest,
   type BlogSwitchRequest,
@@ -122,7 +123,7 @@ export interface PublisherIpcServices {
     openLink(request: HistoryLinkRequest): Promise<void>
   }
   readonly blogs?: {
-    list(): Promise<BlogRegistryView>
+    list(): Promise<BlogRegistryStatus>
     chooseLocal(): Promise<BlogCandidateSelection | undefined>
     addLocal(request: BlogAddLocalRequest): Promise<BlogRegistryView>
     clone(request: BlogCloneRequest): Promise<BlogImportReceipt>

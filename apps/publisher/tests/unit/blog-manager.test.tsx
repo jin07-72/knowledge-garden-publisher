@@ -202,6 +202,59 @@ describe("BlogSwitcher", () => {
 })
 
 describe("BlogManager", () => {
+  it("offers recovery relocation only for a valid non-duplicate candidate", async () => {
+    const user = userEvent.setup()
+    const onRelocate = vi.fn()
+    const props = {
+      ...managerProps({ view: "list", busy: false }),
+      recoveryBlogId: "knowledge",
+      onRelocate,
+    }
+    const view = render(<BlogManager {...props} />)
+    await user.click(screen.getByRole("button", { name: "重新定位 Knowledge Garden" }))
+    expect(props.onChooseLocal).toHaveBeenCalledOnce()
+
+    view.rerender(
+      <BlogManager
+        {...props}
+        importState={{
+          view: "local",
+          busy: false,
+          localSelection: {
+            path: String.raw`E:\Recovered\garden`,
+            inspection: {
+              valid: true,
+              canonicalPath: String.raw`E:\Recovered\garden`,
+              needsInstall: false,
+            },
+          },
+        }}
+      />,
+    )
+    await user.click(screen.getByRole("button", { name: "更新博客位置" }))
+    expect(onRelocate).toHaveBeenCalledWith("knowledge", String.raw`E:\Recovered\garden`)
+
+    view.rerender(
+      <BlogManager
+        {...props}
+        importState={{
+          view: "local",
+          busy: false,
+          localSelection: {
+            path: registry.blogs[1].path,
+            inspection: {
+              valid: true,
+              canonicalPath: registry.blogs[1].canonicalPath,
+              needsInstall: false,
+            },
+          },
+        }}
+      />,
+    )
+    expect(screen.getByText(/已经添加为“Study Garden”/)).toBeVisible()
+    expect(screen.queryByRole("button", { name: "更新博客位置" })).not.toBeInTheDocument()
+  })
+
   it("lists blogs and emits switch, rename, folder, and non-destructive removal intents", async () => {
     const user = userEvent.setup()
     const props = managerProps()
@@ -248,7 +301,9 @@ describe("BlogManager", () => {
     const study = within(manager).getByRole("article", { name: /Study Garden/ })
     const remove = within(study).getByRole("button", { name: "从列表移除 Study Garden" })
     await user.click(remove)
-    expect(within(manager).getByRole("alertdialog", { name: "确认移除 Study Garden" })).toBeVisible()
+    expect(
+      within(manager).getByRole("alertdialog", { name: "确认移除 Study Garden" }),
+    ).toBeVisible()
 
     await user.keyboard("{Escape}")
 

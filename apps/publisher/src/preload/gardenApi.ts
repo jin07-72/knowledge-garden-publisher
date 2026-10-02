@@ -9,6 +9,7 @@ import {
   type BlogImportReceipt,
   type BlogPathRequest,
   type BlogRegistryView,
+  type BlogRegistryStatus,
   type BlogRelocateRequest,
   type BlogRenameRequest,
   type BlogSwitchRequest,
@@ -121,7 +122,7 @@ function subscription<T>(
 /** Builds the only renderer-facing capability object. No Electron primitive escapes this closure. */
 export function createGardenApi(ipc: IpcRendererPort): GardenApi {
   const blogs = Object.freeze({
-    list: () => invoke<BlogRegistryView>(ipc, IPC_CHANNELS.requests.blogsList),
+    list: () => invoke<BlogRegistryStatus>(ipc, IPC_CHANNELS.requests.blogsList),
     chooseLocal: () =>
       invoke<BlogCandidateSelection | undefined>(ipc, IPC_CHANNELS.requests.blogsChooseLocal),
     addLocal: (request: BlogAddLocalRequest) =>

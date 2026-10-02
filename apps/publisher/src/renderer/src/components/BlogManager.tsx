@@ -40,6 +40,8 @@ export interface BlogManagerProps {
   readonly onRemove: (id: string) => void
   readonly onSwitch: (id: string) => void
   readonly onCancelImport?: () => void
+  readonly recoveryBlogId?: string
+  readonly onRelocate?: (id: string, path: string) => void
 }
 
 type ManagerView = BlogImportUiState["view"]
@@ -65,6 +67,8 @@ export function BlogManager({
   onRemove,
   onSwitch,
   onCancelImport,
+  recoveryBlogId,
+  onRelocate,
 }: BlogManagerProps): React.JSX.Element | null {
   const [view, setView] = useState<ManagerView>(importState.view)
   const [localName, setLocalName] = useState("")
@@ -109,6 +113,7 @@ export function BlogManager({
   const duplicate = selectedCanonicalPath
     ? registry.blogs.find(
         (blog) =>
+          blog.id !== recoveryBlogId &&
           blog.canonicalPath.toLocaleLowerCase() === selectedCanonicalPath.toLocaleLowerCase(),
       )
     : undefined
@@ -124,18 +129,20 @@ export function BlogManager({
       <header className="blog-manager-header">
         <div>
           <span className="eyebrow">Knowledge Garden Publisher</span>
-          <h2 id="blog-manager-title">管理博客</h2>
+          <h2 id="blog-manager-title">{recoveryBlogId ? "博客恢复" : "管理博客"}</h2>
         </div>
-        <button
-          ref={closeButton}
-          type="button"
-          className="icon-button"
-          aria-label="关闭博客管理"
-          disabled={busy}
-          onClick={onClose}
-        >
-          <X size={17} aria-hidden="true" />
-        </button>
+        {!recoveryBlogId ? (
+          <button
+            ref={closeButton}
+            type="button"
+            className="icon-button"
+            aria-label="关闭博客管理"
+            disabled={busy}
+            onClick={onClose}
+          >
+            <X size={17} aria-hidden="true" />
+          </button>
+        ) : null}
       </header>
 
       <div
@@ -182,6 +189,8 @@ export function BlogManager({
               setRemoving(undefined)
             }}
             onSwitch={onSwitch}
+            recoveryBlogId={recoveryBlogId}
+            onRecover={onChooseLocal}
           />
         ) : view === "local" ? (
           <section className="blog-import-view" aria-label="添加本地博客">
@@ -230,6 +239,15 @@ export function BlogManager({
                       安装依赖
                     </button>
                   </>
+                ) : recoveryBlogId && onRelocate ? (
+                  <button
+                    type="button"
+                    className="primary-button"
+                    disabled={busy}
+                    onClick={() => onRelocate(recoveryBlogId, selection.path)}
+                  >
+                    更新博客位置
+                  </button>
                 ) : (
                   <form
                     onSubmit={(event) => {
@@ -333,7 +351,7 @@ export function BlogManager({
         )}
       </div>
 
-      {view === "list" ? (
+      {view === "list" && !recoveryBlogId ? (
         <footer className="blog-manager-footer">
           <button
             type="button"
@@ -371,6 +389,8 @@ function BlogList({
   onCancelRemove,
   onRemove,
   onSwitch,
+  recoveryBlogId,
+  onRecover,
 }: {
   readonly registry: BlogRegistryView
   readonly busy: boolean
@@ -385,6 +405,8 @@ function BlogList({
   readonly onCancelRemove: () => void
   readonly onRemove: (id: string) => void
   readonly onSwitch: (id: string) => void
+  readonly recoveryBlogId?: string
+  readonly onRecover: () => void
 }): React.JSX.Element {
   return (
     <div className="blog-manager-list">
@@ -444,6 +466,16 @@ function BlogList({
               />
             ) : (
               <div className="blog-manager-card-actions">
+                {blog.id === recoveryBlogId ? (
+                  <button
+                    type="button"
+                    className="primary-button"
+                    disabled={busy}
+                    onClick={onRecover}
+                  >
+                    重新定位 {blog.name}
+                  </button>
+                ) : null}
                 {!current ? (
                   <button
                     type="button"

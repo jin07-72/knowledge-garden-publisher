@@ -148,7 +148,7 @@ const validByChannel: Record<string, unknown> = {
   [IPC_CHANNELS.requests.historyCancel]: undefined,
   [IPC_CHANNELS.requests.historyOpenLink]: undefined,
   [IPC_CHANNELS.requests.lifecycleCloseAck]: undefined,
-  [IPC_CHANNELS.requests.blogsList]: blogRegistry,
+  [IPC_CHANNELS.requests.blogsList]: { ...blogRegistry, activeAvailability: "available" },
   [IPC_CHANNELS.requests.blogsChooseLocal]: {
     path: String.raw`C:\\Blogs\\quartz`,
     inspection: { valid: true, canonicalPath: String.raw`C:\\Blogs\\quartz`, needsInstall: false },
@@ -209,6 +209,13 @@ describe("IPC success schemas", () => {
     const registrySchema = IPC_SUCCESS_SCHEMAS[IPC_CHANNELS.requests.blogsList]
     const candidateSchema = IPC_SUCCESS_SCHEMAS[IPC_CHANNELS.requests.blogsChooseLocal]
     const receiptSchema = IPC_SUCCESS_SCHEMAS[IPC_CHANNELS.requests.blogsClone]
+    expect(registrySchema.safeParse(blogRegistry).success).toBe(false)
+    expect(
+      registrySchema.safeParse({ ...blogRegistry, activeAvailability: "unavailable" }).success,
+    ).toBe(true)
+    expect(
+      registrySchema.safeParse({ ...blogRegistry, activeAvailability: "unknown" }).success,
+    ).toBe(false)
     for (const path of responsePaths) {
       expect(
         registrySchema.safeParse({ ...blogRegistry, blogs: [{ ...blog, path }] }).success,

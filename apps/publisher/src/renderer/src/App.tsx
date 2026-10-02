@@ -5,6 +5,7 @@ import type {
   BlogAddLocalRequest,
   BlogCloneRequest,
   BlogRegistryView,
+  BlogRegistryStatus,
   ChangeReview,
   GardenApi,
   NoteCreateRequest,
@@ -1232,8 +1233,125 @@ function PublisherStartup({
   )
 }
 
+function BlogRecovery({
+  api,
+  initialRegistry,
+}: {
+  readonly api: GardenApi
+  readonly initialRegistry: BlogRegistryView
+}): React.JSX.Element {
+  const [registry, setRegistry] = useState(initialRegistry)
+  const [importState, setImportState] = useState<BlogImportUiState>({
+    view: "list",
+    busy: false,
+    error: "当前博客文件夹不可用。请选择它现在所在的文件夹。",
+  })
+  const busy = useRef(false)
+  const mounted = useRef(true)
+  useEffect(
+    () => () => {
+      mounted.current = false
+    },
+    [],
+  )
+
+  const run = (operation: () => Promise<void>): void => {
+    if (busy.current) return
+    busy.current = true
+    setImportState((current) => ({ ...current, busy: true, error: undefined }))
+    void operation()
+      .catch((failure: unknown) => {
+        if (mounted.current) {
+          setImportState((current) => ({
+            ...current,
+            error: failure instanceof Error ? failure.message : "博客恢复失败，请重试。",
+          }))
+        }
+      })
+      .finally(() => {
+        busy.current = false
+        if (mounted.current) setImportState((current) => ({ ...current, busy: false }))
+      })
+  }
+
+  const chooseLocal = (): void => {
+    setImportState((current) => ({
+      ...current,
+      view: "local",
+      localSelection: undefined,
+      error: undefined,
+    }))
+    run(async () => {
+      const result = await api.blogs.chooseLocal()
+      if (!result.ok) throw new Error(result.error.message)
+      if (mounted.current && result.value) {
+        setImportState((current) => ({ ...current, localSelection: result.value }))
+      }
+    })
+  }
+
+  const activeId = registry.activeBlogId
+  return (
+    <main className="first-run-shell">
+      <BlogManager
+        open
+        registry={registry}
+        importState={importState}
+        recoveryBlogId={activeId}
+        onClose={() => undefined}
+        onChooseLocal={chooseLocal}
+        onAddLocal={() => undefined}
+        onClone={() => undefined}
+        onInstall={(path) =>
+          run(async () => {
+            const result = await api.blogs.install({ path })
+            if (!result.ok) throw new Error(result.error.message)
+            if (!result.value.valid) throw new Error(result.value.message)
+            if (mounted.current) {
+              setImportState((current) => ({
+                ...current,
+                localSelection: { path, inspection: result.value },
+              }))
+            }
+          })
+        }
+        onRename={(id, name) =>
+          run(async () => {
+            const result = await api.blogs.rename({ id, name })
+            if (!result.ok) throw new Error(result.error.message)
+            if (mounted.current) setRegistry(result.value)
+          })
+        }
+        onOpenFolder={(id) =>
+          run(async () => {
+            const result = await api.blogs.openFolder({ id })
+            if (!result.ok) throw new Error(result.error.message)
+          })
+        }
+        onRemove={(id) =>
+          run(async () => {
+            const result = await api.blogs.remove({ id })
+            if (!result.ok) throw new Error(result.error.message)
+            if (mounted.current) setRegistry(result.value)
+          })
+        }
+        onSwitch={() => undefined}
+        onRelocate={(id, path) =>
+          run(async () => {
+            const relocated = await api.blogs.relocate({ id, path })
+            if (!relocated.ok) throw new Error(relocated.error.message)
+            if (mounted.current) setRegistry(relocated.value)
+            const switched = await api.blogs.switch({ id, editorSaved: true })
+            if (!switched.ok) throw new Error(switched.error.message)
+          })
+        }
+      />
+    </main>
+  )
+}
+
 function BlogStartup({ api }: { readonly api: GardenApi }): React.JSX.Element {
-  const [registry, setRegistry] = useState<BlogRegistryView>()
+  const [registry, setRegistry] = useState<BlogRegistryStatus>()
   const [error, setError] = useState<string>()
   const [attempt, setAttempt] = useState(0)
 
@@ -1287,6 +1405,9 @@ function BlogStartup({ api }: { readonly api: GardenApi }): React.JSX.Element {
         </section>
       </main>
     )
+  }
+  if (registry.activeAvailability === "unavailable") {
+    return <BlogRecovery api={api} initialRegistry={registry} />
   }
   return <PublisherStartup api={api} registry={registry} />
 }
