@@ -4,6 +4,7 @@ import { tmpdir } from "node:os"
 import { join } from "node:path"
 import { afterEach, describe, expect, it, vi } from "vitest"
 import {
+  createRelaunchScheduler,
   createBlogManagementAdapter,
   createBlogRuntime,
   resolveBlogRegistryFile,
@@ -317,6 +318,60 @@ describe("E2E clone source", () => {
       }),
     ).toBeUndefined()
     expect(resolveE2eCloneSource({ isPackaged: false, e2e: true, override: file })).toBeUndefined()
+  })
+})
+
+describe("relaunch scheduler", () => {
+  it.each([
+    { isPackaged: true, e2e: true },
+    { isPackaged: false, e2e: false },
+  ])("uses the real application relaunch outside unpackaged E2E mode", async (mode) => {
+    const root = await temporaryDirectory()
+    const marker = join(root, "relaunch-requested")
+    const relaunch = vi.fn()
+    const record = vi.fn()
+    const schedule = createRelaunchScheduler({ ...mode, marker, relaunch, record })
+
+    schedule()
+
+    expect(relaunch).toHaveBeenCalledOnce()
+    expect(record).not.toHaveBeenCalled()
+  })
+
+  it("records the actual scheduling call instead of spawning only in unpackaged E2E", async () => {
+    const root = await temporaryDirectory()
+    const marker = join(root, "relaunch-requested")
+    const relaunch = vi.fn()
+    const record = vi.fn()
+    const schedule = createRelaunchScheduler({
+      isPackaged: false,
+      e2e: true,
+      marker,
+      relaunch,
+      record,
+    })
+
+    schedule()
+
+    expect(record).toHaveBeenCalledWith(marker, "relaunch-requested")
+    expect(relaunch).not.toHaveBeenCalled()
+  })
+
+  it("fails closed to the real relaunch when the E2E marker is not a valid absolute target", () => {
+    const relaunch = vi.fn()
+    const record = vi.fn()
+    const schedule = createRelaunchScheduler({
+      isPackaged: false,
+      e2e: true,
+      marker: "relative-marker",
+      relaunch,
+      record,
+    })
+
+    schedule()
+
+    expect(relaunch).toHaveBeenCalledOnce()
+    expect(record).not.toHaveBeenCalled()
   })
 })
 

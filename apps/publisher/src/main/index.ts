@@ -8,6 +8,8 @@ import { registerBlogManagementIpc, registerLifecycleIpc, registerPublisherIpc }
 import {
   createBlogManagementAdapter,
   createBlogRuntime,
+  createE2eMarkerRecorder,
+  createRelaunchScheduler,
   resolveBlogRegistryFile,
   resolveE2eCloneSource,
 } from "./blogRuntime"
@@ -239,6 +241,18 @@ app.whenReady().then(async () => {
     legacyPath: legacyWorkspace,
   })
   const importRunner = createSystemBoundedCommandRunner()
+  const scheduleRelaunch = createRelaunchScheduler({
+    isPackaged: app.isPackaged,
+    e2e,
+    marker: process.env.GARDEN_PUBLISHER_E2E_RELAUNCH_MARKER,
+    relaunch: () => app.relaunch(),
+  })
+  const recordCloneValidation = createE2eMarkerRecorder({
+    isPackaged: app.isPackaged,
+    e2e,
+    marker: process.env.GARDEN_PUBLISHER_E2E_VALIDATION_MARKER,
+    value: "validated",
+  })
   let importer!: BlogImportService
   let blogManagement!: ReturnType<typeof createBlogManagementAdapter>
   const blogRuntime = createBlogRuntime({
@@ -262,11 +276,7 @@ app.whenReady().then(async () => {
       previewManager = undefined
       publisherServices = undefined
     },
-    relaunch: () => {
-      // Playwright owns the next application process so it can preserve and
-      // observe the isolated registry without leaving an unmanaged child.
-      if (!e2e) app.relaunch()
-    },
+    relaunch: scheduleRelaunch,
     quit: () => app.quit(),
   })
   blogManagement = createBlogManagementAdapter({
@@ -303,6 +313,7 @@ app.whenReady().then(async () => {
         e2e,
         override: process.env.GARDEN_PUBLISHER_E2E_CLONE_SOURCE,
       }),
+    afterValidation: recordCloneValidation,
   })
   const isTrustedSender = (event: unknown): boolean => {
     const window = mainWindow

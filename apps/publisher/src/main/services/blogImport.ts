@@ -65,6 +65,7 @@ export interface BlogImportDependencies {
   readonly onProgress: (progress: BlogImportProgress) => void
   readonly afterParentCapturedBeforeMkdir?: () => Promise<void>
   readonly cloneSource?: (repository: GitHubRepository) => string | undefined
+  readonly afterValidation?: (path: string) => void | Promise<void>
 }
 
 export const BLOG_IMPORT_ERROR_CODES = [
@@ -534,6 +535,7 @@ export function createBlogImportService(dependencies: BlogImportDependencies): B
       if (clone.exitCode !== 0) throw importError("CLONE_FAILED", "Git could not clone the blog repository.", target.displayPath)
       await assertTarget(target)
       const inspection = await installAt(target.canonicalPath, operationSignal, target)
+      await dependencies.afterValidation?.(inspection.canonicalPath)
       emit("complete")
       return {
         canonicalPath: inspection.canonicalPath,

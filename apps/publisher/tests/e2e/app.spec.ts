@@ -237,6 +237,7 @@ test("manages independent blogs across safe application restarts", async () => {
   })
   const stateRoot = await createTemporaryDirectory("garden-publisher-e2e-state-")
   const registry = join(stateRoot, "blogs.json")
+  const relaunchMarker = join(stateRoot, "relaunch-requested")
   const runtimeRoot = await createE2eRuntime(stateRoot)
   const environment = {
     ...process.env,
@@ -245,6 +246,7 @@ test("manages independent blogs across safe application restarts", async () => {
     GARDEN_PUBLISHER_E2E_RUNTIME: runtimeRoot,
     GARDEN_PUBLISHER_E2E_REGISTRY: registry,
     GARDEN_PUBLISHER_E2E_CHOOSE_LOCAL: second.root,
+    GARDEN_PUBLISHER_E2E_RELAUNCH_MARKER: relaunchMarker,
   }
   let application: Awaited<ReturnType<typeof electron.launch>> | undefined
   try {
@@ -274,6 +276,7 @@ test("manages independent blogs across safe application restarts", async () => {
     await page.getByRole("menuitemradio", { name: /Second Garden/ }).click()
     await closed
     application = undefined
+    await expect.poll(async () => readFile(relaunchMarker, "utf8")).toContain("relaunch-requested")
     expect(await readFile(join(first.root, first.notePath), "utf8")).toContain(
       "pending switch save",
     )
@@ -306,6 +309,18 @@ test("manages independent blogs across safe application restarts", async () => {
     await expect(switcher).toBeVisible()
     await expect(switcher.locator("strong")).toHaveText("Second Garden")
     await expect(switcher.locator("small")).toBeHidden()
+    await switcher.click()
+    const narrowMenu = page.getByRole("menu", { name: "选择博客" })
+    await expect(narrowMenu).toBeVisible()
+    await expect(narrowMenu.locator(".blog-menu-copy small")).toBeHidden()
+    const manage = narrowMenu.getByRole("menuitem", { name: "管理博客" })
+    await expect(manage).toBeVisible()
+    await expect(manage).toBeEnabled()
+    await manage.click()
+    await expect(narrowMenu).toHaveCount(0)
+    await expect(page.getByRole("dialog", { name: "管理博客" })).toBeVisible()
+    await page.getByRole("button", { name: "关闭博客管理" }).click()
+    await expect(page.getByRole("button", { name: "切换博客：Second Garden" })).toBeVisible()
   } finally {
     await closeApplication(application)
     await Promise.all([first.cleanup(), second.cleanup()])
@@ -326,6 +341,7 @@ test("clones a validated GitHub request from a local E2E bare repository", async
   })
   const stateRoot = await createTemporaryDirectory("garden-publisher-e2e-clone-")
   const destination = join(stateRoot, "Cloned Garden")
+  const validationMarker = join(stateRoot, "clone-validated")
   const runtimeRoot = await createE2eRuntime(stateRoot)
   let application: Awaited<ReturnType<typeof electron.launch>> | undefined
   try {
@@ -339,6 +355,7 @@ test("clones a validated GitHub request from a local E2E bare repository", async
         GARDEN_PUBLISHER_E2E_RUNTIME: runtimeRoot,
         GARDEN_PUBLISHER_E2E_REGISTRY: join(stateRoot, "blogs.json"),
         GARDEN_PUBLISHER_E2E_CLONE_SOURCE: cloneSource.remote,
+        GARDEN_PUBLISHER_E2E_VALIDATION_MARKER: validationMarker,
       },
     })
     const page = await application.firstWindow()
@@ -351,6 +368,10 @@ test("clones a validated GitHub request from a local E2E bare repository", async
     await clone.getByLabel("显示名称（可选）").fill("Cloned Garden")
     await clone.getByRole("button", { name: "开始下载" }).click()
 
+    await expect
+      .poll(async () => exists(join(destination, "node_modules", ".package-lock.json")))
+      .toBe(true)
+    await expect.poll(async () => readFile(validationMarker, "utf8")).toContain("validated")
     await expect(page.getByRole("article", { name: "Cloned Garden" })).toBeVisible()
     expect(await readFile(join(destination, cloneSource.notePath), "utf8")).toContain(
       "cloned without a network",

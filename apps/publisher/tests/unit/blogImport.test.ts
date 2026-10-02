@@ -198,6 +198,7 @@ describe("createBlogImportService", () => {
       readonly owner: string
       readonly repository: string
     }) => string | undefined
+    readonly afterValidation?: (path: string) => void | Promise<void>
   }) {
     return {
       gitExecutable: "git.exe",
@@ -207,6 +208,7 @@ describe("createBlogImportService", () => {
       onProgress: ({ phase }: { phase: string }) => options.progress.push(phase),
       afterParentCapturedBeforeMkdir: options.afterParentCapturedBeforeMkdir,
       cloneSource: options.cloneSource,
+      afterValidation: options.afterValidation,
     }
   }
 
@@ -277,6 +279,39 @@ describe("createBlogImportService", () => {
       repository: "quartz",
     }])
     expect(requests[0]?.args).toEqual(["clone", "--", localSource, "."])
+  })
+
+  it("reports final clone validation only after the installed candidate passes inspection", async () => {
+    const parent = await temporaryDirectory()
+    const destination = join(parent, "quartz")
+    const order: string[] = []
+    let inspections = 0
+    const service = createBlogImportService(serviceDependencies({
+      runner: {
+        run: async ({ args }) => {
+          order.push(args[0] === "clone" ? "clone" : "install")
+          return { exitCode: 0, stdout: "", stderr: "" }
+        },
+      },
+      inspect: async (path) => {
+        inspections += 1
+        order.push(inspections === 1 ? "preflight" : "final-inspection")
+        return { valid: true, canonicalPath: path, needsInstall: false }
+      },
+      progress: [],
+      afterValidation: async (path) => {
+        expect(path).toBe(destination)
+        order.push("validated")
+      },
+    }))
+
+    await service.clone({
+      url: "https://github.com/openai/quartz",
+      destination,
+      name: "Quartz",
+    })
+
+    expect(order).toEqual(["clone", "preflight", "install", "final-inspection", "validated"])
   })
 
   it("never resolves an internal clone source for an invalid public URL", async () => {

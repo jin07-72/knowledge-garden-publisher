@@ -1,5 +1,5 @@
-import { isAbsolute, join, resolve } from "node:path"
-import { realpathSync, statSync } from "node:fs"
+import { basename, dirname, isAbsolute, join, resolve } from "node:path"
+import { realpathSync, statSync, writeFileSync } from "node:fs"
 import { parseGitHubRepositoryUrl } from "../shared/contracts"
 import type {
   BlogCloneRequest,
@@ -48,6 +48,47 @@ function samePath(left: string, right: string): boolean {
   return process.platform === "win32"
     ? left.toLocaleLowerCase("en-US") === right.toLocaleLowerCase("en-US")
     : left === right
+}
+
+interface E2eMarkerOptions {
+  readonly isPackaged: boolean
+  readonly e2e: boolean
+  readonly marker?: string
+  readonly record?: (path: string, value: string) => void
+}
+
+function e2eMarkerTarget(options: E2eMarkerOptions): string | undefined {
+  if (options.isPackaged || !options.e2e || !options.marker || !isAbsolute(options.marker)) {
+    return undefined
+  }
+  try {
+    const target = resolve(options.marker)
+    const parent = realpathSync(dirname(target))
+    if (!statSync(parent).isDirectory()) return undefined
+    const canonicalTarget = resolve(parent, basename(target))
+    return samePath(canonicalTarget, target) ? canonicalTarget : undefined
+  } catch {
+    return undefined
+  }
+}
+
+export function createE2eMarkerRecorder(
+  options: E2eMarkerOptions & { readonly value: string },
+): (() => void) | undefined {
+  const target = e2eMarkerTarget(options)
+  if (!target) return undefined
+  const record =
+    options.record ??
+    ((path: string, value: string) =>
+      writeFileSync(path, `${value}\n`, { encoding: "utf8", mode: 0o600, flag: "wx" }))
+  return () => record(target, options.value)
+}
+
+export function createRelaunchScheduler(
+  options: E2eMarkerOptions & { readonly relaunch: () => void },
+): () => void {
+  const record = createE2eMarkerRecorder({ ...options, value: "relaunch-requested" })
+  return record ?? options.relaunch
 }
 
 async function validate(
