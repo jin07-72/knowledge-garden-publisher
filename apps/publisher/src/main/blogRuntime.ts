@@ -94,7 +94,16 @@ export function createBlogRuntime(dependencies: BlogRuntimeDependencies): BlogRu
         await validate(target, dependencies.inspect)
         await dependencies.assertIdle()
         await dependencies.dispose()
-        await dependencies.registry.activate(target.id)
+        try {
+          await dependencies.registry.activate(target.id)
+        } catch (error) {
+          try {
+            dependencies.relaunch()
+          } finally {
+            dependencies.quit()
+          }
+          throw error
+        }
         dependencies.relaunch()
         dependencies.quit()
       })()
@@ -139,6 +148,13 @@ export interface BlogManagementServices {
   subscribeProgress(listener: (progress: BlogImportProgress) => void): () => void
 }
 
+export interface BlogManagementAdapter {
+  readonly services: BlogManagementServices
+  readonly emitProgress: (progress: BlogImportProgress) => void
+  readonly prepareForShutdown: () => Promise<void>
+  readonly restoreAfterFailedShutdown: () => void
+}
+
 export function createBlogManagementAdapter(dependencies: {
   readonly registry: BlogRegistry
   readonly importer: BlogImportService | (() => BlogImportService)
@@ -146,11 +162,17 @@ export function createBlogManagementAdapter(dependencies: {
   readonly chooseDirectory: () => Promise<string | undefined>
   readonly openFolder: (path: string) => Promise<void>
   readonly switchTo: (request: { readonly id: string; readonly editorSaved: true }) => Promise<void>
-}): { readonly services: BlogManagementServices; readonly emitProgress: (progress: BlogImportProgress) => void } {
+}): BlogManagementAdapter {
   const listeners = new Set<(progress: BlogImportProgress) => void>()
   let activeImport:
-    | { readonly controller: AbortController; readonly settled: Promise<void> }
+    | {
+        readonly controller: AbortController
+        readonly result: Promise<unknown>
+        readonly settled: Promise<void>
+      }
     | undefined
+  let importsOpen = true
+  let terminationUncertain: BlogImportError | undefined
   const importer = (): BlogImportService =>
     typeof dependencies.importer === "function" ? dependencies.importer() : dependencies.importer
   const validWorkspace = async (path: string): Promise<Extract<BlogCandidateInspection, { valid: true }>> => {
@@ -161,13 +183,18 @@ export function createBlogManagementAdapter(dependencies: {
     return inspection
   }
   const runImport = <T>(operation: (service: BlogImportService, signal: AbortSignal) => Promise<T>): Promise<T> => {
+    if (!importsOpen) {
+      return Promise.reject(
+        new BlogImportError("IMPORT_UNAVAILABLE", "Blog imports are unavailable while the app is closing."),
+      )
+    }
     if (activeImport) {
       return Promise.reject(new BlogImportError("IMPORT_ACTIVE", "Another blog import is already running."))
     }
     const controller = new AbortController()
-    const result = operation(importer(), controller.signal)
+    const result = Promise.resolve().then(() => operation(importer(), controller.signal))
     const settled = result.then(() => undefined, () => undefined)
-    activeImport = { controller, settled }
+    activeImport = { controller, result, settled }
     void settled.then(() => {
       if (activeImport?.controller === controller) activeImport = undefined
     })
@@ -175,6 +202,25 @@ export function createBlogManagementAdapter(dependencies: {
   }
 
   return {
+    async prepareForShutdown() {
+      importsOpen = false
+      if (terminationUncertain) throw terminationUncertain
+      const current = activeImport
+      if (!current) return
+      current.controller.abort()
+      try {
+        await current.result
+      } catch (error) {
+        if (error instanceof BlogImportError && error.code === "IMPORT_UNAVAILABLE") {
+          terminationUncertain = error
+          throw error
+        }
+        // All other outcomes settled after the importer confirmed that its child process stopped.
+      }
+    },
+    restoreAfterFailedShutdown() {
+      if (terminationUncertain === undefined) importsOpen = true
+    },
     emitProgress(progress) {
       for (const listener of listeners) listener(progress)
     },

@@ -6,6 +6,8 @@ import {
   resolveBlogRegistryFile,
 } from "../../src/main/blogRuntime"
 import type { BlogRecord, BlogRegistryView } from "../../src/shared/contracts"
+import { BlogImportError } from "../../src/main/services/blogImport"
+import { createPublisherCloseCoordinator } from "../../src/main/publisherServices"
 
 const first: BlogRecord = {
   id: "11111111-1111-4111-8111-111111111111",
@@ -145,6 +147,37 @@ describe("blog runtime", () => {
       expect(activate).not.toHaveBeenCalled()
     },
   )
+
+  it("relaunches the unchanged active blog when activation fails after disposal", async () => {
+    const order: string[] = []
+    const relaunch = vi.fn(() => order.push("relaunch"))
+    const quit = vi.fn(() => order.push("quit"))
+    const runtime = createBlogRuntime({
+      registry: {
+        load: async () => state(),
+        activate: async () => {
+          order.push("activate")
+          throw new Error("registry write failed")
+        },
+      },
+      inspect: async () => ({
+        valid: true,
+        canonicalPath: second.canonicalPath,
+        needsInstall: false,
+      }),
+      assertIdle: async () => undefined,
+      dispose: async () => {
+        order.push("dispose")
+      },
+      relaunch,
+      quit,
+    })
+
+    await expect(runtime.switchTo({ id: second.id, editorSaved: true })).rejects.toThrow(
+      "registry write failed",
+    )
+    expect(order).toEqual(["dispose", "activate", "relaunch", "quit"])
+  })
 
   it("ignores the E2E registry override in packaged builds", () => {
     expect(
@@ -288,5 +321,100 @@ describe("blog management adapter", () => {
 
     await adapter.services.switch({ id: second.id, editorSaved: true })
     expect(switchTo).toHaveBeenCalledWith({ id: second.id, editorSaved: true })
+  })
+
+  it("blocks new imports, aborts and awaits an active import before switching", async () => {
+    let finish!: (error?: Error) => void
+    let receivedSignal: AbortSignal | undefined
+    const clone = vi.fn((_request, signal?: AbortSignal) => {
+      receivedSignal = signal
+      return new Promise<never>((_resolve, reject) => {
+        finish = (error = new BlogImportError("CANCELLED", "cancelled")) => reject(error)
+      })
+    })
+    const adapter = createBlogManagementAdapter({
+      registry: {
+        load: async () => state(), add: vi.fn(), rename: vi.fn(), activate: vi.fn(),
+        remove: vi.fn(), relocate: vi.fn(),
+      },
+      importer: { clone, install: vi.fn() },
+      inspect: vi.fn(), chooseDirectory: vi.fn(), openFolder: vi.fn(), switchTo: vi.fn(),
+    })
+    const operation = adapter.services.clone({
+      name: "Clone",
+      url: "https://github.com/owner/repo",
+      destination: String.raw`C:\Blogs\cloned`,
+    })
+    await vi.waitFor(() => expect(receivedSignal).toBeDefined())
+    const relaunch = vi.fn()
+    const quit = vi.fn()
+    const runtime = createBlogRuntime({
+      registry: { load: async () => state(), activate: async () => state(second.id) },
+      inspect: async () => ({ valid: true, canonicalPath: second.canonicalPath, needsInstall: false }),
+      assertIdle: adapter.prepareForShutdown,
+      dispose: adapter.prepareForShutdown,
+      relaunch,
+      quit,
+    })
+    const switching = runtime.switchTo({ id: second.id, editorSaved: true })
+    await vi.waitFor(() => expect(receivedSignal?.aborted).toBe(true))
+    await expect(adapter.services.install({ path: first.canonicalPath })).rejects.toMatchObject({
+      code: "IMPORT_UNAVAILABLE",
+    })
+    finish()
+    await expect(switching).resolves.toBeUndefined()
+    await expect(operation).rejects.toMatchObject({ code: "CANCELLED" })
+    expect(relaunch).toHaveBeenCalledOnce()
+    expect(quit).toHaveBeenCalledOnce()
+  })
+
+  it("fails shutdown closed when active import termination is uncertain", async () => {
+    let receivedSignal: AbortSignal | undefined
+    const clone = vi.fn((_request, signal?: AbortSignal) => {
+      receivedSignal = signal
+      return new Promise<never>((_resolve, reject) => {
+        signal?.addEventListener("abort", () => {
+          reject(new BlogImportError("IMPORT_UNAVAILABLE", "termination uncertain"))
+        }, { once: true })
+      })
+    })
+    const adapter = createBlogManagementAdapter({
+      registry: {
+        load: async () => state(), add: vi.fn(), rename: vi.fn(), activate: vi.fn(),
+        remove: vi.fn(), relocate: vi.fn(),
+      },
+      importer: { clone, install: vi.fn() },
+      inspect: vi.fn(), chooseDirectory: vi.fn(), openFolder: vi.fn(), switchTo: vi.fn(),
+    })
+    const operation = adapter.services.clone({
+      name: "Clone",
+      url: "https://github.com/owner/repo",
+      destination: String.raw`C:\Blogs\cloned`,
+    })
+    await vi.waitFor(() => expect(receivedSignal).toBeDefined())
+
+    await expect(adapter.prepareForShutdown()).rejects.toMatchObject({
+      code: "IMPORT_UNAVAILABLE",
+    })
+    await expect(operation).rejects.toMatchObject({ code: "IMPORT_UNAVAILABLE" })
+    await expect(adapter.prepareForShutdown()).rejects.toMatchObject({
+      code: "IMPORT_UNAVAILABLE",
+    })
+    await expect(adapter.services.install({ path: first.canonicalPath })).rejects.toMatchObject({
+      code: "IMPORT_UNAVAILABLE",
+    })
+
+    const allowQuit = vi.fn()
+    const reportFailure = vi.fn()
+    const coordinator = createPublisherCloseCoordinator({
+      requestRendererFlush: async () => true,
+      cleanup: adapter.prepareForShutdown,
+      allowClose: vi.fn(),
+      allowQuit,
+      reportFailure,
+    })
+    await coordinator.beforeQuit({ preventDefault: vi.fn() })
+    expect(allowQuit).not.toHaveBeenCalled()
+    expect(reportFailure).toHaveBeenCalledWith("保存或关闭准备失败，窗口仍保持打开。")
   })
 })

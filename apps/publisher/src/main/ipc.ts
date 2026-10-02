@@ -142,7 +142,6 @@ export interface RegisterPublisherIpcOptions {
   readonly services: PublisherIpcServices
   readonly isTrustedSender: (event: unknown) => boolean
   readonly eventTargets: () => readonly IpcEventTarget[]
-  readonly acknowledgeClose?: (request: CloseAckRequest) => void
   readonly includeBlogManagement?: boolean
 }
 
@@ -447,6 +446,27 @@ export function registerBlogManagementIpc(options: {
   }
 }
 
+/** Keeps the close acknowledgement available for the entire BrowserWindow lifetime. */
+export function registerLifecycleIpc(options: {
+  readonly ipcMain: IpcMainPort
+  readonly isTrustedSender: (event: unknown) => boolean
+  readonly acknowledgeClose: (request: CloseAckRequest) => void
+}): () => void {
+  const channel = IPC_CHANNELS.requests.lifecycleCloseAck
+  options.ipcMain.handle(
+    channel,
+    secureHandler(channel, closeAckSchema, options.isTrustedSender, (request) =>
+      options.acknowledgeClose(request),
+    ),
+  )
+  let active = true
+  return () => {
+    if (!active) return
+    active = false
+    options.ipcMain.removeHandler(channel)
+  }
+}
+
 /** Registers the complete and finite publisher IPC surface and returns an idempotent disposer. */
 export function registerPublisherIpc(options: RegisterPublisherIpcOptions): () => void {
   const { ipcMain, services, isTrustedSender, eventTargets } = options
@@ -463,15 +483,6 @@ export function registerPublisherIpc(options: RegisterPublisherIpcOptions): () =
         noRequestSchema,
         isTrustedSender,
         () => services.workspace.inspectSafety(),
-      ),
-    ],
-    [
-      IPC_CHANNELS.requests.lifecycleCloseAck,
-      secureHandler(
-        IPC_CHANNELS.requests.lifecycleCloseAck,
-        closeAckSchema,
-        isTrustedSender,
-        (request) => options.acknowledgeClose?.(request),
       ),
     ],
     [

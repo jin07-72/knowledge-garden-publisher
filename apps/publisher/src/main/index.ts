@@ -4,7 +4,7 @@ import { isAbsolute, join, resolve } from "node:path"
 import { randomUUID } from "node:crypto"
 import { DEFAULT_GARDEN_PATH, IPC_CHANNELS } from "../shared/contracts"
 import { systemCommandRunner } from "./lib/commandRunner"
-import { registerBlogManagementIpc, registerPublisherIpc } from "./ipc"
+import { registerBlogManagementIpc, registerLifecycleIpc, registerPublisherIpc } from "./ipc"
 import {
   createBlogManagementAdapter,
   createBlogRuntime,
@@ -46,6 +46,8 @@ let mainWindow: BrowserWindow | undefined
 let mainWindowTrust: RendererTrustPolicy | undefined
 let unregisterIpc: (() => void) | undefined
 let unregisterBlogIpc: (() => void) | undefined
+let unregisterLifecycleIpc: (() => void) | undefined
+let prepareBlogManagementShutdown: (() => Promise<void>) | undefined
 let previewManager: (PreviewServicePort & { dispose(): Promise<void> }) | undefined
 let publisherServices: PublisherRuntimeServices | undefined
 
@@ -88,6 +90,7 @@ function requestRendererFlush(): Promise<boolean> {
 const closeCoordinator = createPublisherCloseCoordinator({
   requestRendererFlush,
   cleanup: async () => {
+    await prepareBlogManagementShutdown?.()
     const manager = previewManager
     const unregister = unregisterIpc
     if (manager === undefined) {
@@ -95,6 +98,8 @@ const closeCoordinator = createPublisherCloseCoordinator({
       unregisterIpc = undefined
       unregisterBlogIpc?.()
       unregisterBlogIpc = undefined
+      unregisterLifecycleIpc?.()
+      unregisterLifecycleIpc = undefined
       return
     }
     await disposePublisherRuntime(unregister, manager, publisherServices)
@@ -103,6 +108,8 @@ const closeCoordinator = createPublisherCloseCoordinator({
     publisherServices = undefined
     unregisterBlogIpc?.()
     unregisterBlogIpc = undefined
+    unregisterLifecycleIpc?.()
+    unregisterLifecycleIpc = undefined
   },
   allowQuit: () => app.quit(),
   allowClose: () => mainWindow?.close(),
@@ -232,13 +239,21 @@ app.whenReady().then(async () => {
   })
   const importRunner = createSystemBoundedCommandRunner()
   let importer!: BlogImportService
+  let blogManagement!: ReturnType<typeof createBlogManagementAdapter>
   const blogRuntime = createBlogRuntime({
     registry,
     inspect: (path) => inspectBlogCandidate(path, { runner: importRunner }),
     assertIdle: async () => {
-      await publisherServices?.assertSwitchSafe()
+      await blogManagement.prepareForShutdown()
+      try {
+        await publisherServices?.assertSwitchSafe()
+      } catch (error) {
+        blogManagement.restoreAfterFailedShutdown()
+        throw error
+      }
     },
     dispose: async () => {
+      await blogManagement.prepareForShutdown()
       const manager = previewManager
       if (!manager) return
       await disposePublisherRuntime(unregisterIpc, manager, publisherServices)
@@ -249,7 +264,7 @@ app.whenReady().then(async () => {
     relaunch: () => app.relaunch(),
     quit: () => app.quit(),
   })
-  const blogManagement = createBlogManagementAdapter({
+  blogManagement = createBlogManagementAdapter({
     registry,
     importer: () => importer,
     inspect: (path) => inspectBlogCandidate(path, { runner: importRunner }),
@@ -263,6 +278,7 @@ app.whenReady().then(async () => {
     },
     switchTo: (request) => blogRuntime.switchTo(request),
   })
+  prepareBlogManagementShutdown = blogManagement.prepareForShutdown
   importer = createBlogImportService({
     gitExecutable: "git",
     nodePath: runtimePath,
@@ -292,6 +308,13 @@ app.whenReady().then(async () => {
     services: blogManagement.services,
     isTrustedSender,
     eventTargets,
+  })
+  unregisterLifecycleIpc = registerLifecycleIpc({
+    ipcMain,
+    isTrustedSender,
+    acknowledgeClose: ({ requestId, success }) => {
+      if (pendingClose?.requestId === requestId) pendingClose.finish(success)
+    },
   })
   app.on("activate", () => {
     if (BrowserWindow.getAllWindows().length === 0) createWindow()
@@ -355,9 +378,6 @@ app.whenReady().then(async () => {
       isTrustedSender,
       eventTargets,
       includeBlogManagement: false,
-      acknowledgeClose: ({ requestId, success }) => {
-        if (pendingClose?.requestId === requestId) pendingClose.finish(success)
-      },
     })
   } catch {
     await publisherServices?.dispose().catch(() => undefined)

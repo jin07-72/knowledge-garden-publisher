@@ -8,6 +8,7 @@ import {
 } from "../../src/shared/contracts"
 import {
   registerBlogManagementIpc,
+  registerLifecycleIpc,
   registerPublisherIpc,
   type IpcEventTarget,
   type IpcMainPort,
@@ -159,17 +160,56 @@ function setup() {
     },
   }
   const acknowledgeClose = vi.fn()
-  const dispose = registerPublisherIpc({
+  const disposeLifecycle = registerLifecycleIpc({
+    ipcMain: ipc,
+    isTrustedSender: (event) => event === trustedEvent,
+    acknowledgeClose,
+  })
+  const disposeWorkspace = registerPublisherIpc({
     ipcMain: ipc,
     services: servicePorts,
     isTrustedSender: (event) => event === trustedEvent,
     eventTargets: () => [target],
-    acknowledgeClose,
   })
+  const dispose = () => {
+    disposeWorkspace()
+    disposeLifecycle()
+  }
   return { ipc, servicePorts, sent, dispose, acknowledgeClose }
 }
 
 describe("secure publisher IPC", () => {
+  it("keeps lifecycle close acknowledgements available in recovery and after workspace IPC disposal", async () => {
+    const ipc = new FakeIpcMain()
+    const servicePorts = services()
+    const acknowledgeClose = vi.fn()
+    const disposeLifecycle = registerLifecycleIpc({
+      ipcMain: ipc,
+      isTrustedSender: (event) => event === trustedEvent,
+      acknowledgeClose,
+    })
+    const request = { requestId: "11111111-1111-4111-8111-111111111111", success: true }
+
+    await expect(
+      ipc.invoke(IPC_CHANNELS.requests.lifecycleCloseAck, trustedEvent, request),
+    ).resolves.toEqual({ ok: true, value: undefined })
+
+    const disposeWorkspace = registerPublisherIpc({
+      ipcMain: ipc,
+      services: servicePorts,
+      isTrustedSender: () => true,
+      eventTargets: () => [],
+      includeBlogManagement: false,
+    })
+    disposeWorkspace()
+
+    await expect(
+      ipc.invoke(IPC_CHANNELS.requests.lifecycleCloseAck, trustedEvent, request),
+    ).resolves.toEqual({ ok: true, value: undefined })
+    expect(acknowledgeClose).toHaveBeenCalledTimes(2)
+    disposeLifecycle()
+  })
+
   it("can register blog recovery IPC before workspace-bound services exist", async () => {
     const ipc = new FakeIpcMain()
     const servicePorts = services()
