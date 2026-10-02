@@ -20,6 +20,11 @@ export function BlogSwitcher({
   onManage,
 }: BlogSwitcherProps): React.JSX.Element {
   const [open, setOpen] = useState(false)
+  const activeIndex = Math.max(
+    0,
+    registry.blogs.findIndex((blog) => blog.id === registry.activeBlogId),
+  )
+  const [focusIndex, setFocusIndex] = useState(activeIndex)
   const root = useRef<HTMLDivElement>(null)
   const trigger = useRef<HTMLButtonElement>(null)
   const active =
@@ -27,16 +32,17 @@ export function BlogSwitcher({
 
   useEffect(() => {
     if (!open) return
-    root.current?.querySelector<HTMLElement>('[role="menuitemradio"][aria-checked="true"]')?.focus()
+    root.current?.querySelector<HTMLElement>(`[data-menu-index="${focusIndex}"]`)?.focus()
     const closeOutside = (event: PointerEvent): void => {
       if (!root.current?.contains(event.target as Node)) setOpen(false)
     }
     document.addEventListener("pointerdown", closeOutside)
     return () => document.removeEventListener("pointerdown", closeOutside)
-  }, [open])
+  }, [focusIndex, open])
 
-  const openAndFocus = (): void => {
+  const openAndFocus = (index = activeIndex): void => {
     if (disabled) return
+    setFocusIndex(index)
     setOpen(true)
   }
 
@@ -55,11 +61,14 @@ export function BlogSwitcher({
         aria-haspopup="menu"
         aria-expanded={open}
         disabled={disabled || !active}
-        onClick={() => setOpen((current) => !current)}
+        onClick={() => {
+          if (open) setOpen(false)
+          else openAndFocus()
+        }}
         onKeyDown={(event) => {
-          if (event.key === "ArrowDown" || event.key === "Enter" || event.key === " ") {
+          if (event.key === "ArrowDown" || event.key === "ArrowUp") {
             event.preventDefault()
-            openAndFocus()
+            openAndFocus(event.key === "ArrowUp" ? registry.blogs.length + 2 : activeIndex)
           }
         }}
       >
@@ -82,24 +91,22 @@ export function BlogSwitcher({
               trigger.current?.focus()
               return
             }
+            if (event.key === "Tab") {
+              queueMicrotask(() => setOpen(false))
+              return
+            }
             if (!["ArrowDown", "ArrowUp", "Home", "End"].includes(event.key)) return
             event.preventDefault()
-            const items = Array.from(
-              event.currentTarget.querySelectorAll<HTMLButtonElement>(
-                '[role="menuitemradio"]:not([disabled]), [role="menuitem"]:not([disabled])',
-              ),
-            )
-            if (items.length === 0) return
-            const current = items.indexOf(document.activeElement as HTMLButtonElement)
+            const count = registry.blogs.length + 3
             const next =
               event.key === "Home"
                 ? 0
                 : event.key === "End"
-                  ? items.length - 1
+                  ? count - 1
                   : event.key === "ArrowUp"
-                    ? (current - 1 + items.length) % items.length
-                    : (current + 1) % items.length
-            items[next]?.focus()
+                    ? (focusIndex - 1 + count) % count
+                    : (focusIndex + 1) % count
+            setFocusIndex(next)
           }}
         >
           <div className="blog-switcher-options">
@@ -111,7 +118,10 @@ export function BlogSwitcher({
                   type="button"
                   role="menuitemradio"
                   aria-checked={current}
+                  data-menu-index={registry.blogs.indexOf(blog)}
+                  tabIndex={focusIndex === registry.blogs.indexOf(blog) ? 0 : -1}
                   disabled={disabled}
+                  onFocus={() => setFocusIndex(registry.blogs.indexOf(blog))}
                   onClick={() => finish(() => onSwitch(blog.id))}
                 >
                   <span className="blog-menu-check" aria-hidden="true">
@@ -132,7 +142,10 @@ export function BlogSwitcher({
             <button
               type="button"
               role="menuitem"
+              data-menu-index={registry.blogs.length}
+              tabIndex={focusIndex === registry.blogs.length ? 0 : -1}
               disabled={disabled}
+              onFocus={() => setFocusIndex(registry.blogs.length)}
               onClick={() => finish(onAddLocal)}
             >
               <FolderPlus size={15} aria-hidden="true" /> 添加本地博客
@@ -140,7 +153,10 @@ export function BlogSwitcher({
             <button
               type="button"
               role="menuitem"
+              data-menu-index={registry.blogs.length + 1}
+              tabIndex={focusIndex === registry.blogs.length + 1 ? 0 : -1}
               disabled={disabled}
+              onFocus={() => setFocusIndex(registry.blogs.length + 1)}
               onClick={() => finish(onClone)}
             >
               <GitFork size={15} aria-hidden="true" /> 从 GitHub 下载
@@ -148,7 +164,10 @@ export function BlogSwitcher({
             <button
               type="button"
               role="menuitem"
+              data-menu-index={registry.blogs.length + 2}
+              tabIndex={focusIndex === registry.blogs.length + 2 ? 0 : -1}
               disabled={disabled}
+              onFocus={() => setFocusIndex(registry.blogs.length + 2)}
               onClick={() => finish(onManage)}
             >
               <Settings2 size={15} aria-hidden="true" /> 管理博客

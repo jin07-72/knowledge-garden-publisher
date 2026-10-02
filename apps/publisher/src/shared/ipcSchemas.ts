@@ -42,6 +42,11 @@ const blogNameSchema = z
   .refine((value) => value.trim().length > 0)
   .refine((value) => !controlCharacterPattern.test(value))
   .transform((value) => value.trim())
+const optionalBlogNameSchema = z
+  .string()
+  .max(80)
+  .refine((value) => !controlCharacterPattern.test(value))
+  .transform((value) => value.trim())
 const blogResponseNameSchema = z
   .string()
   .max(80)
@@ -61,11 +66,19 @@ export const blogAddLocalRequestSchema = z
   .object({ path: blogPathSchema, name: blogNameSchema })
   .strict()
 export const blogCloneRequestSchema = z
-  .object({ url: blogUrlSchema, destination: blogPathSchema, name: blogNameSchema })
+  .object({
+    url: blogUrlSchema,
+    destination: blogPathSchema,
+    name: optionalBlogNameSchema.optional(),
+  })
   .strict()
 export const blogRenameRequestSchema = z.object({ id: blogIdSchema, name: blogNameSchema }).strict()
-export const blogRelocateRequestSchema = z.object({ id: blogIdSchema, path: blogPathSchema }).strict()
-export const blogSwitchRequestSchema = z.object({ id: blogIdSchema, editorSaved: z.literal(true) }).strict()
+export const blogRelocateRequestSchema = z
+  .object({ id: blogIdSchema, path: blogPathSchema })
+  .strict()
+export const blogSwitchRequestSchema = z
+  .object({ id: blogIdSchema, editorSaved: z.literal(true) })
+  .strict()
 
 export const appErrorSchema = z
   .object({
@@ -287,20 +300,39 @@ const blogRecordSchema = z
   })
   .strip()
 const blogRegistryViewSchema = z
-  .object({ version: z.literal(1), activeBlogId: blogIdSchema, blogs: z.array(blogRecordSchema).min(1).max(1_000) })
+  .object({
+    version: z.literal(1),
+    activeBlogId: blogIdSchema,
+    blogs: z.array(blogRecordSchema).min(1).max(1_000),
+  })
   .strip()
 const blogCandidateInspectionSchema = z.discriminatedUnion("valid", [
-  z.object({ valid: z.literal(true), canonicalPath: blogPathSchema, needsInstall: z.boolean() }).strip(),
-  z.object({ valid: z.literal(false), code: z.string().min(1).max(128), message: z.string().min(1).max(1_000) }).strip(),
+  z
+    .object({ valid: z.literal(true), canonicalPath: blogPathSchema, needsInstall: z.boolean() })
+    .strip(),
+  z
+    .object({
+      valid: z.literal(false),
+      code: z.string().min(1).max(128),
+      message: z.string().min(1).max(1_000),
+    })
+    .strip(),
 ])
 const blogCandidateSelectionSchema = z
   .object({ path: blogPathSchema, inspection: blogCandidateInspectionSchema })
   .strip()
 const blogImportReceiptSchema = z
-  .object({ canonicalPath: blogPathSchema, owner: z.string().min(1).max(39), repository: z.string().min(1).max(100) })
+  .object({
+    canonicalPath: blogPathSchema,
+    owner: z.string().min(1).max(39),
+    repository: z.string().min(1).max(100),
+  })
   .strip()
 export const blogImportProgressSchema = z
-  .object({ phase: z.enum(["cloning", "installing", "validating", "complete"]), message: z.string().min(1).max(1_000) })
+  .object({
+    phase: z.enum(["cloning", "installing", "validating", "complete"]),
+    message: z.string().min(1).max(1_000),
+  })
   .strict()
 
 export const previewProgressSchema = previewStatusSchema

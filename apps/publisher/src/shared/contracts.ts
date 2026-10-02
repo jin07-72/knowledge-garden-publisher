@@ -312,7 +312,7 @@ export interface BlogAddLocalRequest extends BlogPathRequest {
 export interface BlogCloneRequest {
   readonly url: string
   readonly destination: string
-  readonly name: string
+  readonly name?: string
 }
 
 export interface GitHubRepository {
@@ -338,7 +338,8 @@ export function parseGitHubRepositoryUrl(value: string): GitHubRepository | unde
     new TextEncoder().encode(value).byteLength > 2_048 ||
     value !== value.trim() ||
     /[\u0000-\u001f\u007f\s]/.test(value)
-  ) return undefined
+  )
+    return undefined
   const match = GITHUB_HTTPS_REPOSITORY.exec(value) ?? GITHUB_SSH_REPOSITORY.exec(value)
   if (!match) return undefined
   const [, owner, matchedRepository] = match

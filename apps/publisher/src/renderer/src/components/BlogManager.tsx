@@ -75,14 +75,29 @@ export function BlogManager({
   const [renameValue, setRenameValue] = useState("")
   const [removing, setRemoving] = useState<string>()
   const closeButton = useRef<HTMLButtonElement>(null)
+  const busyFocus = useRef<HTMLDivElement>(null)
+  const removeOriginId = useRef<string | undefined>(undefined)
+  const restoreRemoveFocus = useRef(false)
 
   useEffect(() => setView(importState.view), [importState.view])
+  useEffect(() => setLocalName(""), [importState.localSelection?.path])
   useEffect(() => {
     if (!open) {
       setRenaming(undefined)
       setRemoving(undefined)
+      setLocalName("")
+      setCloneRequest({ url: "", destination: "", name: "" })
+      setRenameValue("")
     }
   }, [open])
+  useEffect(() => {
+    if (removing !== undefined || !restoreRemoveFocus.current) return
+    restoreRemoveFocus.current = false
+    const origin = Array.from(
+      document.querySelectorAll<HTMLButtonElement>("[data-remove-blog-id]"),
+    ).find((button) => button.dataset.removeBlogId === removeOriginId.current)
+    origin?.focus()
+  }, [removing])
 
   if (!open) return null
   const busy = importState.busy
@@ -100,7 +115,7 @@ export function BlogManager({
     <ModalShell
       labelId="blog-manager-title"
       className="blog-manager-dialog"
-      initialFocus={closeButton}
+      initialFocus={busy ? busyFocus : closeButton}
       closeDisabled={busy}
       onClose={onClose}
     >
@@ -121,7 +136,13 @@ export function BlogManager({
         </button>
       </header>
 
-      <div className="blog-manager-body">
+      <div
+        ref={busyFocus}
+        className="blog-manager-body"
+        role={busy ? "group" : undefined}
+        aria-label={busy ? "博客操作进行中" : undefined}
+        tabIndex={busy ? 0 : -1}
+      >
         {view === "list" ? (
           <BlogList
             registry={registry}
@@ -141,7 +162,14 @@ export function BlogManager({
               setRenaming(undefined)
             }}
             onOpenFolder={onOpenFolder}
-            onStartRemove={setRemoving}
+            onStartRemove={(id) => {
+              removeOriginId.current = id
+              setRemoving(id)
+            }}
+            onCancelRemove={() => {
+              restoreRemoveFocus.current = true
+              setRemoving(undefined)
+            }}
             onRemove={(id) => {
               onRemove(id)
               setRemoving(undefined)
@@ -239,7 +267,7 @@ export function BlogManager({
                   onClone({
                     url: cloneRequest.url.trim(),
                     destination: cloneRequest.destination.trim(),
-                    name: cloneRequest.name.trim(),
+                    name: cloneRequest.name?.trim() ?? "",
                   })
                 }
               }}
@@ -333,6 +361,7 @@ function BlogList({
   onSaveRename,
   onOpenFolder,
   onStartRemove,
+  onCancelRemove,
   onRemove,
   onSwitch,
 }: {
@@ -345,7 +374,8 @@ function BlogList({
   readonly onRenameValue: (value: string) => void
   readonly onSaveRename: (id: string) => void
   readonly onOpenFolder: (id: string) => void
-  readonly onStartRemove: (id: string | undefined) => void
+  readonly onStartRemove: (id: string) => void
+  readonly onCancelRemove: () => void
   readonly onRemove: (id: string) => void
   readonly onSwitch: (id: string) => void
 }): React.JSX.Element {
@@ -398,28 +428,13 @@ function BlogList({
               </form>
             ) : null}
             {removing === blog.id ? (
-              <div className="blog-remove-confirm" role="alert">
-                <p>只会从应用列表中移除“{blog.name}”。</p>
-                <small>不会删除本地文件、Git 记录或 GitHub 仓库。</small>
-                <div>
-                  <button
-                    type="button"
-                    className="secondary-button"
-                    disabled={busy}
-                    onClick={() => onStartRemove(undefined)}
-                  >
-                    取消
-                  </button>
-                  <button
-                    type="button"
-                    className="danger-button"
-                    disabled={busy}
-                    onClick={() => onRemove(blog.id)}
-                  >
-                    确认移除 {blog.name}
-                  </button>
-                </div>
-              </div>
+              <RemoveConfirmation
+                id={blog.id}
+                name={blog.name}
+                busy={busy}
+                onCancel={onCancelRemove}
+                onConfirm={() => onRemove(blog.id)}
+              />
             ) : (
               <div className="blog-manager-card-actions">
                 {!current ? (
@@ -455,6 +470,7 @@ function BlogList({
                   className="secondary-button blog-remove-button"
                   disabled={busy || current}
                   aria-label={`从列表移除 ${blog.name}`}
+                  data-remove-blog-id={blog.id}
                   onClick={() => onStartRemove(blog.id)}
                 >
                   <Trash2 size={14} aria-hidden="true" /> 移除
@@ -464,6 +480,53 @@ function BlogList({
           </article>
         )
       })}
+    </div>
+  )
+}
+
+function RemoveConfirmation({
+  id,
+  name,
+  busy,
+  onCancel,
+  onConfirm,
+}: {
+  readonly id: string
+  readonly name: string
+  readonly busy: boolean
+  readonly onCancel: () => void
+  readonly onConfirm: () => void
+}): React.JSX.Element {
+  const cancel = useRef<HTMLButtonElement>(null)
+  useEffect(() => cancel.current?.focus(), [])
+  const titleId = `remove-blog-${id}-title`
+  const descriptionId = `remove-blog-${id}-description`
+  return (
+    <div
+      className="blog-remove-confirm"
+      role="alertdialog"
+      aria-labelledby={titleId}
+      aria-describedby={descriptionId}
+    >
+      <strong id={titleId}>确认移除 {name}</strong>
+      <div id={descriptionId}>
+        <p>只会从应用列表中移除“{name}”。</p>
+        <small>不会删除本地文件、Git 记录或 GitHub 仓库。</small>
+      </div>
+      <div>
+        <button
+          ref={cancel}
+          type="button"
+          className="secondary-button"
+          disabled={busy}
+          onClick={onCancel}
+        >
+          取消
+        </button>
+        <button type="button" className="danger-button" disabled={busy} onClick={onConfirm}>
+          确认移除 {name}
+        </button>
+      </div>
     </div>
   )
 }
@@ -501,7 +564,9 @@ function ImportProgress({
         {importPhases.map(([phase, label], index) => (
           <li
             key={phase}
-            className={index <= currentIndex ? "complete" : undefined}
+            className={
+              phase === progress.phase ? "current" : index < currentIndex ? "complete" : undefined
+            }
             aria-current={phase === progress.phase ? "step" : undefined}
             data-state={
               phase === progress.phase ? "current" : index < currentIndex ? "complete" : "pending"

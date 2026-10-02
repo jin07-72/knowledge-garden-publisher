@@ -297,7 +297,9 @@ button {
   top: calc(100% + 7px);
   left: 0;
   width: min(390px, calc(100vw - 32px));
-  overflow: hidden;
+  max-height: min(520px, calc(100vh - 80px));
+  overflow-x: hidden;
+  overflow-y: auto;
   border: 1px solid #46515e;
   border-radius: 10px;
   background: #171c22;
@@ -1368,6 +1370,10 @@ button {
 .blog-remove-confirm small {
   margin: 0;
 }
+.blog-remove-confirm > div:first-of-type {
+  display: grid;
+  gap: 6px;
+}
 .blog-remove-confirm small {
   color: #f5c6a8;
 }
@@ -1461,8 +1467,13 @@ button {
   text-align: center;
 }
 .blog-import-progress li.complete {
+  color: #9fc9c3;
+  background: rgb(139 213 202 / 0.12);
+}
+.blog-import-progress li.current {
   color: #0d1616;
   background: #8bd5ca;
+  box-shadow: 0 0 0 1px #c4f3ec inset;
 }
 .blog-import-progress p,
 .blog-manager-error {

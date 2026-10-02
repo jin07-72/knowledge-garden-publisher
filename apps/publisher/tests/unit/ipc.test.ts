@@ -262,32 +262,77 @@ describe("secure publisher IPC", () => {
     const value = {
       version: 1,
       activeBlogId: id,
-      blogs: [{
-        id,
-        name: "Renamed",
-        path: String.raw`C:\\Blogs\\quartz`,
-        canonicalPath: String.raw`C:\\Blogs\\quartz`,
-        createdAt: "2026-10-01T00:00:00.000Z",
-        lastOpenedAt: "2026-10-01T00:00:00.000Z",
-      }],
+      blogs: [
+        {
+          id,
+          name: "Renamed",
+          path: String.raw`C:\\Blogs\\quartz`,
+          canonicalPath: String.raw`C:\\Blogs\\quartz`,
+          createdAt: "2026-10-01T00:00:00.000Z",
+          lastOpenedAt: "2026-10-01T00:00:00.000Z",
+        },
+      ],
     }
     servicePorts.calls.blogsRename.mockResolvedValueOnce(value)
-    await expect(ipc.invoke(IPC_CHANNELS.requests.blogsRename, trustedEvent, request)).resolves.toEqual({
+    await expect(
+      ipc.invoke(IPC_CHANNELS.requests.blogsRename, trustedEvent, request),
+    ).resolves.toEqual({
       ok: true,
       value,
     })
     expect(servicePorts.calls.blogsRename).toHaveBeenCalledWith(request)
-    await expect(ipc.invoke(IPC_CHANNELS.requests.blogsRename, { sender: { isDestroyed: () => false } }, request)).resolves.toMatchObject({
+    await expect(
+      ipc.invoke(
+        IPC_CHANNELS.requests.blogsRename,
+        { sender: { isDestroyed: () => false } },
+        request,
+      ),
+    ).resolves.toMatchObject({
       ok: false,
       error: { code: "IPC_UNAUTHORIZED" },
     })
     expect(servicePorts.calls.blogsRename).toHaveBeenCalledOnce()
   })
 
+  it("accepts omitted and blank clone names while rejecting invalid repository URLs", async () => {
+    const { ipc, servicePorts } = setup()
+    servicePorts.calls.blogsClone.mockResolvedValue({
+      canonicalPath: String.raw`C:\Blogs\quartz`,
+      owner: "openai",
+      repository: "quartz",
+    })
+    const base = {
+      url: "https://github.com/openai/quartz",
+      destination: String.raw`C:\Blogs\quartz`,
+    }
+
+    await expect(
+      ipc.invoke(IPC_CHANNELS.requests.blogsClone, trustedEvent, base),
+    ).resolves.toMatchObject({ ok: true })
+    await expect(
+      ipc.invoke(IPC_CHANNELS.requests.blogsClone, trustedEvent, { ...base, name: "   " }),
+    ).resolves.toMatchObject({ ok: true })
+    expect(servicePorts.calls.blogsClone).toHaveBeenNthCalledWith(1, base)
+    expect(servicePorts.calls.blogsClone).toHaveBeenNthCalledWith(2, { ...base, name: "" })
+
+    await expect(
+      ipc.invoke(IPC_CHANNELS.requests.blogsClone, trustedEvent, {
+        ...base,
+        url: "https://example.com/openai/quartz",
+      }),
+    ).resolves.toEqual({
+      ok: false,
+      error: { code: "INVALID_INPUT", message: "The request is invalid." },
+    })
+    expect(servicePorts.calls.blogsClone).toHaveBeenCalledTimes(2)
+  })
+
   it("requires saved-editor confirmation and returns a bounded switch-busy error", async () => {
     const { ipc, servicePorts } = setup()
     const id = "11111111-1111-4111-8111-111111111111"
-    await expect(ipc.invoke(IPC_CHANNELS.requests.blogsSwitch, trustedEvent, { id })).resolves.toMatchObject({
+    await expect(
+      ipc.invoke(IPC_CHANNELS.requests.blogsSwitch, trustedEvent, { id }),
+    ).resolves.toMatchObject({
       ok: false,
       error: { code: "INVALID_INPUT" },
     })
@@ -316,14 +361,16 @@ describe("secure publisher IPC", () => {
     servicePorts.calls.blogsList.mockResolvedValueOnce({
       version: 1,
       activeBlogId: "11111111-1111-4111-8111-111111111111",
-      blogs: [{
-        id: "11111111-1111-4111-8111-111111111111",
-        name: "Quartz",
-        path: "relative\\quartz",
-        canonicalPath: String.raw`C:\\Blogs\\quartz`,
-        createdAt: "2026-10-01T00:00:00.000Z",
-        lastOpenedAt: "2026-10-01T00:00:00.000Z",
-      }],
+      blogs: [
+        {
+          id: "11111111-1111-4111-8111-111111111111",
+          name: "Quartz",
+          path: "relative\\quartz",
+          canonicalPath: String.raw`C:\\Blogs\\quartz`,
+          createdAt: "2026-10-01T00:00:00.000Z",
+          lastOpenedAt: "2026-10-01T00:00:00.000Z",
+        },
+      ],
     })
     await expect(ipc.invoke(IPC_CHANNELS.requests.blogsList, trustedEvent)).resolves.toEqual({
       ok: false,
@@ -333,19 +380,103 @@ describe("secure publisher IPC", () => {
 
   it("maps typed blog import failures to bounded public errors without disclosing internals", async () => {
     const cases: readonly [string, string, unknown, BlogImportErrorCode, string, string][] = [
-      [IPC_CHANNELS.requests.blogsClone, "blogsClone", { url: "https://github.com/openai/quartz", destination: String.raw`C:\\Blogs\\quartz`, name: "Quartz" }, "DESTINATION_EXISTS", "BLOG_DESTINATION_EXISTS", "The destination already exists."],
-      [IPC_CHANNELS.requests.blogsClone, "blogsClone", { url: "https://github.com/openai/quartz", destination: String.raw`C:\\Blogs\\quartz`, name: "Quartz" }, "IMPORT_ACTIVE", "BLOG_IMPORT_ACTIVE", "Another blog import is already running."],
-      [IPC_CHANNELS.requests.blogsClone, "blogsClone", { url: "https://github.com/openai/quartz", destination: String.raw`C:\\Blogs\\quartz`, name: "Quartz" }, "CANCELLED", "BLOG_IMPORT_CANCELLED", "Blog import was cancelled."],
-      [IPC_CHANNELS.requests.blogsClone, "blogsClone", { url: "https://github.com/openai/quartz", destination: String.raw`C:\\Blogs\\quartz`, name: "Quartz" }, "CLONE_FAILED", "BLOG_CLONE_FAILED", "Git could not clone the blog repository."],
-      [IPC_CHANNELS.requests.blogsInstall, "blogsInstall", { path: String.raw`C:\\Blogs\\quartz` }, "INSTALL_FAILED", "BLOG_INSTALL_FAILED", "Blog dependencies could not be installed."],
-      [IPC_CHANNELS.requests.blogsInstall, "blogsInstall", { path: String.raw`C:\\Blogs\\quartz` }, "VALIDATION_FAILED", "BLOG_VALIDATION_FAILED", "The blog could not be validated."],
-      [IPC_CHANNELS.requests.blogsClone, "blogsClone", { url: "https://github.com/openai/quartz", destination: String.raw`C:\\Blogs\\quartz`, name: "Quartz" }, "IMPORT_UNAVAILABLE", "BLOG_IMPORT_UNAVAILABLE", "Blog import requires an application restart."],
-      [IPC_CHANNELS.requests.blogsClone, "blogsClone", { url: "https://github.com/openai/quartz", destination: String.raw`C:\\Blogs\\quartz`, name: "Quartz" }, "INVALID_REPOSITORY_URL", "INVALID_INPUT", "The request is invalid."],
+      [
+        IPC_CHANNELS.requests.blogsClone,
+        "blogsClone",
+        {
+          url: "https://github.com/openai/quartz",
+          destination: String.raw`C:\\Blogs\\quartz`,
+          name: "Quartz",
+        },
+        "DESTINATION_EXISTS",
+        "BLOG_DESTINATION_EXISTS",
+        "The destination already exists.",
+      ],
+      [
+        IPC_CHANNELS.requests.blogsClone,
+        "blogsClone",
+        {
+          url: "https://github.com/openai/quartz",
+          destination: String.raw`C:\\Blogs\\quartz`,
+          name: "Quartz",
+        },
+        "IMPORT_ACTIVE",
+        "BLOG_IMPORT_ACTIVE",
+        "Another blog import is already running.",
+      ],
+      [
+        IPC_CHANNELS.requests.blogsClone,
+        "blogsClone",
+        {
+          url: "https://github.com/openai/quartz",
+          destination: String.raw`C:\\Blogs\\quartz`,
+          name: "Quartz",
+        },
+        "CANCELLED",
+        "BLOG_IMPORT_CANCELLED",
+        "Blog import was cancelled.",
+      ],
+      [
+        IPC_CHANNELS.requests.blogsClone,
+        "blogsClone",
+        {
+          url: "https://github.com/openai/quartz",
+          destination: String.raw`C:\\Blogs\\quartz`,
+          name: "Quartz",
+        },
+        "CLONE_FAILED",
+        "BLOG_CLONE_FAILED",
+        "Git could not clone the blog repository.",
+      ],
+      [
+        IPC_CHANNELS.requests.blogsInstall,
+        "blogsInstall",
+        { path: String.raw`C:\\Blogs\\quartz` },
+        "INSTALL_FAILED",
+        "BLOG_INSTALL_FAILED",
+        "Blog dependencies could not be installed.",
+      ],
+      [
+        IPC_CHANNELS.requests.blogsInstall,
+        "blogsInstall",
+        { path: String.raw`C:\\Blogs\\quartz` },
+        "VALIDATION_FAILED",
+        "BLOG_VALIDATION_FAILED",
+        "The blog could not be validated.",
+      ],
+      [
+        IPC_CHANNELS.requests.blogsClone,
+        "blogsClone",
+        {
+          url: "https://github.com/openai/quartz",
+          destination: String.raw`C:\\Blogs\\quartz`,
+          name: "Quartz",
+        },
+        "IMPORT_UNAVAILABLE",
+        "BLOG_IMPORT_UNAVAILABLE",
+        "Blog import requires an application restart.",
+      ],
+      [
+        IPC_CHANNELS.requests.blogsClone,
+        "blogsClone",
+        {
+          url: "https://github.com/openai/quartz",
+          destination: String.raw`C:\\Blogs\\quartz`,
+          name: "Quartz",
+        },
+        "INVALID_REPOSITORY_URL",
+        "INVALID_INPUT",
+        "The request is invalid.",
+      ],
     ]
     for (const [channel, call, request, internalCode, code, message] of cases) {
       const { ipc, servicePorts } = setup()
       servicePorts.calls[call].mockRejectedValueOnce(
-        new BlogImportError(internalCode, "secret https://user:token@github.com/openai/quartz", String.raw`C:\\secret`),
+        new BlogImportError(
+          internalCode,
+          "secret https://user:token@github.com/openai/quartz",
+          String.raw`C:\\secret`,
+        ),
       )
       const result = await ipc.invoke(channel, trustedEvent, request)
       expect(result).toEqual({ ok: false, error: { code, message } })
@@ -376,16 +507,25 @@ describe("secure publisher IPC", () => {
     }
     for (const error of [
       new BlogImportError("constructor" as BlogImportErrorCode, "secret C:\\private"),
-      new BlogImportError("__proto__" as BlogImportErrorCode, "secret https://user:token@github.com/openai/quartz"),
+      new BlogImportError(
+        "__proto__" as BlogImportErrorCode,
+        "secret https://user:token@github.com/openai/quartz",
+      ),
       { code: "BLOG_CLONE_FAILED", message: "secret C:\\private\\stdout" },
-      { code: "WORKSPACE_ACCESS_FAILED", message: "secret https://user:token@github.com/openai/quartz" },
+      {
+        code: "WORKSPACE_ACCESS_FAILED",
+        message: "secret https://user:token@github.com/openai/quartz",
+      },
     ]) {
       const { ipc, servicePorts } = setup()
       servicePorts.calls.blogsClone.mockRejectedValueOnce(error)
       const result = await ipc.invoke(IPC_CHANNELS.requests.blogsClone, trustedEvent, request)
       expect(result).toEqual({
         ok: false,
-        error: { code: "INTERNAL_ERROR", message: "The application could not complete the request." },
+        error: {
+          code: "INTERNAL_ERROR",
+          message: "The application could not complete the request.",
+        },
       })
       expect(JSON.stringify(result)).not.toContain("secret")
       expect(JSON.stringify(result)).not.toContain("token")
@@ -411,9 +551,15 @@ describe("secure publisher IPC", () => {
   it("forwards only validated blog progress and cleans the blog subscription", () => {
     const { servicePorts, sent, dispose } = setup()
     expect(servicePorts.blogSubscriptions()).toBe(1)
-    servicePorts.emitBlogProgress({ phase: "cloning", message: "Cloning blog.", stdout: "secret" } as never)
+    servicePorts.emitBlogProgress({
+      phase: "cloning",
+      message: "Cloning blog.",
+      stdout: "secret",
+    } as never)
     servicePorts.emitBlogProgress({ phase: "cloning", message: "Cloning blog." })
-    expect(sent).toEqual([[IPC_CHANNELS.events.blogsImportProgress, { phase: "cloning", message: "Cloning blog." }]])
+    expect(sent).toEqual([
+      [IPC_CHANNELS.events.blogsImportProgress, { phase: "cloning", message: "Cloning blog." }],
+    ])
     dispose()
     expect(servicePorts.blogSubscriptions()).toBe(0)
   })
@@ -492,12 +638,37 @@ describe("secure publisher IPC", () => {
       [IPC_CHANNELS.requests.historyCancel, { requestId: "../bad" }, "historyCancel"],
       [IPC_CHANNELS.requests.blogsList, {}, "blogsList"],
       [IPC_CHANNELS.requests.blogsChooseLocal, {}, "blogsChooseLocal"],
-      [IPC_CHANNELS.requests.blogsAddLocal, { path: "relative\\quartz", name: "Quartz", extra: true }, "blogsAddLocal"],
-      [IPC_CHANNELS.requests.blogsClone, { url: "https://github.com/openai/quartz?token=secret", destination: String.raw`C:\\Blogs\\quartz`, name: "Quartz", extra: true }, "blogsClone"],
+      [
+        IPC_CHANNELS.requests.blogsAddLocal,
+        { path: "relative\\quartz", name: "Quartz", extra: true },
+        "blogsAddLocal",
+      ],
+      [
+        IPC_CHANNELS.requests.blogsClone,
+        {
+          url: "https://github.com/openai/quartz?token=secret",
+          destination: String.raw`C:\\Blogs\\quartz`,
+          name: "Quartz",
+          extra: true,
+        },
+        "blogsClone",
+      ],
       [IPC_CHANNELS.requests.blogsCancelImport, {}, "blogsCancelImport"],
-      [IPC_CHANNELS.requests.blogsInstall, { path: "relative\\quartz", extra: true }, "blogsInstall"],
-      [IPC_CHANNELS.requests.blogsRename, { id: "not-a-uuid", name: "Quartz", extra: true }, "blogsRename"],
-      [IPC_CHANNELS.requests.blogsRelocate, { id: "not-a-uuid", path: "relative\\quartz", extra: true }, "blogsRelocate"],
+      [
+        IPC_CHANNELS.requests.blogsInstall,
+        { path: "relative\\quartz", extra: true },
+        "blogsInstall",
+      ],
+      [
+        IPC_CHANNELS.requests.blogsRename,
+        { id: "not-a-uuid", name: "Quartz", extra: true },
+        "blogsRename",
+      ],
+      [
+        IPC_CHANNELS.requests.blogsRelocate,
+        { id: "not-a-uuid", path: "relative\\quartz", extra: true },
+        "blogsRelocate",
+      ],
       [IPC_CHANNELS.requests.blogsRemove, { id: "not-a-uuid", extra: true }, "blogsRemove"],
       [IPC_CHANNELS.requests.blogsOpenFolder, { id: "not-a-uuid", extra: true }, "blogsOpenFolder"],
       [IPC_CHANNELS.requests.blogsSwitch, { id: "not-a-uuid", extra: true }, "blogsSwitch"],
@@ -600,17 +771,23 @@ describe("secure publisher IPC", () => {
       [IPC_CHANNELS.requests.blogsList, undefined, "blogsList"],
       [IPC_CHANNELS.requests.blogsChooseLocal, undefined, "blogsChooseLocal"],
       [IPC_CHANNELS.requests.blogsAddLocal, { path: destination, name: "Quartz" }, "blogsAddLocal"],
-      [IPC_CHANNELS.requests.blogsClone, { url: "https://github.com/openai/quartz", destination, name: "Quartz" }, "blogsClone"],
+      [
+        IPC_CHANNELS.requests.blogsClone,
+        { url: "https://github.com/openai/quartz", destination, name: "Quartz" },
+        "blogsClone",
+      ],
       [IPC_CHANNELS.requests.blogsCancelImport, undefined, "blogsCancelImport"],
       [IPC_CHANNELS.requests.blogsInstall, { path: destination }, "blogsInstall"],
       [IPC_CHANNELS.requests.blogsRename, { id, name: "Quartz" }, "blogsRename"],
       [IPC_CHANNELS.requests.blogsRelocate, { id, path: destination }, "blogsRelocate"],
       [IPC_CHANNELS.requests.blogsRemove, { id }, "blogsRemove"],
       [IPC_CHANNELS.requests.blogsOpenFolder, { id }, "blogsOpenFolder"],
-        [IPC_CHANNELS.requests.blogsSwitch, { id, editorSaved: true }, "blogsSwitch"],
+      [IPC_CHANNELS.requests.blogsSwitch, { id, editorSaved: true }, "blogsSwitch"],
     ]
     for (const [channel, request, call] of calls) {
-      await expect(ipc.invoke(channel, { sender: { isDestroyed: () => false } }, request)).resolves.toMatchObject({
+      await expect(
+        ipc.invoke(channel, { sender: { isDestroyed: () => false } }, request),
+      ).resolves.toMatchObject({
         ok: false,
         error: { code: "IPC_UNAUTHORIZED" },
       })
@@ -904,7 +1081,16 @@ describe("preload garden API", () => {
     expect(api).not.toHaveProperty("shell")
     expect(api).not.toHaveProperty("exec")
     expect(Object.keys(api).sort()).toEqual(
-      ["blogs", "changes", "history", "lifecycle", "notes", "preview", "publish", "workspace"].sort(),
+      [
+        "blogs",
+        "changes",
+        "history",
+        "lifecycle",
+        "notes",
+        "preview",
+        "publish",
+        "workspace",
+      ].sort(),
     )
   })
 
@@ -922,7 +1108,10 @@ describe("preload garden API", () => {
     await api.blogs.cancelImport()
     await api.blogs.install({ path: String.raw`C:\\Blogs\\quartz` })
     await api.blogs.rename({ id: "11111111-1111-4111-8111-111111111111", name: "Quartz" })
-    await api.blogs.relocate({ id: "11111111-1111-4111-8111-111111111111", path: String.raw`C:\\Blogs\\moved` })
+    await api.blogs.relocate({
+      id: "11111111-1111-4111-8111-111111111111",
+      path: String.raw`C:\\Blogs\\moved`,
+    })
     await api.blogs.remove({ id: "11111111-1111-4111-8111-111111111111" })
     await api.blogs.openFolder({ id: "11111111-1111-4111-8111-111111111111" })
     await api.blogs.switch({ id: "11111111-1111-4111-8111-111111111111", editorSaved: true })
@@ -978,7 +1167,9 @@ describe("preload garden API", () => {
       success: true,
     })
 
-    expect(ipc.invokes.map(([channel]) => channel).sort()).toEqual(Object.values(IPC_CHANNELS.requests).sort())
+    expect(ipc.invokes.map(([channel]) => channel).sort()).toEqual(
+      Object.values(IPC_CHANNELS.requests).sort(),
+    )
   })
 
   it("replaces malformed main-process envelopes with a fixed internal error", async () => {
@@ -1043,10 +1234,20 @@ describe("preload garden API", () => {
     const ipc = new FakeIpcRenderer()
     const listener = vi.fn()
     const unsubscribe = createGardenApi(ipc).blogs.onImportProgress(listener)
-    ipc.emit(IPC_CHANNELS.events.blogsImportProgress, { phase: "cloning", message: "Cloning blog.", stdout: "secret" })
-    ipc.emit(IPC_CHANNELS.events.blogsImportProgress, { phase: "cloning", message: "Cloning blog." })
+    ipc.emit(IPC_CHANNELS.events.blogsImportProgress, {
+      phase: "cloning",
+      message: "Cloning blog.",
+      stdout: "secret",
+    })
+    ipc.emit(IPC_CHANNELS.events.blogsImportProgress, {
+      phase: "cloning",
+      message: "Cloning blog.",
+    })
     unsubscribe()
-    ipc.emit(IPC_CHANNELS.events.blogsImportProgress, { phase: "complete", message: "Blog import complete." })
+    ipc.emit(IPC_CHANNELS.events.blogsImportProgress, {
+      phase: "complete",
+      message: "Blog import complete.",
+    })
     expect(listener).toHaveBeenCalledExactlyOnceWith({ phase: "cloning", message: "Cloning blog." })
   })
 

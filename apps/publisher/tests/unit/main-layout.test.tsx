@@ -1339,15 +1339,18 @@ describe("publisher main layout", () => {
 
     expect(screen.getByRole("button", { name: "切换博客：Knowledge Garden" })).toBeVisible()
     expect(screen.getByText("Knowledge Garden")).toBeVisible()
-    expect(screen.getByText(String.raw`C:\Users\me\knowledge-garden`).closest("small")).toBeTruthy()
+    const path = screen.getByText(String.raw`C:\Users\me\knowledge-garden`)
+    expect(path.tagName).toBe("SMALL")
+    expect(path.parentElement).toHaveClass("blog-switcher-copy")
 
     const stylesheet = readFileSync(resolve(process.cwd(), "src/renderer/src/app.css"), "utf8")
     const narrowRules = stylesheet.slice(
       stylesheet.indexOf("@media (max-width: 680px)"),
       stylesheet.indexOf("@media (prefers-reduced-motion: reduce)"),
     )
-    expect(narrowRules).toContain(".blog-switcher-copy small")
-    expect(narrowRules).toMatch(/\.blog-switcher-copy small,[\s\S]*?display: none;/)
+    expect(narrowRules).toMatch(
+      /\.blog-switcher-copy small,\s*\.blog-menu-copy small,\s*\.blog-manager-card-heading code\s*\{\s*display: none;\s*\}/,
+    )
     expect(narrowRules).not.toMatch(/\.blog-switcher-trigger[^{]*\{[^}]*display:\s*none/)
   })
 

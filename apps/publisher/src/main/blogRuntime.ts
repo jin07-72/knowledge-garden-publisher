@@ -1,8 +1,9 @@
 import { isAbsolute, join, resolve } from "node:path"
+import { parseGitHubRepositoryUrl } from "../shared/contracts"
 import type {
+  BlogCloneRequest,
   BlogAddLocalRequest,
   BlogCandidateInspection,
-  BlogCloneRequest,
   BlogIdRequest,
   BlogImportProgress,
   BlogImportReceipt,
@@ -122,12 +123,7 @@ export function resolveBlogRegistryFile(options: {
   readonly userDataPath: string
   readonly override?: string
 }): string {
-  if (
-    !options.isPackaged &&
-    options.e2e &&
-    options.override &&
-    isAbsolute(options.override)
-  ) {
+  if (!options.isPackaged && options.e2e && options.override && isAbsolute(options.override)) {
     return resolve(options.override)
   }
   return join(options.userDataPath, "blogs.json")
@@ -135,7 +131,9 @@ export function resolveBlogRegistryFile(options: {
 
 export interface BlogManagementServices {
   list(): Promise<BlogRegistryView>
-  chooseLocal(): Promise<{ readonly path: string; readonly inspection: BlogCandidateInspection } | undefined>
+  chooseLocal(): Promise<
+    { readonly path: string; readonly inspection: BlogCandidateInspection } | undefined
+  >
   addLocal(request: BlogAddLocalRequest): Promise<BlogRegistryView>
   clone(request: BlogCloneRequest): Promise<BlogImportReceipt>
   cancelImport(): Promise<void>
@@ -175,21 +173,45 @@ export function createBlogManagementAdapter(dependencies: {
   let terminationUncertain: BlogImportError | undefined
   const importer = (): BlogImportService =>
     typeof dependencies.importer === "function" ? dependencies.importer() : dependencies.importer
-  const validWorkspace = async (path: string): Promise<Extract<BlogCandidateInspection, { valid: true }>> => {
+  const validWorkspace = async (
+    path: string,
+  ): Promise<Extract<BlogCandidateInspection, { valid: true }>> => {
     const inspection = await dependencies.inspect(path)
     if (!inspection.valid) {
       throw new BlogImportError("VALIDATION_FAILED", "The selected blog could not be validated.")
     }
     return inspection
   }
-  const runImport = <T>(operation: (service: BlogImportService, signal: AbortSignal) => Promise<T>): Promise<T> => {
+  const normalizedClone = (request: BlogCloneRequest): Required<BlogCloneRequest> => {
+    const repository = parseGitHubRepositoryUrl(request.url)
+    if (!repository) {
+      throw new BlogImportError("INVALID_REPOSITORY_URL", "The repository URL is invalid.")
+    }
+    const requestedName = request.name?.trim() ?? ""
+    if (requestedName.length > 80 || /[\u0000-\u001f\u007f-\u009f]/.test(requestedName)) {
+      throw new BlogImportError("VALIDATION_FAILED", "The blog display name is invalid.")
+    }
+    const name = requestedName || repository.repository.slice(0, 80)
+    if (!name) {
+      throw new BlogImportError("VALIDATION_FAILED", "The blog display name is invalid.")
+    }
+    return { ...request, name }
+  }
+  const runImport = <T>(
+    operation: (service: BlogImportService, signal: AbortSignal) => Promise<T>,
+  ): Promise<T> => {
     if (!importsOpen) {
       return Promise.reject(
-        new BlogImportError("IMPORT_UNAVAILABLE", "Blog imports are unavailable while the app is closing."),
+        new BlogImportError(
+          "IMPORT_UNAVAILABLE",
+          "Blog imports are unavailable while the app is closing.",
+        ),
       )
     }
     if (activeImport) {
-      return Promise.reject(new BlogImportError("IMPORT_ACTIVE", "Another blog import is already running."))
+      return Promise.reject(
+        new BlogImportError("IMPORT_ACTIVE", "Another blog import is already running."),
+      )
     }
     const controller = new AbortController()
     const result = Promise.resolve().then(() => operation(importer(), controller.signal))
@@ -242,11 +264,13 @@ export function createBlogManagementAdapter(dependencies: {
         await validWorkspace(request.path)
         return dependencies.registry.add(request)
       },
-      clone: (request) => runImport(async (service, signal) => {
-        const receipt = await service.clone(request, signal)
-        await dependencies.registry.add({ name: request.name, path: receipt.canonicalPath })
-        return receipt
-      }),
+      clone: (request) =>
+        runImport(async (service, signal) => {
+          const normalized = normalizedClone(request)
+          const receipt = await service.clone(normalized, signal)
+          await dependencies.registry.add({ name: normalized.name, path: receipt.canonicalPath })
+          return receipt
+        }),
       async cancelImport() {
         const current = activeImport
         current?.controller.abort()

@@ -125,6 +125,66 @@ describe("BlogSwitcher", () => {
     expect(screen.queryByRole("menu")).not.toBeInTheDocument()
   })
 
+  it.each(["{Enter}", " "])(
+    "opens exactly once with %s and closes naturally on Tab",
+    async (key) => {
+      const user = userEvent.setup()
+      render(
+        <>
+          <BlogSwitcher
+            registry={registry}
+            disabled={false}
+            onSwitch={vi.fn()}
+            onAddLocal={vi.fn()}
+            onClone={vi.fn()}
+            onManage={vi.fn()}
+          />
+          <button type="button">后续控件</button>
+        </>,
+      )
+      const trigger = screen.getByRole("button", { name: /切换博客/ })
+      trigger.focus()
+      await user.keyboard(key)
+      expect(screen.getByRole("menu")).toBeInTheDocument()
+      expect(trigger).toHaveAttribute("aria-expanded", "true")
+      await user.tab()
+      expect(screen.queryByRole("menu")).not.toBeInTheDocument()
+      expect(screen.getByRole("button", { name: "后续控件" })).toHaveFocus()
+    },
+  )
+
+  it("uses roving focus with Home, End, wrapping arrows, and Shift+Tab closure", async () => {
+    const user = userEvent.setup()
+    render(
+      <BlogSwitcher
+        registry={registry}
+        disabled={false}
+        onSwitch={vi.fn()}
+        onAddLocal={vi.fn()}
+        onClone={vi.fn()}
+        onManage={vi.fn()}
+      />,
+    )
+    const trigger = screen.getByRole("button", { name: /切换博客/ })
+    trigger.focus()
+    await user.keyboard("{ArrowDown}")
+    const items = Array.from(
+      screen.getByRole("menu").querySelectorAll<HTMLElement>("[role^='menuitem']"),
+    )
+    expect(items.filter((item) => item.tabIndex === 0)).toHaveLength(1)
+    await user.keyboard("{End}")
+    expect(screen.getByRole("menuitem", { name: "管理博客" })).toHaveFocus()
+    await user.keyboard("{ArrowDown}")
+    expect(screen.getByRole("menuitemradio", { name: /Knowledge Garden/ })).toHaveFocus()
+    await user.keyboard("{ArrowUp}")
+    expect(screen.getByRole("menuitem", { name: "管理博客" })).toHaveFocus()
+    await user.keyboard("{Home}")
+    expect(screen.getByRole("menuitemradio", { name: /Knowledge Garden/ })).toHaveFocus()
+    await user.tab({ shift: true })
+    expect(screen.queryByRole("menu")).not.toBeInTheDocument()
+    expect(trigger).toHaveFocus()
+  })
+
   it("disables switching and actions while busy", async () => {
     render(
       <BlogSwitcher
@@ -167,8 +227,15 @@ describe("BlogManager", () => {
     expect(props.onRename).toHaveBeenCalledWith("study", "Study Notes")
 
     await user.click(within(study).getByRole("button", { name: "从列表移除 Study Garden" }))
-    expect(within(dialog).getByText(/只会从应用列表中移除/)).toBeVisible()
+    const confirmation = within(dialog).getByRole("alertdialog", {
+      name: "确认移除 Study Garden",
+    })
+    expect(within(confirmation).getByText(/只会从应用列表中移除/)).toBeVisible()
     expect(within(dialog).getByText(/不会删除本地文件、Git 记录或 GitHub 仓库/)).toBeVisible()
+    expect(within(confirmation).getByRole("button", { name: "取消" })).toHaveFocus()
+    await user.click(within(confirmation).getByRole("button", { name: "取消" }))
+    expect(within(study).getByRole("button", { name: "从列表移除 Study Garden" })).toHaveFocus()
+    await user.click(within(study).getByRole("button", { name: "从列表移除 Study Garden" }))
     await user.click(within(dialog).getByRole("button", { name: "确认移除 Study Garden" }))
     expect(props.onRemove).toHaveBeenCalledWith("study")
   })
@@ -196,6 +263,53 @@ describe("BlogManager", () => {
       path: String.raw`D:\Blogs\new-garden`,
       name: "New Garden",
     })
+  })
+
+  it("resets local and clone drafts when candidates change or the manager reopens", async () => {
+    const user = userEvent.setup()
+    const props = managerProps({
+      view: "local",
+      busy: false,
+      localSelection: {
+        path: String.raw`D:\Blogs\one`,
+        inspection: {
+          valid: true,
+          canonicalPath: String.raw`D:\Blogs\one`,
+          needsInstall: false,
+        },
+      },
+    })
+    const view = render(<BlogManager {...props} />)
+    await user.type(screen.getByRole("textbox", { name: "显示名称" }), "First draft")
+    view.rerender(
+      <BlogManager
+        {...props}
+        importState={{
+          view: "local",
+          busy: false,
+          localSelection: {
+            path: String.raw`D:\Blogs\two`,
+            inspection: {
+              valid: true,
+              canonicalPath: String.raw`D:\Blogs\two`,
+              needsInstall: false,
+            },
+          },
+        }}
+      />,
+    )
+    expect(screen.getByRole("textbox", { name: "显示名称" })).toHaveValue("")
+
+    view.rerender(
+      <BlogManager {...props} open={false} importState={{ view: "clone", busy: false }} />,
+    )
+    view.rerender(<BlogManager {...props} open importState={{ view: "clone", busy: false }} />)
+    await user.type(screen.getByRole("textbox", { name: "GitHub 仓库地址" }), "draft")
+    view.rerender(
+      <BlogManager {...props} open={false} importState={{ view: "clone", busy: false }} />,
+    )
+    view.rerender(<BlogManager {...props} open importState={{ view: "clone", busy: false }} />)
+    expect(screen.getByRole("textbox", { name: "GitHub 仓库地址" })).toHaveValue("")
   })
 
   it("offers dependency installation for an otherwise valid local candidate", async () => {
@@ -329,5 +443,6 @@ describe("BlogManager", () => {
     expect(screen.getByRole("button", { name: "从 GitHub 下载" })).toBeDisabled()
     expect(screen.getByRole("button", { name: "切换到 Study Garden" })).toBeDisabled()
     expect(screen.getByRole("button", { name: "关闭博客管理" })).toBeDisabled()
+    expect(screen.getByLabelText("博客操作进行中")).toHaveFocus()
   })
 })

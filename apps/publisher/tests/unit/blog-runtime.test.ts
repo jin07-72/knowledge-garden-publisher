@@ -285,6 +285,87 @@ describe("blog management adapter", () => {
     expect(registry.relocate).toHaveBeenCalledWith(second.id, String.raw`C:\Blogs\moved`)
   })
 
+  it.each([
+    [undefined, "learning-notes"],
+    ["   ", "learning-notes"],
+    [" My Garden ", "My Garden"],
+  ] as const)("derives a safe clone display name from %s", async (name, expectedName) => {
+    const registry = {
+      load: vi.fn(async () => state()),
+      add: vi.fn(async () => state()),
+      rename: vi.fn(async () => state()),
+      activate: vi.fn(async () => state()),
+      remove: vi.fn(async () => state()),
+      relocate: vi.fn(async () => state()),
+    }
+    const clone = vi.fn(async () => ({
+      canonicalPath: String.raw`C:\Blogs\learning-notes`,
+      owner: "owner",
+      repository: "learning-notes",
+    }))
+    const adapter = createBlogManagementAdapter({
+      registry,
+      importer: { clone, install: vi.fn() },
+      inspect: vi.fn(),
+      chooseDirectory: vi.fn(),
+      openFolder: vi.fn(),
+      switchTo: vi.fn(),
+    })
+
+    await adapter.services.clone({
+      url: "https://github.com/owner/learning-notes.git",
+      destination: String.raw`C:\Blogs\learning-notes`,
+      ...(name === undefined ? {} : { name }),
+    })
+
+    expect(clone).toHaveBeenCalledWith(
+      expect.objectContaining({ name: expectedName }),
+      expect.any(AbortSignal),
+    )
+    expect(registry.add).toHaveBeenCalledWith({
+      name: expectedName,
+      path: String.raw`C:\Blogs\learning-notes`,
+    })
+  })
+
+  it("rejects invalid clone identity before starting an import or writing an empty registry name", async () => {
+    const registry = {
+      load: vi.fn(async () => state()),
+      add: vi.fn(async () => state()),
+      rename: vi.fn(async () => state()),
+      activate: vi.fn(async () => state()),
+      remove: vi.fn(async () => state()),
+      relocate: vi.fn(async () => state()),
+    }
+    const clone = vi.fn()
+    const adapter = createBlogManagementAdapter({
+      registry,
+      importer: { clone, install: vi.fn() },
+      inspect: vi.fn(),
+      chooseDirectory: vi.fn(),
+      openFolder: vi.fn(),
+      switchTo: vi.fn(),
+    })
+
+    await expect(
+      adapter.services.clone({
+        url: "https://example.com/owner/repository",
+        destination: String.raw`C:\Blogs\repository`,
+      }),
+    ).rejects.toMatchObject({ code: "INVALID_REPOSITORY_URL" })
+    for (const name of ["x".repeat(81), "bad\u0001name"]) {
+      await expect(
+        adapter.services.clone({
+          url: "https://github.com/owner/repository",
+          destination: String.raw`C:\Blogs\repository`,
+          name,
+        }),
+      ).rejects.toMatchObject({ code: "VALIDATION_FAILED" })
+    }
+    expect(clone).not.toHaveBeenCalled()
+    expect(registry.add).not.toHaveBeenCalled()
+  })
+
   it("cancels the active clone and forwards switch only after editor save confirmation", async () => {
     let receivedSignal: AbortSignal | undefined
     const clone = vi.fn((_request, signal?: AbortSignal) => {
@@ -334,11 +415,18 @@ describe("blog management adapter", () => {
     })
     const adapter = createBlogManagementAdapter({
       registry: {
-        load: async () => state(), add: vi.fn(), rename: vi.fn(), activate: vi.fn(),
-        remove: vi.fn(), relocate: vi.fn(),
+        load: async () => state(),
+        add: vi.fn(),
+        rename: vi.fn(),
+        activate: vi.fn(),
+        remove: vi.fn(),
+        relocate: vi.fn(),
       },
       importer: { clone, install: vi.fn() },
-      inspect: vi.fn(), chooseDirectory: vi.fn(), openFolder: vi.fn(), switchTo: vi.fn(),
+      inspect: vi.fn(),
+      chooseDirectory: vi.fn(),
+      openFolder: vi.fn(),
+      switchTo: vi.fn(),
     })
     const operation = adapter.services.clone({
       name: "Clone",
@@ -350,7 +438,11 @@ describe("blog management adapter", () => {
     const quit = vi.fn()
     const runtime = createBlogRuntime({
       registry: { load: async () => state(), activate: async () => state(second.id) },
-      inspect: async () => ({ valid: true, canonicalPath: second.canonicalPath, needsInstall: false }),
+      inspect: async () => ({
+        valid: true,
+        canonicalPath: second.canonicalPath,
+        needsInstall: false,
+      }),
       assertIdle: adapter.prepareForShutdown,
       dispose: adapter.prepareForShutdown,
       relaunch,
@@ -373,18 +465,29 @@ describe("blog management adapter", () => {
     const clone = vi.fn((_request, signal?: AbortSignal) => {
       receivedSignal = signal
       return new Promise<never>((_resolve, reject) => {
-        signal?.addEventListener("abort", () => {
-          reject(new BlogImportError("IMPORT_UNAVAILABLE", "termination uncertain"))
-        }, { once: true })
+        signal?.addEventListener(
+          "abort",
+          () => {
+            reject(new BlogImportError("IMPORT_UNAVAILABLE", "termination uncertain"))
+          },
+          { once: true },
+        )
       })
     })
     const adapter = createBlogManagementAdapter({
       registry: {
-        load: async () => state(), add: vi.fn(), rename: vi.fn(), activate: vi.fn(),
-        remove: vi.fn(), relocate: vi.fn(),
+        load: async () => state(),
+        add: vi.fn(),
+        rename: vi.fn(),
+        activate: vi.fn(),
+        remove: vi.fn(),
+        relocate: vi.fn(),
       },
       importer: { clone, install: vi.fn() },
-      inspect: vi.fn(), chooseDirectory: vi.fn(), openFolder: vi.fn(), switchTo: vi.fn(),
+      inspect: vi.fn(),
+      chooseDirectory: vi.fn(),
+      openFolder: vi.fn(),
+      switchTo: vi.fn(),
     })
     const operation = adapter.services.clone({
       name: "Clone",
@@ -404,7 +507,11 @@ describe("blog management adapter", () => {
     const dispose = vi.fn(async () => undefined)
     const runtime = createBlogRuntime({
       registry: { load: async () => state(), activate },
-      inspect: async () => ({ valid: true, canonicalPath: second.canonicalPath, needsInstall: false }),
+      inspect: async () => ({
+        valid: true,
+        canonicalPath: second.canonicalPath,
+        needsInstall: false,
+      }),
       assertIdle: adapter.prepareForShutdown,
       dispose,
       relaunch: vi.fn(),
@@ -438,18 +545,29 @@ describe("blog management adapter", () => {
     const clone = vi.fn((_request, signal?: AbortSignal) => {
       receivedSignal = signal
       return new Promise<never>((_resolve, reject) => {
-        signal?.addEventListener("abort", () => {
-          reject(new BlogImportError("IMPORT_UNAVAILABLE", "secret command details"))
-        }, { once: true })
+        signal?.addEventListener(
+          "abort",
+          () => {
+            reject(new BlogImportError("IMPORT_UNAVAILABLE", "secret command details"))
+          },
+          { once: true },
+        )
       })
     })
     const adapter = createBlogManagementAdapter({
       registry: {
-        load: async () => state(), add: vi.fn(), rename: vi.fn(), activate: vi.fn(),
-        remove: vi.fn(), relocate: vi.fn(),
+        load: async () => state(),
+        add: vi.fn(),
+        rename: vi.fn(),
+        activate: vi.fn(),
+        remove: vi.fn(),
+        relocate: vi.fn(),
       },
       importer: { clone, install: vi.fn() },
-      inspect: vi.fn(), chooseDirectory: vi.fn(), openFolder: vi.fn(), switchTo: vi.fn(),
+      inspect: vi.fn(),
+      chooseDirectory: vi.fn(),
+      openFolder: vi.fn(),
+      switchTo: vi.fn(),
     })
     const operation = adapter.services.clone({
       name: "Clone",
@@ -473,16 +591,24 @@ describe("blog management adapter", () => {
     let rejectClone!: (error: Error) => void
     const adapter = createBlogManagementAdapter({
       registry: {
-        load: async () => state(), add: vi.fn(), rename: vi.fn(), activate: vi.fn(),
-        remove: vi.fn(), relocate: vi.fn(),
+        load: async () => state(),
+        add: vi.fn(),
+        rename: vi.fn(),
+        activate: vi.fn(),
+        remove: vi.fn(),
+        relocate: vi.fn(),
       },
       importer: {
-        clone: () => new Promise<never>((_resolve, reject) => {
-          rejectClone = reject
-        }),
+        clone: () =>
+          new Promise<never>((_resolve, reject) => {
+            rejectClone = reject
+          }),
         install: vi.fn(),
       },
-      inspect: vi.fn(), chooseDirectory: vi.fn(), openFolder: vi.fn(), switchTo: vi.fn(),
+      inspect: vi.fn(),
+      chooseDirectory: vi.fn(),
+      openFolder: vi.fn(),
+      switchTo: vi.fn(),
     })
     const operation = adapter.services.clone({
       name: "Clone",

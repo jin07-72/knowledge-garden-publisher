@@ -181,12 +181,16 @@ describe("IPC success schemas", () => {
     const absolutePath = String.raw`C:\\Blogs\\quartz`
     expect(blogIdRequestSchema.safeParse({ id }).success).toBe(true)
     expect(blogPathRequestSchema.safeParse({ path: absolutePath }).success).toBe(true)
-    expect(blogAddLocalRequestSchema.safeParse({ path: absolutePath, name: "Quartz" }).success).toBe(true)
-    expect(blogCloneRequestSchema.safeParse({
-      url: "https://github.com/openai/quartz.git",
-      destination: absolutePath,
-      name: "Quartz",
-    }).success).toBe(true)
+    expect(
+      blogAddLocalRequestSchema.safeParse({ path: absolutePath, name: "Quartz" }).success,
+    ).toBe(true)
+    expect(
+      blogCloneRequestSchema.safeParse({
+        url: "https://github.com/openai/quartz.git",
+        destination: absolutePath,
+        name: "Quartz",
+      }).success,
+    ).toBe(true)
     expect(blogRenameRequestSchema.safeParse({ id, name: "Renamed" }).success).toBe(true)
     expect(blogRelocateRequestSchema.safeParse({ id, path: absolutePath }).success).toBe(true)
     expect(blogSwitchRequestSchema.safeParse({ id, editorSaved: true }).success).toBe(true)
@@ -206,14 +210,44 @@ describe("IPC success schemas", () => {
     const candidateSchema = IPC_SUCCESS_SCHEMAS[IPC_CHANNELS.requests.blogsChooseLocal]
     const receiptSchema = IPC_SUCCESS_SCHEMAS[IPC_CHANNELS.requests.blogsClone]
     for (const path of responsePaths) {
-      expect(registrySchema.safeParse({ ...blogRegistry, blogs: [{ ...blog, path }] }).success, path).toBe(false)
-      expect(registrySchema.safeParse({ ...blogRegistry, blogs: [{ ...blog, canonicalPath: path }] }).success, path).toBe(false)
-      expect(candidateSchema.safeParse({ path, inspection: { valid: true, canonicalPath: String.raw`C:\\Blogs\\quartz`, needsInstall: false } }).success, path).toBe(false)
-      expect(candidateSchema.safeParse({ path: String.raw`C:\\Blogs\\quartz`, inspection: { valid: true, canonicalPath: path, needsInstall: false } }).success, path).toBe(false)
-      expect(receiptSchema.safeParse({ canonicalPath: path, owner: "openai", repository: "quartz" }).success, path).toBe(false)
+      expect(
+        registrySchema.safeParse({ ...blogRegistry, blogs: [{ ...blog, path }] }).success,
+        path,
+      ).toBe(false)
+      expect(
+        registrySchema.safeParse({ ...blogRegistry, blogs: [{ ...blog, canonicalPath: path }] })
+          .success,
+        path,
+      ).toBe(false)
+      expect(
+        candidateSchema.safeParse({
+          path,
+          inspection: {
+            valid: true,
+            canonicalPath: String.raw`C:\\Blogs\\quartz`,
+            needsInstall: false,
+          },
+        }).success,
+        path,
+      ).toBe(false)
+      expect(
+        candidateSchema.safeParse({
+          path: String.raw`C:\\Blogs\\quartz`,
+          inspection: { valid: true, canonicalPath: path, needsInstall: false },
+        }).success,
+        path,
+      ).toBe(false)
+      expect(
+        receiptSchema.safeParse({ canonicalPath: path, owner: "openai", repository: "quartz" })
+          .success,
+        path,
+      ).toBe(false)
     }
     for (const name of [" ", " Quartz ", "bad\u0001name", "bad\u0085name", "x".repeat(81)]) {
-      expect(registrySchema.safeParse({ ...blogRegistry, blogs: [{ ...blog, name }] }).success, name).toBe(false)
+      expect(
+        registrySchema.safeParse({ ...blogRegistry, blogs: [{ ...blog, name }] }).success,
+        name,
+      ).toBe(false)
     }
   })
 
@@ -221,9 +255,17 @@ describe("IPC success schemas", () => {
     const id = "11111111-1111-4111-8111-111111111111"
     const absolutePath = String.raw`C:\\Blogs\\quartz`
     for (const name of ["", "   ", "bad\u0000name", "bad\nname", "x".repeat(81)]) {
-      expect(blogAddLocalRequestSchema.safeParse({ path: absolutePath, name }).success, name).toBe(false)
+      expect(blogAddLocalRequestSchema.safeParse({ path: absolutePath, name }).success, name).toBe(
+        false,
+      )
     }
-    for (const path of ["relative\\quartz", ".\\quartz", "C:\\bad\u0000path", "C:\\bad\npath", `C:\\${"x".repeat(1_025)}`]) {
+    for (const path of [
+      "relative\\quartz",
+      ".\\quartz",
+      "C:\\bad\u0000path",
+      "C:\\bad\npath",
+      `C:\\${"x".repeat(1_025)}`,
+    ]) {
       expect(blogPathRequestSchema.safeParse({ path }).success, path).toBe(false)
     }
     for (const url of [
@@ -235,23 +277,80 @@ describe("IPC success schemas", () => {
       "https://github.com/openai/quartz/extra",
       `https://github.com/openai/${"x".repeat(2_049)}`,
     ]) {
-      expect(blogCloneRequestSchema.safeParse({ url, destination: absolutePath, name: "Quartz" }).success, url).toBe(false)
+      expect(
+        blogCloneRequestSchema.safeParse({ url, destination: absolutePath, name: "Quartz" })
+          .success,
+        url,
+      ).toBe(false)
     }
     for (const [schema, request] of [
       [blogIdRequestSchema, { id, extra: true }],
       [blogPathRequestSchema, { path: absolutePath, extra: true }],
       [blogAddLocalRequestSchema, { path: absolutePath, name: "Quartz", extra: true }],
-      [blogCloneRequestSchema, { url: "https://github.com/openai/quartz", destination: absolutePath, name: "Quartz", extra: true }],
+      [
+        blogCloneRequestSchema,
+        {
+          url: "https://github.com/openai/quartz",
+          destination: absolutePath,
+          name: "Quartz",
+          extra: true,
+        },
+      ],
       [blogRenameRequestSchema, { id, name: "Quartz", extra: true }],
       [blogRelocateRequestSchema, { id, path: absolutePath, extra: true }],
       [blogSwitchRequestSchema, { id, extra: true }],
-    ] as const) expect(schema.safeParse(request).success).toBe(false)
+    ] as const)
+      expect(schema.safeParse(request).success).toBe(false)
   })
 
   it("allows only bounded application-generated blog progress", () => {
-    expect(blogImportProgressSchema.safeParse({ phase: "cloning", message: "Cloning blog." }).success).toBe(true)
-    expect(blogImportProgressSchema.safeParse({ phase: "cloning", message: "x".repeat(1_001) }).success).toBe(false)
-    expect(blogImportProgressSchema.safeParse({ phase: "cloning", message: "Cloning", stdout: "secret" }).success).toBe(false)
+    expect(
+      blogImportProgressSchema.safeParse({ phase: "cloning", message: "Cloning blog." }).success,
+    ).toBe(true)
+    expect(
+      blogImportProgressSchema.safeParse({ phase: "cloning", message: "x".repeat(1_001) }).success,
+    ).toBe(false)
+    expect(
+      blogImportProgressSchema.safeParse({ phase: "cloning", message: "Cloning", stdout: "secret" })
+        .success,
+    ).toBe(false)
+  })
+  it("accepts an omitted or blank clone display name but still rejects unsafe clone input", () => {
+    expect(
+      blogCloneRequestSchema.parse({
+        url: "https://github.com/openai/quartz",
+        destination: String.raw`C:\Blogs\quartz`,
+      }),
+    ).toEqual({
+      url: "https://github.com/openai/quartz",
+      destination: String.raw`C:\Blogs\quartz`,
+    })
+    expect(
+      blogCloneRequestSchema.parse({
+        url: "git@github.com:openai/quartz.git",
+        destination: String.raw`C:\Blogs\quartz`,
+        name: "   ",
+      }),
+    ).toEqual({
+      url: "git@github.com:openai/quartz.git",
+      destination: String.raw`C:\Blogs\quartz`,
+      name: "",
+    })
+    for (const input of [
+      { url: "https://example.com/openai/quartz", destination: String.raw`C:\Blogs\quartz` },
+      {
+        url: "https://github.com/openai/quartz",
+        destination: String.raw`C:\Blogs\quartz`,
+        name: "x".repeat(81),
+      },
+      {
+        url: "https://github.com/openai/quartz",
+        destination: String.raw`C:\Blogs\quartz`,
+        name: "bad\u0001name",
+      },
+    ]) {
+      expect(blogCloneRequestSchema.safeParse(input).success).toBe(false)
+    }
   })
   it("matches Node UTF-8 byte length for BMP, surrogate pairs, and isolated surrogates", () => {
     const samples = ["", "ASCII", "中文", "😀", "\ud800", "\udc00", "a\ud800b", "\ud83d\ude00"]
