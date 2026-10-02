@@ -78,6 +78,7 @@ function setup(
     getRecovery?: () => Promise<IpcResult<NoteRecovery | undefined>>
     discardRecovery?: () => Promise<IpcResult<void>>
     document?: NoteDocument
+    readOnly?: boolean
   } = {},
 ) {
   const selectedDocument = options.document ?? document
@@ -87,7 +88,7 @@ function setup(
   const writeRecovery = vi.fn(async () => ok({ contentHash: "c".repeat(64) }))
   const discardRecovery = vi.fn(options.discardRecovery ?? (async () => ok(undefined)))
   const ref = createRef<MarkdownEditorHandle>()
-  const view = render(
+  const editor = (readOnly = options.readOnly) => (
     <MarkdownEditor
       ref={ref}
       document={selectedDocument}
@@ -95,9 +96,20 @@ function setup(
       save={async (request) => save(request.markdown)}
       read={read}
       recovery={{ get: getRecovery, write: writeRecovery, discard: discardRecovery }}
-    />,
+      readOnly={readOnly}
+    />
   )
-  return { ...view, ref, save, read, getRecovery, writeRecovery, discardRecovery }
+  const view = render(editor())
+  return {
+    ...view,
+    ref,
+    save,
+    read,
+    getRecovery,
+    writeRecovery,
+    discardRecovery,
+    rerenderReadOnly: (readOnly: boolean) => view.rerender(editor(readOnly)),
+  }
 }
 
 function editorView(): EditorView {
@@ -140,6 +152,48 @@ beforeEach(() => {
 })
 
 describe("MarkdownEditor", () => {
+  it("blocks user and programmatic document changes while a switch barrier is active", async () => {
+    const recovery: NoteRecovery = {
+      path: publicNote.path,
+      markdown: `${original}recovery replacement`,
+      baseMtimeMs: document.mtimeMs,
+      baseContentHash: document.contentHash,
+      createdAt: "2026-09-25T00:30:00.000Z",
+      contentHash: "c".repeat(64),
+    }
+    setup({ recovery, readOnly: true })
+
+    const prompt = await screen.findByRole("dialog", { name: "恢复未保存内容" })
+    expect(editorView().contentDOM).toHaveAttribute("contenteditable", "false")
+    expect(screen.getByRole("status", { name: "编辑器切换状态" })).toHaveTextContent("编辑已暂停")
+    dispatchDoc(`${original}external dispatch`)
+    expect(editorView().state.sliceDoc()).toBe(original)
+    await userEvent.click(within(prompt).getByRole("button", { name: "恢复" }))
+    expect(editorView().state.sliceDoc()).toBe(original)
+  })
+
+  it("does not apply an annotated disk reload after the switch barrier begins", async () => {
+    const external: NoteDocument = {
+      ...document,
+      markdown: `${original}external replacement`,
+      mtimeMs: 12,
+      contentHash: createHash("sha256").update(`${original}external replacement`).digest("hex"),
+    }
+    const { ref, rerenderReadOnly } = setup({
+      save: async () => ({
+        ok: false,
+        error: { code: "EXTERNAL_EDIT", message: "changed elsewhere" },
+      }),
+      read: async () => ok(external),
+    })
+    await replaceDoc(`${original}local buffer`)
+    await act(async () => void (await ref.current!.flush()))
+    rerenderReadOnly(true)
+
+    await userEvent.click(screen.getByRole("button", { name: "重新加载" }))
+    expect(editorView().state.sliceDoc()).toBe(`${original}local buffer`)
+  })
+
   it("keeps the editor read-only until recovery loading is handled", async () => {
     const pending = deferred<IpcResult<NoteRecovery | undefined>>()
     const recovery: NoteRecovery = {

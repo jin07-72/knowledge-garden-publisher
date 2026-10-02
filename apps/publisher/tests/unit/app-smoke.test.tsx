@@ -1,6 +1,8 @@
 import { act, cleanup, render, screen, waitFor, within } from "@testing-library/react"
 import userEvent from "@testing-library/user-event"
+import { EditorView } from "@codemirror/view"
 import { createHash } from "node:crypto"
+import { StrictMode } from "react"
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest"
 import { App } from "../../src/renderer/src/App"
 import type {
@@ -138,6 +140,70 @@ afterEach(() => {
 })
 
 describe("App blog orchestration", () => {
+  it("recovers an unavailable blog chooser after StrictMode error cleanup", async () => {
+    const user = userEvent.setup()
+    const api = gardenApi()
+    const unavailable = { ...registry, activeAvailability: "unavailable" as const }
+    const chosen = String.raw`E:\Recovered\garden`
+    vi.mocked(api.blogs.list).mockResolvedValue(ok(unavailable))
+    vi.mocked(api.blogs.chooseLocal)
+      .mockRejectedValueOnce(new Error("无法打开文件夹选择器。"))
+      .mockResolvedValueOnce(
+        ok({
+          path: chosen,
+          inspection: { valid: true, canonicalPath: chosen, needsInstall: false },
+        }),
+      )
+    Object.defineProperty(window, "garden", { configurable: true, value: api })
+
+    render(
+      <StrictMode>
+        <App />
+      </StrictMode>,
+    )
+
+    await user.click(await screen.findByRole("button", { name: "重新定位 Knowledge Garden" }))
+    expect(await screen.findByRole("alert")).toHaveTextContent("无法打开文件夹选择器")
+    const retry = screen.getByRole("button", { name: "选择文件夹" })
+    expect(retry).not.toBeDisabled()
+    await user.click(retry)
+    expect(await screen.findByText(chosen)).toBeVisible()
+    expect(api.blogs.chooseLocal).toHaveBeenCalledTimes(2)
+  })
+
+  it("recovers a corrupt registry chooser after StrictMode error cleanup", async () => {
+    const user = userEvent.setup()
+    const api = gardenApi()
+    const chosen = String.raw`D:\Blogs\recovered`
+    vi.mocked(api.blogs.list).mockResolvedValue({
+      ok: false,
+      error: { code: "INTERNAL_ERROR", message: "博客列表需要恢复。" },
+    })
+    vi.mocked(api.blogs.chooseLocal)
+      .mockRejectedValueOnce(new Error("无法打开文件夹选择器。"))
+      .mockResolvedValueOnce(
+        ok({
+          path: chosen,
+          inspection: { valid: true, canonicalPath: chosen, needsInstall: false },
+        }),
+      )
+    Object.defineProperty(window, "garden", { configurable: true, value: api })
+
+    render(
+      <StrictMode>
+        <App />
+      </StrictMode>,
+    )
+
+    const choose = await screen.findByRole("button", { name: "选择文件夹" })
+    await user.click(choose)
+    expect(await screen.findByRole("alert")).toHaveTextContent("无法打开文件夹选择器")
+    expect(choose).not.toBeDisabled()
+    await user.click(choose)
+    expect(await screen.findByText(chosen)).toBeVisible()
+    expect(api.blogs.chooseLocal).toHaveBeenCalledTimes(2)
+  })
+
   it("shows actionable recovery for an unavailable active blog without starting workspace services", async () => {
     const user = userEvent.setup()
     const api = gardenApi()
@@ -543,5 +609,85 @@ describe("App blog orchestration", () => {
     expect(vi.mocked(api.notes.save).mock.invocationCallOrder.at(-1)).toBeLessThan(
       vi.mocked(api.blogs.switch).mock.invocationCallOrder[0],
     )
+  })
+
+  it("locks the editor before the switch save barrier and unlocks only after switch failure", async () => {
+    const user = userEvent.setup()
+    const api = gardenApi()
+    const pendingSwitch = deferred<IpcResult<void>>()
+    const successfulSwitch = deferred<IpcResult<void>>()
+    const note = {
+      path: "content/technology/switch-barrier.md",
+      domain: "technology" as const,
+      slug: "switch-barrier",
+      title: "Switch barrier",
+      date: "2026-10-02",
+      description: "switch barrier test",
+      visibility: "public" as const,
+      updatedAt: "2026-10-02T00:00:00.000Z",
+      tags: ["test"],
+    }
+    vi.mocked(api.notes.list).mockResolvedValue(ok([note]))
+    vi.mocked(api.notes.read).mockResolvedValue(
+      ok({ path: note.path, markdown: "# Before", mtimeMs: 1, contentHash: "a".repeat(64) }),
+    )
+    vi.mocked(api.notes.save).mockImplementation(async (request) =>
+      ok({
+        path: request.path,
+        updatedAt: "2026-10-02T00:01:00.000Z",
+        mtimeMs: 2,
+        contentHash: createHash("sha256").update(request.markdown).digest("hex"),
+      }),
+    )
+    vi.mocked(api.blogs.switch)
+      .mockReturnValueOnce(pendingSwitch.promise)
+      .mockReturnValueOnce(successfulSwitch.promise)
+    Object.defineProperty(window, "garden", { configurable: true, value: api })
+    render(<App />)
+
+    const textbox = await screen.findByRole("textbox")
+    await waitFor(() => expect(textbox).toHaveAttribute("contenteditable", "true"))
+    const editor = EditorView.findFromDOM(textbox)
+    if (!editor) throw new Error("CodeMirror view not found")
+    act(() => {
+      editor.dispatch({
+        changes: { from: 0, to: editor.state.doc.length, insert: "# Latest before switch" },
+      })
+    })
+    await user.click(screen.getByRole("button", { name: /切换博客：Knowledge Garden/ }))
+    await user.click(screen.getByRole("menuitemradio", { name: /Study Garden/ }))
+
+    await waitFor(() => expect(api.blogs.switch).toHaveBeenCalledOnce())
+    expect(api.notes.save).toHaveBeenCalledWith(
+      expect.objectContaining({ markdown: "# Latest before switch" }),
+    )
+    expect(textbox).toHaveAttribute("contenteditable", "false")
+    expect(screen.getByRole("status", { name: "编辑器切换状态" })).toHaveTextContent("编辑已暂停")
+    act(() => {
+      editor.dispatch({
+        changes: { from: editor.state.doc.length, insert: " forbidden" },
+      })
+    })
+    expect(editor.state.sliceDoc()).toBe("# Latest before switch")
+    expect(api.notes.save).toHaveBeenCalledTimes(1)
+
+    pendingSwitch.resolve({
+      ok: false,
+      error: { code: "BLOG_SWITCH_BUSY", message: "暂时无法切换博客。" },
+    })
+    expect(await screen.findByRole("alert")).toHaveTextContent("暂时无法切换博客")
+    await waitFor(() => expect(textbox).toHaveAttribute("contenteditable", "true"))
+    act(() => {
+      editor.dispatch({ changes: { from: editor.state.doc.length, insert: " allowed" } })
+    })
+    expect(editor.state.sliceDoc()).toBe("# Latest before switch allowed")
+
+    await user.click(screen.getByRole("button", { name: "关闭博客管理" }))
+    await user.click(screen.getByRole("button", { name: /切换博客：Knowledge Garden/ }))
+    await user.click(screen.getByRole("menuitemradio", { name: /Study Garden/ }))
+    await waitFor(() => expect(api.blogs.switch).toHaveBeenCalledTimes(2))
+    successfulSwitch.resolve(ok(undefined))
+    await act(async () => void (await successfulSwitch.promise))
+    expect(textbox).toHaveAttribute("contenteditable", "false")
   })
 })

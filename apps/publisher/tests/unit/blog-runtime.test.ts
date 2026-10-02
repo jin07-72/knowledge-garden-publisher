@@ -102,6 +102,66 @@ describe("blog runtime", () => {
     expect(order).toEqual(["load", "inspect", "idle", "dispose", "activate", "relaunch", "quit"])
   })
 
+  it("quits exactly once and preserves a relaunch failure after activation", async () => {
+    const relaunchError = new Error("relaunch failed")
+    const quitError = new Error("quit failed")
+    const relaunch = vi.fn(() => {
+      throw relaunchError
+    })
+    const quit = vi.fn(() => {
+      throw quitError
+    })
+    const runtime = createBlogRuntime({
+      registry: { load: async () => state(), activate: async () => state(second.id) },
+      inspect: async () => ({
+        valid: true,
+        canonicalPath: second.canonicalPath,
+        needsInstall: false,
+      }),
+      assertIdle: async () => undefined,
+      dispose: async () => undefined,
+      relaunch,
+      quit,
+    })
+
+    await expect(runtime.switchTo({ id: second.id, editorSaved: true })).rejects.toBe(relaunchError)
+    expect(relaunch).toHaveBeenCalledOnce()
+    expect(quit).toHaveBeenCalledOnce()
+  })
+
+  it("preserves an activation failure when both terminal calls also fail", async () => {
+    const activationError = new Error("activation failed")
+    const relaunch = vi.fn(() => {
+      throw new Error("relaunch failed")
+    })
+    const quit = vi.fn(() => {
+      throw new Error("quit failed")
+    })
+    const runtime = createBlogRuntime({
+      registry: {
+        load: async () => state(),
+        activate: async () => {
+          throw activationError
+        },
+      },
+      inspect: async () => ({
+        valid: true,
+        canonicalPath: second.canonicalPath,
+        needsInstall: false,
+      }),
+      assertIdle: async () => undefined,
+      dispose: async () => undefined,
+      relaunch,
+      quit,
+    })
+
+    await expect(runtime.switchTo({ id: second.id, editorSaved: true })).rejects.toBe(
+      activationError,
+    )
+    expect(relaunch).toHaveBeenCalledOnce()
+    expect(quit).toHaveBeenCalledOnce()
+  })
+
   it("rejects direct switch calls that do not confirm a saved editor", async () => {
     const load = vi.fn(async () => state())
     const runtime = createBlogRuntime({

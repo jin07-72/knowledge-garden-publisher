@@ -1,4 +1,5 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from "react"
+import { flushSync } from "react-dom"
 import { BookOpen, Check, Eye, GitBranch, LoaderCircle, Trash2, TriangleAlert } from "lucide-react"
 import type {
   AppError,
@@ -168,6 +169,7 @@ export function PublisherApp({
   const [registry, setRegistry] = useState<BlogRegistryView>(initialRegistry)
   const [managerOpen, setManagerOpen] = useState(false)
   const [blogBusy, setBlogBusy] = useState(false)
+  const [switchPreparing, setSwitchPreparing] = useState(false)
   const blogBusyRef = useRef(false)
   const [importState, setImportState] = useState<BlogImportUiState>({
     view: "list",
@@ -262,10 +264,17 @@ export function PublisherApp({
     (id: string): void => {
       if (id === registry.activeBlogId || blogBusyRef.current) return
       void runBlogOperation(async () => {
-        const editorSaved = (await markdownEditor.current?.flushSave()) ?? true
-        if (!editorSaved) throw new Error("当前笔记保存失败，未切换博客。")
-        const result = await api.blogs.switch({ id, editorSaved: true })
-        if (!result.ok) throw new Error(result.error.message)
+        flushSync(() => setSwitchPreparing(true))
+        let restoreEditing = true
+        try {
+          const editorSaved = (await markdownEditor.current?.flushSave()) ?? true
+          if (!editorSaved) throw new Error("当前笔记保存失败，未切换博客。")
+          const result = await api.blogs.switch({ id, editorSaved: true })
+          if (!result.ok) throw new Error(result.error.message)
+          restoreEditing = false
+        } finally {
+          if (restoreEditing && appMounted.current) setSwitchPreparing(false)
+        }
       })
     },
     [api, registry.activeBlogId, runBlogOperation],
@@ -917,6 +926,7 @@ export function PublisherApp({
                     write: api.notes.recovery.write,
                     discard: api.notes.recovery.discard,
                   }}
+                  readOnly={switchPreparing}
                   onSaved={(receipt) => {
                     setDocument((current) =>
                       current?.path === receipt.path
@@ -1248,12 +1258,12 @@ function BlogRecovery({
   })
   const busy = useRef(false)
   const mounted = useRef(true)
-  useEffect(
-    () => () => {
+  useEffect(() => {
+    mounted.current = true
+    return () => {
       mounted.current = false
-    },
-    [],
-  )
+    }
+  }, [])
 
   const run = (operation: () => Promise<void>): void => {
     if (busy.current) return
@@ -1372,12 +1382,12 @@ function CorruptRegistryRecovery({
   })
   const busy = useRef(false)
   const mounted = useRef(true)
-  useEffect(
-    () => () => {
+  useEffect(() => {
+    mounted.current = true
+    return () => {
       mounted.current = false
-    },
-    [],
-  )
+    }
+  }, [])
 
   const run = (operation: () => Promise<void>): void => {
     if (busy.current) return

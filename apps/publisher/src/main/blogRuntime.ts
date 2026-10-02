@@ -71,6 +71,24 @@ async function validate(
 export function createBlogRuntime(dependencies: BlogRuntimeDependencies): BlogRuntime {
   let switchFlight: Promise<void> | undefined
 
+  const terminate = (): void => {
+    let failure: { readonly error: unknown } | undefined
+    try {
+      try {
+        dependencies.relaunch()
+      } catch (error) {
+        failure = { error }
+      }
+    } finally {
+      try {
+        dependencies.quit()
+      } catch (error) {
+        failure ??= { error }
+      }
+    }
+    if (failure) throw failure.error
+  }
+
   const active = async (): Promise<BlogRecord> => {
     const state = await dependencies.registry.load()
     const record = state.blogs.find((blog) => blog.id === state.activeBlogId)
@@ -100,14 +118,13 @@ export function createBlogRuntime(dependencies: BlogRuntimeDependencies): BlogRu
           await dependencies.registry.activate(target.id)
         } catch (error) {
           try {
-            dependencies.relaunch()
-          } finally {
-            dependencies.quit()
+            terminate()
+          } catch {
+            // Activation is the primary failure; terminal failures must not conceal it.
           }
           throw error
         }
-        dependencies.relaunch()
-        dependencies.quit()
+        terminate()
       })()
       switchFlight = operation.finally(() => {
         if (switchFlight === tracked) switchFlight = undefined

@@ -9,7 +9,14 @@ import { markdown } from "@codemirror/lang-markdown"
 import { openSearchPanel, searchKeymap } from "@codemirror/search"
 import { Annotation, Compartment, EditorState } from "@codemirror/state"
 import { EditorView, keymap } from "@codemirror/view"
-import { forwardRef, useEffect, useImperativeHandle, useRef, useState } from "react"
+import {
+  forwardRef,
+  useEffect,
+  useImperativeHandle,
+  useLayoutEffect,
+  useRef,
+  useState,
+} from "react"
 import type {
   IpcResult,
   NoteDocument,
@@ -136,11 +143,12 @@ export const MarkdownEditor = forwardRef<
     readonly save: (request: NoteSaveRequest) => Promise<IpcResult<NoteWriteReceipt>>
     readonly read: () => Promise<IpcResult<NoteDocument>>
     readonly recovery: RecoveryPort
+    readonly readOnly?: boolean
     readonly onSaved?: (receipt: NoteWriteReceipt) => void
     readonly onSaveStateChange?: (label: string) => void
   }
 >(function MarkdownEditor(
-  { document, notes, save, read, recovery, onSaved, onSaveStateChange },
+  { document, notes, save, read, recovery, readOnly = false, onSaved, onSaveStateChange },
   ref,
 ) {
   const host = useRef<HTMLDivElement>(null)
@@ -151,6 +159,8 @@ export const MarkdownEditor = forwardRef<
   const recoveryReady = useRef(false)
   const recoveryWritesEnabled = useRef(false)
   const reloadPending = useRef(false)
+  const switchReadOnly = useRef(readOnly)
+  switchReadOnly.current = readOnly
   const refreshWritable = useRef<() => void>(() => undefined)
   const retryRecoveryLoad = useRef<() => void>(() => undefined)
   const [recoveryPrompt, setRecoveryPrompt] = useState<NoteRecovery>()
@@ -186,8 +196,9 @@ export const MarkdownEditor = forwardRef<
   useImperativeHandle(
     ref,
     () => ({
-      flush: () => autosaveRef.current.flush(),
-      flushSave: () => autosaveRef.current.flush(),
+      flush: () => (reloadPending.current ? Promise.resolve(false) : autosaveRef.current.flush()),
+      flushSave: () =>
+        reloadPending.current ? Promise.resolve(false) : autosaveRef.current.flush(),
     }),
     [],
   )
@@ -213,13 +224,14 @@ export const MarkdownEditor = forwardRef<
             }),
           ),
           editing.current.of([EditorState.readOnly.of(true), EditorView.editable.of(false)]),
-          EditorState.transactionFilter.of((transaction) =>
-            transaction.docChanged &&
-            (!recoveryReady.current || reloadPending.current) &&
-            !transaction.annotation(programmaticReplace)
+          EditorState.transactionFilter.of((transaction) => {
+            if (!transaction.docChanged) return transaction
+            if (switchReadOnly.current) return []
+            return (!recoveryReady.current || reloadPending.current) &&
+              !transaction.annotation(programmaticReplace)
               ? []
-              : transaction,
-          ),
+              : transaction
+          }),
           EditorView.lineWrapping,
           EditorView.updateListener.of((update) => {
             if (!update.docChanged) return
@@ -242,7 +254,7 @@ export const MarkdownEditor = forwardRef<
     let active = true
     const updateWritable = (): void => {
       if (!active) return
-      const writable = recoveryReady.current && !reloadPending.current
+      const writable = recoveryReady.current && !reloadPending.current && !switchReadOnly.current
       view.dispatch({
         effects: editing.current.reconfigure([
           EditorState.readOnly.of(!writable),
@@ -302,6 +314,10 @@ export const MarkdownEditor = forwardRef<
     }
   }, [document.path])
 
+  useLayoutEffect(() => {
+    refreshWritable.current()
+  }, [readOnly])
+
   useEffect(() => {
     const view = editor.current
     if (!view) return
@@ -317,14 +333,15 @@ export const MarkdownEditor = forwardRef<
 
   const replace = (next: NoteRecovery): void => {
     const view = editor.current
-    if (!view) return
+    if (!view || switchReadOnly.current) return
     view.dispatch({ changes: { from: 0, to: view.state.doc.length, insert: next.markdown } })
   }
 
   const replaceFromDisk = async (next: NoteDocument): Promise<boolean> => {
+    if (switchReadOnly.current) return false
     const reset = await autosave.reset(next)
     const view = editor.current
-    if (!reset || !view) return false
+    if (!reset || !view || switchReadOnly.current) return false
     view.dispatch({
       changes: { from: 0, to: view.state.doc.length, insert: next.markdown },
       annotations: programmaticReplace.of(true),
@@ -349,12 +366,12 @@ export const MarkdownEditor = forwardRef<
   }
 
   const reloadExternal = async (): Promise<void> => {
-    if (reloadPending.current) return
+    if (reloadPending.current || switchReadOnly.current) return
     reloadPending.current = true
     refreshWritable.current()
     try {
       const next = await readExternal()
-      if (!next) return
+      if (!next || switchReadOnly.current) return
       await replaceFromDisk(next)
     } finally {
       reloadPending.current = false
@@ -403,6 +420,7 @@ export const MarkdownEditor = forwardRef<
       <div className="editor-toolbar" aria-label="编辑器工具栏">
         <button
           type="button"
+          disabled={readOnly}
           onClick={() => editor.current && undo(editor.current)}
           aria-label="撤销"
         >
@@ -410,6 +428,7 @@ export const MarkdownEditor = forwardRef<
         </button>
         <button
           type="button"
+          disabled={readOnly}
           onClick={() => editor.current && redo(editor.current)}
           aria-label="重做"
         >
@@ -417,12 +436,18 @@ export const MarkdownEditor = forwardRef<
         </button>
         <button
           type="button"
+          disabled={readOnly}
           onClick={() => editor.current && openSearchPanel(editor.current)}
           aria-label="搜索"
         >
           搜索
         </button>
       </div>
+      {readOnly ? (
+        <p role="status" aria-label="编辑器切换状态" className="save-state">
+          正在准备切换博客，编辑已暂停。
+        </p>
+      ) : null}
       <div ref={host} className="codemirror-host" />
       <div
         className={`save-state save-${autosave.state}`}
@@ -434,7 +459,7 @@ export const MarkdownEditor = forwardRef<
         {autosave.error ? <small>{autosave.error.message}</small> : null}
         {autosave.state === "conflict" ? (
           <span className="conflict-actions">
-            <button type="button" onClick={() => void reloadExternal()}>
+            <button type="button" disabled={readOnly} onClick={() => void reloadExternal()}>
               重新加载
             </button>
             <button
@@ -497,6 +522,7 @@ export const MarkdownEditor = forwardRef<
                 </button>
                 <button
                   type="button"
+                  disabled={readOnly}
                   onClick={() => {
                     replace(recoveryPrompt)
                     setConfirmStaleRecovery(false)
@@ -538,6 +564,7 @@ export const MarkdownEditor = forwardRef<
                 recoveryPrompt.baseContentHash === document.contentHash ? (
                   <button
                     type="button"
+                    disabled={readOnly}
                     onClick={() => {
                       replace(recoveryPrompt)
                       setRecoveryPrompt(undefined)
@@ -550,13 +577,18 @@ export const MarkdownEditor = forwardRef<
                     <button type="button" onClick={() => setRecoveryComparisonOpen(true)}>
                       比较版本
                     </button>
-                    <button type="button" onClick={() => setConfirmStaleRecovery(true)}>
+                    <button
+                      type="button"
+                      disabled={readOnly}
+                      onClick={() => setConfirmStaleRecovery(true)}
+                    >
                       仍使用恢复稿
                     </button>
                   </>
                 )}
                 <button
                   type="button"
+                  disabled={readOnly}
                   onClick={() =>
                     void recovery
                       .discard({ path: document.path, contentHash: recoveryPrompt.contentHash })
