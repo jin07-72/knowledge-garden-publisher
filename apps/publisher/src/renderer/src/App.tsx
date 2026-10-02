@@ -1291,6 +1291,12 @@ function BlogRecovery({
   }
 
   const activeId = registry.activeBlogId
+  const switchBlog = (id: string): void => {
+    run(async () => {
+      const result = await api.blogs.switch({ id, editorSaved: true })
+      if (!result.ok) throw new Error(result.error.message)
+    })
+  }
   return (
     <main className="first-run-shell">
       <BlogManager
@@ -1335,7 +1341,7 @@ function BlogRecovery({
             if (mounted.current) setRegistry(result.value)
           })
         }
-        onSwitch={() => undefined}
+        onSwitch={switchBlog}
         onRelocate={(id, path) =>
           run(async () => {
             const relocated = await api.blogs.relocate({ id, path })

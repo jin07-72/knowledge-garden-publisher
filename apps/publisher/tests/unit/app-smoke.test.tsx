@@ -173,6 +173,58 @@ describe("App blog orchestration", () => {
     expect(api.workspace.inspectSafety).not.toHaveBeenCalled()
   })
 
+  it("switches to an alternate registered blog once in recovery and reports switch errors", async () => {
+    const user = userEvent.setup()
+    const api = gardenApi()
+    const unavailable = { ...registry, activeAvailability: "unavailable" as const }
+    const pending = deferred<IpcResult<void>>()
+    vi.mocked(api.blogs.list).mockResolvedValue(ok(unavailable))
+    vi.mocked(api.blogs.switch).mockReturnValue(pending.promise)
+    Object.defineProperty(window, "garden", { configurable: true, value: api })
+    render(<App />)
+
+    const switchButton = await screen.findByRole("button", { name: "切换到 Study Garden" })
+    await user.dblClick(switchButton)
+    expect(api.blogs.switch).toHaveBeenCalledTimes(1)
+    expect(api.blogs.switch).toHaveBeenCalledWith({ id: "study", editorSaved: true })
+    expect(switchButton).toBeDisabled()
+    pending.resolve({
+      ok: false,
+      error: { code: "BLOG_SWITCH_BUSY", message: "暂时无法切换博客。" },
+    })
+
+    expect(await screen.findByRole("alert")).toHaveTextContent("暂时无法切换博客")
+    expect(api.workspace.inspectSafety).not.toHaveBeenCalled()
+    expect(api.notes.list).not.toHaveBeenCalled()
+  })
+
+  it("switches to an already registered blog selected as the recovery candidate", async () => {
+    const user = userEvent.setup()
+    const api = gardenApi()
+    const unavailable = { ...registry, activeAvailability: "unavailable" as const }
+    vi.mocked(api.blogs.list).mockResolvedValue(ok(unavailable))
+    vi.mocked(api.blogs.chooseLocal).mockResolvedValue(
+      ok({
+        path: registry.blogs[1].path,
+        inspection: {
+          valid: true,
+          canonicalPath: registry.blogs[1].canonicalPath,
+          needsInstall: false,
+        },
+      }),
+    )
+    Object.defineProperty(window, "garden", { configurable: true, value: api })
+    render(<App />)
+
+    await user.click(await screen.findByRole("button", { name: "重新定位 Knowledge Garden" }))
+    expect(await screen.findByText(/已经添加为“Study Garden”/)).toBeVisible()
+    await user.click(screen.getByRole("button", { name: "切换到 Study Garden" }))
+
+    expect(api.blogs.switch).toHaveBeenCalledWith({ id: "study", editorSaved: true })
+    expect(api.blogs.relocate).not.toHaveBeenCalled()
+    expect(api.workspace.inspectSafety).not.toHaveBeenCalled()
+  })
+
   it("loads the blog registry before publisher startup and shows the migrated legacy blog", async () => {
     const pending = deferred<IpcResult<BlogRegistryStatus>>()
     const api = gardenApi()
