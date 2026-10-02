@@ -119,6 +119,7 @@ function Comparison({
 
 export interface MarkdownEditorHandle {
   flush(): Promise<boolean>
+  flushSave(): Promise<boolean>
 }
 
 interface RecoveryPort {
@@ -182,7 +183,14 @@ export const MarkdownEditor = forwardRef<
   const autosaveRef = useRef(autosave)
   autosaveRef.current = autosave
 
-  useImperativeHandle(ref, () => ({ flush: () => autosaveRef.current.flush() }), [])
+  useImperativeHandle(
+    ref,
+    () => ({
+      flush: () => autosaveRef.current.flush(),
+      flushSave: () => autosaveRef.current.flush(),
+    }),
+    [],
+  )
 
   useEffect(() => {
     mounted.current = true

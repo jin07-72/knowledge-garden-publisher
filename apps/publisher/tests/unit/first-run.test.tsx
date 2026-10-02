@@ -277,9 +277,27 @@ describe("first-run diagnostics", () => {
   it("gates production renderer operations behind the startup inspection", async () => {
     const inspect = vi.fn(async () => ({ ok: true as const, value: diagnostics }))
     const list = vi.fn()
+    const listBlogs = vi.fn(async () => ({
+      ok: true as const,
+      value: {
+        version: 1 as const,
+        activeBlogId: "00000000-0000-4000-8000-000000000000",
+        blogs: [
+          {
+            id: "00000000-0000-4000-8000-000000000000",
+            name: "Knowledge Garden",
+            path: String.raw`C:\garden`,
+            canonicalPath: String.raw`C:\garden`,
+            createdAt: "2026-10-01T00:00:00.000Z",
+            lastOpenedAt: "2026-10-01T00:00:00.000Z",
+          },
+        ],
+      },
+    }))
     Object.defineProperty(window, "garden", {
       configurable: true,
       value: {
+        blogs: { list: listBlogs },
         workspace: { inspectSafety: inspect, inspect: vi.fn(), repair: vi.fn() },
         notes: { list },
       } as unknown as GardenApi,
@@ -288,6 +306,7 @@ describe("first-run diagnostics", () => {
     render(<App />)
 
     expect(await screen.findByRole("region", { name: "启动检查" })).toBeVisible()
+    expect(listBlogs).toHaveBeenCalledOnce()
     expect(inspect).toHaveBeenCalledOnce()
     expect(list).not.toHaveBeenCalled()
   })

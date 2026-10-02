@@ -39,6 +39,7 @@ export interface BlogManagerProps {
   readonly onOpenFolder: (id: string) => void
   readonly onRemove: (id: string) => void
   readonly onSwitch: (id: string) => void
+  readonly onCancelImport?: () => void
 }
 
 type ManagerView = BlogImportUiState["view"]
@@ -63,6 +64,7 @@ export function BlogManager({
   onOpenFolder,
   onRemove,
   onSwitch,
+  onCancelImport,
 }: BlogManagerProps): React.JSX.Element | null {
   const [view, setView] = useState<ManagerView>(importState.view)
   const [localName, setLocalName] = useState("")
@@ -143,6 +145,11 @@ export function BlogManager({
         aria-label={busy ? "博客操作进行中" : undefined}
         tabIndex={busy ? 0 : -1}
       >
+        {importState.error ? (
+          <p role="alert" className="blog-manager-error">
+            {importState.error}
+          </p>
+        ) : null}
         {view === "list" ? (
           <BlogList
             registry={registry}
@@ -317,10 +324,10 @@ export function BlogManager({
               </button>
             </form>
             <ImportProgress progress={importState.progress} />
-            {importState.error ? (
-              <p role="alert" className="blog-manager-error">
-                {importState.error}
-              </p>
+            {busy && onCancelImport ? (
+              <button type="button" className="secondary-button" onClick={onCancelImport}>
+                取消导入
+              </button>
             ) : null}
           </section>
         )}

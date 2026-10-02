@@ -102,6 +102,21 @@ function deferred<T>(): {
   }
 }
 
+const testRegistry: BlogRegistryView = {
+  version: 1,
+  activeBlogId: "00000000-0000-4000-8000-000000000000",
+  blogs: [
+    {
+      id: "00000000-0000-4000-8000-000000000000",
+      name: "Knowledge Garden",
+      path: String.raw`C:\Users\11546\Desktop\web`,
+      canonicalPath: String.raw`C:\Users\11546\Desktop\web`,
+      createdAt: "2026-10-01T00:00:00.000Z",
+      lastOpenedAt: "2026-10-01T00:00:00.000Z",
+    },
+  ],
+}
+
 function createGardenMock(): GardenApi {
   const ready: PreviewStatus = {
     state: "ready",
@@ -113,7 +128,7 @@ function createGardenMock(): GardenApi {
 
   return {
     blogs: {
-      list: vi.fn(async () => unavailable<BlogRegistryView>("博客服务将在后续任务中提供。")),
+      list: vi.fn(async () => ok(testRegistry)),
       chooseLocal: vi.fn(async () => ok(undefined)),
       addLocal: vi.fn(async () => unavailable<BlogRegistryView>("博客服务将在后续任务中提供。")),
       clone: vi.fn(async () => unavailable<BlogImportReceipt>("博客服务将在后续任务中提供。")),
@@ -206,7 +221,7 @@ function createGardenMock(): GardenApi {
 
 describe("publisher main layout", () => {
   let garden: GardenApi
-  const App = (): React.JSX.Element => <PublisherApp api={garden} />
+  const App = (): React.JSX.Element => <PublisherApp api={garden} initialRegistry={testRegistry} />
 
   beforeEach(() => {
     localStorage.clear()
@@ -285,7 +300,7 @@ describe("publisher main layout", () => {
       recoveryListener = listener
       return () => undefined
     })
-    render(<PublisherApp api={garden} />)
+    render(<PublisherApp api={garden} initialRegistry={testRegistry} />)
     await waitFor(() => expect(garden.notes.list).toHaveBeenCalledOnce())
 
     act(() => recoveryListener?.({ restored: ["content/life/daily.md"], conflicts: [] }))

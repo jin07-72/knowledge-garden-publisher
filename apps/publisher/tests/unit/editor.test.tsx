@@ -183,9 +183,9 @@ describe("MarkdownEditor", () => {
     expect(screen.getByText(/不会覆盖状态未知的恢复稿/)).toBeVisible()
   })
 
-  it("returns immediately for a clean close barrier without writing or saving", async () => {
+  it("returns immediately from flushSave for a clean editor without writing or saving", async () => {
     const { ref, save, writeRecovery } = setup()
-    await expect(ref.current!.flush()).resolves.toBe(true)
+    await expect(ref.current!.flushSave()).resolves.toBe(true)
     expect(save).not.toHaveBeenCalled()
     expect(writeRecovery).not.toHaveBeenCalled()
   })
@@ -226,7 +226,7 @@ describe("MarkdownEditor", () => {
     })
     const view = editorView()
     act(() => view.dispatch({ changes: { from: view.state.doc.length, insert: "\nfourth" } }))
-    await act(async () => void (await ref.current!.flush()))
+    await act(async () => void (await ref.current!.flushSave()))
     expect(save).toHaveBeenCalledWith("first\r\nsecond\nthird\nfourth")
   })
 
@@ -239,7 +239,7 @@ describe("MarkdownEditor", () => {
     })
     await replaceDoc(`${original}first buffer`)
     let barrierResolved = false
-    const barrier = ref.current!.flush().then((result) => {
+    const barrier = ref.current!.flushSave().then((result) => {
       barrierResolved = true
       return result
     })
@@ -271,10 +271,10 @@ describe("MarkdownEditor", () => {
       save: async () => (++call === 1 ? save1.promise : save2.promise),
     })
     await replaceDoc(`${original}v1`)
-    const first = ref.current!.flush()
+    const first = ref.current!.flushSave()
     await waitFor(() => expect(save).toHaveBeenCalledTimes(1))
     await replaceDoc(`${original}v2`)
-    const second = ref.current!.flush()
+    const second = ref.current!.flushSave()
     save1.resolve(ok(receipt(`${original}v1`)))
     await waitFor(() => expect(save).toHaveBeenCalledTimes(2))
     save2.resolve({

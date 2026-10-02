@@ -2,6 +2,9 @@ import { useCallback, useEffect, useMemo, useRef, useState } from "react"
 import { BookOpen, Check, Eye, GitBranch, LoaderCircle, Trash2, TriangleAlert } from "lucide-react"
 import type {
   AppError,
+  BlogAddLocalRequest,
+  BlogCloneRequest,
+  BlogRegistryView,
   ChangeReview,
   GardenApi,
   NoteCreateRequest,
@@ -23,6 +26,8 @@ import { PublishReview } from "./components/PublishReview"
 import type { HistorySnapshot } from "./components/HistoryView"
 import { FirstRun } from "./components/FirstRun"
 import { DeleteNoteDialog } from "./components/DeleteNoteDialog"
+import { BlogSwitcher } from "./components/BlogSwitcher"
+import { BlogManager, type BlogImportUiState } from "./components/BlogManager"
 import "./app.css"
 
 type LoadState = "loading" | "ready" | "error"
@@ -152,11 +157,21 @@ function PaneSeparator({
 
 export function PublisherApp({
   api,
+  initialRegistry,
   diagnosticsReady = false,
 }: {
   readonly api: GardenApi
+  readonly initialRegistry: BlogRegistryView
   readonly diagnosticsReady?: boolean
 }): React.JSX.Element {
+  const [registry, setRegistry] = useState<BlogRegistryView>(initialRegistry)
+  const [managerOpen, setManagerOpen] = useState(false)
+  const [blogBusy, setBlogBusy] = useState(false)
+  const blogBusyRef = useRef(false)
+  const [importState, setImportState] = useState<BlogImportUiState>({
+    view: "list",
+    busy: false,
+  })
   const [notes, setNotes] = useState<readonly NoteSummary[]>([])
   const [selectedPath, setSelectedPath] = useState<string>()
   const [document, setDocument] = useState<NoteDocument>()
@@ -206,6 +221,63 @@ export function PublisherApp({
     [paneSizes, workspaceWidth],
   )
   const compactPanes = workspaceWidth <= COMPACT_PANE_BREAKPOINT
+
+  const setBlogOperationBusy = useCallback((busy: boolean): void => {
+    blogBusyRef.current = busy
+    setBlogBusy(busy)
+    setImportState((current) => ({ ...current, busy }))
+  }, [])
+
+  const runBlogOperation = useCallback(
+    async (operation: () => Promise<void>): Promise<void> => {
+      if (blogBusyRef.current) return
+      setBlogOperationBusy(true)
+      setImportState((current) => ({ ...current, error: undefined }))
+      try {
+        await operation()
+      } catch (failure) {
+        if (appMounted.current) {
+          setImportState((current) => ({
+            ...current,
+            error: failure instanceof Error ? failure.message : "博客操作失败，请重试。",
+          }))
+          setManagerOpen(true)
+        }
+      } finally {
+        if (appMounted.current) setBlogOperationBusy(false)
+      }
+    },
+    [setBlogOperationBusy],
+  )
+
+  const refreshBlogs = useCallback(async (): Promise<BlogRegistryView> => {
+    const result = await api.blogs.list()
+    if (!result.ok) throw new Error(result.error.message)
+    if (appMounted.current) setRegistry(result.value)
+    return result.value
+  }, [api])
+
+  const switchBlog = useCallback(
+    (id: string): void => {
+      if (id === registry.activeBlogId || blogBusyRef.current) return
+      void runBlogOperation(async () => {
+        const editorSaved = (await markdownEditor.current?.flushSave()) ?? true
+        if (!editorSaved) throw new Error("当前笔记保存失败，未切换博客。")
+        const result = await api.blogs.switch({ id, editorSaved: true })
+        if (!result.ok) throw new Error(result.error.message)
+      })
+    },
+    [api, registry.activeBlogId, runBlogOperation],
+  )
+
+  useEffect(
+    () =>
+      api.blogs.onImportProgress((progress) => {
+        if (!appMounted.current) return
+        setImportState((current) => ({ ...current, progress }))
+      }),
+    [api],
+  )
 
   const selectedNote = useMemo(
     () => notes.find((note) => note.path === selectedPath),
@@ -632,6 +704,63 @@ export function PublisherApp({
     stopping: "预览停止中",
   }
 
+  const chooseLocalBlog = (): void => {
+    setManagerOpen(true)
+    setImportState((current) => ({ ...current, view: "local", localSelection: undefined }))
+    void runBlogOperation(async () => {
+      const result = await api.blogs.chooseLocal()
+      if (!result.ok) throw new Error(result.error.message)
+      if (appMounted.current && result.value) {
+        setImportState((current) => ({ ...current, view: "local", localSelection: result.value }))
+      }
+    })
+  }
+
+  const addLocalBlog = (request: BlogAddLocalRequest): void => {
+    void runBlogOperation(async () => {
+      const result = await api.blogs.addLocal(request)
+      if (!result.ok) throw new Error(result.error.message)
+      if (appMounted.current) {
+        setRegistry(result.value)
+        setImportState({ view: "list", busy: true })
+      }
+    })
+  }
+
+  const cloneBlog = (request: BlogCloneRequest): void => {
+    void runBlogOperation(async () => {
+      setImportState((current) => ({ ...current, view: "clone", progress: undefined }))
+      const normalized = { ...request, name: request.name?.trim() || undefined }
+      const result = await api.blogs.clone(normalized)
+      if (!result.ok) throw new Error(result.error.message)
+      await refreshBlogs()
+      if (appMounted.current) setImportState({ view: "list", busy: true })
+    })
+  }
+
+  const installBlog = (path: string): void => {
+    void runBlogOperation(async () => {
+      const result = await api.blogs.install({ path })
+      if (!result.ok) throw new Error(result.error.message)
+      if (!result.value.valid) throw new Error(result.value.message)
+      if (appMounted.current) {
+        setImportState((current) => ({
+          ...current,
+          view: "local",
+          localSelection: { path, inspection: result.value },
+        }))
+      }
+    })
+  }
+
+  const updateRegistry = (operation: () => ReturnType<GardenApi["blogs"]["rename"]>): void => {
+    void runBlogOperation(async () => {
+      const result = await operation()
+      if (!result.ok) throw new Error(result.error.message)
+      if (appMounted.current) setRegistry(result.value)
+    })
+  }
+
   return (
     <main
       className="app-shell"
@@ -645,6 +774,20 @@ export function PublisherApp({
           <p className="eyebrow">个人知识花园</p>
           <h1>~/Knowledge Garden</h1>
         </div>
+        <BlogSwitcher
+          registry={registry}
+          disabled={blogBusy}
+          onSwitch={switchBlog}
+          onAddLocal={chooseLocalBlog}
+          onClone={() => {
+            setManagerOpen(true)
+            setImportState((current) => ({ ...current, view: "clone", error: undefined }))
+          }}
+          onManage={() => {
+            setManagerOpen(true)
+            setImportState((current) => ({ ...current, view: "list", error: undefined }))
+          }}
+        />
         <div className="topbar-meta">
           <span className={`status-dot preview-${preview.state}`} />
           {previewLabel[preview.state]}
@@ -928,11 +1071,53 @@ export function PublisherApp({
           }}
         />
       ) : null}
+      <BlogManager
+        open={managerOpen}
+        registry={registry}
+        importState={importState}
+        onClose={() => setManagerOpen(false)}
+        onChooseLocal={chooseLocalBlog}
+        onAddLocal={addLocalBlog}
+        onClone={cloneBlog}
+        onInstall={installBlog}
+        onRename={(id, name) => updateRegistry(() => api.blogs.rename({ id, name }))}
+        onOpenFolder={(id) => {
+          void runBlogOperation(async () => {
+            const result = await api.blogs.openFolder({ id })
+            if (!result.ok) throw new Error(result.error.message)
+          })
+        }}
+        onRemove={(id) => updateRegistry(() => api.blogs.remove({ id }))}
+        onSwitch={switchBlog}
+        onCancelImport={() => {
+          void api.blogs
+            .cancelImport()
+            .then((result) => {
+              if (!result.ok && appMounted.current) {
+                setImportState((current) => ({ ...current, error: result.error.message }))
+              }
+            })
+            .catch((failure: unknown) => {
+              if (appMounted.current) {
+                setImportState((current) => ({
+                  ...current,
+                  error: failure instanceof Error ? failure.message : "无法取消导入。",
+                }))
+              }
+            })
+        }}
+      />
     </main>
   )
 }
 
-function PublisherStartup({ api }: { readonly api: GardenApi }): React.JSX.Element {
+function PublisherStartup({
+  api,
+  registry,
+}: {
+  readonly api: GardenApi
+  readonly registry: BlogRegistryView
+}): React.JSX.Element {
   const [safety, setSafety] = useState<WorkspaceInspection>()
   const [inspection, setInspection] = useState<WorkspaceInspection>()
   const [busy, setBusy] = useState(false)
@@ -1015,7 +1200,11 @@ function PublisherStartup({ api }: { readonly api: GardenApi }): React.JSX.Eleme
             }}
           />
         ) : null}
-        <PublisherApp api={api} diagnosticsReady={inspection?.ok === true} />
+        <PublisherApp
+          api={api}
+          initialRegistry={registry}
+          diagnosticsReady={inspection?.ok === true}
+        />
       </>
     )
   }
@@ -1041,6 +1230,65 @@ function PublisherStartup({ api }: { readonly api: GardenApi }): React.JSX.Eleme
       }}
     />
   )
+}
+
+function BlogStartup({ api }: { readonly api: GardenApi }): React.JSX.Element {
+  const [registry, setRegistry] = useState<BlogRegistryView>()
+  const [error, setError] = useState<string>()
+  const [attempt, setAttempt] = useState(0)
+
+  useEffect(() => {
+    let active = true
+    setRegistry(undefined)
+    setError(undefined)
+    void api.blogs
+      .list()
+      .then((result) => {
+        if (!active) return
+        if (result.ok) setRegistry(result.value)
+        else setError(result.error.message)
+      })
+      .catch((failure: unknown) => {
+        if (active) setError(failure instanceof Error ? failure.message : "无法读取博客列表。")
+      })
+    return () => {
+      active = false
+    }
+  }, [api, attempt])
+
+  if (error) {
+    return (
+      <main className="first-run-shell">
+        <section className="first-run-card" role="region" aria-label="博客恢复">
+          <header>
+            <div>
+              <p className="eyebrow">Knowledge Garden Publisher</p>
+              <h1>博客恢复</h1>
+            </div>
+          </header>
+          <p role="alert">{error}</p>
+          <p>工作区服务尚未启动。修复或恢复博客列表后再继续。</p>
+          <button
+            type="button"
+            className="secondary-button"
+            onClick={() => setAttempt((v) => v + 1)}
+          >
+            重新读取博客列表
+          </button>
+        </section>
+      </main>
+    )
+  }
+  if (!registry) {
+    return (
+      <main className="first-run-shell">
+        <section className="first-run-card" role="status" aria-label="正在载入博客">
+          <p>正在载入博客…</p>
+        </section>
+      </main>
+    )
+  }
+  return <PublisherStartup api={api} registry={registry} />
 }
 
 export function App(): React.JSX.Element {
@@ -1082,5 +1330,5 @@ export function App(): React.JSX.Element {
       </main>
     )
   }
-  return <PublisherStartup api={window.garden} />
+  return <BlogStartup api={window.garden} />
 }
