@@ -2,10 +2,13 @@ import { act, cleanup, fireEvent, render, screen, waitFor, within } from "@testi
 import userEvent from "@testing-library/user-event"
 import { EditorView } from "@codemirror/view"
 import { createHash } from "node:crypto"
+import { readFileSync } from "node:fs"
+import { resolve } from "node:path"
 import { StrictMode } from "react"
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest"
 import { createPublisherCloseCoordinator } from "../../src/main/publisherServices"
 import { App as StartupApp, PublisherApp } from "../../src/renderer/src/App"
+import { BlogSwitcher } from "../../src/renderer/src/components/BlogSwitcher"
 import { shanghaiCalendarDate } from "../../src/renderer/src/components/NoteSidebar"
 import type {
   ChangeReview,
@@ -115,7 +118,9 @@ function createGardenMock(): GardenApi {
       addLocal: vi.fn(async () => unavailable<BlogRegistryView>("博客服务将在后续任务中提供。")),
       clone: vi.fn(async () => unavailable<BlogImportReceipt>("博客服务将在后续任务中提供。")),
       cancelImport: vi.fn(async () => ok(undefined)),
-      install: vi.fn(async () => unavailable<BlogCandidateInspection>("博客服务将在后续任务中提供。")),
+      install: vi.fn(async () =>
+        unavailable<BlogCandidateInspection>("博客服务将在后续任务中提供。"),
+      ),
       rename: vi.fn(async () => unavailable<BlogRegistryView>("博客服务将在后续任务中提供。")),
       relocate: vi.fn(async () => unavailable<BlogRegistryView>("博客服务将在后续任务中提供。")),
       remove: vi.fn(async () => unavailable<BlogRegistryView>("博客服务将在后续任务中提供。")),
@@ -1301,6 +1306,49 @@ describe("publisher main layout", () => {
         editor: 360,
       }),
     )
+  })
+
+  it("collapses only the blog path at narrow width while retaining the name and switch affordance", () => {
+    Object.defineProperty(window, "innerWidth", { configurable: true, value: 640 })
+    const registry: BlogRegistryView = {
+      version: 1,
+      activeBlogId: "knowledge",
+      blogs: [
+        {
+          id: "knowledge",
+          name: "Knowledge Garden",
+          path: String.raw`C:\Users\me\knowledge-garden`,
+          canonicalPath: String.raw`C:\Users\me\knowledge-garden`,
+          createdAt: "2026-10-01T00:00:00.000Z",
+          lastOpenedAt: "2026-10-01T00:00:00.000Z",
+        },
+      ],
+    }
+    render(
+      <header className="topbar">
+        <BlogSwitcher
+          registry={registry}
+          disabled={false}
+          onSwitch={vi.fn()}
+          onAddLocal={vi.fn()}
+          onClone={vi.fn()}
+          onManage={vi.fn()}
+        />
+      </header>,
+    )
+
+    expect(screen.getByRole("button", { name: "切换博客：Knowledge Garden" })).toBeVisible()
+    expect(screen.getByText("Knowledge Garden")).toBeVisible()
+    expect(screen.getByText(String.raw`C:\Users\me\knowledge-garden`).closest("small")).toBeTruthy()
+
+    const stylesheet = readFileSync(resolve(process.cwd(), "src/renderer/src/app.css"), "utf8")
+    const narrowRules = stylesheet.slice(
+      stylesheet.indexOf("@media (max-width: 680px)"),
+      stylesheet.indexOf("@media (prefers-reduced-motion: reduce)"),
+    )
+    expect(narrowRules).toContain(".blog-switcher-copy small")
+    expect(narrowRules).toMatch(/\.blog-switcher-copy small,[\s\S]*?display: none;/)
+    expect(narrowRules).not.toMatch(/\.blog-switcher-trigger[^{]*\{[^}]*display:\s*none/)
   })
 
   it("reclamps persisted panes when a ResizeObserver reports a wide-to-narrow change", async () => {

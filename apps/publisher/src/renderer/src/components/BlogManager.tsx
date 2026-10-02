@@ -235,7 +235,7 @@ export function BlogManager({
               className="blog-clone-form"
               onSubmit={(event) => {
                 event.preventDefault()
-                if (Object.values(cloneRequest).every((value) => value.trim())) {
+                if (cloneRequest.url.trim() && cloneRequest.destination.trim()) {
                   onClone({
                     url: cloneRequest.url.trim(),
                     destination: cloneRequest.destination.trim(),
@@ -269,7 +269,7 @@ export function BlogManager({
                 />
               </label>
               <label>
-                显示名称
+                显示名称（可选）
                 <input
                   value={cloneRequest.name}
                   maxLength={80}
@@ -283,7 +283,7 @@ export function BlogManager({
               <button
                 type="submit"
                 className="primary-button"
-                disabled={busy || !Object.values(cloneRequest).every((value) => value.trim())}
+                disabled={busy || !cloneRequest.url.trim() || !cloneRequest.destination.trim()}
               >
                 <GitFork size={15} aria-hidden="true" /> 开始下载
               </button>
@@ -503,6 +503,9 @@ function ImportProgress({
             key={phase}
             className={index <= currentIndex ? "complete" : undefined}
             aria-current={phase === progress.phase ? "step" : undefined}
+            data-state={
+              phase === progress.phase ? "current" : index < currentIndex ? "complete" : "pending"
+            }
           >
             {label}
           </li>

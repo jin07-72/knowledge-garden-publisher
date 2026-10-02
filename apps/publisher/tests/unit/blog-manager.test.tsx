@@ -266,7 +266,7 @@ describe("BlogManager", () => {
       "https://github.com/me/garden.git",
     )
     await user.type(screen.getByRole("textbox", { name: "保存位置" }), String.raw`D:\Blogs\garden`)
-    await user.type(screen.getByRole("textbox", { name: "显示名称" }), "Garden")
+    await user.type(screen.getByRole("textbox", { name: /显示名称/ }), "Garden")
     expect(screen.getByRole("status", { name: "导入进度" })).toHaveTextContent("正在安装依赖")
     expect(screen.getByRole("alert")).toHaveTextContent("下载失败")
     await user.click(screen.getByRole("button", { name: "开始下载" }))
@@ -275,6 +275,51 @@ describe("BlogManager", () => {
       destination: String.raw`D:\Blogs\garden`,
       name: "Garden",
     })
+  })
+
+  it("allows a GitHub clone request to use the repository name by leaving display name blank", async () => {
+    const user = userEvent.setup()
+    const props = managerProps({ view: "clone", busy: false })
+    render(<BlogManager {...props} />)
+    await user.type(
+      screen.getByRole("textbox", { name: "GitHub 仓库地址" }),
+      "https://github.com/me/learning-notes.git",
+    )
+    await user.type(
+      screen.getByRole("textbox", { name: "保存位置" }),
+      String.raw`D:\Blogs\learning-notes`,
+    )
+
+    const submit = screen.getByRole("button", { name: "开始下载" })
+    expect(submit).toBeEnabled()
+    await user.click(submit)
+    expect(props.onClone).toHaveBeenCalledWith({
+      url: "https://github.com/me/learning-notes.git",
+      destination: String.raw`D:\Blogs\learning-notes`,
+      name: "",
+    })
+  })
+
+  it.each([
+    ["cloning", "下载中", "正在下载…"],
+    ["installing", "安装依赖", "正在安装依赖…"],
+    ["validating", "检查中", "正在检查…"],
+    ["complete", "完成", "导入完成。"],
+  ] as const)("marks %s as the current import stage", (phase, label, message) => {
+    const props = managerProps({
+      view: "clone",
+      busy: phase !== "complete",
+      progress: { phase, message },
+    })
+    render(<BlogManager {...props} />)
+
+    const progress = screen.getByRole("status", { name: "导入进度" })
+    expect(progress).toHaveTextContent(message)
+    const stages = within(progress).getAllByRole("listitem")
+    const current = stages.find((stage) => stage.textContent === label)
+    expect(current).toHaveAttribute("aria-current", "step")
+    expect(current).toHaveAttribute("data-state", "current")
+    expect(stages.filter((stage) => stage.hasAttribute("aria-current"))).toHaveLength(1)
   })
 
   it("disables mutating controls while an operation is busy", () => {
