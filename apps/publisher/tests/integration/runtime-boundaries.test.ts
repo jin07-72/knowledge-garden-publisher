@@ -54,7 +54,7 @@ function maskStringsAndComments(source: string): string {
 }
 
 function hasStaticEsmDeclaration(source: string): boolean {
-  return /(?:^|[;}\n])\s*(?:import\s*(?:["']|[\w*$\s{},]+\bfrom\s*["'])|export\s*(?:default\b|(?:const|let|var|function|class)\b|\{|\*))/.test(maskStringsAndComments(source))
+  return /(?:^|[;}\n])\s*(?:import\s*(?:["']|[\w*$\s{},]+\bfrom\s*["'])|export\s*(?:default\b|(?:const|let|var|function|class|async\s+function)\b|\{|\*))/.test(maskStringsAndComments(source))
 }
 
 describe("production runtime boundaries", () => {
@@ -88,6 +88,7 @@ describe("production runtime boundaries", () => {
       'import"garden";const api=1;',
       'const api=1;export{api};',
       'export default function api() {}',
+      'export async function run() {}',
     ]) expect(hasStaticEsmDeclaration(source), source).toBe(true)
   })
 

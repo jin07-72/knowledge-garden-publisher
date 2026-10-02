@@ -248,27 +248,39 @@ function unauthorized(): IpcResult<never> {
   }
 }
 
-function serviceUnavailable(): never {
-  throw { code: "SERVICE_UNAVAILABLE", message: "Blog management is not available." }
+const blogServiceUnavailable: AppError = {
+  code: "SERVICE_UNAVAILABLE",
+  message: "Blog management is not available.",
 }
 
-const blogImportFailureMap: Readonly<Record<BlogImportErrorCode, AppError>> = {
-  DESTINATION_EXISTS: { code: "BLOG_DESTINATION_EXISTS", message: "The destination already exists." },
-  DESTINATION_INVALID: { code: "BLOG_DESTINATION_INVALID", message: "The selected destination is unavailable." },
-  TARGET_CHANGED: { code: "BLOG_TARGET_CHANGED", message: "The selected destination changed unexpectedly." },
-  IMPORT_ACTIVE: { code: "BLOG_IMPORT_ACTIVE", message: "Another blog import is already running." },
-  CANCELLED: { code: "BLOG_IMPORT_CANCELLED", message: "Blog import was cancelled." },
-  CLONE_FAILED: { code: "BLOG_CLONE_FAILED", message: "Git could not clone the blog repository." },
-  INSTALL_FAILED: { code: "BLOG_INSTALL_FAILED", message: "Blog dependencies could not be installed." },
-  VALIDATION_FAILED: { code: "BLOG_VALIDATION_FAILED", message: "The blog could not be validated." },
-  IMPORT_UNAVAILABLE: { code: "BLOG_IMPORT_UNAVAILABLE", message: "Blog import requires an application restart." },
-  INVALID_REPOSITORY_URL: { code: "INVALID_INPUT", message: "The request is invalid." },
+function serviceUnavailable(): never {
+  throw blogServiceUnavailable
 }
+
+const blogImportFailureMap: ReadonlyMap<BlogImportErrorCode, AppError> = new Map([
+  ["DESTINATION_EXISTS", { code: "BLOG_DESTINATION_EXISTS", message: "The destination already exists." }],
+  ["DESTINATION_INVALID", { code: "BLOG_DESTINATION_INVALID", message: "The selected destination is unavailable." }],
+  ["TARGET_CHANGED", { code: "BLOG_TARGET_CHANGED", message: "The selected destination changed unexpectedly." }],
+  ["IMPORT_ACTIVE", { code: "BLOG_IMPORT_ACTIVE", message: "Another blog import is already running." }],
+  ["CANCELLED", { code: "BLOG_IMPORT_CANCELLED", message: "Blog import was cancelled." }],
+  ["CLONE_FAILED", { code: "BLOG_CLONE_FAILED", message: "Git could not clone the blog repository." }],
+  ["INSTALL_FAILED", { code: "BLOG_INSTALL_FAILED", message: "Blog dependencies could not be installed." }],
+  ["VALIDATION_FAILED", { code: "BLOG_VALIDATION_FAILED", message: "The blog could not be validated." }],
+  ["IMPORT_UNAVAILABLE", { code: "BLOG_IMPORT_UNAVAILABLE", message: "Blog import requires an application restart." }],
+  ["INVALID_REPOSITORY_URL", { code: "INVALID_INPUT", message: "The request is invalid." }],
+])
 
 function serializeFailure(error: unknown, isBlogImportChannel = false): IpcResult<never> {
-  if (isBlogImportChannel && error instanceof BlogImportError) {
-    const mapped = blogImportFailureMap[error.code]
-    if (mapped) return { ok: false, error: mapped }
+  if (isBlogImportChannel) {
+    if (error === blogServiceUnavailable) return { ok: false, error: blogServiceUnavailable }
+    if (error instanceof BlogImportError) {
+      const mapped = blogImportFailureMap.get(error.code)
+      if (mapped) return { ok: false, error: mapped }
+    }
+    return {
+      ok: false,
+      error: { code: "INTERNAL_ERROR", message: "The application could not complete the request." },
+    }
   }
   try {
     const parsed = appErrorSchema.safeParse(error)

@@ -255,6 +255,30 @@ describe("secure publisher IPC", () => {
     })
   })
 
+  it("fails closed for prototype-key and valid-looking non-import blog failures", async () => {
+    const request = {
+      url: "https://github.com/openai/quartz",
+      destination: String.raw`C:\\Blogs\\quartz`,
+      name: "Quartz",
+    }
+    for (const error of [
+      new BlogImportError("constructor" as BlogImportErrorCode, "secret C:\\private"),
+      new BlogImportError("__proto__" as BlogImportErrorCode, "secret https://user:token@github.com/openai/quartz"),
+      { code: "BLOG_CLONE_FAILED", message: "secret C:\\private\\stdout" },
+      { code: "WORKSPACE_ACCESS_FAILED", message: "secret https://user:token@github.com/openai/quartz" },
+    ]) {
+      const { ipc, servicePorts } = setup()
+      servicePorts.calls.blogsClone.mockRejectedValueOnce(error)
+      const result = await ipc.invoke(IPC_CHANNELS.requests.blogsClone, trustedEvent, request)
+      expect(result).toEqual({
+        ok: false,
+        error: { code: "INTERNAL_ERROR", message: "The application could not complete the request." },
+      })
+      expect(JSON.stringify(result)).not.toContain("secret")
+      expect(JSON.stringify(result)).not.toContain("token")
+    }
+  })
+
   it("keeps the finite blog channel allowlist safe until the optional service is wired", async () => {
     const ipc = new FakeIpcMain()
     const servicePorts = services()
