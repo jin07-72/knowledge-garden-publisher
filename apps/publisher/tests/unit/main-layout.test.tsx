@@ -133,6 +133,9 @@ function createGardenMock(): GardenApi {
       list: vi.fn(async () => ok(testRegistry)),
       chooseLocal: vi.fn(async () => ok(undefined)),
       addLocal: vi.fn(async () => unavailable<BlogRegistryView>("博客服务将在后续任务中提供。")),
+      recoverLocal: vi.fn(async () =>
+        unavailable<BlogRegistryView>("博客服务将在后续任务中提供。"),
+      ),
       clone: vi.fn(async () => unavailable<BlogImportReceipt>("博客服务将在后续任务中提供。")),
       cancelImport: vi.fn(async () => ok(undefined)),
       install: vi.fn(async () =>

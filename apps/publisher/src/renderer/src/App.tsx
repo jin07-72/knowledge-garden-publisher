@@ -1356,6 +1356,107 @@ function BlogRecovery({
   )
 }
 
+function CorruptRegistryRecovery({
+  api,
+  error,
+  onRetry,
+}: {
+  readonly api: GardenApi
+  readonly error: string
+  readonly onRetry: () => void
+}): React.JSX.Element {
+  const [importState, setImportState] = useState<BlogImportUiState>({
+    view: "local",
+    busy: false,
+    error,
+  })
+  const busy = useRef(false)
+  const mounted = useRef(true)
+  useEffect(
+    () => () => {
+      mounted.current = false
+    },
+    [],
+  )
+
+  const run = (operation: () => Promise<void>): void => {
+    if (busy.current) return
+    busy.current = true
+    setImportState((current) => ({ ...current, busy: true, error: undefined }))
+    void operation()
+      .catch((failure: unknown) => {
+        if (mounted.current) {
+          setImportState((current) => ({
+            ...current,
+            error: failure instanceof Error ? failure.message : "博客恢复失败，请重试。",
+          }))
+        }
+      })
+      .finally(() => {
+        busy.current = false
+        if (mounted.current) setImportState((current) => ({ ...current, busy: false }))
+      })
+  }
+
+  const chooseLocal = (): void => {
+    run(async () => {
+      const result = await api.blogs.chooseLocal()
+      if (!result.ok) throw new Error(result.error.message)
+      if (mounted.current && result.value) {
+        setImportState((current) => ({ ...current, localSelection: result.value }))
+      }
+    })
+  }
+
+  const emptyRegistry: BlogRegistryView = {
+    version: 1,
+    activeBlogId: "00000000-0000-4000-8000-000000000000",
+    blogs: [],
+  }
+  return (
+    <main className="first-run-shell">
+      <BlogManager
+        open
+        registry={emptyRegistry}
+        importState={importState}
+        registryRecovery
+        onRetryRecovery={onRetry}
+        onClose={() => undefined}
+        onChooseLocal={chooseLocal}
+        onAddLocal={(request) =>
+          run(async () => {
+            const recovered = await api.blogs.recoverLocal(request)
+            if (!recovered.ok) throw new Error(recovered.error.message)
+            const switched = await api.blogs.switch({
+              id: recovered.value.activeBlogId,
+              editorSaved: true,
+            })
+            if (!switched.ok) throw new Error(switched.error.message)
+          })
+        }
+        onClone={() => undefined}
+        onInstall={(path) =>
+          run(async () => {
+            const result = await api.blogs.install({ path })
+            if (!result.ok) throw new Error(result.error.message)
+            if (!result.value.valid) throw new Error(result.value.message)
+            if (mounted.current) {
+              setImportState((current) => ({
+                ...current,
+                localSelection: { path, inspection: result.value },
+              }))
+            }
+          })
+        }
+        onRename={() => undefined}
+        onOpenFolder={() => undefined}
+        onRemove={() => undefined}
+        onSwitch={() => undefined}
+      />
+    </main>
+  )
+}
+
 function BlogStartup({ api }: { readonly api: GardenApi }): React.JSX.Element {
   const [registry, setRegistry] = useState<BlogRegistryStatus>()
   const [error, setError] = useState<string>()
@@ -1382,25 +1483,11 @@ function BlogStartup({ api }: { readonly api: GardenApi }): React.JSX.Element {
 
   if (error) {
     return (
-      <main className="first-run-shell">
-        <section className="first-run-card" role="region" aria-label="博客恢复">
-          <header>
-            <div>
-              <p className="eyebrow">Knowledge Garden Publisher</p>
-              <h1>博客恢复</h1>
-            </div>
-          </header>
-          <p role="alert">{error}</p>
-          <p>工作区服务尚未启动。修复或恢复博客列表后再继续。</p>
-          <button
-            type="button"
-            className="secondary-button"
-            onClick={() => setAttempt((v) => v + 1)}
-          >
-            重新读取博客列表
-          </button>
-        </section>
-      </main>
+      <CorruptRegistryRecovery
+        api={api}
+        error={error}
+        onRetry={() => setAttempt((value) => value + 1)}
+      />
     )
   }
   if (!registry) {

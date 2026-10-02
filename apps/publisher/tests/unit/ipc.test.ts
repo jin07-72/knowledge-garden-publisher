@@ -115,6 +115,7 @@ function services(): PublisherIpcServices & {
       list: call("blogsList"),
       chooseLocal: call("blogsChooseLocal"),
       addLocal: call("blogsAddLocal"),
+      recoverLocal: call("blogsRecoverLocal"),
       clone: call("blogsClone"),
       cancelImport: call("blogsCancelImport"),
       install: call("blogsInstall"),
@@ -325,6 +326,32 @@ describe("secure publisher IPC", () => {
       error: { code: "INVALID_INPUT", message: "The request is invalid." },
     })
     expect(servicePorts.calls.blogsClone).toHaveBeenCalledTimes(2)
+  })
+
+  it("routes strict corrupt-registry recovery and keeps failures path-safe", async () => {
+    const { ipc, servicePorts } = setup()
+    const request = { path: String.raw`C:\Blogs\quartz`, name: "Recovered" }
+    servicePorts.calls.blogsRecoverLocal.mockRejectedValueOnce(
+      new Error(String.raw`Could not replace C:\Users\owner\AppData\blogs.json`),
+    )
+
+    await expect(
+      ipc.invoke(IPC_CHANNELS.requests.blogsRecoverLocal, trustedEvent, request),
+    ).resolves.toEqual({
+      ok: false,
+      error: { code: "INTERNAL_ERROR", message: "The application could not complete the request." },
+    })
+    expect(servicePorts.calls.blogsRecoverLocal).toHaveBeenCalledWith(request)
+    await expect(
+      ipc.invoke(IPC_CHANNELS.requests.blogsRecoverLocal, {}, request),
+    ).resolves.toMatchObject({ ok: false, error: { code: "IPC_UNAUTHORIZED" } })
+    expect(servicePorts.calls.blogsRecoverLocal).toHaveBeenCalledTimes(1)
+    await expect(
+      ipc.invoke(IPC_CHANNELS.requests.blogsRecoverLocal, trustedEvent, {
+        ...request,
+        extra: true,
+      }),
+    ).resolves.toMatchObject({ ok: false, error: { code: "INVALID_INPUT" } })
   })
 
   it("requires saved-editor confirmation and returns a bounded switch-busy error", async () => {
@@ -645,6 +672,11 @@ describe("secure publisher IPC", () => {
         "blogsAddLocal",
       ],
       [
+        IPC_CHANNELS.requests.blogsRecoverLocal,
+        { path: "relative\\quartz", name: "Quartz", extra: true },
+        "blogsRecoverLocal",
+      ],
+      [
         IPC_CHANNELS.requests.blogsClone,
         {
           url: "https://github.com/openai/quartz?token=secret",
@@ -772,6 +804,11 @@ describe("secure publisher IPC", () => {
       [IPC_CHANNELS.requests.blogsList, undefined, "blogsList"],
       [IPC_CHANNELS.requests.blogsChooseLocal, undefined, "blogsChooseLocal"],
       [IPC_CHANNELS.requests.blogsAddLocal, { path: destination, name: "Quartz" }, "blogsAddLocal"],
+      [
+        IPC_CHANNELS.requests.blogsRecoverLocal,
+        { path: destination, name: "Recovered" },
+        "blogsRecoverLocal",
+      ],
       [
         IPC_CHANNELS.requests.blogsClone,
         { url: "https://github.com/openai/quartz", destination, name: "Quartz" },
@@ -1101,6 +1138,7 @@ describe("preload garden API", () => {
     await api.blogs.list()
     await api.blogs.chooseLocal()
     await api.blogs.addLocal({ path: String.raw`C:\\Blogs\\quartz`, name: "Quartz" })
+    await api.blogs.recoverLocal({ path: String.raw`C:\\Blogs\\quartz`, name: "Recovered" })
     await api.blogs.clone({
       url: "https://github.com/openai/quartz",
       destination: String.raw`C:\\Blogs\\quartz`,

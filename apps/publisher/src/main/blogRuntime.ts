@@ -136,6 +136,7 @@ export interface BlogManagementServices {
     { readonly path: string; readonly inspection: BlogCandidateInspection } | undefined
   >
   addLocal(request: BlogAddLocalRequest): Promise<BlogRegistryView>
+  recoverLocal(request: BlogAddLocalRequest): Promise<BlogRegistryView>
   clone(request: BlogCloneRequest): Promise<BlogImportReceipt>
   cancelImport(): Promise<void>
   install(request: BlogPathRequest): Promise<BlogCandidateInspection>
@@ -279,6 +280,10 @@ export function createBlogManagementAdapter(dependencies: {
       async addLocal(request) {
         await validWorkspace(request.path)
         return dependencies.registry.add(request)
+      },
+      async recoverLocal(request) {
+        await validWorkspace(request.path)
+        return dependencies.registry.recover(request)
       },
       clone: (request) =>
         runImport(async (service, signal) => {

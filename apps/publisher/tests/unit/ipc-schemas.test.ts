@@ -155,6 +155,7 @@ const validByChannel: Record<string, unknown> = {
     ...privateField,
   },
   [IPC_CHANNELS.requests.blogsAddLocal]: blogRegistry,
+  [IPC_CHANNELS.requests.blogsRecoverLocal]: blogRegistry,
   [IPC_CHANNELS.requests.blogsClone]: {
     canonicalPath: String.raw`C:\\Blogs\\quartz`,
     owner: "openai",
@@ -256,6 +257,15 @@ describe("IPC success schemas", () => {
         name,
       ).toBe(false)
     }
+  })
+
+  it("maps corrupt-registry recovery to the strict registry response schema", () => {
+    const schema = IPC_SUCCESS_SCHEMAS[IPC_CHANNELS.requests.blogsRecoverLocal]
+
+    expect(schema.safeParse(blogRegistry).success).toBe(true)
+    expect(
+      schema.parse({ ...blogRegistry, leakedRegistryPath: String.raw`C:\\private` }),
+    ).not.toHaveProperty("leakedRegistryPath")
   })
 
   it("rejects unsafe blog request fields and unknown keys", () => {

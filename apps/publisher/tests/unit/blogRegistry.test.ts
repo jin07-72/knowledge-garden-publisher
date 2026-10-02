@@ -1,4 +1,15 @@
-import { mkdir, mkdtemp, open as openFile, readFile, readdir, realpath, rm, stat, utimes, writeFile } from "node:fs/promises"
+import {
+  mkdir,
+  mkdtemp,
+  open as openFile,
+  readFile,
+  readdir,
+  realpath,
+  rm,
+  stat,
+  utimes,
+  writeFile,
+} from "node:fs/promises"
 import { tmpdir } from "node:os"
 import { basename, join, relative } from "node:path"
 import { afterEach, describe, expect, it } from "vitest"
@@ -7,7 +18,11 @@ import { createBlogRegistry } from "../../src/main/services/blogRegistry"
 const temporaryDirectories: string[] = []
 
 afterEach(async () => {
-  await Promise.all(temporaryDirectories.splice(0).map((directory) => rm(directory, { recursive: true, force: true })))
+  await Promise.all(
+    temporaryDirectories
+      .splice(0)
+      .map((directory) => rm(directory, { recursive: true, force: true })),
+  )
 })
 
 async function createDirectory(prefix: string): Promise<string> {
@@ -56,7 +71,10 @@ describe("blog registry", () => {
 
     expect(state.version).toBe(1)
     expect(state.blogs).toHaveLength(1)
-    expect(state.blogs[0]).toMatchObject({ path: legacyPath, canonicalPath: await realpath(legacyPath) })
+    expect(state.blogs[0]).toMatchObject({
+      path: legacyPath,
+      canonicalPath: await realpath(legacyPath),
+    })
     expect(state.activeBlogId).toBe(state.blogs[0]?.id)
     await expect(readFile(file, "utf8")).resolves.toContain('"version":1')
   })
@@ -71,7 +89,10 @@ describe("blog registry", () => {
     await registry.add({ name: "Second", path: secondPath })
 
     const persisted = JSON.parse(await readFile(file, "utf8"))
-    expect(persisted).toMatchObject({ version: 1, blogs: [{ path: legacyPath }, { path: secondPath }] })
+    expect(persisted).toMatchObject({
+      version: 1,
+      blogs: [{ path: legacyPath }, { path: secondPath }],
+    })
     await expect(readdir(directory)).resolves.toEqual([basename(file)])
   })
 
@@ -79,7 +100,10 @@ describe("blog registry", () => {
     const directory = await createDirectory("garden-blog-registry-state-")
     const legacyPath = await createGarden("legacy")
     const file = join(directory, "blogs.v1.json")
-    const candidate = join(directory, ".blogs.v1.json.lock.candidate-00000000-0000-4000-8000-000000000001")
+    const candidate = join(
+      directory,
+      ".blogs.v1.json.lock.candidate-00000000-0000-4000-8000-000000000001",
+    )
     const temporary = join(directory, ".blogs.v1.json.00000000-0000-4000-8000-000000000001.tmp")
     await Promise.all([writeFile(candidate, "stale"), writeFile(temporary, "stale")])
     const stale = new Date(Date.now() - 2_000)
@@ -105,7 +129,9 @@ describe("blog registry", () => {
 
     const state = await registry.load()
     expect(state.blogs).toHaveLength(3)
-    expect(state.blogs.map((blog) => blog.path)).toEqual(expect.arrayContaining([legacyPath, secondPath, thirdPath]))
+    expect(state.blogs.map((blog) => blog.path)).toEqual(
+      expect.arrayContaining([legacyPath, secondPath, thirdPath]),
+    )
   })
 
   it("serializes concurrent registrations from separate registry instances", async () => {
@@ -116,8 +142,18 @@ describe("blog registry", () => {
     const file = join(directory, "blogs.v1.json")
     let identifier = 0
     const uuid = () => `00000000-0000-4000-8000-${String(++identifier).padStart(12, "0")}`
-    const first = createBlogRegistry({ file, legacyPath, now: () => new Date("2026-10-01T00:00:00.000Z"), uuid })
-    const second = createBlogRegistry({ file, legacyPath, now: () => new Date("2026-10-01T00:00:00.000Z"), uuid })
+    const first = createBlogRegistry({
+      file,
+      legacyPath,
+      now: () => new Date("2026-10-01T00:00:00.000Z"),
+      uuid,
+    })
+    const second = createBlogRegistry({
+      file,
+      legacyPath,
+      now: () => new Date("2026-10-01T00:00:00.000Z"),
+      uuid,
+    })
     await first.load()
 
     await Promise.all([
@@ -127,7 +163,9 @@ describe("blog registry", () => {
 
     const state = await first.load()
     expect(state.blogs).toHaveLength(3)
-    expect(state.blogs.map((blog) => blog.path)).toEqual(expect.arrayContaining([legacyPath, secondPath, thirdPath]))
+    expect(state.blogs.map((blog) => blog.path)).toEqual(
+      expect.arrayContaining([legacyPath, secondPath, thirdPath]),
+    )
   })
 
   it("retains the previous registry when syncing a temporary write fails", async () => {
@@ -150,7 +188,9 @@ describe("blog registry", () => {
         }
       },
     }
-    const registryOptions: Parameters<typeof createBlogRegistry>[0] & { readonly fileSystem: typeof fileSystem } = {
+    const registryOptions: Parameters<typeof createBlogRegistry>[0] & {
+      readonly fileSystem: typeof fileSystem
+    } = {
       file,
       legacyPath,
       now: () => new Date("2026-10-01T00:00:00.000Z"),
@@ -162,7 +202,9 @@ describe("blog registry", () => {
     const previous = await readFile(file, "utf8")
     failTemporarySync = true
 
-    await expect(registry.add({ name: "Second", path: secondPath })).rejects.toThrow("simulated sync failure")
+    await expect(registry.add({ name: "Second", path: secondPath })).rejects.toThrow(
+      "simulated sync failure",
+    )
     await expect(readFile(file, "utf8")).resolves.toBe(previous)
     await expect(readdir(directory)).resolves.toEqual([basename(file)])
   })
@@ -185,7 +227,9 @@ describe("blog registry", () => {
         return openFile(path, flags, mode)
       },
     }
-    const registryOptions: Parameters<typeof createBlogRegistry>[0] & { readonly fileSystem: typeof fileSystem } = {
+    const registryOptions: Parameters<typeof createBlogRegistry>[0] & {
+      readonly fileSystem: typeof fileSystem
+    } = {
       file,
       legacyPath,
       now: () => new Date("2026-10-01T00:00:00.000Z"),
@@ -197,7 +241,9 @@ describe("blog registry", () => {
     const previous = await readFile(file, "utf8")
     failTemporaryOpen = true
 
-    await expect(registry.add({ name: "Second", path: secondPath })).rejects.toMatchObject({ code: "EEXIST" })
+    await expect(registry.add({ name: "Second", path: secondPath })).rejects.toMatchObject({
+      code: "EEXIST",
+    })
     await expect(readFile(file, "utf8")).resolves.toBe(previous)
     await expect(readFile(foreignTemporary!, "utf8")).resolves.toBe("foreign temporary data")
   })
@@ -216,7 +262,9 @@ describe("blog registry", () => {
         await rename(source, destination)
       },
     }
-    const registryOptions: Parameters<typeof createBlogRegistry>[0] & { readonly fileSystem: typeof fileSystem } = {
+    const registryOptions: Parameters<typeof createBlogRegistry>[0] & {
+      readonly fileSystem: typeof fileSystem
+    } = {
       file,
       legacyPath,
       now: () => new Date("2026-10-01T00:00:00.000Z"),
@@ -228,7 +276,9 @@ describe("blog registry", () => {
     const previous = await readFile(file, "utf8")
     failReplacement = true
 
-    await expect(registry.add({ name: "Second", path: secondPath })).rejects.toThrow("simulated rename failure")
+    await expect(registry.add({ name: "Second", path: secondPath })).rejects.toThrow(
+      "simulated rename failure",
+    )
     await expect(readFile(file, "utf8")).resolves.toBe(previous)
     await expect(readdir(directory)).resolves.toEqual([basename(file)])
   })
@@ -242,7 +292,10 @@ describe("blog registry", () => {
 
     const state = await registry.add({ name: "Second", path: relativePath })
 
-    expect(state.blogs[1]).toMatchObject({ path: relativePath, canonicalPath: await realpath(relativePath) })
+    expect(state.blogs[1]).toMatchObject({
+      path: relativePath,
+      canonicalPath: await realpath(relativePath),
+    })
   })
 
   it("keeps a missing inactive workspace registered so it can be removed", async () => {
@@ -254,8 +307,12 @@ describe("blog registry", () => {
     const second = added.blogs[1]!
     await rm(secondPath, { recursive: true })
 
-    await expect(registry.load()).resolves.toMatchObject({ blogs: [{ path: legacyPath }, { id: second.id, path: secondPath }] })
-    await expect(registry.remove(second.id)).resolves.toMatchObject({ blogs: [{ path: legacyPath }] })
+    await expect(registry.load()).resolves.toMatchObject({
+      blogs: [{ path: legacyPath }, { id: second.id, path: secondPath }],
+    })
+    await expect(registry.remove(second.id)).resolves.toMatchObject({
+      blogs: [{ path: legacyPath }],
+    })
   })
 
   it("relocates a missing inactive workspace to a new available directory", async () => {
@@ -269,7 +326,10 @@ describe("blog registry", () => {
     await rm(secondPath, { recursive: true })
 
     await expect(registry.relocate(second.id, replacementPath)).resolves.toMatchObject({
-      blogs: [{ path: legacyPath }, { id: second.id, path: replacementPath, canonicalPath: await realpath(replacementPath) }],
+      blogs: [
+        { path: legacyPath },
+        { id: second.id, path: replacementPath, canonicalPath: await realpath(replacementPath) },
+      ],
     })
   })
 
@@ -284,7 +344,9 @@ describe("blog registry", () => {
 
     try {
       process.chdir(directory)
-      await expect(registry.load()).resolves.toMatchObject({ blogs: [{ path: legacyPath }, { path: relativePath }] })
+      await expect(registry.load()).resolves.toMatchObject({
+        blogs: [{ path: legacyPath }, { path: relativePath }],
+      })
     } finally {
       process.chdir(originalWorkingDirectory)
     }
@@ -344,8 +406,131 @@ describe("blog registry", () => {
     await writeFile(file, "{broken")
     const registry = createRegistry(file, legacyPath)
 
-    await expect(registry.load()).rejects.toMatchObject({ code: "BLOG_REGISTRY_INVALID", path: file })
+    await expect(registry.load()).rejects.toMatchObject({
+      code: "BLOG_REGISTRY_INVALID",
+      path: file,
+    })
     await expect(readFile(file, "utf8")).resolves.toBe("{broken")
+  })
+
+  it("recovers a corrupt registry only after preserving its exact bytes in a unique sibling backup", async () => {
+    const directory = await createDirectory("garden-blog-registry-state-")
+    const legacyPath = await createGarden("legacy")
+    const recoveredPath = await createGarden("recovered")
+    const file = join(directory, "blogs.v1.json")
+    const corrupt = Buffer.from([0xff, 0x7b, 0x00, 0x42])
+    await writeFile(file, corrupt)
+    const registry = createRegistry(file, legacyPath)
+
+    const recovered = await registry.recover({ name: "Recovered", path: recoveredPath })
+
+    expect(recovered).toMatchObject({
+      version: 1,
+      activeBlogId: recovered.blogs[0]?.id,
+      blogs: [{ name: "Recovered", path: recoveredPath }],
+    })
+    const backup = (await readdir(directory)).find((name) =>
+      /^blogs\.v1\.json\.corrupt-[0-9a-f-]{36}\.bak$/i.test(name),
+    )
+    expect(backup).toBeDefined()
+    await expect(readFile(join(directory, backup!))).resolves.toEqual(corrupt)
+    await expect(registry.load()).resolves.toEqual(recovered)
+  })
+
+  it("rejects recovery for a healthy registry without creating a backup", async () => {
+    const directory = await createDirectory("garden-blog-registry-state-")
+    const legacyPath = await createGarden("legacy")
+    const recoveredPath = await createGarden("recovered")
+    const file = join(directory, "blogs.v1.json")
+    const registry = createRegistry(file, legacyPath)
+    await registry.load()
+
+    await expect(
+      registry.recover({ name: "Recovered", path: recoveredPath }),
+    ).rejects.toMatchObject({
+      code: "BLOG_REGISTRY_HEALTHY",
+    })
+    await expect(readdir(directory)).resolves.toEqual([basename(file)])
+  })
+
+  it("keeps the corrupt original and durable backup when replacement fails", async () => {
+    const directory = await createDirectory("garden-blog-registry-state-")
+    const legacyPath = await createGarden("legacy")
+    const recoveredPath = await createGarden("recovered")
+    const file = join(directory, "blogs.v1.json")
+    const corrupt = "{broken"
+    await writeFile(file, corrupt)
+    const fileSystem = {
+      rename: async () => {
+        throw new Error("simulated recovery publish failure")
+      },
+    }
+    const registry = createBlogRegistry({ file, legacyPath, fileSystem })
+
+    await expect(registry.recover({ name: "Recovered", path: recoveredPath })).rejects.toThrow(
+      "simulated recovery publish failure",
+    )
+    await expect(readFile(file, "utf8")).resolves.toBe(corrupt)
+    const backups = (await readdir(directory)).filter((name) => name.endsWith(".bak"))
+    expect(backups).toHaveLength(1)
+    await expect(readFile(join(directory, backups[0]!), "utf8")).resolves.toBe(corrupt)
+  })
+
+  it("atomically restores corrupt bytes when replacement fails after publication", async () => {
+    const directory = await createDirectory("garden-blog-registry-state-")
+    const legacyPath = await createGarden("legacy")
+    const recoveredPath = await createGarden("recovered")
+    const file = join(directory, "blogs.v1.json")
+    const corrupt = Buffer.from([0xff, 0x00, 0x7b])
+    await writeFile(file, corrupt)
+    let directorySyncs = 0
+    const fileSystem = {
+      open: async (path: string, flags: "r" | "wx", mode?: number) => {
+        const handle = await openFile(path, flags, mode)
+        if (path !== directory || flags !== "r") return handle
+        directorySyncs += 1
+        return {
+          writeFile: handle.writeFile.bind(handle),
+          sync: async () => {
+            if (directorySyncs === 2) throw new Error("simulated post-publish sync failure")
+            await handle.sync()
+          },
+          close: handle.close.bind(handle),
+        }
+      },
+    }
+    const registry = createBlogRegistry({ file, legacyPath, fileSystem })
+
+    await expect(registry.recover({ name: "Recovered", path: recoveredPath })).rejects.toThrow(
+      "simulated post-publish sync failure",
+    )
+    await expect(readFile(file)).resolves.toEqual(corrupt)
+    const backups = (await readdir(directory)).filter((name) => name.endsWith(".bak"))
+    expect(backups).toHaveLength(1)
+    await expect(readFile(join(directory, backups[0]!))).resolves.toEqual(corrupt)
+  })
+
+  it("serializes concurrent corrupt-registry recovery so only one replacement succeeds", async () => {
+    const directory = await createDirectory("garden-blog-registry-state-")
+    const legacyPath = await createGarden("legacy")
+    const recoveredPath = await createGarden("recovered")
+    const file = join(directory, "blogs.v1.json")
+    await writeFile(file, "{broken")
+    const registry = createRegistry(file, legacyPath)
+
+    const results = await Promise.allSettled([
+      registry.recover({ name: "Recovered", path: recoveredPath }),
+      registry.recover({ name: "Recovered twice", path: recoveredPath }),
+    ])
+
+    expect(results.filter((result) => result.status === "fulfilled")).toHaveLength(1)
+    expect(results.filter((result) => result.status === "rejected")).toHaveLength(1)
+    expect(
+      (results.find((result) => result.status === "rejected") as PromiseRejectedResult).reason,
+    ).toMatchObject({
+      code: "BLOG_REGISTRY_HEALTHY",
+    })
+    expect((await readdir(directory)).filter((name) => name.endsWith(".bak"))).toHaveLength(1)
   })
 
   it("rejects a schema-valid canonical path that no longer matches the display path", async () => {
@@ -369,7 +554,10 @@ describe("blog registry", () => {
     })
     await writeFile(file, source)
 
-    await expect(createRegistry(file, legacyPath).load()).rejects.toMatchObject({ code: "BLOG_REGISTRY_INVALID", path: file })
+    await expect(createRegistry(file, legacyPath).load()).rejects.toMatchObject({
+      code: "BLOG_REGISTRY_INVALID",
+      path: file,
+    })
     await expect(readFile(file, "utf8")).resolves.toBe(source)
   })
 
@@ -393,7 +581,10 @@ describe("blog registry", () => {
     })
     await writeFile(file, source)
 
-    await expect(createRegistry(file, legacyPath).load()).rejects.toMatchObject({ code: "BLOG_REGISTRY_INVALID", path: file })
+    await expect(createRegistry(file, legacyPath).load()).rejects.toMatchObject({
+      code: "BLOG_REGISTRY_INVALID",
+      path: file,
+    })
     await expect(readFile(file, "utf8")).resolves.toBe(source)
   })
 
@@ -427,7 +618,10 @@ describe("blog registry", () => {
     })
     await writeFile(file, source)
 
-    await expect(createRegistry(file, legacyPath).load()).rejects.toMatchObject({ code: "BLOG_REGISTRY_INVALID", path: file })
+    await expect(createRegistry(file, legacyPath).load()).rejects.toMatchObject({
+      code: "BLOG_REGISTRY_INVALID",
+      path: file,
+    })
     await expect(readFile(file, "utf8")).resolves.toBe(source)
   })
 
@@ -443,7 +637,9 @@ describe("blog registry", () => {
     const renamed = await registry.rename(second.id, "Renamed blog")
 
     expect(renamed.blogs[1]).toMatchObject({ id: second.id, name: "Renamed blog" })
-    await expect(createRegistry(file, legacyPath).load()).resolves.toMatchObject({ blogs: [{ name: expect.any(String) }, { name: "Renamed blog" }] })
+    await expect(createRegistry(file, legacyPath).load()).resolves.toMatchObject({
+      blogs: [{ name: expect.any(String) }, { name: "Renamed blog" }],
+    })
   })
 
   it("activates a registered blog and refreshes its last-opened timestamp", async () => {

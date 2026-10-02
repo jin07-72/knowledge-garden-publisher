@@ -127,6 +127,8 @@ export function createGardenApi(ipc: IpcRendererPort): GardenApi {
       invoke<BlogCandidateSelection | undefined>(ipc, IPC_CHANNELS.requests.blogsChooseLocal),
     addLocal: (request: BlogAddLocalRequest) =>
       invoke<BlogRegistryView>(ipc, IPC_CHANNELS.requests.blogsAddLocal, request),
+    recoverLocal: (request: BlogAddLocalRequest) =>
+      invoke<BlogRegistryView>(ipc, IPC_CHANNELS.requests.blogsRecoverLocal, request),
     clone: (request: BlogCloneRequest) =>
       invoke<BlogImportReceipt>(ipc, IPC_CHANNELS.requests.blogsClone, request),
     cancelImport: () => invoke<void>(ipc, IPC_CHANNELS.requests.blogsCancelImport),
@@ -143,7 +145,12 @@ export function createGardenApi(ipc: IpcRendererPort): GardenApi {
     switch: (request: BlogSwitchRequest) =>
       invoke<void>(ipc, IPC_CHANNELS.requests.blogsSwitch, request),
     onImportProgress: (listener: (progress: BlogImportProgress) => void) =>
-      subscription(ipc, IPC_CHANNELS.events.blogsImportProgress, blogImportProgressSchema, listener),
+      subscription(
+        ipc,
+        IPC_CHANNELS.events.blogsImportProgress,
+        blogImportProgressSchema,
+        listener,
+      ),
   })
   const lifecycle = Object.freeze({
     acknowledgeClose: (request: CloseAckRequest) =>

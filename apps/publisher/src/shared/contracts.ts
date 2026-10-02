@@ -408,6 +408,7 @@ export const IPC_CHANNELS = {
     blogsList: "garden:blogs:list",
     blogsChooseLocal: "garden:blogs:choose-local",
     blogsAddLocal: "garden:blogs:add-local",
+    blogsRecoverLocal: "garden:blogs:recover-local",
     blogsClone: "garden:blogs:clone",
     blogsCancelImport: "garden:blogs:cancel-import",
     blogsInstall: "garden:blogs:install",
@@ -556,6 +557,7 @@ export interface GardenApi {
     list(): Promise<IpcResult<BlogRegistryStatus>>
     chooseLocal(): Promise<IpcResult<BlogCandidateSelection | undefined>>
     addLocal(request: BlogAddLocalRequest): Promise<IpcResult<BlogRegistryView>>
+    recoverLocal(request: BlogAddLocalRequest): Promise<IpcResult<BlogRegistryView>>
     clone(request: BlogCloneRequest): Promise<IpcResult<BlogImportReceipt>>
     cancelImport(): Promise<IpcResult<void>>
     install(request: BlogPathRequest): Promise<IpcResult<BlogCandidateInspection>>

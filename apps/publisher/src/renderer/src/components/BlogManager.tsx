@@ -41,6 +41,8 @@ export interface BlogManagerProps {
   readonly onSwitch: (id: string) => void
   readonly onCancelImport?: () => void
   readonly recoveryBlogId?: string
+  readonly registryRecovery?: boolean
+  readonly onRetryRecovery?: () => void
   readonly onRelocate?: (id: string, path: string) => void
 }
 
@@ -68,6 +70,8 @@ export function BlogManager({
   onSwitch,
   onCancelImport,
   recoveryBlogId,
+  registryRecovery = false,
+  onRetryRecovery,
   onRelocate,
 }: BlogManagerProps): React.JSX.Element | null {
   const [view, setView] = useState<ManagerView>(importState.view)
@@ -122,16 +126,18 @@ export function BlogManager({
     <ModalShell
       labelId="blog-manager-title"
       className="blog-manager-dialog"
-      initialFocus={busy ? busyFocus : closeButton}
+      initialFocus={busy || registryRecovery ? busyFocus : closeButton}
       closeDisabled={busy}
       onClose={onClose}
     >
       <header className="blog-manager-header">
         <div>
           <span className="eyebrow">Knowledge Garden Publisher</span>
-          <h2 id="blog-manager-title">{recoveryBlogId ? "博客恢复" : "管理博客"}</h2>
+          <h2 id="blog-manager-title">
+            {recoveryBlogId || registryRecovery ? "博客恢复" : "管理博客"}
+          </h2>
         </div>
-        {!recoveryBlogId ? (
+        {!recoveryBlogId && !registryRecovery ? (
           <button
             ref={closeButton}
             type="button"
@@ -194,7 +200,9 @@ export function BlogManager({
           />
         ) : view === "local" ? (
           <section className="blog-import-view" aria-label="添加本地博客">
-            <ViewBack disabled={busy} onClick={() => setView("list")} />
+            {!registryRecovery ? (
+              <ViewBack disabled={busy} onClick={() => setView("list")} />
+            ) : null}
             <div>
               <h3>添加本地博客</h3>
               <p>选择一个现有的 Quartz Git 仓库。应用不会移动或复制其中的文件。</p>
@@ -270,7 +278,7 @@ export function BlogManager({
                       className="primary-button"
                       disabled={busy || !localName.trim()}
                     >
-                      添加此博客
+                      {registryRecovery ? "恢复此博客" : "添加此博客"}
                     </button>
                   </form>
                 )}
@@ -351,7 +359,20 @@ export function BlogManager({
         )}
       </div>
 
-      {view === "list" && !recoveryBlogId ? (
+      {registryRecovery && onRetryRecovery ? (
+        <footer className="blog-manager-footer">
+          <button
+            type="button"
+            className="secondary-button"
+            disabled={busy}
+            onClick={onRetryRecovery}
+          >
+            重新读取博客列表
+          </button>
+        </footer>
+      ) : null}
+
+      {view === "list" && !recoveryBlogId && !registryRecovery ? (
         <footer className="blog-manager-footer">
           <button
             type="button"

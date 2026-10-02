@@ -61,6 +61,7 @@ function gardenApi(): GardenApi {
       list: vi.fn(async () => ok(registry)),
       chooseLocal: vi.fn(async () => ok(undefined)),
       addLocal: vi.fn(async () => ok(registry)),
+      recoverLocal: vi.fn(async () => ok(registry)),
       clone: vi.fn(),
       cancelImport: vi.fn(async () => ok(undefined)),
       install: vi.fn(),
@@ -241,21 +242,128 @@ describe("App blog orchestration", () => {
     expect(api.workspace.inspectSafety).toHaveBeenCalledOnce()
   })
 
-  it("shows manager-first recovery without touching workspace services when registry loading fails", async () => {
+  it("offers local recovery with invalid guidance without touching workspace services when registry loading fails", async () => {
+    const user = userEvent.setup()
     const api = gardenApi()
     vi.mocked(api.blogs.list).mockResolvedValueOnce({
       ok: false,
       error: { code: "INTERNAL_ERROR", message: "博客列表需要恢复。" },
     })
+    vi.mocked(api.blogs.chooseLocal).mockResolvedValueOnce(
+      ok({
+        path: String.raw`D:\Not-a-blog`,
+        inspection: { valid: false, code: "NOT_QUARTZ", message: "请选择 Quartz 博客文件夹。" },
+      }),
+    )
     Object.defineProperty(window, "garden", { configurable: true, value: api })
 
     render(<App />)
 
-    expect(await screen.findByRole("region", { name: "博客恢复" })).toHaveTextContent(
+    expect(await screen.findByRole("dialog", { name: "博客恢复" })).toHaveTextContent(
       "博客列表需要恢复",
     )
+    await user.click(screen.getByRole("button", { name: "选择文件夹" }))
+    expect(await screen.findByRole("alert")).toHaveTextContent("请选择 Quartz 博客文件夹")
+    expect(api.blogs.recoverLocal).not.toHaveBeenCalled()
     expect(api.workspace.inspectSafety).not.toHaveBeenCalled()
     expect(api.notes.list).not.toHaveBeenCalled()
+    expect(api.preview.status).not.toHaveBeenCalled()
+    expect(api.publish.start).not.toHaveBeenCalled()
+  })
+
+  it("installs and recovers a valid local blog before requesting a safe relaunch", async () => {
+    const user = userEvent.setup()
+    const api = gardenApi()
+    const chosen = String.raw`D:\Blogs\recovered`
+    vi.mocked(api.blogs.list).mockResolvedValueOnce({
+      ok: false,
+      error: { code: "INTERNAL_ERROR", message: "博客列表需要恢复。" },
+    })
+    vi.mocked(api.blogs.chooseLocal).mockResolvedValueOnce(
+      ok({
+        path: chosen,
+        inspection: { valid: true, canonicalPath: chosen, needsInstall: true },
+      }),
+    )
+    vi.mocked(api.blogs.install).mockResolvedValueOnce(
+      ok({ valid: true, canonicalPath: chosen, needsInstall: false }),
+    )
+    const recovered: BlogRegistryView = {
+      ...registry,
+      activeBlogId: "recovered",
+      blogs: [
+        {
+          ...registry.blogs[0],
+          id: "recovered",
+          name: "Recovered",
+          path: chosen,
+          canonicalPath: chosen,
+        },
+      ],
+    }
+    const recovering = deferred<IpcResult<BlogRegistryView>>()
+    vi.mocked(api.blogs.recoverLocal).mockReturnValueOnce(recovering.promise)
+    Object.defineProperty(window, "garden", { configurable: true, value: api })
+
+    render(<App />)
+    await user.click(await screen.findByRole("button", { name: "选择文件夹" }))
+    await user.click(await screen.findByRole("button", { name: "安装依赖" }))
+    await user.type(await screen.findByLabelText("显示名称"), "Recovered")
+    await user.dblClick(screen.getByRole("button", { name: "恢复此博客" }))
+
+    await waitFor(() => expect(api.blogs.recoverLocal).toHaveBeenCalledTimes(1))
+    expect(api.blogs.recoverLocal).toHaveBeenCalledWith({ path: chosen, name: "Recovered" })
+    recovering.resolve(ok(recovered))
+    await waitFor(() => expect(api.blogs.switch).toHaveBeenCalledOnce())
+    expect(api.blogs.switch).toHaveBeenCalledWith({ id: "recovered", editorSaved: true })
+    expect(api.workspace.inspectSafety).not.toHaveBeenCalled()
+  })
+
+  it("keeps retry as a secondary corrupt-registry recovery action", async () => {
+    const user = userEvent.setup()
+    const api = gardenApi()
+    vi.mocked(api.blogs.list)
+      .mockResolvedValueOnce({
+        ok: false,
+        error: { code: "INTERNAL_ERROR", message: "博客列表需要恢复。" },
+      })
+      .mockResolvedValueOnce(ok(registry))
+    Object.defineProperty(window, "garden", { configurable: true, value: api })
+
+    render(<App />)
+    await user.click(await screen.findByRole("button", { name: "重新读取博客列表" }))
+    expect(await screen.findByRole("button", { name: /切换博客：Knowledge Garden/ })).toBeVisible()
+    expect(api.blogs.list).toHaveBeenCalledTimes(2)
+  })
+
+  it("reports corrupt-registry recovery failures without starting the workspace", async () => {
+    const user = userEvent.setup()
+    const api = gardenApi()
+    const chosen = String.raw`D:\Blogs\recovered`
+    vi.mocked(api.blogs.list).mockResolvedValueOnce({
+      ok: false,
+      error: { code: "INTERNAL_ERROR", message: "博客列表需要恢复。" },
+    })
+    vi.mocked(api.blogs.chooseLocal).mockResolvedValueOnce(
+      ok({
+        path: chosen,
+        inspection: { valid: true, canonicalPath: chosen, needsInstall: false },
+      }),
+    )
+    vi.mocked(api.blogs.recoverLocal).mockResolvedValueOnce({
+      ok: false,
+      error: { code: "INTERNAL_ERROR", message: "无法安全恢复博客列表。" },
+    })
+    Object.defineProperty(window, "garden", { configurable: true, value: api })
+
+    render(<App />)
+    await user.click(await screen.findByRole("button", { name: "选择文件夹" }))
+    await user.type(await screen.findByLabelText("显示名称"), "Recovered")
+    await user.click(screen.getByRole("button", { name: "恢复此博客" }))
+
+    expect(await screen.findByRole("alert")).toHaveTextContent("无法安全恢复博客列表")
+    expect(api.blogs.switch).not.toHaveBeenCalled()
+    expect(api.workspace.inspectSafety).not.toHaveBeenCalled()
   })
 
   it("switches safely without an editor and suppresses duplicate switch intents", async () => {

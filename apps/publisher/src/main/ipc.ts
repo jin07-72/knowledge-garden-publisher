@@ -126,6 +126,7 @@ export interface PublisherIpcServices {
     list(): Promise<BlogRegistryStatus>
     chooseLocal(): Promise<BlogCandidateSelection | undefined>
     addLocal(request: BlogAddLocalRequest): Promise<BlogRegistryView>
+    recoverLocal(request: BlogAddLocalRequest): Promise<BlogRegistryView>
     clone(request: BlogCloneRequest): Promise<BlogImportReceipt>
     cancelImport(): Promise<void>
     install(request: BlogPathRequest): Promise<BlogCandidateInspection>
@@ -368,6 +369,7 @@ function blogRequestHandlers(
     [IPC_CHANNELS.requests.blogsList, secureHandler(IPC_CHANNELS.requests.blogsList, noRequestSchema, isTrustedSender, () => services.list())],
     [IPC_CHANNELS.requests.blogsChooseLocal, secureHandler(IPC_CHANNELS.requests.blogsChooseLocal, noRequestSchema, isTrustedSender, () => services.chooseLocal())],
     [IPC_CHANNELS.requests.blogsAddLocal, secureHandler(IPC_CHANNELS.requests.blogsAddLocal, blogAddLocalRequestSchema, isTrustedSender, (request) => services.addLocal(request))],
+    [IPC_CHANNELS.requests.blogsRecoverLocal, secureHandler(IPC_CHANNELS.requests.blogsRecoverLocal, blogAddLocalRequestSchema, isTrustedSender, (request) => services.recoverLocal(request))],
     [IPC_CHANNELS.requests.blogsClone, secureHandler(IPC_CHANNELS.requests.blogsClone, blogCloneRequestSchema, isTrustedSender, (request) => services.clone(request))],
     [IPC_CHANNELS.requests.blogsCancelImport, secureHandler(IPC_CHANNELS.requests.blogsCancelImport, noRequestSchema, isTrustedSender, () => services.cancelImport())],
     [IPC_CHANNELS.requests.blogsInstall, secureHandler(IPC_CHANNELS.requests.blogsInstall, blogPathRequestSchema, isTrustedSender, (request) => services.install(request))],
@@ -386,6 +388,7 @@ function unavailableBlogRequestHandlers(
     [IPC_CHANNELS.requests.blogsList, secureHandler(IPC_CHANNELS.requests.blogsList, noRequestSchema, isTrustedSender, serviceUnavailable)],
     [IPC_CHANNELS.requests.blogsChooseLocal, secureHandler(IPC_CHANNELS.requests.blogsChooseLocal, noRequestSchema, isTrustedSender, serviceUnavailable)],
     [IPC_CHANNELS.requests.blogsAddLocal, secureHandler(IPC_CHANNELS.requests.blogsAddLocal, blogAddLocalRequestSchema, isTrustedSender, serviceUnavailable)],
+    [IPC_CHANNELS.requests.blogsRecoverLocal, secureHandler(IPC_CHANNELS.requests.blogsRecoverLocal, blogAddLocalRequestSchema, isTrustedSender, serviceUnavailable)],
     [IPC_CHANNELS.requests.blogsClone, secureHandler(IPC_CHANNELS.requests.blogsClone, blogCloneRequestSchema, isTrustedSender, serviceUnavailable)],
     [IPC_CHANNELS.requests.blogsCancelImport, secureHandler(IPC_CHANNELS.requests.blogsCancelImport, noRequestSchema, isTrustedSender, serviceUnavailable)],
     [IPC_CHANNELS.requests.blogsInstall, secureHandler(IPC_CHANNELS.requests.blogsInstall, blogPathRequestSchema, isTrustedSender, serviceUnavailable)],

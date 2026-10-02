@@ -1,4 +1,14 @@
-import { link, lstat, mkdir, open, readFile, readdir, realpath, rename, unlink } from "node:fs/promises"
+import {
+  link,
+  lstat,
+  mkdir,
+  open,
+  readFile,
+  readdir,
+  realpath,
+  rename,
+  unlink,
+} from "node:fs/promises"
 import { randomUUID } from "node:crypto"
 import { basename, dirname, isAbsolute, join, resolve } from "node:path"
 import { z } from "zod"
@@ -9,6 +19,7 @@ export type BlogRegistryState = BlogRegistryView
 
 export interface BlogRegistry {
   load(): Promise<BlogRegistryState>
+  recover(input: { readonly name: string; readonly path: string }): Promise<BlogRegistryState>
   add(input: { readonly name: string; readonly path: string }): Promise<BlogRegistryState>
   rename(id: string, name: string): Promise<BlogRegistryState>
   activate(id: string): Promise<BlogRegistryState>
@@ -20,9 +31,19 @@ const identifierSchema = z.string().uuid()
 const nameInputSchema = z
   .string()
   .max(80)
-  .refine((value) => value.trim().length > 0 && !/[\u0000-\u001f\u007f-\u009f]/.test(value), "Invalid blog name")
-const nameSchema = nameInputSchema.refine((value) => value === value.trim(), "Blog names must be trimmed")
-const pathSchema = z.string().min(1).max(16_384).refine((value) => !value.includes("\u0000"), "Invalid path")
+  .refine(
+    (value) => value.trim().length > 0 && !/[\u0000-\u001f\u007f-\u009f]/.test(value),
+    "Invalid blog name",
+  )
+const nameSchema = nameInputSchema.refine(
+  (value) => value === value.trim(),
+  "Blog names must be trimmed",
+)
+const pathSchema = z
+  .string()
+  .min(1)
+  .max(16_384)
+  .refine((value) => !value.includes("\u0000"), "Invalid path")
 const timestampSchema = z.string().datetime({ offset: true })
 const leaseSchema = z
   .object({
@@ -34,7 +55,7 @@ const leaseSchema = z
   .strict()
 
 interface RegistryFileHandle {
-  writeFile(data: string): Promise<void>
+  writeFile(data: string | Uint8Array): Promise<void>
   sync(): Promise<void>
   close(): Promise<void>
 }
@@ -92,9 +113,21 @@ const registryStateSchema = z
 class BlogRegistryInvalidError extends Error {
   readonly code = "BLOG_REGISTRY_INVALID"
 
-  constructor(readonly path: string, cause: unknown) {
+  constructor(
+    readonly path: string,
+    cause: unknown,
+  ) {
     super(`Blog registry is invalid: ${path}`, { cause })
     this.name = "BlogRegistryInvalidError"
+  }
+}
+
+class BlogRegistryHealthyError extends Error {
+  readonly code = "BLOG_REGISTRY_HEALTHY"
+
+  constructor() {
+    super("Blog registry recovery is only available for an invalid registry")
+    this.name = "BlogRegistryHealthyError"
   }
 }
 
@@ -123,7 +156,12 @@ function isAlreadyExists(error: unknown): boolean {
 }
 
 function isUnavailablePath(error: unknown): boolean {
-  return typeof error === "object" && error !== null && "code" in error && (error.code === "ENOENT" || error.code === "ENOTDIR")
+  return (
+    typeof error === "object" &&
+    error !== null &&
+    "code" in error &&
+    (error.code === "ENOENT" || error.code === "ENOTDIR")
+  )
 }
 
 function isProcessAlive(pid: number): boolean {
@@ -240,7 +278,7 @@ async function hasReclaimClaim(claim: string): Promise<boolean> {
     throw error
   }
 
-  if (!await lockIsStale(claim)) return true
+  if (!(await lockIsStale(claim))) return true
   await unlink(claim).catch((error: NodeJS.ErrnoException) => {
     if (error.code !== "ENOENT") throw error
   })
@@ -256,7 +294,12 @@ async function createLease(lock: string, openFile: RegistryOpen): Promise<string
     handle = await openFile(candidate, "wx", 0o600)
     createdCandidate = true
     await handle.writeFile(
-      JSON.stringify({ version: 1, token, pid: process.pid, expiresAt: Date.now() + registryLeaseMs }),
+      JSON.stringify({
+        version: 1,
+        token,
+        pid: process.pid,
+        expiresAt: Date.now() + registryLeaseMs,
+      }),
     )
     await handle.sync()
     await handle.close()
@@ -271,7 +314,10 @@ async function createLease(lock: string, openFile: RegistryOpen): Promise<string
   }
 }
 
-async function acquireLease(file: string, openFile: RegistryOpen): Promise<{ readonly lock: string; readonly token: string }> {
+async function acquireLease(
+  file: string,
+  openFile: RegistryOpen,
+): Promise<{ readonly lock: string; readonly token: string }> {
   const directory = dirname(file)
   const lock = join(directory, `.${basename(file)}.lock`)
   const reclaim = `${lock}.reclaim`
@@ -341,22 +387,26 @@ export function createBlogRegistry(options: {
   const timestamp = () => now().toISOString()
 
   function runExclusive<T>(operation: (file: string) => Promise<T>): Promise<T> {
-    return canonicalRegistryFile(options.file).then((file) => runForRegistryFile(file, async () => {
-      const lease = await acquireLease(file, openFile)
-      try {
-        await cleanupStaleArtifacts(file)
-        return await operation(file)
-      } finally {
-        await releaseLease(lease.lock, lease.token)
-      }
-    }))
+    return canonicalRegistryFile(options.file).then((file) =>
+      runForRegistryFile(file, async () => {
+        const lease = await acquireLease(file, openFile)
+        try {
+          await cleanupStaleArtifacts(file)
+          return await operation(file)
+        } finally {
+          await releaseLease(lease.lock, lease.token)
+        }
+      }),
+    )
   }
 
-  async function canonicalize(path: string): Promise<{ readonly path: string; readonly canonicalPath: string }> {
+  async function canonicalize(
+    path: string,
+  ): Promise<{ readonly path: string; readonly canonicalPath: string }> {
     return { path, canonicalPath: await realpath(path) }
   }
 
-  async function persist(file: string, state: BlogRegistryState): Promise<void> {
+  async function persistBytes(file: string, data: string | Uint8Array): Promise<void> {
     const directory = dirname(file)
     const temporary = join(directory, `.${basename(file)}.${randomUUID()}.tmp`)
     await mkdir(directory, { recursive: true })
@@ -367,7 +417,7 @@ export function createBlogRegistry(options: {
     try {
       handle = await openFile(temporary, "wx", 0o600)
       createdTemporary = true
-      await handle.writeFile(JSON.stringify(state))
+      await handle.writeFile(data)
       await handle.sync()
       await handle.close()
       handle = undefined
@@ -377,6 +427,30 @@ export function createBlogRegistry(options: {
     } finally {
       await handle?.close().catch(() => undefined)
       if (createdTemporary && !published) await unlink(temporary).catch(() => undefined)
+    }
+  }
+
+  const persist = (file: string, state: BlogRegistryState): Promise<void> =>
+    persistBytes(file, JSON.stringify(state))
+
+  async function preserveCorruptSource(file: string, source: Uint8Array): Promise<string> {
+    const directory = dirname(file)
+    const backup = join(directory, `${basename(file)}.corrupt-${randomUUID()}.bak`)
+    let handle: RegistryFileHandle | undefined
+    let created = false
+    try {
+      handle = await openFile(backup, "wx", 0o600)
+      created = true
+      await handle.writeFile(source)
+      await handle.sync()
+      await handle.close()
+      handle = undefined
+      await syncDirectory(directory, openFile)
+      return backup
+    } catch (error) {
+      await handle?.close().catch(() => undefined)
+      if (created) await unlink(backup).catch(() => undefined)
+      throw error
     }
   }
 
@@ -431,9 +505,15 @@ export function createBlogRegistry(options: {
           })
           if (displayTarget !== undefined && canonicalTarget === undefined)
             throw new Error("Stored canonical path is unavailable while display path exists")
-          if (canonicalTarget !== undefined && canonicalKey(canonicalTarget) !== canonicalKey(blog.canonicalPath))
+          if (
+            canonicalTarget !== undefined &&
+            canonicalKey(canonicalTarget) !== canonicalKey(blog.canonicalPath)
+          )
             throw new Error("Stored canonical path does not match its target")
-          if (displayTarget !== undefined && canonicalKey(displayTarget) !== canonicalKey(canonicalTarget!))
+          if (
+            displayTarget !== undefined &&
+            canonicalKey(displayTarget) !== canonicalKey(canonicalTarget!)
+          )
             throw new Error("Stored canonical path does not match display path")
         }),
       )
@@ -453,12 +533,56 @@ export function createBlogRegistry(options: {
   return {
     load: () => runExclusive(readState),
 
+    async recover(input) {
+      return runExclusive(async (file) => {
+        const source = await readFile(file)
+        try {
+          await readState(file)
+        } catch (error) {
+          if (!(error instanceof BlogRegistryInvalidError)) throw error
+          const location = await canonicalize(input.path)
+          const createdAt = timestamp()
+          const id = validIdentifier(uuid())
+          const recovered: BlogRegistryState = {
+            version: 1,
+            activeBlogId: id,
+            blogs: [
+              {
+                id,
+                name: validName(input.name),
+                path: location.path,
+                canonicalPath: location.canonicalPath,
+                createdAt,
+                lastOpenedAt: createdAt,
+              },
+            ],
+          }
+          await preserveCorruptSource(file, source)
+          try {
+            await persist(file, recovered)
+          } catch (persistError) {
+            const current = await readFile(file).catch(() => undefined)
+            if (current === undefined || !Buffer.from(current).equals(Buffer.from(source))) {
+              await persistBytes(file, source)
+            }
+            throw persistError
+          }
+          return recovered
+        }
+        throw new BlogRegistryHealthyError()
+      })
+    },
+
     async add(input) {
       return runExclusive(async (file) => {
         const state = await readState(file)
         const name = validName(input.name)
         const location = await canonicalize(input.path)
-        if (state.blogs.some((blog) => canonicalKey(blog.canonicalPath) === canonicalKey(location.canonicalPath))) {
+        if (
+          state.blogs.some(
+            (blog) => canonicalKey(blog.canonicalPath) === canonicalKey(location.canonicalPath),
+          )
+        ) {
           return state
         }
 
@@ -487,7 +611,9 @@ export function createBlogRegistry(options: {
         const blog = await requireBlog(state, id)
         const next: BlogRegistryState = {
           ...state,
-          blogs: state.blogs.map((candidate) => (candidate.id === blog.id ? { ...candidate, name: validName(name) } : candidate)),
+          blogs: state.blogs.map((candidate) =>
+            candidate.id === blog.id ? { ...candidate, name: validName(name) } : candidate,
+          ),
         }
         await persist(file, next)
         return next
@@ -533,7 +659,8 @@ export function createBlogRegistry(options: {
         if (
           state.blogs.some(
             (candidate) =>
-              candidate.id !== blog.id && canonicalKey(candidate.canonicalPath) === canonicalKey(location.canonicalPath),
+              candidate.id !== blog.id &&
+              canonicalKey(candidate.canonicalPath) === canonicalKey(location.canonicalPath),
           )
         ) {
           throw new Error("Workspace path is already registered")

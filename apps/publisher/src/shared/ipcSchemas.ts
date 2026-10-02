@@ -379,6 +379,7 @@ export const IPC_SUCCESS_SCHEMAS = {
   [IPC_CHANNELS.requests.blogsList]: blogRegistryStatusSchema,
   [IPC_CHANNELS.requests.blogsChooseLocal]: blogCandidateSelectionSchema.optional(),
   [IPC_CHANNELS.requests.blogsAddLocal]: blogRegistryViewSchema,
+  [IPC_CHANNELS.requests.blogsRecoverLocal]: blogRegistryViewSchema,
   [IPC_CHANNELS.requests.blogsClone]: blogImportReceiptSchema,
   [IPC_CHANNELS.requests.blogsCancelImport]: z.undefined(),
   [IPC_CHANNELS.requests.blogsInstall]: blogCandidateInspectionSchema,

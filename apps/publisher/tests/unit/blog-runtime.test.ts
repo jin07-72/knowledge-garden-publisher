@@ -219,6 +219,7 @@ describe("blog management adapter", () => {
       activate: vi.fn(async () => state()),
       remove: vi.fn(async () => state()),
       relocate: vi.fn(async () => state()),
+      recover: vi.fn(async () => state()),
     }
     const inspect = vi
       .fn()
@@ -257,6 +258,7 @@ describe("blog management adapter", () => {
       activate: vi.fn(async () => state()),
       remove: vi.fn(async () => state()),
       relocate: vi.fn(async () => state()),
+      recover: vi.fn(async () => state()),
     }
     const adapter = createBlogManagementAdapter({
       registry,
@@ -283,6 +285,7 @@ describe("blog management adapter", () => {
       activate: vi.fn(async () => state()),
       remove: vi.fn(async () => state()),
       relocate: vi.fn(async () => state()),
+      recover: vi.fn(async () => state()),
     }
     const inspect = vi.fn(async (path: string) => ({
       valid: true as const,
@@ -308,6 +311,7 @@ describe("blog management adapter", () => {
       inspection: { valid: true },
     })
     await adapter.services.addLocal({ name: "Local", path: String.raw`C:\Blogs\local` })
+    await adapter.services.recoverLocal({ name: "Recovered", path: String.raw`C:\Blogs\recovered` })
     await adapter.services.clone({
       name: "Clone",
       url: "https://github.com/owner/repo",
@@ -322,6 +326,10 @@ describe("blog management adapter", () => {
     expect(registry.add).toHaveBeenNthCalledWith(2, {
       name: "Clone",
       path: String.raw`C:\Blogs\cloned`,
+    })
+    expect(registry.recover).toHaveBeenCalledWith({
+      name: "Recovered",
+      path: String.raw`C:\Blogs\recovered`,
     })
     expect(registry.relocate).toHaveBeenCalledWith(second.id, String.raw`C:\Blogs\moved`)
   })
@@ -338,6 +346,7 @@ describe("blog management adapter", () => {
       activate: vi.fn(async () => state()),
       remove: vi.fn(async () => state()),
       relocate: vi.fn(async () => state()),
+      recover: vi.fn(async () => state()),
     }
     const clone = vi.fn(async () => ({
       canonicalPath: String.raw`C:\Blogs\learning-notes`,
@@ -377,6 +386,7 @@ describe("blog management adapter", () => {
       activate: vi.fn(async () => state()),
       remove: vi.fn(async () => state()),
       relocate: vi.fn(async () => state()),
+      recover: vi.fn(async () => state()),
     }
     const clone = vi.fn()
     const adapter = createBlogManagementAdapter({
@@ -424,6 +434,7 @@ describe("blog management adapter", () => {
         activate: vi.fn(),
         remove: vi.fn(),
         relocate: vi.fn(),
+        recover: vi.fn(),
       },
       importer: { clone, install: vi.fn() },
       inspect: vi.fn(),
@@ -462,6 +473,7 @@ describe("blog management adapter", () => {
         activate: vi.fn(),
         remove: vi.fn(),
         relocate: vi.fn(),
+        recover: vi.fn(),
       },
       importer: { clone, install: vi.fn() },
       inspect: vi.fn(),
@@ -523,6 +535,7 @@ describe("blog management adapter", () => {
         activate: vi.fn(),
         remove: vi.fn(),
         relocate: vi.fn(),
+        recover: vi.fn(),
       },
       importer: { clone, install: vi.fn() },
       inspect: vi.fn(),
@@ -603,6 +616,7 @@ describe("blog management adapter", () => {
         activate: vi.fn(),
         remove: vi.fn(),
         relocate: vi.fn(),
+        recover: vi.fn(),
       },
       importer: { clone, install: vi.fn() },
       inspect: vi.fn(),
@@ -638,6 +652,7 @@ describe("blog management adapter", () => {
         activate: vi.fn(),
         remove: vi.fn(),
         relocate: vi.fn(),
+        recover: vi.fn(),
       },
       importer: {
         clone: () =>
