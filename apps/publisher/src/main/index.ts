@@ -1,10 +1,15 @@
-import { app, BrowserWindow, ipcMain, net, shell } from "electron"
+import { app, BrowserWindow, dialog, ipcMain, net, shell } from "electron"
 import { existsSync } from "node:fs"
 import { isAbsolute, join, resolve } from "node:path"
 import { randomUUID } from "node:crypto"
 import { DEFAULT_GARDEN_PATH, IPC_CHANNELS } from "../shared/contracts"
 import { systemCommandRunner } from "./lib/commandRunner"
-import { registerPublisherIpc } from "./ipc"
+import { registerBlogManagementIpc, registerPublisherIpc } from "./ipc"
+import {
+  createBlogManagementAdapter,
+  createBlogRuntime,
+  resolveBlogRegistryFile,
+} from "./blogRuntime"
 import {
   createPublisherCloseCoordinator,
   createPublisherServices,
@@ -23,16 +28,24 @@ import { createProductionPreviewManager } from "./services/previewRuntime"
 import { isPreviewPortAvailable } from "./services/previewRuntime"
 import { createElectronTrashAdapter } from "./services/trash"
 import {
+  createSystemBoundedCommandRunner,
   createProductionPublisher,
   createPublisherForTest,
   type PublishProgressEvent,
 } from "./services/publish"
 import type { PreviewStatus, PublishProgress } from "../shared/contracts"
 import { resolveMainRuntimeFiles } from "./mainRuntime"
+import { createBlogRegistry } from "./services/blogRegistry"
+import {
+  createBlogImportService,
+  inspectBlogCandidate,
+  type BlogImportService,
+} from "./services/blogImport"
 
 let mainWindow: BrowserWindow | undefined
 let mainWindowTrust: RendererTrustPolicy | undefined
 let unregisterIpc: (() => void) | undefined
+let unregisterBlogIpc: (() => void) | undefined
 let previewManager: (PreviewServicePort & { dispose(): Promise<void> }) | undefined
 let publisherServices: PublisherRuntimeServices | undefined
 
@@ -80,12 +93,16 @@ const closeCoordinator = createPublisherCloseCoordinator({
     if (manager === undefined) {
       unregister?.()
       unregisterIpc = undefined
+      unregisterBlogIpc?.()
+      unregisterBlogIpc = undefined
       return
     }
     await disposePublisherRuntime(unregister, manager, publisherServices)
     unregisterIpc = undefined
     previewManager = undefined
     publisherServices = undefined
+    unregisterBlogIpc?.()
+    unregisterBlogIpc = undefined
   },
   allowQuit: () => app.quit(),
   allowClose: () => mainWindow?.close(),
@@ -180,10 +197,10 @@ function e2ePreview(): PreviewServicePort & { dispose(): Promise<void> } {
   }
 }
 
-app.whenReady().then(() => {
+app.whenReady().then(async () => {
   const e2e = !app.isPackaged && process.env.GARDEN_PUBLISHER_E2E === "1"
   const requestedWorkspace = process.env.GARDEN_PUBLISHER_E2E_WORKSPACE
-  const workspace =
+  const legacyWorkspace =
     e2e && requestedWorkspace && isAbsolute(requestedWorkspace)
       ? resolve(requestedWorkspace)
       : DEFAULT_GARDEN_PATH
@@ -204,79 +221,155 @@ app.whenReady().then(() => {
     app.isPackaged || (existsSync(runtimePath) && existsSync(npmCliPath))
       ? { nodePath: runtimePath, npmCliPath }
       : undefined
-  previewManager = e2e ? e2ePreview() : createProductionPreviewManager(runtimePath)
-  const publisherFactory = (onProgress: (progress: PublishProgress) => void) => {
-    const relay = (progress: PublishProgressEvent): void => {
-      const mapped = mapPublishProgress(progress)
-      if (mapped) onProgress(mapped)
-    }
-    if (e2e && e2eRuntimeRoot) {
-      return createPublisherForTest({
+  const registry = createBlogRegistry({
+    file: resolveBlogRegistryFile({
+      isPackaged: app.isPackaged,
+      e2e,
+      userDataPath: app.getPath("userData"),
+      override: process.env.GARDEN_PUBLISHER_E2E_REGISTRY,
+    }),
+    legacyPath: legacyWorkspace,
+  })
+  const importRunner = createSystemBoundedCommandRunner()
+  let importer!: BlogImportService
+  const blogRuntime = createBlogRuntime({
+    registry,
+    inspect: (path) => inspectBlogCandidate(path, { runner: importRunner }),
+    assertIdle: async () => {
+      await publisherServices?.assertSwitchSafe()
+    },
+    dispose: async () => {
+      const manager = previewManager
+      if (!manager) return
+      await disposePublisherRuntime(unregisterIpc, manager, publisherServices)
+      unregisterIpc = undefined
+      previewManager = undefined
+      publisherServices = undefined
+    },
+    relaunch: () => app.relaunch(),
+    quit: () => app.quit(),
+  })
+  const blogManagement = createBlogManagementAdapter({
+    registry,
+    importer: () => importer,
+    inspect: (path) => inspectBlogCandidate(path, { runner: importRunner }),
+    chooseDirectory: async () => {
+      const selection = await dialog.showOpenDialog({ properties: ["openDirectory"] })
+      return selection.canceled ? undefined : selection.filePaths[0]
+    },
+    openFolder: async (path) => {
+      const error = await shell.openPath(path)
+      if (error) throw new Error("The blog folder could not be opened.")
+    },
+    switchTo: (request) => blogRuntime.switchTo(request),
+  })
+  importer = createBlogImportService({
+    gitExecutable: "git",
+    nodePath: runtimePath,
+    npmCliPath,
+    runner: importRunner,
+    inspect: inspectBlogCandidate,
+    onProgress: blogManagement.emitProgress,
+  })
+  const isTrustedSender = (event: unknown): boolean => {
+    const window = mainWindow
+    const trust = mainWindowTrust
+    if (window === undefined || trust === undefined) return false
+    return isTrustedRendererSender(event as Electron.IpcMainInvokeEvent, window, trust)
+  }
+  const eventTargets = () => {
+    const window = mainWindow
+    const trust = mainWindowTrust
+    return window === undefined ||
+      trust === undefined ||
+      window.isDestroyed() ||
+      !trust.isTrustedUrl(window.webContents.getURL())
+      ? []
+      : [window.webContents]
+  }
+  unregisterBlogIpc = registerBlogManagementIpc({
+    ipcMain,
+    services: blogManagement.services,
+    isTrustedSender,
+    eventTargets,
+  })
+  app.on("activate", () => {
+    if (BrowserWindow.getAllWindows().length === 0) createWindow()
+  })
+
+  let workspace: string
+  try {
+    workspace = (await blogRuntime.active()).canonicalPath
+  } catch {
+    console.error("The active blog workspace is unavailable; opening blog recovery.")
+    createWindow()
+    return
+  }
+
+  try {
+    previewManager = e2e ? e2ePreview() : createProductionPreviewManager(runtimePath)
+    const publisherFactory = (onProgress: (progress: PublishProgress) => void) => {
+      const relay = (progress: PublishProgressEvent): void => {
+        const mapped = mapPublishProgress(progress)
+        if (mapped) onProgress(mapped)
+      }
+      if (e2e && e2eRuntimeRoot) {
+        return createPublisherForTest({
+          workspace,
+          runtime: {
+            root: resolve(e2eRuntimeRoot),
+            nodeExecutable: runtimePath,
+            npmCliPath,
+            nodeModules: join(workspace, "node_modules"),
+          },
+          validateDependencies: async () => true,
+          verifySite: async () => ({ exitCode: 0 }),
+          onProgress: relay,
+        })
+      }
+      return createProductionPublisher({
         workspace,
-        runtime: {
-          root: resolve(e2eRuntimeRoot),
-          nodeExecutable: runtimePath,
-          npmCliPath,
-          nodeModules: join(workspace, "node_modules"),
-        },
-        validateDependencies: async () => true,
-        verifySite: async () => ({ exitCode: 0 }),
+        isPackaged: app.isPackaged,
+        resourcesPath: process.resourcesPath,
+        appPath: app.getAppPath(),
         onProgress: relay,
       })
     }
-    return createProductionPublisher({
+    publisherServices = createPublisherServices({
       workspace,
-      isPackaged: app.isPackaged,
-      resourcesPath: process.resourcesPath,
-      appPath: app.getAppPath(),
-      onProgress: relay,
+      trash: createElectronTrashAdapter(shell),
+      isTracked,
+      preview: previewManager,
+      openExternal: (url) => shell.openExternal(url),
+      ...(bundledRuntime ? { runtime: bundledRuntime } : {}),
+      ...(e2e ? {} : { previewPortAvailable: () => isPreviewPortAvailable(8080) }),
+      online: () => (e2e ? true : net.isOnline()),
+      publisherFactory,
+      ...(e2e && process.env.GARDEN_PUBLISHER_E2E_DEPLOYMENT === "success"
+        ? { publishCompletionMessage: "部署成功" }
+        : {}),
     })
+    unregisterIpc = registerPublisherIpc({
+      ipcMain,
+      services: publisherServices,
+      isTrustedSender,
+      eventTargets,
+      includeBlogManagement: false,
+      acknowledgeClose: ({ requestId, success }) => {
+        if (pendingClose?.requestId === requestId) pendingClose.finish(success)
+      },
+    })
+  } catch {
+    await publisherServices?.dispose().catch(() => undefined)
+    await previewManager?.dispose().catch(() => undefined)
+    publisherServices = undefined
+    previewManager = undefined
+    unregisterIpc?.()
+    unregisterIpc = undefined
+    console.error("The active blog runtime could not start; opening blog recovery.")
   }
-  publisherServices = createPublisherServices({
-    workspace,
-    trash: createElectronTrashAdapter(shell),
-    isTracked,
-    preview: previewManager,
-    openExternal: (url) => shell.openExternal(url),
-    ...(bundledRuntime ? { runtime: bundledRuntime } : {}),
-    ...(e2e ? {} : { previewPortAvailable: () => isPreviewPortAvailable(8080) }),
-    online: () => (e2e ? true : net.isOnline()),
-    publisherFactory,
-    ...(e2e && process.env.GARDEN_PUBLISHER_E2E_DEPLOYMENT === "success"
-      ? { publishCompletionMessage: "部署成功" }
-      : {}),
-  })
-  unregisterIpc = registerPublisherIpc({
-    ipcMain,
-    services: publisherServices,
-    isTrustedSender: (event) => {
-      const window = mainWindow
-      const trust = mainWindowTrust
-      if (window === undefined || trust === undefined) return false
-      const invokeEvent = event as Electron.IpcMainInvokeEvent
-      return isTrustedRendererSender(invokeEvent, window, trust)
-    },
-    eventTargets: () => {
-      const window = mainWindow
-      const trust = mainWindowTrust
-      return window === undefined ||
-        trust === undefined ||
-        window.isDestroyed() ||
-        !trust.isTrustedUrl(window.webContents.getURL())
-        ? []
-        : [window.webContents]
-    },
-    acknowledgeClose: ({ requestId, success }) => {
-      if (pendingClose?.requestId === requestId) pendingClose.finish(success)
-    },
-  })
   createWindow()
 
-  app.on("activate", () => {
-    if (BrowserWindow.getAllWindows().length === 0) {
-      createWindow()
-    }
-  })
 })
 
 app.on("before-quit", (event) => {

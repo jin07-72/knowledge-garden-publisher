@@ -1,0 +1,222 @@
+import { isAbsolute, join, resolve } from "node:path"
+import type {
+  BlogAddLocalRequest,
+  BlogCandidateInspection,
+  BlogCloneRequest,
+  BlogIdRequest,
+  BlogImportProgress,
+  BlogImportReceipt,
+  BlogPathRequest,
+  BlogRecord,
+  BlogRegistryView,
+  BlogRelocateRequest,
+  BlogRenameRequest,
+  BlogSwitchRequest,
+} from "../shared/contracts"
+import type { BlogRegistry } from "./services/blogRegistry"
+import { BlogImportError, type BlogImportService } from "./services/blogImport"
+
+export interface BlogRuntime {
+  active(): Promise<BlogRecord>
+  switchTo(request: { readonly id: string; readonly editorSaved: true }): Promise<void>
+}
+
+export interface BlogRuntimeRegistry {
+  load(): Promise<BlogRegistryView>
+  activate(id: string): Promise<BlogRegistryView>
+}
+
+export interface BlogRuntimeDependencies {
+  readonly registry: BlogRuntimeRegistry
+  readonly inspect: (path: string) => Promise<BlogCandidateInspection>
+  readonly assertIdle: () => Promise<void>
+  readonly dispose: () => Promise<void>
+  readonly relaunch: () => void
+  readonly quit: () => void
+}
+
+function unavailable(): Error & { readonly code: "BLOG_WORKSPACE_UNAVAILABLE" } {
+  return Object.assign(new Error("The selected blog workspace is unavailable."), {
+    code: "BLOG_WORKSPACE_UNAVAILABLE" as const,
+  })
+}
+
+function samePath(left: string, right: string): boolean {
+  return process.platform === "win32"
+    ? left.toLocaleLowerCase("en-US") === right.toLocaleLowerCase("en-US")
+    : left === right
+}
+
+async function validate(
+  record: BlogRecord,
+  inspect: BlogRuntimeDependencies["inspect"],
+): Promise<BlogRecord> {
+  let inspection: BlogCandidateInspection
+  try {
+    inspection = await inspect(record.canonicalPath)
+  } catch {
+    throw unavailable()
+  }
+  if (
+    !inspection.valid ||
+    !samePath(resolve(inspection.canonicalPath), resolve(record.canonicalPath))
+  ) {
+    throw unavailable()
+  }
+  return record
+}
+
+export function createBlogRuntime(dependencies: BlogRuntimeDependencies): BlogRuntime {
+  let switchFlight: Promise<void> | undefined
+
+  const active = async (): Promise<BlogRecord> => {
+    const state = await dependencies.registry.load()
+    const record = state.blogs.find((blog) => blog.id === state.activeBlogId)
+    if (!record) throw unavailable()
+    return validate(record, dependencies.inspect)
+  }
+
+  return {
+    active,
+    switchTo(request) {
+      if (request.editorSaved !== true) {
+        return Promise.reject(
+          Object.assign(new Error("Save the editor before switching blogs."), {
+            code: "BLOG_EDITOR_UNSAVED" as const,
+          }),
+        )
+      }
+      if (switchFlight) return switchFlight
+      const operation = (async () => {
+        const state = await dependencies.registry.load()
+        const target = state.blogs.find((blog) => blog.id === request.id)
+        if (!target) throw unavailable()
+        await validate(target, dependencies.inspect)
+        await dependencies.assertIdle()
+        await dependencies.dispose()
+        await dependencies.registry.activate(target.id)
+        dependencies.relaunch()
+        dependencies.quit()
+      })()
+      switchFlight = operation.finally(() => {
+        if (switchFlight === tracked) switchFlight = undefined
+      })
+      const tracked = switchFlight
+      return switchFlight
+    },
+  }
+}
+
+export function resolveBlogRegistryFile(options: {
+  readonly isPackaged: boolean
+  readonly e2e: boolean
+  readonly userDataPath: string
+  readonly override?: string
+}): string {
+  if (
+    !options.isPackaged &&
+    options.e2e &&
+    options.override &&
+    isAbsolute(options.override)
+  ) {
+    return resolve(options.override)
+  }
+  return join(options.userDataPath, "blogs.json")
+}
+
+export interface BlogManagementServices {
+  list(): Promise<BlogRegistryView>
+  chooseLocal(): Promise<{ readonly path: string; readonly inspection: BlogCandidateInspection } | undefined>
+  addLocal(request: BlogAddLocalRequest): Promise<BlogRegistryView>
+  clone(request: BlogCloneRequest): Promise<BlogImportReceipt>
+  cancelImport(): Promise<void>
+  install(request: BlogPathRequest): Promise<BlogCandidateInspection>
+  rename(request: BlogRenameRequest): Promise<BlogRegistryView>
+  relocate(request: BlogRelocateRequest): Promise<BlogRegistryView>
+  remove(request: BlogIdRequest): Promise<BlogRegistryView>
+  openFolder(request: BlogIdRequest): Promise<void>
+  switch(request: BlogSwitchRequest): Promise<void>
+  subscribeProgress(listener: (progress: BlogImportProgress) => void): () => void
+}
+
+export function createBlogManagementAdapter(dependencies: {
+  readonly registry: BlogRegistry
+  readonly importer: BlogImportService | (() => BlogImportService)
+  readonly inspect: (path: string) => Promise<BlogCandidateInspection>
+  readonly chooseDirectory: () => Promise<string | undefined>
+  readonly openFolder: (path: string) => Promise<void>
+  readonly switchTo: (request: { readonly id: string; readonly editorSaved: true }) => Promise<void>
+}): { readonly services: BlogManagementServices; readonly emitProgress: (progress: BlogImportProgress) => void } {
+  const listeners = new Set<(progress: BlogImportProgress) => void>()
+  let activeImport:
+    | { readonly controller: AbortController; readonly settled: Promise<void> }
+    | undefined
+  const importer = (): BlogImportService =>
+    typeof dependencies.importer === "function" ? dependencies.importer() : dependencies.importer
+  const validWorkspace = async (path: string): Promise<Extract<BlogCandidateInspection, { valid: true }>> => {
+    const inspection = await dependencies.inspect(path)
+    if (!inspection.valid) {
+      throw new BlogImportError("VALIDATION_FAILED", "The selected blog could not be validated.")
+    }
+    return inspection
+  }
+  const runImport = <T>(operation: (service: BlogImportService, signal: AbortSignal) => Promise<T>): Promise<T> => {
+    if (activeImport) {
+      return Promise.reject(new BlogImportError("IMPORT_ACTIVE", "Another blog import is already running."))
+    }
+    const controller = new AbortController()
+    const result = operation(importer(), controller.signal)
+    const settled = result.then(() => undefined, () => undefined)
+    activeImport = { controller, settled }
+    void settled.then(() => {
+      if (activeImport?.controller === controller) activeImport = undefined
+    })
+    return result
+  }
+
+  return {
+    emitProgress(progress) {
+      for (const listener of listeners) listener(progress)
+    },
+    services: {
+      list: () => dependencies.registry.load(),
+      async chooseLocal() {
+        const path = await dependencies.chooseDirectory()
+        if (!path) return undefined
+        return { path, inspection: await dependencies.inspect(path) }
+      },
+      async addLocal(request) {
+        await validWorkspace(request.path)
+        return dependencies.registry.add(request)
+      },
+      clone: (request) => runImport(async (service, signal) => {
+        const receipt = await service.clone(request, signal)
+        await dependencies.registry.add({ name: request.name, path: receipt.canonicalPath })
+        return receipt
+      }),
+      async cancelImport() {
+        const current = activeImport
+        current?.controller.abort()
+        await current?.settled
+      },
+      install: (request) => runImport((service, signal) => service.install(request.path, signal)),
+      rename: (request) => dependencies.registry.rename(request.id, request.name),
+      async relocate(request) {
+        await validWorkspace(request.path)
+        return dependencies.registry.relocate(request.id, request.path)
+      },
+      remove: (request) => dependencies.registry.remove(request.id),
+      async openFolder(request) {
+        const state = await dependencies.registry.load()
+        const blog = state.blogs.find((candidate) => candidate.id === request.id)
+        if (!blog) throw new Error("Blog is not registered")
+        await dependencies.openFolder(blog.canonicalPath)
+      },
+      switch: (request) => dependencies.switchTo(request),
+      subscribeProgress(listener) {
+        listeners.add(listener)
+        return () => listeners.delete(listener)
+      },
+    },
+  }
+}

@@ -65,7 +65,7 @@ export const blogCloneRequestSchema = z
   .strict()
 export const blogRenameRequestSchema = z.object({ id: blogIdSchema, name: blogNameSchema }).strict()
 export const blogRelocateRequestSchema = z.object({ id: blogIdSchema, path: blogPathSchema }).strict()
-export const blogSwitchRequestSchema = blogIdRequestSchema
+export const blogSwitchRequestSchema = z.object({ id: blogIdSchema, editorSaved: z.literal(true) }).strict()
 
 export const appErrorSchema = z
   .object({

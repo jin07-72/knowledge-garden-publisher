@@ -75,10 +75,17 @@ export interface PublisherServiceDependencies {
   readonly publishCompletionMessage?: string
 }
 
-export type PublisherRuntimeServices = PublisherIpcServices & { dispose(): Promise<void> }
+export type PublisherRuntimeServices = PublisherIpcServices & {
+  assertSwitchSafe(): Promise<void>
+  dispose(): Promise<void>
+}
 
 function unavailable(name: string): AppError {
   return { code: "SERVICE_UNAVAILABLE", message: `${name} is not available yet.` }
+}
+
+function switchBusy(): AppError {
+  return { code: "BLOG_SWITCH_BUSY", message: "Finish the current publication task before switching blogs." }
 }
 
 /** Wires implemented capabilities; publishing remains unavailable until Task 11. */
@@ -97,6 +104,8 @@ export function createPublisherServices(
   }
   const publisher = dependencies.publisherFactory?.(emitPublish)
   let activePublish: string | undefined
+  let preparingPublish = 0
+  let switchPreparing = false
   const recoveryListeners = new Set<(update: TrashRecoveryUpdate) => void>()
   const reconcileTrash =
     dependencies.reconcileTrash ??
@@ -144,7 +153,17 @@ export function createPublisherServices(
       })
   }
   return {
+    assertSwitchSafe: async () => {
+      if (activePublish || preparingPublish > 0) throw switchBusy()
+      switchPreparing = true
+      try {
+        await changeScanner.cancel()
+      } catch {
+        throw switchBusy()
+      }
+    },
     dispose: async () => {
+      switchPreparing = true
       recoveryDisposed = true
       if (recoveryTimer) clearTimeout(recoveryTimer)
       recoveryAbort?.abort()
@@ -204,11 +223,12 @@ export function createPublisherServices(
       subscribe: (listener) => preview.subscribe(listener),
     },
     changes: {
-      list: () => changeScanner.list(),
+      list: () => switchPreparing ? Promise.reject(switchBusy()) : changeScanner.list(),
       cancel: () => changeScanner.cancel(),
     },
     publish: {
       start: async (request) => {
+        if (switchPreparing) throw switchBusy()
         if (!publisher) return reject("Publishing")
         if (activePublish) {
           throw {
@@ -216,7 +236,14 @@ export function createPublisherServices(
             message: "A publication is already running.",
           } satisfies AppError
         }
-        const review = await changeScanner.list()
+        preparingPublish += 1
+        let review
+        try {
+          review = await changeScanner.list()
+        } finally {
+          preparingPublish -= 1
+        }
+        if (switchPreparing) throw switchBusy()
         const groups = request.changeGroupIds.map((id) =>
           review.groups.find((group) => group.id === id),
         )

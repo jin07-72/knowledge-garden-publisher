@@ -189,7 +189,9 @@ describe("IPC success schemas", () => {
     }).success).toBe(true)
     expect(blogRenameRequestSchema.safeParse({ id, name: "Renamed" }).success).toBe(true)
     expect(blogRelocateRequestSchema.safeParse({ id, path: absolutePath }).success).toBe(true)
-    expect(blogSwitchRequestSchema.safeParse({ id }).success).toBe(true)
+    expect(blogSwitchRequestSchema.safeParse({ id, editorSaved: true }).success).toBe(true)
+    expect(blogSwitchRequestSchema.safeParse({ id }).success).toBe(false)
+    expect(blogSwitchRequestSchema.safeParse({ id, editorSaved: false }).success).toBe(false)
   })
 
   it("fails closed when blog response paths or names are unsafe", () => {

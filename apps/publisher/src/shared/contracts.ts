@@ -92,6 +92,7 @@ export const APP_ERROR_CODES = [
   "PREVIEW_EXITED",
   "PREVIEW_STOP_FAILED",
   ...BLOG_IMPORT_PUBLIC_ERROR_CODES,
+  "BLOG_SWITCH_BUSY",
   "IPC_UNAUTHORIZED",
   "SERVICE_UNAVAILABLE",
   "INTERNAL_ERROR",
@@ -361,7 +362,9 @@ export interface BlogRenameRequest extends BlogIdRequest {
 
 export interface BlogRelocateRequest extends BlogIdRequest, BlogPathRequest {}
 
-export interface BlogSwitchRequest extends BlogIdRequest {}
+export interface BlogSwitchRequest extends BlogIdRequest {
+  readonly editorSaved: true
+}
 
 export type BlogImportPhase = "cloning" | "installing" | "validating" | "complete"
 

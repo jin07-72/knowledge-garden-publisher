@@ -7,6 +7,7 @@ import {
   type PublishProgress,
 } from "../../src/shared/contracts"
 import {
+  registerBlogManagementIpc,
   registerPublisherIpc,
   type IpcEventTarget,
   type IpcMainPort,
@@ -169,6 +170,51 @@ function setup() {
 }
 
 describe("secure publisher IPC", () => {
+  it("can register blog recovery IPC before workspace-bound services exist", async () => {
+    const ipc = new FakeIpcMain()
+    const servicePorts = services()
+    const dispose = registerBlogManagementIpc({
+      ipcMain: ipc,
+      services: servicePorts.blogs!,
+      isTrustedSender: (event) => event === trustedEvent,
+      eventTargets: () => [],
+    })
+
+    expect(ipc.handlers.has(IPC_CHANNELS.requests.blogsList)).toBe(true)
+    expect(ipc.handlers.has(IPC_CHANNELS.requests.notesList)).toBe(false)
+    expect(servicePorts.blogSubscriptions()).toBe(1)
+    await ipc.invoke(IPC_CHANNELS.requests.blogsList, trustedEvent)
+    expect(servicePorts.calls.blogsList).toHaveBeenCalledOnce()
+    dispose()
+    expect(servicePorts.blogSubscriptions()).toBe(0)
+  })
+
+  it("adds workspace IPC later without replacing independently registered blog recovery IPC", () => {
+    const ipc = new FakeIpcMain()
+    const servicePorts = services()
+    const disposeBlogs = registerBlogManagementIpc({
+      ipcMain: ipc,
+      services: servicePorts.blogs!,
+      isTrustedSender: () => true,
+      eventTargets: () => [],
+    })
+    const disposeWorkspace = registerPublisherIpc({
+      ipcMain: ipc,
+      services: servicePorts,
+      isTrustedSender: () => true,
+      eventTargets: () => [],
+      includeBlogManagement: false,
+    })
+
+    expect(ipc.handlers.has(IPC_CHANNELS.requests.blogsList)).toBe(true)
+    expect(ipc.handlers.has(IPC_CHANNELS.requests.notesList)).toBe(true)
+    expect(servicePorts.blogSubscriptions()).toBe(1)
+    disposeWorkspace()
+    expect(ipc.handlers.has(IPC_CHANNELS.requests.blogsList)).toBe(true)
+    disposeBlogs()
+    expect(ipc.handlers.size).toBe(0)
+  })
+
   it("routes validated blog requests and rejects untrusted senders before the service", async () => {
     const { ipc, servicePorts } = setup()
     const id = "11111111-1111-4111-8111-111111111111"
@@ -196,6 +242,33 @@ describe("secure publisher IPC", () => {
       error: { code: "IPC_UNAUTHORIZED" },
     })
     expect(servicePorts.calls.blogsRename).toHaveBeenCalledOnce()
+  })
+
+  it("requires saved-editor confirmation and returns a bounded switch-busy error", async () => {
+    const { ipc, servicePorts } = setup()
+    const id = "11111111-1111-4111-8111-111111111111"
+    await expect(ipc.invoke(IPC_CHANNELS.requests.blogsSwitch, trustedEvent, { id })).resolves.toMatchObject({
+      ok: false,
+      error: { code: "INVALID_INPUT" },
+    })
+    await expect(
+      ipc.invoke(IPC_CHANNELS.requests.blogsSwitch, trustedEvent, { id, editorSaved: false }),
+    ).resolves.toMatchObject({ ok: false, error: { code: "INVALID_INPUT" } })
+    expect(servicePorts.calls.blogsSwitch).not.toHaveBeenCalled()
+
+    servicePorts.calls.blogsSwitch.mockRejectedValueOnce({
+      code: "BLOG_SWITCH_BUSY",
+      message: "secret workspace path",
+    })
+    await expect(
+      ipc.invoke(IPC_CHANNELS.requests.blogsSwitch, trustedEvent, { id, editorSaved: true }),
+    ).resolves.toEqual({
+      ok: false,
+      error: {
+        code: "BLOG_SWITCH_BUSY",
+        message: "Finish the current publication task before switching blogs.",
+      },
+    })
   })
 
   it("fails closed instead of exposing a registry record with a relative display path", async () => {
@@ -494,7 +567,7 @@ describe("secure publisher IPC", () => {
       [IPC_CHANNELS.requests.blogsRelocate, { id, path: destination }, "blogsRelocate"],
       [IPC_CHANNELS.requests.blogsRemove, { id }, "blogsRemove"],
       [IPC_CHANNELS.requests.blogsOpenFolder, { id }, "blogsOpenFolder"],
-      [IPC_CHANNELS.requests.blogsSwitch, { id }, "blogsSwitch"],
+        [IPC_CHANNELS.requests.blogsSwitch, { id, editorSaved: true }, "blogsSwitch"],
     ]
     for (const [channel, request, call] of calls) {
       await expect(ipc.invoke(channel, { sender: { isDestroyed: () => false } }, request)).resolves.toMatchObject({
@@ -812,7 +885,7 @@ describe("preload garden API", () => {
     await api.blogs.relocate({ id: "11111111-1111-4111-8111-111111111111", path: String.raw`C:\\Blogs\\moved` })
     await api.blogs.remove({ id: "11111111-1111-4111-8111-111111111111" })
     await api.blogs.openFolder({ id: "11111111-1111-4111-8111-111111111111" })
-    await api.blogs.switch({ id: "11111111-1111-4111-8111-111111111111" })
+    await api.blogs.switch({ id: "11111111-1111-4111-8111-111111111111", editorSaved: true })
     await api.workspace.inspectSafety()
     await api.workspace.inspect()
     await api.workspace.repair({ action: "install-dependencies" })

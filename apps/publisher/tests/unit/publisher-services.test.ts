@@ -316,6 +316,84 @@ describe("publisher service wiring", () => {
     expect(order).toEqual(["changes", "preview", "ipc"])
   })
 
+  it("rejects switching while a publication is active", async () => {
+    const workspace = await garden()
+    let finishPublish!: () => void
+    const publishing = new Promise<void>((resolve) => {
+      finishPublish = resolve
+    })
+    const services = createPublisherServices({
+      workspace,
+      trash: { trashItem: async () => undefined },
+      isTracked: async () => false,
+      preview: preview(),
+      changeScanner: {
+        list: async () => ({
+          groups: [{
+            id: "note:daily",
+            label: "Daily",
+            kind: "modified",
+            selection: "default",
+            description: "changed",
+            paths: ["content/life/daily.md"],
+            attachments: [],
+          }],
+        }),
+        cancel: vi.fn(async () => undefined),
+      },
+      publisherFactory: () => ({
+        publish: () => publishing,
+        cancel: async () => undefined,
+        dispose: async () => undefined,
+      }),
+    })
+    await services.publish.start({ changeGroupIds: ["note:daily"] })
+
+    await expect(services.assertSwitchSafe()).rejects.toMatchObject({ code: "BLOG_SWITCH_BUSY" })
+    finishPublish()
+    await services.dispose()
+  })
+
+  it("fails closed when an active change scan cannot be safely cancelled", async () => {
+    const workspace = await garden()
+    const cancel = vi.fn(async () => {
+      throw new Error("termination not confirmed")
+    })
+    const services = createPublisherServices({
+      workspace,
+      trash: { trashItem: async () => undefined },
+      isTracked: async () => false,
+      preview: preview(),
+      changeScanner: { list: vi.fn(), cancel },
+    })
+
+    await expect(services.assertSwitchSafe()).rejects.toMatchObject({ code: "BLOG_SWITCH_BUSY" })
+    await expect(services.changes.list()).rejects.toMatchObject({ code: "BLOG_SWITCH_BUSY" })
+  })
+
+  it("closes the runtime gate before cancelling scans so new work cannot race disposal", async () => {
+    const workspace = await garden()
+    let finishCancel!: () => void
+    const cancelPending = new Promise<void>((resolve) => {
+      finishCancel = resolve
+    })
+    const services = createPublisherServices({
+      workspace,
+      trash: { trashItem: async () => undefined },
+      isTracked: async () => false,
+      preview: preview(),
+      changeScanner: { list: vi.fn(), cancel: () => cancelPending },
+    })
+
+    const safe = services.assertSwitchSafe()
+    await expect(services.changes.list()).rejects.toMatchObject({ code: "BLOG_SWITCH_BUSY" })
+    await expect(services.publish.start({ changeGroupIds: ["note:daily"] })).rejects.toMatchObject({
+      code: "BLOG_SWITCH_BUSY",
+    })
+    finishCancel()
+    await expect(safe).resolves.toBeUndefined()
+  })
+
   it("keeps quit cleanup blocked when change-scan disposal is uncertain", async () => {
     const disposePreview = vi.fn(async () => undefined)
     const unregister = vi.fn()

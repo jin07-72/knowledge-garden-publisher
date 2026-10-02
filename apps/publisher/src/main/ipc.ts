@@ -143,6 +143,7 @@ export interface RegisterPublisherIpcOptions {
   readonly isTrustedSender: (event: unknown) => boolean
   readonly eventTargets: () => readonly IpcEventTarget[]
   readonly acknowledgeClose?: (request: CloseAckRequest) => void
+  readonly includeBlogManagement?: boolean
 }
 
 function bestEffortCleanup(actions: readonly (() => void)[]): void {
@@ -277,6 +278,24 @@ function serializeFailure(error: unknown, isBlogImportChannel = false): IpcResul
       const mapped = blogImportFailureMap.get(error.code)
       if (mapped) return { ok: false, error: mapped }
     }
+    try {
+      if (
+        typeof error === "object" &&
+        error !== null &&
+        "code" in error &&
+        error.code === "BLOG_SWITCH_BUSY"
+      ) {
+        return {
+          ok: false,
+          error: {
+            code: "BLOG_SWITCH_BUSY",
+            message: "Finish the current publication task before switching blogs.",
+          },
+        }
+      }
+    } catch {
+      // Hostile getters never cross the privileged boundary.
+    }
     return {
       ok: false,
       error: { code: "INTERNAL_ERROR", message: "The application could not complete the request." },
@@ -339,21 +358,104 @@ function secureHandler<Input, Output>(
   }
 }
 
+type BlogManagementIpcServices = NonNullable<PublisherIpcServices["blogs"]>
+
+function blogRequestHandlers(
+  services: BlogManagementIpcServices,
+  isTrustedSender: (event: unknown) => boolean,
+): ReadonlyArray<readonly [string, RequestHandler]> {
+  return [
+    [IPC_CHANNELS.requests.blogsList, secureHandler(IPC_CHANNELS.requests.blogsList, noRequestSchema, isTrustedSender, () => services.list())],
+    [IPC_CHANNELS.requests.blogsChooseLocal, secureHandler(IPC_CHANNELS.requests.blogsChooseLocal, noRequestSchema, isTrustedSender, () => services.chooseLocal())],
+    [IPC_CHANNELS.requests.blogsAddLocal, secureHandler(IPC_CHANNELS.requests.blogsAddLocal, blogAddLocalRequestSchema, isTrustedSender, (request) => services.addLocal(request))],
+    [IPC_CHANNELS.requests.blogsClone, secureHandler(IPC_CHANNELS.requests.blogsClone, blogCloneRequestSchema, isTrustedSender, (request) => services.clone(request))],
+    [IPC_CHANNELS.requests.blogsCancelImport, secureHandler(IPC_CHANNELS.requests.blogsCancelImport, noRequestSchema, isTrustedSender, () => services.cancelImport())],
+    [IPC_CHANNELS.requests.blogsInstall, secureHandler(IPC_CHANNELS.requests.blogsInstall, blogPathRequestSchema, isTrustedSender, (request) => services.install(request))],
+    [IPC_CHANNELS.requests.blogsRename, secureHandler(IPC_CHANNELS.requests.blogsRename, blogRenameRequestSchema, isTrustedSender, (request) => services.rename(request))],
+    [IPC_CHANNELS.requests.blogsRelocate, secureHandler(IPC_CHANNELS.requests.blogsRelocate, blogRelocateRequestSchema, isTrustedSender, (request) => services.relocate(request))],
+    [IPC_CHANNELS.requests.blogsRemove, secureHandler(IPC_CHANNELS.requests.blogsRemove, blogIdRequestSchema, isTrustedSender, (request) => services.remove(request))],
+    [IPC_CHANNELS.requests.blogsOpenFolder, secureHandler(IPC_CHANNELS.requests.blogsOpenFolder, blogIdRequestSchema, isTrustedSender, (request) => services.openFolder(request))],
+    [IPC_CHANNELS.requests.blogsSwitch, secureHandler(IPC_CHANNELS.requests.blogsSwitch, blogSwitchRequestSchema, isTrustedSender, (request) => services.switch(request))],
+  ]
+}
+
+function unavailableBlogRequestHandlers(
+  isTrustedSender: (event: unknown) => boolean,
+): ReadonlyArray<readonly [string, RequestHandler]> {
+  return [
+    [IPC_CHANNELS.requests.blogsList, secureHandler(IPC_CHANNELS.requests.blogsList, noRequestSchema, isTrustedSender, serviceUnavailable)],
+    [IPC_CHANNELS.requests.blogsChooseLocal, secureHandler(IPC_CHANNELS.requests.blogsChooseLocal, noRequestSchema, isTrustedSender, serviceUnavailable)],
+    [IPC_CHANNELS.requests.blogsAddLocal, secureHandler(IPC_CHANNELS.requests.blogsAddLocal, blogAddLocalRequestSchema, isTrustedSender, serviceUnavailable)],
+    [IPC_CHANNELS.requests.blogsClone, secureHandler(IPC_CHANNELS.requests.blogsClone, blogCloneRequestSchema, isTrustedSender, serviceUnavailable)],
+    [IPC_CHANNELS.requests.blogsCancelImport, secureHandler(IPC_CHANNELS.requests.blogsCancelImport, noRequestSchema, isTrustedSender, serviceUnavailable)],
+    [IPC_CHANNELS.requests.blogsInstall, secureHandler(IPC_CHANNELS.requests.blogsInstall, blogPathRequestSchema, isTrustedSender, serviceUnavailable)],
+    [IPC_CHANNELS.requests.blogsRename, secureHandler(IPC_CHANNELS.requests.blogsRename, blogRenameRequestSchema, isTrustedSender, serviceUnavailable)],
+    [IPC_CHANNELS.requests.blogsRelocate, secureHandler(IPC_CHANNELS.requests.blogsRelocate, blogRelocateRequestSchema, isTrustedSender, serviceUnavailable)],
+    [IPC_CHANNELS.requests.blogsRemove, secureHandler(IPC_CHANNELS.requests.blogsRemove, blogIdRequestSchema, isTrustedSender, serviceUnavailable)],
+    [IPC_CHANNELS.requests.blogsOpenFolder, secureHandler(IPC_CHANNELS.requests.blogsOpenFolder, blogIdRequestSchema, isTrustedSender, serviceUnavailable)],
+    [IPC_CHANNELS.requests.blogsSwitch, secureHandler(IPC_CHANNELS.requests.blogsSwitch, blogSwitchRequestSchema, isTrustedSender, serviceUnavailable)],
+  ]
+}
+
+export function registerBlogManagementIpc(options: {
+  readonly ipcMain: IpcMainPort
+  readonly services: BlogManagementIpcServices
+  readonly isTrustedSender: (event: unknown) => boolean
+  readonly eventTargets: () => readonly IpcEventTarget[]
+}): () => void {
+  const registered: string[] = []
+  let unsubscribe: (() => void) | undefined
+  try {
+    for (const [channel, handler] of blogRequestHandlers(options.services, options.isTrustedSender)) {
+      options.ipcMain.handle(channel, handler)
+      registered.push(channel)
+    }
+    unsubscribe = options.services.subscribeProgress((progress) => {
+      const parsed = blogImportProgressSchema.safeParse(progress)
+      if (!parsed.success) return
+      let targets: readonly IpcEventTarget[]
+      try {
+        targets = options.eventTargets()
+      } catch {
+        return
+      }
+      for (const target of targets) {
+        try {
+          if (!target.isDestroyed()) {
+            target.send(IPC_CHANNELS.events.blogsImportProgress, parsed.data)
+          }
+        } catch {
+          // A closing window cannot block another target.
+        }
+      }
+    })
+  } catch (error) {
+    bestEffortCleanup([
+      ...registered.map((channel) => () => options.ipcMain.removeHandler(channel)),
+      ...(unsubscribe ? [unsubscribe] : []),
+    ])
+    throw error
+  }
+  let active = true
+  return () => {
+    if (!active) return
+    active = false
+    bestEffortCleanup([
+      ...registered.map((channel) => () => options.ipcMain.removeHandler(channel)),
+      ...(unsubscribe ? [unsubscribe] : []),
+    ])
+  }
+}
+
 /** Registers the complete and finite publisher IPC surface and returns an idempotent disposer. */
 export function registerPublisherIpc(options: RegisterPublisherIpcOptions): () => void {
   const { ipcMain, services, isTrustedSender, eventTargets } = options
   const handlers: ReadonlyArray<readonly [string, RequestHandler]> = [
-    [IPC_CHANNELS.requests.blogsList, secureHandler(IPC_CHANNELS.requests.blogsList, noRequestSchema, isTrustedSender, () => services.blogs?.list() ?? serviceUnavailable())],
-    [IPC_CHANNELS.requests.blogsChooseLocal, secureHandler(IPC_CHANNELS.requests.blogsChooseLocal, noRequestSchema, isTrustedSender, () => services.blogs?.chooseLocal() ?? serviceUnavailable())],
-    [IPC_CHANNELS.requests.blogsAddLocal, secureHandler(IPC_CHANNELS.requests.blogsAddLocal, blogAddLocalRequestSchema, isTrustedSender, (request) => services.blogs?.addLocal(request) ?? serviceUnavailable())],
-    [IPC_CHANNELS.requests.blogsClone, secureHandler(IPC_CHANNELS.requests.blogsClone, blogCloneRequestSchema, isTrustedSender, (request) => services.blogs?.clone(request) ?? serviceUnavailable())],
-    [IPC_CHANNELS.requests.blogsCancelImport, secureHandler(IPC_CHANNELS.requests.blogsCancelImport, noRequestSchema, isTrustedSender, () => services.blogs?.cancelImport() ?? serviceUnavailable())],
-    [IPC_CHANNELS.requests.blogsInstall, secureHandler(IPC_CHANNELS.requests.blogsInstall, blogPathRequestSchema, isTrustedSender, (request) => services.blogs?.install(request) ?? serviceUnavailable())],
-    [IPC_CHANNELS.requests.blogsRename, secureHandler(IPC_CHANNELS.requests.blogsRename, blogRenameRequestSchema, isTrustedSender, (request) => services.blogs?.rename(request) ?? serviceUnavailable())],
-    [IPC_CHANNELS.requests.blogsRelocate, secureHandler(IPC_CHANNELS.requests.blogsRelocate, blogRelocateRequestSchema, isTrustedSender, (request) => services.blogs?.relocate(request) ?? serviceUnavailable())],
-    [IPC_CHANNELS.requests.blogsRemove, secureHandler(IPC_CHANNELS.requests.blogsRemove, blogIdRequestSchema, isTrustedSender, (request) => services.blogs?.remove(request) ?? serviceUnavailable())],
-    [IPC_CHANNELS.requests.blogsOpenFolder, secureHandler(IPC_CHANNELS.requests.blogsOpenFolder, blogIdRequestSchema, isTrustedSender, (request) => services.blogs?.openFolder(request) ?? serviceUnavailable())],
-    [IPC_CHANNELS.requests.blogsSwitch, secureHandler(IPC_CHANNELS.requests.blogsSwitch, blogSwitchRequestSchema, isTrustedSender, (request) => services.blogs?.switch(request) ?? serviceUnavailable())],
+    ...(options.includeBlogManagement === false
+      ? []
+      : services.blogs
+        ? blogRequestHandlers(services.blogs, isTrustedSender)
+        : unavailableBlogRequestHandlers(isTrustedSender)),
     [
       IPC_CHANNELS.requests.workspaceInspectSafety,
       secureHandler(
@@ -602,7 +704,7 @@ export function registerPublisherIpc(options: RegisterPublisherIpcOptions): () =
         broadcast(IPC_CHANNELS.events.publishProgress, publishProgressSchema, progress),
       ),
     )
-    if (services.blogs) {
+    if (options.includeBlogManagement !== false && services.blogs) {
       subscriptions.push(
         services.blogs.subscribeProgress((progress) =>
           broadcast(IPC_CHANNELS.events.blogsImportProgress, blogImportProgressSchema, progress),
