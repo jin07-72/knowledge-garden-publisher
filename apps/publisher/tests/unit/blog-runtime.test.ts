@@ -400,6 +400,21 @@ describe("blog management adapter", () => {
     await expect(adapter.prepareForShutdown()).rejects.toMatchObject({
       code: "IMPORT_UNAVAILABLE",
     })
+    const activate = vi.fn(async () => state(second.id))
+    const dispose = vi.fn(async () => undefined)
+    const runtime = createBlogRuntime({
+      registry: { load: async () => state(), activate },
+      inspect: async () => ({ valid: true, canonicalPath: second.canonicalPath, needsInstall: false }),
+      assertIdle: adapter.prepareForShutdown,
+      dispose,
+      relaunch: vi.fn(),
+      quit: vi.fn(),
+    })
+    await expect(runtime.switchTo({ id: second.id, editorSaved: true })).rejects.toMatchObject({
+      code: "IMPORT_UNAVAILABLE",
+    })
+    expect(dispose).not.toHaveBeenCalled()
+    expect(activate).not.toHaveBeenCalled()
     await expect(adapter.services.install({ path: first.canonicalPath })).rejects.toMatchObject({
       code: "IMPORT_UNAVAILABLE",
     })
@@ -416,5 +431,71 @@ describe("blog management adapter", () => {
     await coordinator.beforeQuit({ preventDefault: vi.fn() })
     expect(allowQuit).not.toHaveBeenCalled()
     expect(reportFailure).toHaveBeenCalledWith("保存或关闭准备失败，窗口仍保持打开。")
+  })
+
+  it("latches uncertain termination observed by cancel before the shutdown barrier", async () => {
+    let receivedSignal: AbortSignal | undefined
+    const clone = vi.fn((_request, signal?: AbortSignal) => {
+      receivedSignal = signal
+      return new Promise<never>((_resolve, reject) => {
+        signal?.addEventListener("abort", () => {
+          reject(new BlogImportError("IMPORT_UNAVAILABLE", "secret command details"))
+        }, { once: true })
+      })
+    })
+    const adapter = createBlogManagementAdapter({
+      registry: {
+        load: async () => state(), add: vi.fn(), rename: vi.fn(), activate: vi.fn(),
+        remove: vi.fn(), relocate: vi.fn(),
+      },
+      importer: { clone, install: vi.fn() },
+      inspect: vi.fn(), chooseDirectory: vi.fn(), openFolder: vi.fn(), switchTo: vi.fn(),
+    })
+    const operation = adapter.services.clone({
+      name: "Clone",
+      url: "https://github.com/owner/repo",
+      destination: String.raw`C:\Blogs\cloned`,
+    })
+    await vi.waitFor(() => expect(receivedSignal).toBeDefined())
+
+    await expect(adapter.services.cancelImport()).resolves.toBeUndefined()
+    await expect(operation).rejects.toMatchObject({ code: "IMPORT_UNAVAILABLE" })
+    await expect(adapter.prepareForShutdown()).rejects.toMatchObject({
+      code: "IMPORT_UNAVAILABLE",
+    })
+    await expect(adapter.services.install({ path: first.canonicalPath })).rejects.toMatchObject({
+      code: "IMPORT_UNAVAILABLE",
+      message: "Blog imports are unavailable while the app is closing.",
+    })
+  })
+
+  it("latches an uncertain import rejection that settles before shutdown starts", async () => {
+    let rejectClone!: (error: Error) => void
+    const adapter = createBlogManagementAdapter({
+      registry: {
+        load: async () => state(), add: vi.fn(), rename: vi.fn(), activate: vi.fn(),
+        remove: vi.fn(), relocate: vi.fn(),
+      },
+      importer: {
+        clone: () => new Promise<never>((_resolve, reject) => {
+          rejectClone = reject
+        }),
+        install: vi.fn(),
+      },
+      inspect: vi.fn(), chooseDirectory: vi.fn(), openFolder: vi.fn(), switchTo: vi.fn(),
+    })
+    const operation = adapter.services.clone({
+      name: "Clone",
+      url: "https://github.com/owner/repo",
+      destination: String.raw`C:\Blogs\cloned`,
+    })
+    await vi.waitFor(() => expect(rejectClone).toEqual(expect.any(Function)))
+    rejectClone(new BlogImportError("IMPORT_UNAVAILABLE", "termination uncertain"))
+    await expect(operation).rejects.toMatchObject({ code: "IMPORT_UNAVAILABLE" })
+    await vi.waitFor(async () => {
+      await expect(adapter.prepareForShutdown()).rejects.toMatchObject({
+        code: "IMPORT_UNAVAILABLE",
+      })
+    })
   })
 })

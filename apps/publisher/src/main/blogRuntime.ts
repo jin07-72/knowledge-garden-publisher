@@ -193,7 +193,14 @@ export function createBlogManagementAdapter(dependencies: {
     }
     const controller = new AbortController()
     const result = Promise.resolve().then(() => operation(importer(), controller.signal))
-    const settled = result.then(() => undefined, () => undefined)
+    const settled = result.then(
+      () => undefined,
+      (error: unknown) => {
+        if (error instanceof BlogImportError && error.code === "IMPORT_UNAVAILABLE") {
+          terminationUncertain ??= error
+        }
+      },
+    )
     activeImport = { controller, result, settled }
     void settled.then(() => {
       if (activeImport?.controller === controller) activeImport = undefined
