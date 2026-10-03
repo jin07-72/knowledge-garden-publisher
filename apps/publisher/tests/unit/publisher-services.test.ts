@@ -329,15 +329,17 @@ describe("publisher service wiring", () => {
       preview: preview(),
       changeScanner: {
         list: async () => ({
-          groups: [{
-            id: "note:daily",
-            label: "Daily",
-            kind: "modified",
-            selection: "default",
-            description: "changed",
-            paths: ["content/life/daily.md"],
-            attachments: [],
-          }],
+          groups: [
+            {
+              id: "note:daily",
+              label: "Daily",
+              kind: "modified",
+              selection: "default",
+              description: "changed",
+              paths: ["content/life/daily.md"],
+              attachments: [],
+            },
+          ],
         }),
         cancel: vi.fn(async () => undefined),
       },

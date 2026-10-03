@@ -62,9 +62,7 @@ async function terminateLaunchedChild(child: ChildProcess): Promise<boolean> {
   return waitForChildExit(child)
 }
 
-async function closeApplication(
-  application: ElectronApplication | undefined,
-): Promise<void> {
+async function closeApplication(application: ElectronApplication | undefined): Promise<void> {
   if (!application) return
   const child = application.process()
   const close = application.close()
@@ -187,12 +185,12 @@ test("edits, changes visibility, and publishes only the selected public note", a
     )
 
     application = await launchApplication(stateRoot, {
-        ...process.env,
-        GARDEN_PUBLISHER_E2E: "1",
-        GARDEN_PUBLISHER_E2E_WORKSPACE: repository.root,
-        GARDEN_PUBLISHER_E2E_RUNTIME: runtimeRoot,
-        GARDEN_PUBLISHER_E2E_REGISTRY: join(stateRoot, "blogs.json"),
-        GARDEN_PUBLISHER_E2E_DEPLOYMENT: "success",
+      ...process.env,
+      GARDEN_PUBLISHER_E2E: "1",
+      GARDEN_PUBLISHER_E2E_WORKSPACE: repository.root,
+      GARDEN_PUBLISHER_E2E_RUNTIME: runtimeRoot,
+      GARDEN_PUBLISHER_E2E_REGISTRY: join(stateRoot, "blogs.json"),
+      GARDEN_PUBLISHER_E2E_DEPLOYMENT: "success",
     })
     const page = await application.firstWindow()
     await expect(page.locator('main[data-workspace-diagnostics="ready"]')).toBeVisible()
@@ -398,13 +396,13 @@ test("clones a validated GitHub request from a local E2E bare repository", async
   let application: ElectronApplication | undefined
   try {
     application = await launchApplication(stateRoot, {
-        ...process.env,
-        GARDEN_PUBLISHER_E2E: "1",
-        GARDEN_PUBLISHER_E2E_WORKSPACE: active.root,
-        GARDEN_PUBLISHER_E2E_RUNTIME: runtimeRoot,
-        GARDEN_PUBLISHER_E2E_REGISTRY: join(stateRoot, "blogs.json"),
-        GARDEN_PUBLISHER_E2E_CLONE_SOURCE: cloneSource.remote,
-        GARDEN_PUBLISHER_E2E_VALIDATION_MARKER: validationMarker,
+      ...process.env,
+      GARDEN_PUBLISHER_E2E: "1",
+      GARDEN_PUBLISHER_E2E_WORKSPACE: active.root,
+      GARDEN_PUBLISHER_E2E_RUNTIME: runtimeRoot,
+      GARDEN_PUBLISHER_E2E_REGISTRY: join(stateRoot, "blogs.json"),
+      GARDEN_PUBLISHER_E2E_CLONE_SOURCE: cloneSource.remote,
+      GARDEN_PUBLISHER_E2E_VALIDATION_MARKER: validationMarker,
     })
     const page = await application.firstWindow()
     await expect(page.locator('main[data-workspace-diagnostics="ready"]')).toBeVisible()

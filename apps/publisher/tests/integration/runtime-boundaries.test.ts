@@ -54,7 +54,9 @@ function maskStringsAndComments(source: string): string {
 }
 
 function hasStaticEsmDeclaration(source: string): boolean {
-  return /(?:^|[;}\n])\s*(?:import\s*(?:["']|[\w*$\s{},]+\bfrom\s*["'])|export\s*(?:default\b|(?:const|let|var|function|class|async\s+function)\b|\{|\*))/.test(maskStringsAndComments(source))
+  return /(?:^|[;}\n])\s*(?:import\s*(?:["']|[\w*$\s{},]+\bfrom\s*["'])|export\s*(?:default\b|(?:const|let|var|function|class|async\s+function)\b|\{|\*))/.test(
+    maskStringsAndComments(source),
+  )
 }
 
 describe("production runtime boundaries", () => {
@@ -82,14 +84,16 @@ describe("production runtime boundaries", () => {
       "// export is documentation only\nconst api = { import: false, export: false };",
       'const text = "export default false"; const value = { import: true };',
       "const text = `\nexport default false\n`;",
-    ]) expect(hasStaticEsmDeclaration(source), source).toBe(false)
+    ])
+      expect(hasStaticEsmDeclaration(source), source).toBe(false)
     for (const source of [
       'import { api } from "garden";',
       'import"garden";const api=1;',
-      'const api=1;export{api};',
-      'export default function api() {}',
-      'export async function run() {}',
-    ]) expect(hasStaticEsmDeclaration(source), source).toBe(true)
+      "const api=1;export{api};",
+      "export default function api() {}",
+      "export async function run() {}",
+    ])
+      expect(hasStaticEsmDeclaration(source), source).toBe(true)
   })
 
   it("emits the sandbox preload as a CommonJS script", () => {

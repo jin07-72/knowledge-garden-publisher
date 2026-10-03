@@ -357,26 +357,25 @@ describe("relaunch scheduler", () => {
     expect(relaunch).not.toHaveBeenCalled()
   })
 
-  it.each([
-    undefined,
-    "relative-marker",
-    String.raw`C:\missing-parent\relaunch-requested`,
-  ])("never spawns an unmanaged process for invalid E2E marker %s", (marker) => {
-    const relaunch = vi.fn()
-    const record = vi.fn()
-    const schedule = createRelaunchScheduler({
-      isPackaged: false,
-      e2e: true,
-      marker,
-      relaunch,
-      record,
-    })
+  it.each([undefined, "relative-marker", String.raw`C:\missing-parent\relaunch-requested`])(
+    "never spawns an unmanaged process for invalid E2E marker %s",
+    (marker) => {
+      const relaunch = vi.fn()
+      const record = vi.fn()
+      const schedule = createRelaunchScheduler({
+        isPackaged: false,
+        e2e: true,
+        marker,
+        relaunch,
+        record,
+      })
 
-    schedule()
+      schedule()
 
-    expect(relaunch).not.toHaveBeenCalled()
-    expect(record).not.toHaveBeenCalled()
-  })
+      expect(relaunch).not.toHaveBeenCalled()
+      expect(record).not.toHaveBeenCalled()
+    },
+  )
 })
 
 describe("blog management adapter", () => {

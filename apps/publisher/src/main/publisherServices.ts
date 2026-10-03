@@ -85,7 +85,10 @@ function unavailable(name: string): AppError {
 }
 
 function switchBusy(): AppError {
-  return { code: "BLOG_SWITCH_BUSY", message: "Finish the current publication task before switching blogs." }
+  return {
+    code: "BLOG_SWITCH_BUSY",
+    message: "Finish the current publication task before switching blogs.",
+  }
 }
 
 /** Wires implemented capabilities; publishing remains unavailable until Task 11. */
@@ -223,7 +226,7 @@ export function createPublisherServices(
       subscribe: (listener) => preview.subscribe(listener),
     },
     changes: {
-      list: () => switchPreparing ? Promise.reject(switchBusy()) : changeScanner.list(),
+      list: () => (switchPreparing ? Promise.reject(switchBusy()) : changeScanner.list()),
       cancel: () => changeScanner.cancel(),
     },
     publish: {

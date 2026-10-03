@@ -174,7 +174,10 @@ describe("deployment history", () => {
       stdout: `${"a".repeat(40)}\0${"2026-09-27T10:00:00+08:00"}\0Publish note\0Ada\0`,
       stderr: "",
     }))
-    const service = createDeploymentHistoryService({ workspace: "C:\\garden", runner: createBoundedCommandRunnerForTest(runner) })
+    const service = createDeploymentHistoryService({
+      workspace: "C:\\garden",
+      runner: createBoundedCommandRunnerForTest(runner),
+    })
 
     await expect(service.git({ limit: 2 })).resolves.toEqual([
       {
