@@ -1,5 +1,5 @@
 import { _electron as electron, expect, test } from "@playwright/test"
-import { execFile } from "node:child_process"
+import type { ChildProcess } from "node:child_process"
 import { mkdir, readFile, writeFile } from "node:fs/promises"
 import { dirname, join, resolve } from "node:path"
 import { createQuartzGardenFixture, createTemporaryGitRepository, git } from "../helpers/git"
@@ -12,23 +12,25 @@ import {
 
 const publisherRoot = resolve(import.meta.dirname, "../..")
 type ElectronApplication = Awaited<ReturnType<typeof electron.launch>>
-const launchedPids = new Set<number>()
+const launchedChildren = new Set<ChildProcess>()
 
-function processIsAlive(pid: number): boolean {
-  try {
-    process.kill(pid, 0)
-    return true
-  } catch {
-    return false
-  }
+function childHasExited(child: ChildProcess): boolean {
+  return child.exitCode !== null || child.signalCode !== null
 }
 
-async function waitForProcessExit(pid: number, milliseconds = 5_000): Promise<boolean> {
-  const deadline = Date.now() + milliseconds
-  while (processIsAlive(pid) && Date.now() < deadline) {
-    await new Promise((resolvePromise) => setTimeout(resolvePromise, 50))
-  }
-  return !processIsAlive(pid)
+async function waitForChildExit(child: ChildProcess, milliseconds = 5_000): Promise<boolean> {
+  if (childHasExited(child)) return true
+  return new Promise<boolean>((resolvePromise) => {
+    let timer: ReturnType<typeof setTimeout> | undefined
+    const finish = (exited: boolean): void => {
+      if (timer) clearTimeout(timer)
+      child.off("exit", onExit)
+      resolvePromise(exited)
+    }
+    const onExit = (): void => finish(true)
+    child.once("exit", onExit)
+    timer = setTimeout(() => finish(childHasExited(child)), milliseconds)
+  })
 }
 
 async function bounded<T>(operation: Promise<T>, milliseconds: number): Promise<boolean> {
@@ -48,21 +50,16 @@ async function bounded<T>(operation: Promise<T>, milliseconds: number): Promise<
   }
 }
 
-async function killLaunchedProcessTree(pid: number | undefined): Promise<void> {
-  if (!pid) return
-  if (process.platform !== "win32") {
-    try {
-      process.kill(pid, "SIGKILL")
-    } catch {
-      // The launched app already exited.
-    }
-    return
+async function terminateLaunchedChild(child: ChildProcess): Promise<boolean> {
+  if (childHasExited(child)) return true
+  // Use the original ChildProcess handle rather than a raw PID. This avoids
+  // targeting an unrelated process if Windows has already recycled the PID.
+  try {
+    child.kill("SIGKILL")
+  } catch {
+    // The original child may have exited between the state check and kill.
   }
-  await new Promise<void>((resolvePromise) => {
-    execFile("taskkill.exe", ["/PID", String(pid), "/T", "/F"], { windowsHide: true }, () =>
-      resolvePromise(),
-    )
-  })
+  return waitForChildExit(child)
 }
 
 async function closeApplication(
@@ -71,15 +68,12 @@ async function closeApplication(
   if (!application) return
   const child = application.process()
   const close = application.close()
-  if (!(await bounded(close, 5_000))) await killLaunchedProcessTree(child.pid)
+  if (!(await bounded(close, 5_000))) await terminateLaunchedChild(child)
   await bounded(close, 5_000)
-  if (child.pid && !(await waitForProcessExit(child.pid))) {
-    await killLaunchedProcessTree(child.pid)
-    if (!(await waitForProcessExit(child.pid))) {
-      throw new Error(`Electron process ${child.pid} remained after forced termination.`)
-    }
+  if (!(await waitForChildExit(child)) && !(await terminateLaunchedChild(child))) {
+    throw new Error(`Electron process ${child.pid ?? "unknown"} remained after forced termination.`)
   }
-  if (child.pid) launchedPids.delete(child.pid)
+  launchedChildren.delete(child)
 }
 
 function samePath(left: string, right: string): boolean {
@@ -102,20 +96,18 @@ async function launchApplication(
     cwd: publisherRoot,
     env: launchEnvironment,
   })
-  const pid = application.process().pid
-  if (pid) launchedPids.add(pid)
+  launchedChildren.add(application.process())
   const actualUserData = await application.evaluate(({ app }) => app.getPath("userData"))
   expect(samePath(actualUserData, userData)).toBe(true)
   return application
 }
 
 test.afterAll(async () => {
-  const survivors: number[] = []
-  for (const pid of launchedPids) {
-    if (await waitForProcessExit(pid)) continue
-    survivors.push(pid)
-    await killLaunchedProcessTree(pid)
-    await waitForProcessExit(pid)
+  const survivors: string[] = []
+  for (const child of launchedChildren) {
+    if (await waitForChildExit(child)) continue
+    survivors.push(String(child.pid ?? "unknown"))
+    await terminateLaunchedChild(child)
   }
   if (survivors.length > 0) {
     throw new Error(`Electron test processes remained after cleanup: ${survivors.join(", ")}`)
