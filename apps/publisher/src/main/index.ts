@@ -12,6 +12,7 @@ import {
   createRelaunchScheduler,
   resolveBlogRegistryFile,
   resolveE2eCloneSource,
+  runBlogManagementShutdown,
 } from "./blogRuntime"
 import {
   createPublisherCloseCoordinator,
@@ -51,6 +52,7 @@ let unregisterIpc: (() => void) | undefined
 let unregisterBlogIpc: (() => void) | undefined
 let unregisterLifecycleIpc: (() => void) | undefined
 let prepareBlogManagementShutdown: (() => Promise<void>) | undefined
+let restoreBlogManagementAfterFailedShutdown: (() => void) | undefined
 let previewManager: (PreviewServicePort & { dispose(): Promise<void> }) | undefined
 let publisherServices: PublisherRuntimeServices | undefined
 
@@ -92,28 +94,33 @@ function requestRendererFlush(): Promise<boolean> {
 
 const closeCoordinator = createPublisherCloseCoordinator({
   requestRendererFlush,
-  cleanup: async () => {
-    await prepareBlogManagementShutdown?.()
-    const manager = previewManager
-    const unregister = unregisterIpc
-    if (manager === undefined) {
-      unregister?.()
-      unregisterIpc = undefined
-      unregisterBlogIpc?.()
-      unregisterBlogIpc = undefined
-      unregisterLifecycleIpc?.()
-      unregisterLifecycleIpc = undefined
-      return
-    }
-    await disposePublisherRuntime(unregister, manager, publisherServices)
-    unregisterIpc = undefined
-    previewManager = undefined
-    publisherServices = undefined
-    unregisterBlogIpc?.()
-    unregisterBlogIpc = undefined
-    unregisterLifecycleIpc?.()
-    unregisterLifecycleIpc = undefined
-  },
+  cleanup: () =>
+    runBlogManagementShutdown({
+      prepare: async () => prepareBlogManagementShutdown?.(),
+      cleanup: async (markRestoreUnsafe) => {
+        const manager = previewManager
+        const unregister = unregisterIpc
+        if (manager === undefined) {
+          unregister?.()
+          unregisterIpc = undefined
+          unregisterBlogIpc?.()
+          unregisterBlogIpc = undefined
+          unregisterLifecycleIpc?.()
+          unregisterLifecycleIpc = undefined
+          return
+        }
+        markRestoreUnsafe()
+        await disposePublisherRuntime(unregister, manager, publisherServices)
+        unregisterIpc = undefined
+        previewManager = undefined
+        publisherServices = undefined
+        unregisterBlogIpc?.()
+        unregisterBlogIpc = undefined
+        unregisterLifecycleIpc?.()
+        unregisterLifecycleIpc = undefined
+      },
+      restore: () => restoreBlogManagementAfterFailedShutdown?.(),
+    }),
   allowQuit: () => app.quit(),
   allowClose: () => mainWindow?.close(),
   reportFailure: (message) => {
@@ -300,6 +307,7 @@ app.whenReady().then(async () => {
     switchTo: (request) => blogRuntime.switchTo(request),
   })
   prepareBlogManagementShutdown = blogManagement.prepareForShutdown
+  restoreBlogManagementAfterFailedShutdown = blogManagement.restoreAfterFailedShutdown
   importer = createBlogImportService({
     gitExecutable: "git",
     nodePath: runtimePath,

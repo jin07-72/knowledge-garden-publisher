@@ -7,6 +7,7 @@ import {
   createRelaunchScheduler,
   createBlogManagementAdapter,
   createBlogRuntime,
+  runBlogManagementShutdown,
   resolveBlogRegistryFile,
   resolveE2eCloneSource,
 } from "../../src/main/blogRuntime"
@@ -679,6 +680,169 @@ describe("blog management adapter", () => {
     await expect(operation).rejects.toMatchObject({ code: "CANCELLED" })
     expect(relaunch).toHaveBeenCalledOnce()
     expect(quit).toHaveBeenCalledOnce()
+  })
+
+  it("restores the import gate when shutdown cleanup fails after preparation", async () => {
+    const installed = {
+      valid: true as const,
+      canonicalPath: first.canonicalPath,
+      needsInstall: false,
+    }
+    const install = vi.fn(async () => installed)
+    const adapter = createBlogManagementAdapter({
+      registry: {
+        load: async () => state(),
+        add: vi.fn(),
+        rename: vi.fn(),
+        activate: vi.fn(),
+        remove: vi.fn(),
+        relocate: vi.fn(),
+        recover: vi.fn(),
+      },
+      importer: { clone: vi.fn(), install },
+      inspect: vi.fn(),
+      chooseDirectory: vi.fn(),
+      openFolder: vi.fn(),
+      switchTo: vi.fn(),
+    })
+
+    await expect(
+      runBlogManagementShutdown({
+        prepare: adapter.prepareForShutdown,
+        cleanup: async () => {
+          throw new Error("preview cleanup failed")
+        },
+        restore: adapter.restoreAfterFailedShutdown,
+      }),
+    ).rejects.toThrow("preview cleanup failed")
+
+    await expect(adapter.services.install({ path: first.canonicalPath })).resolves.toEqual(installed)
+  })
+
+  it("keeps imports closed after successful shutdown cleanup", async () => {
+    const install = vi.fn(async () => ({
+      valid: true as const,
+      canonicalPath: first.canonicalPath,
+      needsInstall: false,
+    }))
+    const adapter = createBlogManagementAdapter({
+      registry: {
+        load: async () => state(),
+        add: vi.fn(),
+        rename: vi.fn(),
+        activate: vi.fn(),
+        remove: vi.fn(),
+        relocate: vi.fn(),
+        recover: vi.fn(),
+      },
+      importer: { clone: vi.fn(), install },
+      inspect: vi.fn(),
+      chooseDirectory: vi.fn(),
+      openFolder: vi.fn(),
+      switchTo: vi.fn(),
+    })
+
+    await runBlogManagementShutdown({
+      prepare: adapter.prepareForShutdown,
+      cleanup: async () => undefined,
+      restore: adapter.restoreAfterFailedShutdown,
+    })
+
+    await expect(adapter.services.install({ path: first.canonicalPath })).rejects.toMatchObject({
+      code: "IMPORT_UNAVAILABLE",
+    })
+    expect(install).not.toHaveBeenCalled()
+  })
+
+  it("keeps imports closed when cleanup fails after entering irreversible resource disposal", async () => {
+    const install = vi.fn(async () => ({
+      valid: true as const,
+      canonicalPath: first.canonicalPath,
+      needsInstall: false,
+    }))
+    const adapter = createBlogManagementAdapter({
+      registry: {
+        load: async () => state(),
+        add: vi.fn(),
+        rename: vi.fn(),
+        activate: vi.fn(),
+        remove: vi.fn(),
+        relocate: vi.fn(),
+        recover: vi.fn(),
+      },
+      importer: { clone: vi.fn(), install },
+      inspect: vi.fn(),
+      chooseDirectory: vi.fn(),
+      openFolder: vi.fn(),
+      switchTo: vi.fn(),
+    })
+
+    await expect(
+      runBlogManagementShutdown({
+        prepare: adapter.prepareForShutdown,
+        cleanup: async (markRestoreUnsafe) => {
+          markRestoreUnsafe()
+          throw new Error("preview cleanup failed after publisher disposal")
+        },
+        restore: adapter.restoreAfterFailedShutdown,
+      }),
+    ).rejects.toThrow("preview cleanup failed after publisher disposal")
+
+    await expect(adapter.services.install({ path: first.canonicalPath })).rejects.toMatchObject({
+      code: "IMPORT_UNAVAILABLE",
+    })
+    expect(install).not.toHaveBeenCalled()
+  })
+
+  it("does not clear uncertain import termination when shutdown preparation fails", async () => {
+    let receivedSignal: AbortSignal | undefined
+    const clone = vi.fn((_request, signal?: AbortSignal) => {
+      receivedSignal = signal
+      return new Promise<never>((_resolve, reject) => {
+        signal?.addEventListener(
+          "abort",
+          () => reject(new BlogImportError("IMPORT_UNAVAILABLE", "termination uncertain")),
+          { once: true },
+        )
+      })
+    })
+    const adapter = createBlogManagementAdapter({
+      registry: {
+        load: async () => state(),
+        add: vi.fn(),
+        rename: vi.fn(),
+        activate: vi.fn(),
+        remove: vi.fn(),
+        relocate: vi.fn(),
+        recover: vi.fn(),
+      },
+      importer: { clone, install: vi.fn() },
+      inspect: vi.fn(),
+      chooseDirectory: vi.fn(),
+      openFolder: vi.fn(),
+      switchTo: vi.fn(),
+    })
+    const operation = adapter.services.clone({
+      name: "Clone",
+      url: "https://github.com/owner/repo",
+      destination: String.raw`C:\Blogs\cloned`,
+    })
+    await vi.waitFor(() => expect(receivedSignal).toBeDefined())
+    const cleanup = vi.fn(async () => undefined)
+
+    await expect(
+      runBlogManagementShutdown({
+        prepare: adapter.prepareForShutdown,
+        cleanup,
+        restore: adapter.restoreAfterFailedShutdown,
+      }),
+    ).rejects.toMatchObject({ code: "IMPORT_UNAVAILABLE" })
+    await expect(operation).rejects.toMatchObject({ code: "IMPORT_UNAVAILABLE" })
+    expect(cleanup).not.toHaveBeenCalled()
+    adapter.restoreAfterFailedShutdown()
+    await expect(adapter.services.install({ path: first.canonicalPath })).rejects.toMatchObject({
+      code: "IMPORT_UNAVAILABLE",
+    })
   })
 
   it("fails shutdown closed when active import termination is uncertain", async () => {

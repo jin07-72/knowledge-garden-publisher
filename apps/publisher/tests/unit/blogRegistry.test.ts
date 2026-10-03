@@ -437,6 +437,79 @@ describe("blog registry", () => {
     await expect(registry.load()).resolves.toEqual(recovered)
   })
 
+  it("recovers a missing registry when the legacy workspace is unavailable without inventing a backup", async () => {
+    const directory = await createDirectory("garden-blog-registry-state-")
+    const unavailableLegacy = join(directory, "missing-legacy")
+    const recoveredPath = await createGarden("recovered")
+    const file = join(directory, "blogs.v1.json")
+    const registry = createRegistry(file, unavailableLegacy)
+
+    await expect(registry.load()).rejects.toMatchObject({ code: "ENOENT" })
+
+    const recovered = await registry.recover({ name: "Recovered", path: recoveredPath })
+
+    expect(recovered).toMatchObject({
+      version: 1,
+      activeBlogId: recovered.blogs[0]?.id,
+      blogs: [{ name: "Recovered", path: recoveredPath }],
+    })
+    await expect(registry.load()).resolves.toEqual(recovered)
+    expect((await readdir(directory)).filter((name) => name.endsWith(".bak"))).toEqual([])
+  })
+
+  it("removes a newly published registry when missing-file recovery cannot durably sync it", async () => {
+    const directory = await createDirectory("garden-blog-registry-state-")
+    const unavailableLegacy = join(directory, "missing-legacy")
+    const recoveredPath = await createGarden("recovered")
+    const file = join(directory, "blogs.v1.json")
+    let directorySyncs = 0
+    const fileSystem = {
+      open: async (path: string, flags: "r" | "wx", mode?: number) => {
+        const handle = await openFile(path, flags, mode)
+        if (path !== directory || flags !== "r") return handle
+        directorySyncs += 1
+        return {
+          writeFile: handle.writeFile.bind(handle),
+          sync: async () => {
+            if (directorySyncs === 1) throw new Error("simulated recovery durability failure")
+            await handle.sync()
+          },
+          close: handle.close.bind(handle),
+        }
+      },
+    }
+    const registry = createBlogRegistry({ file, legacyPath: unavailableLegacy, fileSystem })
+
+    await expect(registry.recover({ name: "Recovered", path: recoveredPath })).rejects.toThrow(
+      "simulated recovery durability failure",
+    )
+
+    await expect(readFile(file)).rejects.toMatchObject({ code: "ENOENT" })
+    expect(
+      (await readdir(directory)).filter((name) => name.endsWith(".bak") || name.endsWith(".tmp")),
+    ).toEqual([])
+  })
+
+  it("serializes concurrent missing-file recovery and rejects the loser as healthy", async () => {
+    const directory = await createDirectory("garden-blog-registry-state-")
+    const unavailableLegacy = join(directory, "missing-legacy")
+    const recoveredPath = await createGarden("recovered")
+    const file = join(directory, "blogs.v1.json")
+    const registry = createRegistry(file, unavailableLegacy)
+
+    const results = await Promise.allSettled([
+      registry.recover({ name: "Recovered", path: recoveredPath }),
+      registry.recover({ name: "Recovered twice", path: recoveredPath }),
+    ])
+
+    expect(results.filter((result) => result.status === "fulfilled")).toHaveLength(1)
+    expect(results.filter((result) => result.status === "rejected")).toHaveLength(1)
+    expect(
+      (results.find((result) => result.status === "rejected") as PromiseRejectedResult).reason,
+    ).toMatchObject({ code: "BLOG_REGISTRY_HEALTHY" })
+    expect((await readdir(directory)).filter((name) => name.endsWith(".bak"))).toEqual([])
+  })
+
   it("rejects recovery for a healthy registry without creating a backup", async () => {
     const directory = await createDirectory("garden-blog-registry-state-")
     const legacyPath = await createGarden("legacy")
@@ -508,6 +581,80 @@ describe("blog registry", () => {
     const backups = (await readdir(directory)).filter((name) => name.endsWith(".bak"))
     expect(backups).toHaveLength(1)
     await expect(readFile(join(directory, backups[0]!))).resolves.toEqual(corrupt)
+  })
+
+  it("preserves the primary recovery failure when corrupt-byte rollback durability also fails", async () => {
+    const directory = await createDirectory("garden-blog-registry-state-")
+    const legacyPath = await createGarden("legacy")
+    const recoveredPath = await createGarden("recovered")
+    const file = join(directory, "blogs.v1.json")
+    const corrupt = Buffer.from([0xff, 0x00, 0x7b])
+    await writeFile(file, corrupt)
+    let directorySyncs = 0
+    const fileSystem = {
+      open: async (path: string, flags: "r" | "wx", mode?: number) => {
+        const handle = await openFile(path, flags, mode)
+        if (path !== directory || flags !== "r") return handle
+        directorySyncs += 1
+        return {
+          writeFile: handle.writeFile.bind(handle),
+          sync: async () => {
+            if (directorySyncs === 2) throw new Error("replacement durability failed")
+            if (directorySyncs === 3) throw new Error("rollback durability failed")
+            await handle.sync()
+          },
+          close: handle.close.bind(handle),
+        }
+      },
+    }
+    const registry = createBlogRegistry({ file, legacyPath, fileSystem })
+
+    const failure = await registry
+      .recover({ name: "Recovered", path: recoveredPath })
+      .then(() => undefined, (error: unknown) => error)
+
+    expect(failure).toBeInstanceOf(AggregateError)
+    expect((failure as AggregateError).errors).toEqual([
+      expect.objectContaining({ message: "replacement durability failed" }),
+      expect.objectContaining({ message: "rollback durability failed" }),
+    ])
+    await expect(readFile(file)).resolves.toEqual(corrupt)
+  })
+
+  it("preserves the primary missing-file recovery failure when rollback sync also fails", async () => {
+    const directory = await createDirectory("garden-blog-registry-state-")
+    const unavailableLegacy = join(directory, "missing-legacy")
+    const recoveredPath = await createGarden("recovered")
+    const file = join(directory, "blogs.v1.json")
+    let directorySyncs = 0
+    const fileSystem = {
+      open: async (path: string, flags: "r" | "wx", mode?: number) => {
+        const handle = await openFile(path, flags, mode)
+        if (path !== directory || flags !== "r") return handle
+        directorySyncs += 1
+        return {
+          writeFile: handle.writeFile.bind(handle),
+          sync: async () => {
+            if (directorySyncs === 1) throw new Error("replacement durability failed")
+            if (directorySyncs === 2) throw new Error("rollback durability failed")
+            await handle.sync()
+          },
+          close: handle.close.bind(handle),
+        }
+      },
+    }
+    const registry = createBlogRegistry({ file, legacyPath: unavailableLegacy, fileSystem })
+
+    const failure = await registry
+      .recover({ name: "Recovered", path: recoveredPath })
+      .then(() => undefined, (error: unknown) => error)
+
+    expect(failure).toBeInstanceOf(AggregateError)
+    expect((failure as AggregateError).errors).toEqual([
+      expect.objectContaining({ message: "replacement durability failed" }),
+      expect.objectContaining({ message: "rollback durability failed" }),
+    ])
+    await expect(readFile(file)).rejects.toMatchObject({ code: "ENOENT" })
   })
 
   it("serializes concurrent corrupt-registry recovery so only one replacement succeeds", async () => {

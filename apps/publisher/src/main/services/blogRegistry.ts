@@ -454,6 +454,13 @@ export function createBlogRegistry(options: {
     }
   }
 
+  function rollbackFailure(primary: unknown, rollback: unknown): AggregateError {
+    return new AggregateError(
+      [primary, rollback],
+      "Blog registry recovery failed and rollback durability could not be confirmed",
+    )
+  }
+
   async function migrateLegacy(file: string): Promise<BlogRegistryState> {
     const location = await canonicalize(options.legacyPath)
     const createdAt = timestamp()
@@ -530,46 +537,81 @@ export function createBlogRegistry(options: {
     return blog
   }
 
+  async function recoveredState(input: {
+    readonly name: string
+    readonly path: string
+  }): Promise<BlogRegistryState> {
+    const location = await canonicalize(input.path)
+    const createdAt = timestamp()
+    const id = validIdentifier(uuid())
+    return {
+      version: 1,
+      activeBlogId: id,
+      blogs: [
+        {
+          id,
+          name: validName(input.name),
+          path: location.path,
+          canonicalPath: location.canonicalPath,
+          createdAt,
+          lastOpenedAt: createdAt,
+        },
+      ],
+    }
+  }
+
   return {
     load: () => runExclusive(readState),
 
     async recover(input) {
       return runExclusive(async (file) => {
-        const source = await readFile(file)
+        let source: Buffer | undefined
         try {
-          await readState(file)
+          source = await readFile(file)
         } catch (error) {
-          if (!(error instanceof BlogRegistryInvalidError)) throw error
-          const location = await canonicalize(input.path)
-          const createdAt = timestamp()
-          const id = validIdentifier(uuid())
-          const recovered: BlogRegistryState = {
-            version: 1,
-            activeBlogId: id,
-            blogs: [
-              {
-                id,
-                name: validName(input.name),
-                path: location.path,
-                canonicalPath: location.canonicalPath,
-                createdAt,
-                lastOpenedAt: createdAt,
-              },
-            ],
-          }
-          await preserveCorruptSource(file, source)
-          try {
-            await persist(file, recovered)
-          } catch (persistError) {
-            const current = await readFile(file).catch(() => undefined)
-            if (current === undefined || !Buffer.from(current).equals(Buffer.from(source))) {
-              await persistBytes(file, source)
-            }
-            throw persistError
-          }
-          return recovered
+          if (!isMissingFile(error)) throw error
         }
-        throw new BlogRegistryHealthyError()
+
+        if (source !== undefined) {
+          try {
+            await readState(file)
+          } catch (error) {
+            if (!(error instanceof BlogRegistryInvalidError)) throw error
+            const recovered = await recoveredState(input)
+            await preserveCorruptSource(file, source)
+            try {
+              await persist(file, recovered)
+            } catch (persistError) {
+              try {
+                const current = await readFile(file).catch(() => undefined)
+                if (current === undefined || !Buffer.from(current).equals(source)) {
+                  await persistBytes(file, source)
+                }
+              } catch (rollbackError) {
+                throw rollbackFailure(persistError, rollbackError)
+              }
+              throw persistError
+            }
+            return recovered
+          }
+          throw new BlogRegistryHealthyError()
+        }
+
+        const recovered = await recoveredState(input)
+        try {
+          await persist(file, recovered)
+        } catch (persistError) {
+          try {
+            await unlink(file).catch((error: NodeJS.ErrnoException) => {
+              if (error.code !== "ENOENT") throw error
+            })
+            await syncDirectory(dirname(file), openFile)
+          } catch (rollbackError) {
+            throw rollbackFailure(persistError, rollbackError)
+          }
+          throw persistError
+        }
+        return recovered
       })
     },
 

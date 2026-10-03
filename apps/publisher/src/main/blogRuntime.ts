@@ -232,6 +232,23 @@ export interface BlogManagementAdapter {
   readonly restoreAfterFailedShutdown: () => void
 }
 
+export async function runBlogManagementShutdown(options: {
+  readonly prepare: () => Promise<void>
+  readonly cleanup: (markRestoreUnsafe: () => void) => Promise<void>
+  readonly restore: () => void
+}): Promise<void> {
+  let restoreSafe = true
+  await options.prepare()
+  try {
+    await options.cleanup(() => {
+      restoreSafe = false
+    })
+  } catch (error) {
+    if (restoreSafe) options.restore()
+    throw error
+  }
+}
+
 export function createBlogManagementAdapter(dependencies: {
   readonly registry: BlogRegistry
   readonly importer: BlogImportService | (() => BlogImportService)
