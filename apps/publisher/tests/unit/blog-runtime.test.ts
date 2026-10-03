@@ -357,20 +357,24 @@ describe("relaunch scheduler", () => {
     expect(relaunch).not.toHaveBeenCalled()
   })
 
-  it("fails closed to the real relaunch when the E2E marker is not a valid absolute target", () => {
+  it.each([
+    undefined,
+    "relative-marker",
+    String.raw`C:\missing-parent\relaunch-requested`,
+  ])("never spawns an unmanaged process for invalid E2E marker %s", (marker) => {
     const relaunch = vi.fn()
     const record = vi.fn()
     const schedule = createRelaunchScheduler({
       isPackaged: false,
       e2e: true,
-      marker: "relative-marker",
+      marker,
       relaunch,
       record,
     })
 
     schedule()
 
-    expect(relaunch).toHaveBeenCalledOnce()
+    expect(relaunch).not.toHaveBeenCalled()
     expect(record).not.toHaveBeenCalled()
   })
 })

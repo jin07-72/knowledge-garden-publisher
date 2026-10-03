@@ -87,8 +87,10 @@ export function createE2eMarkerRecorder(
 export function createRelaunchScheduler(
   options: E2eMarkerOptions & { readonly relaunch: () => void },
 ): () => void {
-  const record = createE2eMarkerRecorder({ ...options, value: "relaunch-requested" })
-  return record ?? options.relaunch
+  if (!options.isPackaged && options.e2e) {
+    return createE2eMarkerRecorder({ ...options, value: "relaunch-requested" }) ?? (() => undefined)
+  }
+  return options.relaunch
 }
 
 async function validate(

@@ -1,6 +1,6 @@
 import { _electron as electron, expect, test } from "@playwright/test"
 import { execFile } from "node:child_process"
-import { copyFile, mkdir, readFile, writeFile } from "node:fs/promises"
+import { mkdir, readFile, writeFile } from "node:fs/promises"
 import { dirname, join, resolve } from "node:path"
 import { createQuartzGardenFixture, createTemporaryGitRepository, git } from "../helpers/git"
 import {
@@ -11,6 +11,25 @@ import {
 } from "../helpers/fs"
 
 const publisherRoot = resolve(import.meta.dirname, "../..")
+type ElectronApplication = Awaited<ReturnType<typeof electron.launch>>
+const launchedPids = new Set<number>()
+
+function processIsAlive(pid: number): boolean {
+  try {
+    process.kill(pid, 0)
+    return true
+  } catch {
+    return false
+  }
+}
+
+async function waitForProcessExit(pid: number, milliseconds = 5_000): Promise<boolean> {
+  const deadline = Date.now() + milliseconds
+  while (processIsAlive(pid) && Date.now() < deadline) {
+    await new Promise((resolvePromise) => setTimeout(resolvePromise, 50))
+  }
+  return !processIsAlive(pid)
+}
 
 async function bounded<T>(operation: Promise<T>, milliseconds: number): Promise<boolean> {
   let timer: ReturnType<typeof setTimeout> | undefined
@@ -47,14 +66,61 @@ async function killLaunchedProcessTree(pid: number | undefined): Promise<void> {
 }
 
 async function closeApplication(
-  application: Awaited<ReturnType<typeof electron.launch>> | undefined,
+  application: ElectronApplication | undefined,
 ): Promise<void> {
   if (!application) return
   const child = application.process()
   const close = application.close()
   if (!(await bounded(close, 5_000))) await killLaunchedProcessTree(child.pid)
   await bounded(close, 5_000)
+  if (child.pid && !(await waitForProcessExit(child.pid))) {
+    await killLaunchedProcessTree(child.pid)
+    if (!(await waitForProcessExit(child.pid))) {
+      throw new Error(`Electron process ${child.pid} remained after forced termination.`)
+    }
+  }
+  if (child.pid) launchedPids.delete(child.pid)
 }
+
+function samePath(left: string, right: string): boolean {
+  return process.platform === "win32"
+    ? resolve(left).toLocaleLowerCase("en-US") === resolve(right).toLocaleLowerCase("en-US")
+    : resolve(left) === resolve(right)
+}
+
+async function launchApplication(
+  stateRoot: string,
+  env: Record<string, string | undefined>,
+): Promise<ElectronApplication> {
+  const userData = join(stateRoot, "user-data")
+  await mkdir(userData, { recursive: true })
+  const launchEnvironment = Object.fromEntries(
+    Object.entries(env).filter((entry): entry is [string, string] => entry[1] !== undefined),
+  )
+  const application = await electron.launch({
+    args: [".", `--user-data-dir=${userData}`],
+    cwd: publisherRoot,
+    env: launchEnvironment,
+  })
+  const pid = application.process().pid
+  if (pid) launchedPids.add(pid)
+  const actualUserData = await application.evaluate(({ app }) => app.getPath("userData"))
+  expect(samePath(actualUserData, userData)).toBe(true)
+  return application
+}
+
+test.afterAll(async () => {
+  const survivors: number[] = []
+  for (const pid of launchedPids) {
+    if (await waitForProcessExit(pid)) continue
+    survivors.push(pid)
+    await killLaunchedProcessTree(pid)
+    await waitForProcessExit(pid)
+  }
+  if (survivors.length > 0) {
+    throw new Error(`Electron test processes remained after cleanup: ${survivors.join(", ")}`)
+  }
+})
 
 async function writeGardenFile(root: string, path: string, contents: string): Promise<void> {
   const target = join(root, ...path.split("/"))
@@ -77,7 +143,8 @@ ${body}
 
 test("edits, changes visibility, and publishes only the selected public note", async () => {
   const repository = await createTemporaryGitRepository()
-  let application: Awaited<ReturnType<typeof electron.launch>> | undefined
+  const stateRoot = await createTemporaryDirectory("garden-publisher-e2e-publish-")
+  let application: ElectronApplication | undefined
   try {
     await Promise.all([
       writeGardenFile(repository.root, "content/life/alpha.md", note("Alpha", "original alpha")),
@@ -117,11 +184,7 @@ test("edits, changes visibility, and publishes only the selected public note", a
     await git(repository.root, ["commit", "-m", "Initial garden"])
     await git(repository.root, ["push", "-u", "origin", "main"])
 
-    const runtimeRoot = join(repository.root, ".e2e-runtime")
-    const npmCli = join(runtimeRoot, "node_modules", "npm", "bin", "npm-cli.js")
-    await mkdir(dirname(npmCli), { recursive: true })
-    await copyFile(process.execPath, join(runtimeRoot, "node.exe"))
-    await writeFile(npmCli, "process.exit(0)\n")
+    const runtimeRoot = await createE2eRuntime(stateRoot)
     await writeFile(
       join(repository.root, "node_modules", ".package-lock.json"),
       JSON.stringify({
@@ -131,17 +194,13 @@ test("edits, changes visibility, and publishes only the selected public note", a
       }),
     )
 
-    application = await electron.launch({
-      args: ["."],
-      cwd: publisherRoot,
-      env: {
+    application = await launchApplication(stateRoot, {
         ...process.env,
         GARDEN_PUBLISHER_E2E: "1",
         GARDEN_PUBLISHER_E2E_WORKSPACE: repository.root,
         GARDEN_PUBLISHER_E2E_RUNTIME: runtimeRoot,
-        GARDEN_PUBLISHER_E2E_REGISTRY: join(runtimeRoot, "blogs.json"),
+        GARDEN_PUBLISHER_E2E_REGISTRY: join(stateRoot, "blogs.json"),
         GARDEN_PUBLISHER_E2E_DEPLOYMENT: "success",
-      },
     })
     const page = await application.firstWindow()
     await expect(page.locator('main[data-workspace-diagnostics="ready"]')).toBeVisible()
@@ -221,6 +280,7 @@ test("edits, changes visibility, and publishes only the selected public note", a
     if (!(await bounded(repository.cleanup(), 10_000))) {
       throw new Error("The temporary E2E garden could not be cleaned up within 10 seconds.")
     }
+    await removeTemporaryDirectory(stateRoot)
   }
 })
 
@@ -248,9 +308,9 @@ test("manages independent blogs across safe application restarts", async () => {
     GARDEN_PUBLISHER_E2E_CHOOSE_LOCAL: second.root,
     GARDEN_PUBLISHER_E2E_RELAUNCH_MARKER: relaunchMarker,
   }
-  let application: Awaited<ReturnType<typeof electron.launch>> | undefined
+  let application: ElectronApplication | undefined
   try {
-    application = await electron.launch({ args: ["."], cwd: publisherRoot, env: environment })
+    application = await launchApplication(stateRoot, environment)
     let page = await application.firstWindow()
     await expect(page.locator('main[data-workspace-diagnostics="ready"]')).toBeVisible()
     await expect(page.getByRole("button", { name: "切换博客：Knowledge Garden" })).toBeVisible()
@@ -281,7 +341,7 @@ test("manages independent blogs across safe application restarts", async () => {
       "pending switch save",
     )
 
-    application = await electron.launch({ args: ["."], cwd: publisherRoot, env: environment })
+    application = await launchApplication(stateRoot, environment)
     page = await application.firstWindow()
     await expect(page.locator('main[data-workspace-diagnostics="ready"]')).toBeVisible()
     await expect(page.getByRole("button", { name: "切换博客：Second Garden" })).toBeVisible()
@@ -289,7 +349,7 @@ test("manages independent blogs across safe application restarts", async () => {
     await expect(page.getByRole("button", { name: /First Garden Note，公开/ })).toHaveCount(0)
 
     await closeApplication(application)
-    application = await electron.launch({ args: ["."], cwd: publisherRoot, env: environment })
+    application = await launchApplication(stateRoot, environment)
     page = await application.firstWindow()
     await expect(page.getByRole("button", { name: "切换博客：Second Garden" })).toBeVisible()
 
@@ -343,12 +403,9 @@ test("clones a validated GitHub request from a local E2E bare repository", async
   const destination = join(stateRoot, "Cloned Garden")
   const validationMarker = join(stateRoot, "clone-validated")
   const runtimeRoot = await createE2eRuntime(stateRoot)
-  let application: Awaited<ReturnType<typeof electron.launch>> | undefined
+  let application: ElectronApplication | undefined
   try {
-    application = await electron.launch({
-      args: ["."],
-      cwd: publisherRoot,
-      env: {
+    application = await launchApplication(stateRoot, {
         ...process.env,
         GARDEN_PUBLISHER_E2E: "1",
         GARDEN_PUBLISHER_E2E_WORKSPACE: active.root,
@@ -356,7 +413,6 @@ test("clones a validated GitHub request from a local E2E bare repository", async
         GARDEN_PUBLISHER_E2E_REGISTRY: join(stateRoot, "blogs.json"),
         GARDEN_PUBLISHER_E2E_CLONE_SOURCE: cloneSource.remote,
         GARDEN_PUBLISHER_E2E_VALIDATION_MARKER: validationMarker,
-      },
     })
     const page = await application.firstWindow()
     await expect(page.locator('main[data-workspace-diagnostics="ready"]')).toBeVisible()
@@ -371,7 +427,8 @@ test("clones a validated GitHub request from a local E2E bare repository", async
     await expect
       .poll(async () => exists(join(destination, "node_modules", ".package-lock.json")))
       .toBe(true)
-    await expect.poll(async () => readFile(validationMarker, "utf8")).toContain("validated")
+    await expect.poll(async () => exists(validationMarker)).toBe(true)
+    expect(await readFile(validationMarker, "utf8")).toContain("validated")
     await expect(page.getByRole("article", { name: "Cloned Garden" })).toBeVisible()
     expect(await readFile(join(destination, cloneSource.notePath), "utf8")).toContain(
       "cloned without a network",
@@ -402,9 +459,9 @@ test("recovers a corrupt registry through the local blog chooser", async () => {
     GARDEN_PUBLISHER_E2E_REGISTRY: registry,
     GARDEN_PUBLISHER_E2E_CHOOSE_LOCAL: garden.root,
   }
-  let application: Awaited<ReturnType<typeof electron.launch>> | undefined
+  let application: ElectronApplication | undefined
   try {
-    application = await electron.launch({ args: ["."], cwd: publisherRoot, env: environment })
+    application = await launchApplication(stateRoot, environment)
     let page = await application.firstWindow()
     const recovery = page.getByRole("dialog", { name: "博客恢复" })
     await expect(recovery).toBeVisible()
@@ -416,7 +473,7 @@ test("recovers a corrupt registry through the local blog chooser", async () => {
     await closed
     application = undefined
 
-    application = await electron.launch({ args: ["."], cwd: publisherRoot, env: environment })
+    application = await launchApplication(stateRoot, environment)
     page = await application.firstWindow()
     await expect(page.locator('main[data-workspace-diagnostics="ready"]')).toBeVisible()
     await expect(page.getByRole("button", { name: "切换博客：Recovered Garden" })).toBeVisible()
