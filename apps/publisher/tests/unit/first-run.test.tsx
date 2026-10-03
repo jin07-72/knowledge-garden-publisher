@@ -274,6 +274,43 @@ describe("first-run diagnostics", () => {
     )
   })
 
+  it("allows bundled npm verification to exceed the Git startup deadline on Windows", async () => {
+    vi.useFakeTimers({ toFake: ["setTimeout", "clearTimeout"] })
+    try {
+      const root = await repository()
+      await mkdir(join(root, "node_modules", "example"), { recursive: true })
+      const lock = {
+        lockfileVersion: 3,
+        packages: { "": {}, "node_modules/example": { version: "1.2.3" } },
+      }
+      await writeFile(join(root, "package-lock.json"), JSON.stringify(lock))
+      await writeFile(join(root, "node_modules", ".package-lock.json"), JSON.stringify(lock))
+      await writeFile(
+        join(root, "node_modules", "example", "package.json"),
+        JSON.stringify({ version: "1.2.3" }),
+      )
+      const run = vi.fn(
+        () =>
+          new Promise<{ exitCode: number; stdout: string; stderr: string }>((resolvePromise) => {
+            setTimeout(() => resolvePromise({ exitCode: 0, stdout: "{}", stderr: "" }), 16_000)
+          }),
+      )
+
+      const inspection = inspectWorkspace(root, {
+        checkGit: false,
+        runner: { run },
+        runtime: { nodePath: "bundled-node.exe", npmCliPath: "bundled-npm-cli.js" },
+      })
+      while (run.mock.calls.length === 0)
+        await new Promise<void>((resolvePromise) => setImmediate(resolvePromise))
+      await vi.advanceTimersByTimeAsync(16_000)
+
+      await expect(inspection).resolves.toMatchObject({ ok: true })
+    } finally {
+      vi.useRealTimers()
+    }
+  })
+
   it("gates production renderer operations behind the startup inspection", async () => {
     const inspect = vi.fn(async () => ({ ok: true as const, value: diagnostics }))
     const list = vi.fn()

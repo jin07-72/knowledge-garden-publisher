@@ -281,8 +281,8 @@ describe("publisher main layout", () => {
     await waitFor(() => {
       expect(screen.getByRole("region", { name: "启动检查" })).toBeVisible()
       expect(screen.getByRole("region", { name: "Markdown 编辑器" })).toBeVisible()
+      expect(garden.notes.list).toHaveBeenCalledOnce()
     })
-    expect(garden.notes.list).toHaveBeenCalledOnce()
     expect(screen.getByText("origin/main is temporarily unreachable.")).toBeVisible()
     expect(screen.getByText("The preferred preview port is occupied.")).toBeVisible()
   })

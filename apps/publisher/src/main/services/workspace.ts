@@ -12,6 +12,10 @@ import { type CommandResult, type CommandRunner } from "../lib/commandRunner"
 import { createSystemBoundedCommandRunner, type BoundedCommandRunner } from "./publish"
 
 const startupCommandRunner = createSystemBoundedCommandRunner({ commandDeadlineMs: 15_000 })
+const dependencyCommandDeadlineMs = 45_000
+const dependencyCommandRunner = createSystemBoundedCommandRunner({
+  commandDeadlineMs: dependencyCommandDeadlineMs,
+})
 const repairCommandRunner = createSystemBoundedCommandRunner({ commandDeadlineMs: 10 * 60_000 })
 const startupOutputBytes = 512 * 1024
 const repairOutputBytes = 2 * 1024 * 1024
@@ -609,7 +613,12 @@ export async function inspectWorkspace(
       ? await inspectDependencies(
           root,
           options.runtime,
-          workspaceCommandRunner(options.runner, startupCommandRunner, startupOutputBytes, 15_000),
+          workspaceCommandRunner(
+            options.runner,
+            dependencyCommandRunner,
+            startupOutputBytes,
+            dependencyCommandDeadlineMs,
+          ),
         )
       : []
   issues.push(...dependencyIssues)

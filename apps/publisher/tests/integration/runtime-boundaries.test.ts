@@ -71,7 +71,7 @@ describe("production runtime boundaries", () => {
 
     mainOutput = readFileSync(`${publisherRoot}/out/main/index.js`, "utf8")
     preloadOutput = readFileSync(`${publisherRoot}/out/preload/index.js`, "utf8")
-  })
+  }, 30_000)
 
   it("keeps Electron external in the generated main entry", () => {
     expect(mainOutput).toMatch(/(?:from|require)\s*\(?\s*["']electron["']/)
