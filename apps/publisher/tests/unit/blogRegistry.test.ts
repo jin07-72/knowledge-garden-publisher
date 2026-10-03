@@ -609,9 +609,10 @@ describe("blog registry", () => {
     }
     const registry = createBlogRegistry({ file, legacyPath, fileSystem })
 
-    const failure = await registry
-      .recover({ name: "Recovered", path: recoveredPath })
-      .then(() => undefined, (error: unknown) => error)
+    const failure = await registry.recover({ name: "Recovered", path: recoveredPath }).then(
+      () => undefined,
+      (error: unknown) => error,
+    )
 
     expect(failure).toBeInstanceOf(AggregateError)
     expect((failure as AggregateError).errors).toEqual([
@@ -645,9 +646,10 @@ describe("blog registry", () => {
     }
     const registry = createBlogRegistry({ file, legacyPath: unavailableLegacy, fileSystem })
 
-    const failure = await registry
-      .recover({ name: "Recovered", path: recoveredPath })
-      .then(() => undefined, (error: unknown) => error)
+    const failure = await registry.recover({ name: "Recovered", path: recoveredPath }).then(
+      () => undefined,
+      (error: unknown) => error,
+    )
 
     expect(failure).toBeInstanceOf(AggregateError)
     expect((failure as AggregateError).errors).toEqual([

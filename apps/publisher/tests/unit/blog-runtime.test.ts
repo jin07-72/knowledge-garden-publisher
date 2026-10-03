@@ -716,7 +716,9 @@ describe("blog management adapter", () => {
       }),
     ).rejects.toThrow("preview cleanup failed")
 
-    await expect(adapter.services.install({ path: first.canonicalPath })).resolves.toEqual(installed)
+    await expect(adapter.services.install({ path: first.canonicalPath })).resolves.toEqual(
+      installed,
+    )
   })
 
   it("keeps imports closed after successful shutdown cleanup", async () => {
