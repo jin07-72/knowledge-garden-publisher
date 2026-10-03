@@ -401,11 +401,13 @@ export function createPublisherCloseCoordinator(options: {
         options.reportFailure("保存或关闭准备失败，窗口仍保持打开。")
       }
     })()
-    flight = operation.finally(() => {
-      if (flight === tracked) flight = undefined
+    const tracked = operation.finally(() => {
+      if (flight !== tracked) return
+      flight = undefined
+      if ((closeRequested && !closeAllowed) || (quitRequested && !quitAllowed)) return run()
     })
-    const tracked = flight
-    return flight
+    flight = tracked
+    return tracked
   }
 
   return {

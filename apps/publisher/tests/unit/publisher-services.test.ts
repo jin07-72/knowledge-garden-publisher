@@ -570,6 +570,33 @@ describe("publisher service wiring", () => {
     expect(closeEvent.preventDefault).not.toHaveBeenCalled()
   })
 
+  it("continues with cleanup when app quit arrives as the close flight settles", async () => {
+    const cleanup = vi.fn(async () => undefined)
+    const allowQuit = vi.fn()
+    const quitEvent = { preventDefault: vi.fn() }
+    let quit: Promise<void> | undefined
+    let coordinator!: ReturnType<typeof createPublisherCloseCoordinator>
+    coordinator = createPublisherCloseCoordinator({
+      requestRendererFlush: vi.fn(async () => true),
+      cleanup,
+      allowClose: vi.fn(() => {
+        queueMicrotask(() => {
+          quit = coordinator.beforeQuit(quitEvent)
+        })
+      }),
+      allowQuit,
+      reportFailure: vi.fn(),
+    })
+
+    await coordinator.beforeWindowClose({ preventDefault: vi.fn() })
+    await Promise.resolve()
+    await quit
+
+    expect(quitEvent.preventDefault).toHaveBeenCalledOnce()
+    expect(cleanup).toHaveBeenCalledOnce()
+    expect(allowQuit).toHaveBeenCalledOnce()
+  })
+
   it("requires a fresh renderer flush after close preparation fails", async () => {
     const requestRendererFlush = vi.fn(async () => true)
     const cleanup = vi
