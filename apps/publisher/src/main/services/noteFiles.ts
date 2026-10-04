@@ -17,6 +17,7 @@ import { dirname, isAbsolute, posix, relative, resolve } from "node:path"
 import { stringify } from "yaml"
 import type {
   AppError,
+  DomainSlug,
   NoteDocument,
   NoteTrashReceipt,
   SerializableValue,
@@ -79,7 +80,7 @@ const maximumRecoveryRetentionStateBytes = 256 * 1_024
 const maximumRecoveryManifestBytes = 64 * 1_024
 const maximumRecoveryIntegrityBytes = 128
 
-export type NoteDomain = "technology" | "reading" | "language" | "life"
+export type NoteDomain = DomainSlug
 
 export interface NoteRevision {
   readonly mtimeMs: number

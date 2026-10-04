@@ -16,7 +16,7 @@ import {
 } from "node:fs/promises"
 import { dirname, extname, isAbsolute, posix, relative, resolve } from "node:path"
 import { isScalar, isSeq, parseDocument } from "yaml"
-import type { AppError, TrashAdapter, Visibility } from "../../shared/contracts"
+import type { AppError, DomainSlug, TrashAdapter, Visibility } from "../../shared/contracts"
 import { systemCommandRunner, type CommandRunner } from "../lib/commandRunner"
 import {
   acquireInternalNotePathLease,
@@ -38,7 +38,7 @@ export const MAX_TRANSACTION_RETENTION_SCAN = 256
 export const MAX_TRANSACTION_RETENTION_TRASH_CALLS = 16
 export const MAX_TRANSACTION_MANIFEST_BYTES = 256 * 1024
 
-export type NoteDomain = "technology" | "reading" | "language" | "life"
+export type NoteDomain = DomainSlug
 
 export interface TransactionRevision {
   mtimeMs: number

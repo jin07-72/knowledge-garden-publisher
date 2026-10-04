@@ -10,6 +10,11 @@ import {
   blogRelocateRequestSchema,
   blogRenameRequestSchema,
   blogSwitchRequestSchema,
+  domainCreateSchema,
+  domainRemoveSchema,
+  domainRenameSchema,
+  noteCreateSchema,
+  noteRenameSchema,
   utf8ByteLength,
 } from "../../src/shared/ipcSchemas"
 
@@ -53,6 +58,14 @@ const blog = {
   ...privateField,
 }
 const blogRegistry = { version: 1, activeBlogId: blogId, blogs: [blog], ...privateField }
+const customDomain = {
+  slug: "artificial-intelligence",
+  name: "人工智能",
+  description: "人工智能领域的学习记录。",
+  order: 5,
+  publicNotes: 2,
+  privateNotes: 1,
+}
 
 const validByChannel: Record<string, unknown> = {
   [IPC_CHANNELS.requests.workspaceInspectSafety]: {
@@ -74,6 +87,10 @@ const validByChannel: Record<string, unknown> = {
     message: "Repository dependencies were installed.",
     ...privateField,
   },
+  [IPC_CHANNELS.requests.domainsList]: [customDomain],
+  [IPC_CHANNELS.requests.domainsCreate]: [customDomain],
+  [IPC_CHANNELS.requests.domainsRename]: [customDomain],
+  [IPC_CHANNELS.requests.domainsRemove]: [customDomain],
   [IPC_CHANNELS.requests.notesList]: [note],
   [IPC_CHANNELS.requests.notesRead]: {
     path: "content/life/daily.md",
@@ -177,6 +194,90 @@ const validByChannel: Record<string, unknown> = {
 }
 
 describe("IPC success schemas", () => {
+  it("validates dynamic domain contracts and rejects unsafe requests", () => {
+    expect(IPC_SUCCESS_SCHEMAS[IPC_CHANNELS.requests.domainsList].parse([customDomain])).toEqual([
+      customDomain,
+    ])
+    expect(() => domainCreateSchema.parse({ name: "人工智能", slug: "../outside" })).toThrow()
+    expect(() => domainCreateSchema.parse({ name: "人工智能", slug: "Content" })).toThrow()
+    for (const slug of ["index", "content", "private", "garden-publisher"])
+      expect(() => domainCreateSchema.parse({ name: "人工智能", slug })).toThrow()
+    expect(() => domainCreateSchema.parse({ name: "x".repeat(81), slug: "custom" })).toThrow()
+    expect(() => domainCreateSchema.parse({ name: "人工智能", slug: "custom", extra: true })).toThrow()
+    expect(() => domainRenameSchema.parse({ slug: "artificial-intelligence", name: "" })).toThrow()
+    expect(
+      () => domainRenameSchema.parse({ slug: "artificial-intelligence", name: "重命名", extra: true }),
+    ).toThrow()
+    expect(() => domainRemoveSchema.parse({ slug: "artificial-intelligence", force: true })).toThrow()
+    expect(
+      IPC_SUCCESS_SCHEMAS[IPC_CHANNELS.requests.domainsList].safeParse([
+        { ...customDomain, extra: true },
+      ]).success,
+    ).toBe(false)
+    for (const [field, value] of [
+      ["publicNotes", -1],
+      ["privateNotes", -1],
+      ["publicNotes", 1.5],
+      ["privateNotes", 1.5],
+      ["publicNotes", "2"],
+      ["privateNotes", "1"],
+    ] as const) {
+      expect(
+        IPC_SUCCESS_SCHEMAS[IPC_CHANNELS.requests.domainsList].safeParse([
+          { ...customDomain, [field]: value },
+        ]).success,
+        `${field}=${String(value)}`,
+      ).toBe(false)
+    }
+    expect(
+      IPC_SUCCESS_SCHEMAS[IPC_CHANNELS.requests.domainsList].safeParse([
+        { ...customDomain, order: -1 },
+      ]).success,
+    ).toBe(false)
+  })
+
+  it("preserves strict note request constraints for custom domains", () => {
+    const createRequest = {
+      visibility: "public" as const,
+      domain: "artificial-intelligence",
+      slug: "transformers",
+      title: "Transformers",
+      date: "2026-10-04",
+      description: "A note about transformers.",
+      tags: ["ai"],
+    }
+    expect(noteCreateSchema.parse(createRequest)).toEqual(createRequest)
+    expect(
+      noteRenameSchema.parse({
+        path: "content/artificial-intelligence/transformers.md",
+        newDomain: "artificial-intelligence",
+        newSlug: "attention-models",
+      }),
+    ).toEqual({
+      path: "content/artificial-intelligence/transformers.md",
+      newDomain: "artificial-intelligence",
+      newSlug: "attention-models",
+    })
+    for (const slug of ["../outside", "Content", "bad_slug"])
+      expect(() => noteCreateSchema.parse({ ...createRequest, slug })).toThrow()
+    for (const slug of ["../outside", "Content", "bad_slug"])
+      expect(
+        () =>
+          noteRenameSchema.parse({
+            path: "content/artificial-intelligence/transformers.md",
+            newSlug: slug,
+          }),
+      ).toThrow()
+    for (const path of [
+      "content/../outside/transformers.md",
+      "content/Artificial-Intelligence/transformers.md",
+      "content/artificial-intelligence/Bad_slug.md",
+    ])
+      expect(() => noteRenameSchema.parse({ path, newSlug: "renamed" })).toThrow()
+    for (const date of ["2026-1-4", "2026/10/04", "not-a-date"])
+      expect(() => noteCreateSchema.parse({ ...createRequest, date })).toThrow()
+  })
+
   it("strictly validates safe blog management requests", () => {
     const id = "11111111-1111-4111-8111-111111111111"
     const absolutePath = String.raw`C:\\Blogs\\quartz`

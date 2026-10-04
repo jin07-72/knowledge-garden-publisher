@@ -2,6 +2,8 @@ import { z } from "zod"
 import {
   APP_ERROR_CODES,
   IPC_CHANNELS,
+  KEBAB_SLUG_SOURCE,
+  MANAGED_NOTE_PATH_PATTERN,
   parseGitHubRepositoryUrl,
   type AppError,
   type IpcResult,
@@ -60,6 +62,32 @@ const blogUrlSchema = z
   .refine((value) => utf8ByteLength(value) <= 2_048)
   .refine((value) => parseGitHubRepositoryUrl(value) !== undefined)
 
+const RESERVED_DOMAIN_SLUGS = new Set(["index", "content", "private", "garden-publisher"])
+export const domainSlugSchema = z
+  .string()
+  .min(1)
+  .max(80)
+  .regex(new RegExp(`^${KEBAB_SLUG_SOURCE}$`))
+  .refine((value) => !RESERVED_DOMAIN_SLUGS.has(value))
+export const domainNameSchema = z.string().trim().min(1).max(80)
+export const domainCreateSchema = z
+  .object({ name: domainNameSchema, slug: domainSlugSchema })
+  .strict()
+export const domainRenameSchema = z
+  .object({ slug: domainSlugSchema, name: domainNameSchema })
+  .strict()
+export const domainRemoveSchema = z.object({ slug: domainSlugSchema }).strict()
+export const domainSummarySchema = z
+  .object({
+    slug: domainSlugSchema,
+    name: domainNameSchema,
+    description: z.string().min(1).max(2_000),
+    order: z.number().int().nonnegative(),
+    publicNotes: z.number().int().nonnegative(),
+    privateNotes: z.number().int().nonnegative(),
+  })
+  .strict()
+
 export const blogIdRequestSchema = z.object({ id: blogIdSchema }).strict()
 export const blogPathRequestSchema = z.object({ path: blogPathSchema }).strict()
 export const blogAddLocalRequestSchema = z
@@ -90,6 +118,8 @@ export const appErrorSchema = z
   .transform(({ code, message }): AppError => ({ code, message }) as AppError)
 
 const pathSchema = z.string().min(1).max(512)
+export const managedNotePathSchema = z.string().max(512).regex(MANAGED_NOTE_PATH_PATTERN)
+export const noteSlugSchema = z.string().max(128).regex(new RegExp(`^${KEBAB_SLUG_SOURCE}$`))
 const hashSchema = z.string().regex(/^[a-f0-9]{64}$/)
 const warningSchema = z
   .object({ code: z.string().min(1).max(128), message: z.string().min(1).max(1_000) })
@@ -141,8 +171,8 @@ const workspaceRepairReceiptSchema = z
 const noteSummarySchema = z
   .object({
     path: pathSchema,
-    domain: z.enum(["technology", "reading", "language", "life"]),
-    slug: z.string().min(1).max(128),
+    domain: domainSlugSchema,
+    slug: noteSlugSchema,
     title: z.string().min(1).max(256),
     date: z.string().min(1).max(64),
     description: z.string().min(1).max(2_000),
@@ -151,6 +181,26 @@ const noteSummarySchema = z
     tags: z.array(z.string().min(1).max(128)).min(1).max(100),
   })
   .strip()
+export const noteCreateSchema = z
+  .object({
+    visibility: z.enum(["public", "private"]),
+    domain: domainSlugSchema,
+    slug: noteSlugSchema,
+    title: z.string().trim().min(1).max(256),
+    date: z.string().regex(/^\d{4}-\d{2}-\d{2}$/),
+    description: z.string().trim().min(1).max(2_000),
+    tags: z.array(z.string().trim().min(1).max(128)).min(1).max(100),
+    body: markdownSchema.optional(),
+  })
+  .strict()
+export const noteRenameSchema = z
+  .object({
+    path: managedNotePathSchema,
+    newDomain: domainSlugSchema.optional(),
+    newSlug: noteSlugSchema.optional(),
+  })
+  .strict()
+  .refine((request) => request.newDomain !== undefined || request.newSlug !== undefined)
 const noteDocumentSchema = z
   .object({
     path: pathSchema,
@@ -354,6 +404,10 @@ export const IPC_SUCCESS_SCHEMAS = {
   [IPC_CHANNELS.requests.workspaceInspectSafety]: workspaceInspectionSchema,
   [IPC_CHANNELS.requests.workspaceInspect]: workspaceInspectionSchema,
   [IPC_CHANNELS.requests.workspaceRepair]: workspaceRepairReceiptSchema,
+  [IPC_CHANNELS.requests.domainsList]: z.array(domainSummarySchema).max(1_000),
+  [IPC_CHANNELS.requests.domainsCreate]: z.array(domainSummarySchema).max(1_000),
+  [IPC_CHANNELS.requests.domainsRename]: z.array(domainSummarySchema).max(1_000),
+  [IPC_CHANNELS.requests.domainsRemove]: z.array(domainSummarySchema).max(1_000),
   [IPC_CHANNELS.requests.notesList]: z.array(noteSummarySchema).max(100_000),
   [IPC_CHANNELS.requests.notesRead]: noteDocumentSchema,
   [IPC_CHANNELS.requests.notesSave]: noteWriteReceiptSchema,

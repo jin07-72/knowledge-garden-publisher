@@ -185,9 +185,34 @@ export type WorkspaceInspection =
       readonly issues: readonly WorkspaceIssue[]
     }
 
+export type DomainSlug = string
+
+export interface DomainSummary {
+  readonly slug: DomainSlug
+  readonly name: string
+  readonly description: string
+  readonly order: number
+  readonly publicNotes: number
+  readonly privateNotes: number
+}
+
+export interface DomainCreateRequest {
+  readonly name: string
+  readonly slug: DomainSlug
+}
+
+export interface DomainRenameRequest {
+  readonly slug: DomainSlug
+  readonly name: string
+}
+
+export interface DomainRemoveRequest {
+  readonly slug: DomainSlug
+}
+
 export interface NoteSummary {
   readonly path: string
-  readonly domain: "technology" | "reading" | "language" | "life"
+  readonly domain: DomainSlug
   readonly slug: string
   readonly title: string
   readonly date: string
@@ -200,7 +225,7 @@ export interface NoteSummary {
 export const NOTE_DOMAINS = ["technology", "reading", "language", "life"] as const
 export const KEBAB_SLUG_SOURCE = "[a-z0-9]+(?:-[a-z0-9]+)*"
 export const MANAGED_NOTE_PATH_PATTERN = new RegExp(
-  `^(content|private)/(${NOTE_DOMAINS.join("|")})/(${KEBAB_SLUG_SOURCE})\\.md$`,
+  `^(content|private)/(${KEBAB_SLUG_SOURCE})/(${KEBAB_SLUG_SOURCE})\\.md$`,
 )
 
 export type ChangeKind = "added" | "modified" | "unpublish" | "attachment" | "private" | "config"
@@ -383,6 +408,10 @@ export const IPC_CHANNELS = {
     workspaceInspectSafety: "garden:workspace:inspect-safety",
     workspaceInspect: "garden:workspace:inspect",
     workspaceRepair: "garden:workspace:repair",
+    domainsList: "garden:domains:list",
+    domainsCreate: "garden:domains:create",
+    domainsRename: "garden:domains:rename",
+    domainsRemove: "garden:domains:remove",
     notesList: "garden:notes:list",
     notesRead: "garden:notes:read",
     notesSave: "garden:notes:save",
@@ -476,7 +505,7 @@ export interface CloseAckRequest extends BeforeCloseRequest {
 
 export interface NoteCreateRequest {
   readonly visibility: Visibility
-  readonly domain: NoteSummary["domain"]
+  readonly domain: DomainSlug
   readonly slug: string
   readonly title: string
   readonly date: string
@@ -486,7 +515,7 @@ export interface NoteCreateRequest {
 }
 
 export interface NoteRenameRequest extends NotePathRequest {
-  readonly newDomain?: NoteSummary["domain"]
+  readonly newDomain?: DomainSlug
   readonly newSlug?: string
 }
 
