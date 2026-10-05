@@ -36,6 +36,11 @@ import {
   createDeploymentHistoryService,
   type DeploymentHistoryService,
 } from "./services/deployments"
+import {
+  createDomainCatalog,
+  type DomainCatalog,
+  type DomainCatalogOptions,
+} from "./services/domains"
 
 export interface PreviewServicePort {
   start(request: {
@@ -55,6 +60,7 @@ export interface PublisherServiceDependencies {
   readonly changeScanner?: Pick<ChangeScanner, "list" | "cancel"> &
     Partial<Pick<ChangeScanner, "dispose">>
   readonly deploymentHistory?: DeploymentHistoryService
+  readonly domainCatalogFactory?: (options: DomainCatalogOptions) => DomainCatalog
   readonly openExternal?: (url: string) => Promise<void>
   readonly runtime?: BundledNpmRuntime
   readonly previewPortAvailable?: () => Promise<boolean>
@@ -84,28 +90,91 @@ function unavailable(name: string): AppError {
   return { code: "SERVICE_UNAVAILABLE", message: `${name} is not available yet.` }
 }
 
-function switchBusy(): AppError {
+function switchBusy(restoreSafe = false): AppError & { readonly restoreSafe: boolean } {
   return {
     code: "BLOG_SWITCH_BUSY",
     message: "Finish the current publication task before switching blogs.",
+    restoreSafe,
   }
 }
 
+export function canRestorePublisherRuntime(error: unknown): boolean {
+  return (
+    typeof error === "object" &&
+    error !== null &&
+    "restoreSafe" in error &&
+    error.restoreSafe === true
+  )
+}
+
 /** Wires implemented capabilities; publishing remains unavailable until Task 11. */
-export function createPublisherServices(
+export async function createPublisherServices(
   dependencies: PublisherServiceDependencies,
-): PublisherRuntimeServices {
+): Promise<PublisherRuntimeServices> {
   const { workspace, trash, preview, isTracked } = dependencies
+  const ownsChangeScanner = dependencies.changeScanner === undefined
   const changeScanner = dependencies.changeScanner ?? createChangeScanner({ workspace })
-  const deploymentHistory =
-    dependencies.deploymentHistory ??
-    createDeploymentHistoryService({ workspace, openExternal: dependencies.openExternal })
-  const reject = async <T>(name: string): Promise<T> => Promise.reject(unavailable(name))
-  const publishListeners = new Set<(progress: PublishProgress) => void>()
-  const emitPublish = (progress: PublishProgress): void => {
-    for (const listener of publishListeners) listener(progress)
+  let domains: DomainCatalog | undefined
+  let deploymentHistory: DeploymentHistoryService | undefined
+  let publisher:
+    ReturnType<NonNullable<PublisherServiceDependencies["publisherFactory"]>> | undefined
+
+  let reject!: <T>(name: string) => Promise<T>
+  let publishListeners!: Set<(progress: PublishProgress) => void>
+  let emitPublish!: (progress: PublishProgress) => void
+  const rollbackConstruction = async (primary: unknown): Promise<never> => {
+    const failures: unknown[] = []
+    if (publisher) {
+      try {
+        await publisher.dispose()
+      } catch (error) {
+        failures.push(error)
+      }
+    }
+    if (deploymentHistory && dependencies.deploymentHistory === undefined) {
+      try {
+        await deploymentHistory.dispose()
+      } catch (error) {
+        failures.push(error)
+      }
+    }
+    if (domains) {
+      try {
+        await domains.dispose()
+      } catch (error) {
+        failures.push(error)
+      }
+    }
+    if (ownsChangeScanner) {
+      try {
+        await (changeScanner.dispose?.() ?? changeScanner.cancel())
+      } catch (error) {
+        failures.push(error)
+      }
+    }
+    if (failures.length > 0) {
+      throw new AggregateError([primary, ...failures], "Publisher service construction failed.")
+    }
+    throw primary
   }
-  const publisher = dependencies.publisherFactory?.(emitPublish)
+  try {
+    domains = (dependencies.domainCatalogFactory ?? createDomainCatalog)({ workspace, trash })
+    deploymentHistory =
+      dependencies.deploymentHistory ??
+      createDeploymentHistoryService({ workspace, openExternal: dependencies.openExternal })
+    reject = async <T>(name: string): Promise<T> => Promise.reject(unavailable(name))
+    publishListeners = new Set<(progress: PublishProgress) => void>()
+    emitPublish = (progress: PublishProgress): void => {
+      for (const listener of publishListeners) listener(progress)
+    }
+    publisher = dependencies.publisherFactory?.(emitPublish)
+  } catch (primary) {
+    return rollbackConstruction(primary)
+  }
+  const catalog = domains
+  const history = deploymentHistory
+  if (!catalog || !history)
+    return rollbackConstruction(new Error("Publisher services failed to initialize."))
   let activePublish: string | undefined
   let preparingPublish = 0
   let switchPreparing = false
@@ -157,23 +226,31 @@ export function createPublisherServices(
   }
   return {
     assertSwitchSafe: async () => {
-      if (activePublish || preparingPublish > 0) throw switchBusy()
+      if (activePublish || preparingPublish > 0) throw switchBusy(true)
       switchPreparing = true
       try {
         await changeScanner.cancel()
-      } catch {
-        throw switchBusy()
+        await catalog.assertIdle()
+      } catch (error) {
+        const restoreSafe =
+          typeof error === "object" &&
+          error !== null &&
+          "code" in error &&
+          error.code === "DOMAIN_BUSY"
+        if (restoreSafe) switchPreparing = false
+        throw switchBusy(restoreSafe)
       }
     },
     dispose: async () => {
       switchPreparing = true
+      await catalog.dispose()
       recoveryDisposed = true
       if (recoveryTimer) clearTimeout(recoveryTimer)
       recoveryAbort?.abort()
       await Promise.all([
         recoveryFlight,
         changeScanner.dispose?.() ?? changeScanner.cancel(),
-        deploymentHistory.dispose(),
+        history.dispose(),
         publisher?.dispose(),
       ])
     },
@@ -192,6 +269,7 @@ export function createPublisherServices(
         return repairWorkspace(workspace, request, { runtime: dependencies.runtime })
       },
     },
+    domains: catalog,
     notes: {
       subscribeRecovery: (listener) => {
         recoveryListeners.add(listener)
@@ -305,10 +383,10 @@ export function createPublisherServices(
       },
     },
     history: {
-      git: (request) => deploymentHistory.git(request),
-      deployments: (request) => deploymentHistory.deployments(request),
-      cancel: (request) => deploymentHistory.cancel(request),
-      openLink: ({ url }) => deploymentHistory.openLink(url),
+      git: (request) => history.git(request),
+      deployments: (request) => history.deployments(request),
+      cancel: (request) => history.cancel(request),
+      openLink: ({ url }) => history.openLink(url),
     },
   }
 }
@@ -321,6 +399,86 @@ export async function disposePublisherRuntime(
   await services?.dispose()
   await preview.dispose()
   unregisterIpc?.()
+}
+
+export function createPublisherRuntimeShutdown(options: {
+  readonly services?: {
+    assertSwitchSafe?(): Promise<void>
+    dispose(): Promise<void>
+  }
+  readonly preview?: { dispose(): Promise<void> }
+  readonly unregister?: () => void
+  readonly getServices?: () =>
+    | {
+        assertSwitchSafe?(): Promise<void>
+        dispose(): Promise<void>
+      }
+    | undefined
+  readonly getPreview?: () => { dispose(): Promise<void> } | undefined
+  readonly getUnregister?: () => (() => void) | undefined
+  readonly preflight?: (markRestoreUnsafe: () => void) => Promise<void>
+}): (markRestoreUnsafe?: () => void, skipPreflight?: boolean) => Promise<void> {
+  let servicesDisposed = false
+  let irreversibleStarted = false
+  let previewDisposed = false
+  let ipcUnregistered = false
+  let flight: Promise<void> | undefined
+  const pendingMarks = new Set<() => void>()
+  const getServices = options.getServices ?? (() => options.services)
+  const getPreview = options.getPreview ?? (() => options.preview)
+  const getUnregister = options.getUnregister ?? (() => options.unregister)
+
+  const beginIrreversibleCleanup = (): void => {
+    if (irreversibleStarted) return
+    irreversibleStarted = true
+    const marks = [...pendingMarks]
+    pendingMarks.clear()
+    for (const mark of marks) mark()
+  }
+
+  return (markRestoreUnsafe = () => undefined, skipPreflight = false) => {
+    let marked = false
+    const mark = (): void => {
+      if (marked) return
+      marked = true
+      markRestoreUnsafe()
+    }
+    if (irreversibleStarted) mark()
+    else pendingMarks.add(mark)
+    if (flight) return flight
+
+    const operation = (async () => {
+      try {
+        if (!servicesDisposed) {
+          const services = getServices()
+          if (services) {
+            if (!skipPreflight && !irreversibleStarted) {
+              if (options.preflight) await options.preflight(mark)
+              else await services.assertSwitchSafe?.()
+            }
+            beginIrreversibleCleanup()
+            await services.dispose()
+          }
+          servicesDisposed = true
+        }
+        if (!previewDisposed) {
+          await getPreview()?.dispose()
+          previewDisposed = true
+        }
+        if (!ipcUnregistered) {
+          getUnregister()?.()
+          ipcUnregistered = true
+        }
+      } finally {
+        pendingMarks.clear()
+      }
+    })()
+    const tracked = operation.finally(() => {
+      if (flight === tracked) flight = undefined
+    })
+    flight = tracked
+    return tracked
+  }
 }
 
 export interface PublisherQuitCoordinator {

@@ -4,10 +4,13 @@ import { join } from "node:path"
 import { afterEach, describe, expect, it, vi } from "vitest"
 import {
   createPublisherCloseCoordinator,
+  createPublisherRuntimeShutdown,
   createPublisherQuitCoordinator,
   createPublisherServices,
   disposePublisherRuntime,
 } from "../../src/main/publisherServices"
+import { createBlogRuntime, runBlogManagementShutdown } from "../../src/main/blogRuntime"
+import type { DomainCatalog } from "../../src/main/services/domains"
 import type { PreviewStatus } from "../../src/shared/contracts"
 import { git } from "../helpers/git"
 
@@ -45,11 +48,232 @@ function preview() {
   }
 }
 
+function domainCatalog(overrides: Partial<DomainCatalog> = {}): DomainCatalog {
+  return {
+    list: vi.fn(async () => []),
+    require: vi.fn(async () => {
+      throw new Error("not found")
+    }),
+    create: vi.fn(async () => []),
+    rename: vi.fn(async () => []),
+    remove: vi.fn(async () => []),
+    assertIdle: vi.fn(async () => undefined),
+    dispose: vi.fn(async () => undefined),
+    ...overrides,
+  }
+}
+
 describe("publisher service wiring", () => {
+  it("keeps imports closed across repeated preview cleanup failures after services become irreversible", async () => {
+    const services = {
+      assertSwitchSafe: vi.fn(async () => undefined),
+      dispose: vi.fn(async () => undefined),
+    }
+    const preview = {
+      dispose: vi
+        .fn()
+        .mockRejectedValueOnce(new Error("preview cleanup failed 1"))
+        .mockRejectedValueOnce(new Error("preview cleanup failed 2"))
+        .mockResolvedValueOnce(undefined),
+    }
+    const restore = vi.fn()
+    const shutdown = createPublisherRuntimeShutdown({ services, preview })
+    const coordinator = createPublisherCloseCoordinator({
+      requestRendererFlush: vi.fn(async () => true),
+      cleanup: () =>
+        runBlogManagementShutdown({
+          prepare: async () => undefined,
+          cleanup: (markRestoreUnsafe) => shutdown(markRestoreUnsafe),
+          restore,
+        }),
+      allowClose: vi.fn(),
+      allowQuit: vi.fn(),
+      reportFailure: vi.fn(),
+    })
+
+    await coordinator.beforeQuit({ preventDefault: vi.fn() })
+    await coordinator.beforeQuit({ preventDefault: vi.fn() })
+    await coordinator.beforeQuit({ preventDefault: vi.fn() })
+
+    expect(services.dispose).toHaveBeenCalledOnce()
+    expect(preview.dispose).toHaveBeenCalledTimes(3)
+    expect(restore).not.toHaveBeenCalled()
+  })
+
+  it("coalesces overlapping switch and quit shutdowns and retries remaining cleanup", async () => {
+    let releaseServices!: () => void
+    const servicesPending = new Promise<void>((resolve) => {
+      releaseServices = resolve
+    })
+    const servicesStarted = vi.fn()
+    const services = {
+      assertSwitchSafe: vi.fn(async () => undefined),
+      dispose: vi.fn(async () => {
+        servicesStarted()
+        await servicesPending
+      }),
+    }
+    const preview = {
+      dispose: vi.fn().mockRejectedValueOnce(new Error("preview cleanup failed")),
+    }
+    const shutdown = createPublisherRuntimeShutdown({ services, preview })
+    const markSwitch = vi.fn()
+    const markQuit = vi.fn()
+    const markRetry = vi.fn()
+
+    const switchShutdown = shutdown(markSwitch, true)
+    await vi.waitFor(() => expect(servicesStarted).toHaveBeenCalledOnce())
+    const quitShutdown = shutdown(markQuit)
+    expect(services.dispose).toHaveBeenCalledOnce()
+    expect(markSwitch).toHaveBeenCalledOnce()
+    expect(markQuit).toHaveBeenCalledOnce()
+
+    releaseServices()
+    await expect(Promise.all([switchShutdown, quitShutdown])).rejects.toThrow(
+      "preview cleanup failed",
+    )
+    await expect(shutdown(markRetry)).resolves.toBeUndefined()
+
+    expect(services.dispose).toHaveBeenCalledOnce()
+    expect(preview.dispose).toHaveBeenCalledTimes(2)
+    expect(markRetry).toHaveBeenCalledOnce()
+  })
+
+  it("resumes preview cleanup after service disposal without re-preflighting a disposed catalog", async () => {
+    const assertSwitchSafe = vi.fn(async () => undefined)
+    const catalogDispose = vi.fn(async () => undefined)
+    const services = {
+      assertSwitchSafe,
+      dispose: vi.fn(catalogDispose),
+    }
+    const preview = {
+      dispose: vi
+        .fn()
+        .mockRejectedValueOnce(new Error("preview cleanup failed"))
+        .mockResolvedValueOnce(undefined),
+    }
+    const unregister = vi.fn()
+    const shutdown = createPublisherRuntimeShutdown({
+      services,
+      preview,
+      unregister,
+    })
+    const allowQuit = vi.fn()
+    const coordinator = createPublisherCloseCoordinator({
+      requestRendererFlush: vi.fn(async () => true),
+      cleanup: shutdown,
+      allowClose: vi.fn(),
+      allowQuit,
+      reportFailure: vi.fn(),
+    })
+
+    await coordinator.beforeQuit({ preventDefault: vi.fn() })
+    expect(allowQuit).not.toHaveBeenCalled()
+    await coordinator.beforeQuit({ preventDefault: vi.fn() })
+
+    expect(assertSwitchSafe).toHaveBeenCalledOnce()
+    expect(services.dispose).toHaveBeenCalledOnce()
+    expect(catalogDispose).toHaveBeenCalledOnce()
+    expect(preview.dispose).toHaveBeenCalledTimes(2)
+    expect(unregister).toHaveBeenCalledOnce()
+    expect(allowQuit).toHaveBeenCalledOnce()
+  })
+
+  it("disposes the domain catalog before rejecting when publisher construction fails", async () => {
+    const workspace = await garden()
+    const order: string[] = []
+    const catalog = domainCatalog({
+      dispose: vi.fn(async () => {
+        order.push("domains")
+      }),
+    })
+
+    await expect(
+      createPublisherServices({
+        workspace,
+        trash: { trashItem: async () => undefined },
+        isTracked: async () => false,
+        preview: preview(),
+        domainCatalogFactory: () => catalog,
+        publisherFactory: () => {
+          order.push("publisher")
+          throw new Error("publisher construction failed")
+        },
+      }),
+    ).rejects.toThrow("publisher construction failed")
+
+    expect(catalog.dispose).toHaveBeenCalledOnce()
+    expect(order).toEqual(["publisher", "domains"])
+  })
+
+  it("preserves publisher construction and domain disposal failures in an AggregateError", async () => {
+    const workspace = await garden()
+    const primary = new Error("publisher construction failed")
+    const cleanup = new Error("domain disposal failed")
+    const catalog = domainCatalog({
+      dispose: vi.fn(async () => {
+        throw cleanup
+      }),
+    })
+
+    let failure: unknown
+    try {
+      await createPublisherServices({
+        workspace,
+        trash: { trashItem: async () => undefined },
+        isTracked: async () => false,
+        preview: preview(),
+        domainCatalogFactory: () => catalog,
+        publisherFactory: () => {
+          throw primary
+        },
+      })
+    } catch (error) {
+      failure = error
+    }
+
+    expect(failure).toBeInstanceOf(AggregateError)
+    expect((failure as AggregateError).errors).toEqual([primary, cleanup])
+    expect(catalog.dispose).toHaveBeenCalledOnce()
+  })
+
+  it("creates exactly one workspace-bound domain catalog with the shared trash adapter", async () => {
+    const workspace = await garden()
+    const trash = { trashItem: vi.fn(async () => undefined) }
+    const catalog = domainCatalog()
+    const domainCatalogFactory = vi.fn(() => catalog)
+    const services = await createPublisherServices({
+      workspace,
+      trash,
+      isTracked: async () => false,
+      preview: preview(),
+      domainCatalogFactory,
+    })
+
+    expect(domainCatalogFactory).toHaveBeenCalledExactlyOnceWith({ workspace, trash })
+    await services.domains.list()
+    await services.domains.create({
+      name: "Artificial Intelligence",
+      slug: "artificial-intelligence",
+    })
+    await services.domains.rename({ slug: "artificial-intelligence", name: "AI" })
+    await services.domains.remove({ slug: "artificial-intelligence" })
+    expect(catalog.list).toHaveBeenCalledOnce()
+    expect(catalog.create).toHaveBeenCalledWith({
+      name: "Artificial Intelligence",
+      slug: "artificial-intelligence",
+    })
+    expect(catalog.rename).toHaveBeenCalledWith({
+      slug: "artificial-intelligence",
+      name: "AI",
+    })
+    expect(catalog.remove).toHaveBeenCalledWith({ slug: "artificial-intelligence" })
+  })
+
   it("wires existing note and singleton preview capabilities to the fixed workspace", async () => {
     const workspace = await garden()
     const manager = preview()
-    const services = createPublisherServices({
+    const services = await createPublisherServices({
       workspace,
       trash: { trashItem: async () => undefined },
       isTracked: async () => false,
@@ -74,7 +298,7 @@ describe("publisher service wiring", () => {
     const workspace = await garden()
     const recycled = join(workspace, "recycled-daily.md")
     let staged = ""
-    const services = createPublisherServices({
+    const services = await createPublisherServices({
       workspace,
       trash: {
         trashItem: async (target) => {
@@ -104,7 +328,7 @@ describe("publisher service wiring", () => {
       finishRecovery = () => resolve({ pending: false })
     })
     const reconcileTrash = vi.fn(() => recovery)
-    const services = createPublisherServices({
+    const services = await createPublisherServices({
       workspace,
       trash: { trashItem: async () => undefined },
       isTracked: async () => false,
@@ -126,7 +350,7 @@ describe("publisher service wiring", () => {
       .fn()
       .mockRejectedValueOnce(new Error("temporary recovery failure"))
       .mockResolvedValueOnce({ pending: false })
-    const services = createPublisherServices({
+    const services = await createPublisherServices({
       workspace,
       trash: { trashItem: async () => undefined },
       isTracked: async () => false,
@@ -158,7 +382,7 @@ describe("publisher service wiring", () => {
           )
         }),
     )
-    const services = createPublisherServices({
+    const services = await createPublisherServices({
       workspace,
       trash: { trashItem: async () => undefined },
       isTracked: async () => false,
@@ -174,7 +398,7 @@ describe("publisher service wiring", () => {
 
   it("wires change review and history while keeping publishing explicitly unavailable", async () => {
     const workspace = await garden()
-    const services = createPublisherServices({
+    const services = await createPublisherServices({
       workspace,
       trash: { trashItem: async () => undefined },
       isTracked: async () => false,
@@ -198,7 +422,7 @@ describe("publisher service wiring", () => {
       expect(paths).toEqual(["content/life/daily.md"])
       return { commit: "a".repeat(40), tree: "b".repeat(40), pushed: true as const }
     })
-    const services = createPublisherServices({
+    const services = await createPublisherServices({
       workspace,
       trash: { trashItem: async () => undefined },
       isTracked: async () => false,
@@ -296,7 +520,7 @@ describe("publisher service wiring", () => {
         rejectScan({ code: "CHANGE_SCAN_CANCELLED", message: "cancelled" })
       }),
     }
-    const services = createPublisherServices({
+    const services = await createPublisherServices({
       workspace,
       trash: { trashItem: async () => undefined },
       isTracked: async () => false,
@@ -322,7 +546,7 @@ describe("publisher service wiring", () => {
     const publishing = new Promise<void>((resolve) => {
       finishPublish = resolve
     })
-    const services = createPublisherServices({
+    const services = await createPublisherServices({
       workspace,
       trash: { trashItem: async () => undefined },
       isTracked: async () => false,
@@ -351,7 +575,10 @@ describe("publisher service wiring", () => {
     })
     await services.publish.start({ changeGroupIds: ["note:daily"] })
 
-    await expect(services.assertSwitchSafe()).rejects.toMatchObject({ code: "BLOG_SWITCH_BUSY" })
+    await expect(services.assertSwitchSafe()).rejects.toMatchObject({
+      code: "BLOG_SWITCH_BUSY",
+      restoreSafe: true,
+    })
     finishPublish()
     await services.dispose()
   })
@@ -361,7 +588,7 @@ describe("publisher service wiring", () => {
     const cancel = vi.fn(async () => {
       throw new Error("termination not confirmed")
     })
-    const services = createPublisherServices({
+    const services = await createPublisherServices({
       workspace,
       trash: { trashItem: async () => undefined },
       isTracked: async () => false,
@@ -369,7 +596,10 @@ describe("publisher service wiring", () => {
       changeScanner: { list: vi.fn(), cancel },
     })
 
-    await expect(services.assertSwitchSafe()).rejects.toMatchObject({ code: "BLOG_SWITCH_BUSY" })
+    await expect(services.assertSwitchSafe()).rejects.toMatchObject({
+      code: "BLOG_SWITCH_BUSY",
+      restoreSafe: false,
+    })
     await expect(services.changes.list()).rejects.toMatchObject({ code: "BLOG_SWITCH_BUSY" })
   })
 
@@ -379,12 +609,13 @@ describe("publisher service wiring", () => {
     const cancelPending = new Promise<void>((resolve) => {
       finishCancel = resolve
     })
-    const services = createPublisherServices({
+    const services = await createPublisherServices({
       workspace,
       trash: { trashItem: async () => undefined },
       isTracked: async () => false,
       preview: preview(),
       changeScanner: { list: vi.fn(), cancel: () => cancelPending },
+      domainCatalogFactory: () => domainCatalog(),
     })
 
     const safe = services.assertSwitchSafe()
@@ -394,6 +625,187 @@ describe("publisher service wiring", () => {
     })
     finishCancel()
     await expect(safe).resolves.toBeUndefined()
+  })
+
+  it("waits for the domain idle barrier before a blog switch disposes preview or relaunches", async () => {
+    const workspace = await garden()
+    let releaseDomains!: () => void
+    const domainsIdle = new Promise<void>((resolve) => {
+      releaseDomains = resolve
+    })
+    const catalog = domainCatalog({ assertIdle: vi.fn(() => domainsIdle) })
+    const manager = preview()
+    const services = await createPublisherServices({
+      workspace,
+      trash: { trashItem: async () => undefined },
+      isTracked: async () => false,
+      preview: manager,
+      changeScanner: { list: vi.fn(), cancel: vi.fn(async () => undefined) },
+      domainCatalogFactory: () => catalog,
+    })
+    const relaunch = vi.fn()
+    const activate = vi.fn(async () => ({ version: 1 as const, blogs: [], activeBlogId: "target" }))
+    const runtime = createBlogRuntime({
+      registry: {
+        load: async () => ({
+          version: 1,
+          activeBlogId: "current",
+          blogs: [
+            {
+              id: "target",
+              name: "Target",
+              path: workspace,
+              canonicalPath: workspace,
+              createdAt: "2026-10-05T00:00:00.000Z",
+              lastOpenedAt: "2026-10-05T00:00:00.000Z",
+            },
+          ],
+        }),
+        activate,
+      },
+      inspect: async () => ({ valid: true, canonicalPath: workspace, needsInstall: false }),
+      assertIdle: services.assertSwitchSafe,
+      dispose: () => disposePublisherRuntime(vi.fn(), manager, services),
+      relaunch,
+      quit: vi.fn(),
+    })
+
+    const switching = runtime.switchTo({ id: "target", editorSaved: true })
+    await vi.waitFor(() => expect(catalog.assertIdle).toHaveBeenCalledOnce())
+    expect(manager.dispose).not.toHaveBeenCalled()
+    expect(activate).not.toHaveBeenCalled()
+    expect(relaunch).not.toHaveBeenCalled()
+
+    releaseDomains()
+    await switching
+    expect(manager.dispose).toHaveBeenCalledOnce()
+    expect(activate).toHaveBeenCalledOnce()
+    expect(relaunch).toHaveBeenCalledOnce()
+  })
+
+  it("reopens runtime gates when a busy domain assertion safely blocks switching", async () => {
+    const workspace = await garden()
+    const list = vi.fn(async () => ({ groups: [] }))
+    const services = await createPublisherServices({
+      workspace,
+      trash: { trashItem: async () => undefined },
+      isTracked: async () => false,
+      preview: preview(),
+      changeScanner: { list, cancel: vi.fn(async () => undefined) },
+      domainCatalogFactory: () =>
+        domainCatalog({
+          assertIdle: vi.fn(async () =>
+            Promise.reject(Object.assign(new Error("busy"), { code: "DOMAIN_BUSY" })),
+          ),
+        }),
+    })
+
+    await expect(services.assertSwitchSafe()).rejects.toMatchObject({
+      code: "BLOG_SWITCH_BUSY",
+      restoreSafe: true,
+    })
+    await expect(services.changes.list()).resolves.toEqual({ groups: [] })
+    expect(list).toHaveBeenCalledOnce()
+  })
+
+  it("fails closed when domain idle safety is uncertain", async () => {
+    const workspace = await garden()
+    const services = await createPublisherServices({
+      workspace,
+      trash: { trashItem: async () => undefined },
+      isTracked: async () => false,
+      preview: preview(),
+      changeScanner: { list: vi.fn(), cancel: vi.fn(async () => undefined) },
+      domainCatalogFactory: () =>
+        domainCatalog({
+          assertIdle: vi.fn(async () =>
+            Promise.reject(
+              Object.assign(new Error("uncertain"), { code: "DOMAIN_ROLLBACK_UNCERTAIN" }),
+            ),
+          ),
+        }),
+    })
+
+    await expect(services.assertSwitchSafe()).rejects.toMatchObject({
+      code: "BLOG_SWITCH_BUSY",
+      restoreSafe: false,
+    })
+    await expect(services.changes.list()).rejects.toMatchObject({ code: "BLOG_SWITCH_BUSY" })
+  })
+
+  it("disposes domains before other services, preview, and IPC", async () => {
+    const workspace = await garden()
+    const order: string[] = []
+    let releaseDomains!: () => void
+    const domainDisposal = new Promise<void>((resolve) => {
+      releaseDomains = resolve
+    })
+    const catalog = domainCatalog({
+      dispose: vi.fn(async () => {
+        order.push("domains")
+        await domainDisposal
+      }),
+    })
+    const services = await createPublisherServices({
+      workspace,
+      trash: { trashItem: async () => undefined },
+      isTracked: async () => false,
+      preview: preview(),
+      changeScanner: {
+        list: vi.fn(),
+        cancel: vi.fn(async () => undefined),
+        dispose: vi.fn(async () => {
+          order.push("changes")
+        }),
+      },
+      domainCatalogFactory: () => catalog,
+    })
+    const manager = {
+      dispose: vi.fn(async () => {
+        order.push("preview")
+      }),
+    }
+    const unregister = vi.fn(() => order.push("ipc"))
+
+    const disposal = disposePublisherRuntime(unregister, manager, services)
+    await vi.waitFor(() => expect(catalog.dispose).toHaveBeenCalledOnce())
+    expect(order).toEqual(["domains"])
+    expect(manager.dispose).not.toHaveBeenCalled()
+    expect(unregister).not.toHaveBeenCalled()
+
+    releaseDomains()
+    await disposal
+    expect(order).toEqual(["domains", "changes", "preview", "ipc"])
+  })
+
+  it("keeps preview and IPC alive and leaves runtime fail-closed after domain disposal fails", async () => {
+    const workspace = await garden()
+    const manager = preview()
+    const unregister = vi.fn()
+    const changeDispose = vi.fn(async () => undefined)
+    const services = await createPublisherServices({
+      workspace,
+      trash: { trashItem: async () => undefined },
+      isTracked: async () => false,
+      preview: manager,
+      changeScanner: { list: vi.fn(), cancel: vi.fn(), dispose: changeDispose },
+      domainCatalogFactory: () =>
+        domainCatalog({
+          dispose: vi.fn(async () => {
+            throw Object.assign(new Error("rollback uncertain"), {
+              code: "DOMAIN_ROLLBACK_UNCERTAIN",
+            })
+          }),
+        }),
+    })
+
+    await expect(disposePublisherRuntime(unregister, manager, services)).rejects.toThrow(
+      "rollback uncertain",
+    )
+    expect(changeDispose).not.toHaveBeenCalled()
+    expect(manager.dispose).not.toHaveBeenCalled()
+    expect(unregister).not.toHaveBeenCalled()
+    await expect(services.changes.list()).rejects.toMatchObject({ code: "BLOG_SWITCH_BUSY" })
   })
 
   it("keeps quit cleanup blocked when change-scan disposal is uncertain", async () => {

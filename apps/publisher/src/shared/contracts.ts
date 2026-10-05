@@ -607,6 +607,12 @@ export interface GardenApi {
     inspect(): Promise<IpcResult<WorkspaceInspection>>
     repair(request: WorkspaceRepairRequest): Promise<IpcResult<WorkspaceRepairReceipt>>
   }
+  readonly domains: {
+    list(): Promise<IpcResult<readonly DomainSummary[]>>
+    create(request: DomainCreateRequest): Promise<IpcResult<readonly DomainSummary[]>>
+    rename(request: DomainRenameRequest): Promise<IpcResult<readonly DomainSummary[]>>
+    remove(request: DomainRemoveRequest): Promise<IpcResult<readonly DomainSummary[]>>
+  }
   readonly notes: {
     onRecovery(listener: (update: TrashRecoveryUpdate) => void): Unsubscribe
     list(): Promise<IpcResult<readonly NoteSummary[]>>

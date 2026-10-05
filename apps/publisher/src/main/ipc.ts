@@ -19,6 +19,10 @@ import {
   type ChangeReview,
   type CloseAckRequest,
   type DeploymentHistory,
+  type DomainCreateRequest,
+  type DomainRemoveRequest,
+  type DomainRenameRequest,
+  type DomainSummary,
   type GitCommit,
   type HistoryCancelRequest,
   type HistoryRequest,
@@ -60,6 +64,9 @@ import {
   blogRelocateRequestSchema,
   blogRenameRequestSchema,
   blogSwitchRequestSchema,
+  domainCreateSchema,
+  domainRemoveSchema,
+  domainRenameSchema,
   markdownSchema,
   previewProgressSchema,
   publishProgressSchema,
@@ -85,6 +92,12 @@ export interface PublisherIpcServices {
     inspectSafety(): Promise<WorkspaceInspection>
     inspect(): Promise<WorkspaceInspection>
     repair(request: WorkspaceRepairRequest): Promise<WorkspaceRepairReceipt>
+  }
+  readonly domains: {
+    list(): Promise<readonly DomainSummary[]>
+    create(request: DomainCreateRequest): Promise<readonly DomainSummary[]>
+    rename(request: DomainRenameRequest): Promise<readonly DomainSummary[]>
+    remove(request: DomainRemoveRequest): Promise<readonly DomainSummary[]>
   }
   readonly notes: {
     subscribeRecovery(listener: (update: TrashRecoveryUpdate) => void): () => void
@@ -709,6 +722,39 @@ export function registerPublisherIpc(options: RegisterPublisherIpcOptions): () =
         workspaceRepairSchema,
         isTrustedSender,
         (request) => services.workspace.repair(request),
+      ),
+    ],
+    [
+      IPC_CHANNELS.requests.domainsList,
+      secureHandler(IPC_CHANNELS.requests.domainsList, noRequestSchema, isTrustedSender, () =>
+        services.domains.list(),
+      ),
+    ],
+    [
+      IPC_CHANNELS.requests.domainsCreate,
+      secureHandler(
+        IPC_CHANNELS.requests.domainsCreate,
+        domainCreateSchema,
+        isTrustedSender,
+        (request) => services.domains.create(request),
+      ),
+    ],
+    [
+      IPC_CHANNELS.requests.domainsRename,
+      secureHandler(
+        IPC_CHANNELS.requests.domainsRename,
+        domainRenameSchema,
+        isTrustedSender,
+        (request) => services.domains.rename(request),
+      ),
+    ],
+    [
+      IPC_CHANNELS.requests.domainsRemove,
+      secureHandler(
+        IPC_CHANNELS.requests.domainsRemove,
+        domainRemoveSchema,
+        isTrustedSender,
+        (request) => services.domains.remove(request),
       ),
     ],
     [

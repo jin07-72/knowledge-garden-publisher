@@ -13,11 +13,15 @@ import {
   type BlogRelocateRequest,
   type BlogRenameRequest,
   type BlogSwitchRequest,
-  type GardenApi,
+  type GardenApi as BaseGardenApi,
   type ChangeReview,
   type BeforeCloseRequest,
   type CloseAckRequest,
   type DeploymentHistory,
+  type DomainCreateRequest,
+  type DomainRemoveRequest,
+  type DomainRenameRequest,
+  type DomainSummary,
   type GitCommit,
   type HistoryCancelRequest,
   type HistoryRequest,
@@ -59,6 +63,8 @@ import {
   trashRecoveryUpdateSchema,
 } from "../shared/ipcSchemas"
 import { z } from "zod"
+
+export type GardenApi = BaseGardenApi
 
 declare global {
   interface Window {
@@ -169,6 +175,15 @@ export function createGardenApi(ipc: IpcRendererPort): GardenApi {
     repair: (request: WorkspaceRepairRequest) =>
       invoke<WorkspaceRepairReceipt>(ipc, IPC_CHANNELS.requests.workspaceRepair, request),
   })
+  const domains = Object.freeze({
+    list: () => invoke<readonly DomainSummary[]>(ipc, IPC_CHANNELS.requests.domainsList),
+    create: (request: DomainCreateRequest) =>
+      invoke<readonly DomainSummary[]>(ipc, IPC_CHANNELS.requests.domainsCreate, request),
+    rename: (request: DomainRenameRequest) =>
+      invoke<readonly DomainSummary[]>(ipc, IPC_CHANNELS.requests.domainsRename, request),
+    remove: (request: DomainRemoveRequest) =>
+      invoke<readonly DomainSummary[]>(ipc, IPC_CHANNELS.requests.domainsRemove, request),
+  })
   const notes = Object.freeze({
     onRecovery: (listener: (update: TrashRecoveryUpdate) => void) =>
       subscription(ipc, IPC_CHANNELS.events.notesRecovery, trashRecoveryUpdateSchema, listener),
@@ -224,5 +239,15 @@ export function createGardenApi(ipc: IpcRendererPort): GardenApi {
     openLink: (request: HistoryLinkRequest) =>
       invoke<void>(ipc, IPC_CHANNELS.requests.historyOpenLink, request),
   })
-  return Object.freeze({ blogs, lifecycle, workspace, notes, preview, changes, publish, history })
+  return Object.freeze({
+    blogs,
+    lifecycle,
+    workspace,
+    domains,
+    notes,
+    preview,
+    changes,
+    publish,
+    history,
+  })
 }

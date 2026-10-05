@@ -84,6 +84,12 @@ function gardenApi(): GardenApi {
       inspect: vi.fn(async () => ok(inspection)),
       repair: vi.fn(),
     },
+    domains: {
+      list: vi.fn(async () => ok([])),
+      create: vi.fn(async () => ok([])),
+      rename: vi.fn(async () => ok([])),
+      remove: vi.fn(async () => ok([])),
+    },
     notes: {
       onRecovery: vi.fn(() => () => undefined),
       list: vi.fn(async () => ok([])),

@@ -16,6 +16,7 @@ import {
 } from "../../src/main/ipc"
 import { BlogImportError, type BlogImportErrorCode } from "../../src/main/services/blogImport"
 import { createGardenApi, type IpcRendererPort } from "../../src/preload/gardenApi"
+import type { GardenApi as SharedGardenApi } from "../../src/shared/contracts"
 
 type Handler = (event: unknown, request?: unknown) => Promise<unknown>
 
@@ -68,6 +69,12 @@ function services(): PublisherIpcServices & {
       inspectSafety: call("workspaceInspectSafety"),
       inspect: call("workspaceInspect"),
       repair: call("workspaceRepair"),
+    },
+    domains: {
+      list: call("domainsList"),
+      create: call("domainsCreate"),
+      rename: call("domainsRename"),
+      remove: call("domainsRemove"),
     },
     notes: {
       subscribeRecovery(listener) {
@@ -616,10 +623,110 @@ describe("secure publisher IPC", () => {
     expect(ipc.handlers.size).toBe(0)
   })
 
+  it("routes the exact domain request pairs and validates every successful result", async () => {
+    const { ipc, servicePorts } = setup()
+    const domains = [
+      {
+        slug: "artificial-intelligence",
+        name: "Artificial Intelligence",
+        description: "Notes about artificial intelligence.",
+        order: 4,
+        publicNotes: 2,
+        privateNotes: 1,
+      },
+    ]
+    const pairs = [
+      [IPC_CHANNELS.requests.domainsList, undefined, "domainsList"],
+      [
+        IPC_CHANNELS.requests.domainsCreate,
+        { name: "Artificial Intelligence", slug: "artificial-intelligence" },
+        "domainsCreate",
+      ],
+      [
+        IPC_CHANNELS.requests.domainsRename,
+        { slug: "artificial-intelligence", name: "AI" },
+        "domainsRename",
+      ],
+      [IPC_CHANNELS.requests.domainsRemove, { slug: "artificial-intelligence" }, "domainsRemove"],
+    ] as const
+
+    for (const [channel, request, call] of pairs) {
+      servicePorts.calls[call].mockResolvedValueOnce(domains)
+      await expect(ipc.invoke(channel, trustedEvent, request)).resolves.toEqual({
+        ok: true,
+        value: domains,
+      })
+      expect(servicePorts.calls[call]).toHaveBeenCalledWith(
+        ...(request === undefined ? [] : [request]),
+      )
+    }
+
+    servicePorts.calls.domainsList.mockResolvedValueOnce([{ ...domains[0], publicNotes: -1 }])
+    await expect(ipc.invoke(IPC_CHANNELS.requests.domainsList, trustedEvent)).resolves.toEqual({
+      ok: false,
+      error: { code: "INTERNAL_ERROR", message: "The application could not complete the request." },
+    })
+  })
+
+  it("rejects strict invalid and untrusted domain requests before service dispatch", async () => {
+    const { ipc, servicePorts } = setup()
+    const cases = [
+      [IPC_CHANNELS.requests.domainsList, {}, "domainsList"],
+      [
+        IPC_CHANNELS.requests.domainsCreate,
+        { name: "Artificial Intelligence", slug: "AI", extra: true },
+        "domainsCreate",
+      ],
+      [IPC_CHANNELS.requests.domainsRename, { slug: "life", name: "   " }, "domainsRename"],
+      [IPC_CHANNELS.requests.domainsRemove, { slug: "../life" }, "domainsRemove"],
+    ] as const
+
+    for (const [channel, request, call] of cases) {
+      await expect(ipc.invoke(channel, trustedEvent, request)).resolves.toMatchObject({
+        ok: false,
+        error: { code: "INVALID_INPUT" },
+      })
+      await expect(
+        ipc.invoke(channel, { sender: { isDestroyed: () => false } }, request),
+      ).resolves.toMatchObject({ ok: false, error: { code: "IPC_UNAUTHORIZED" } })
+      expect(servicePorts.calls[call]).not.toHaveBeenCalled()
+    }
+  })
+
+  it("rolls back every earlier domain handler when registration finds a duplicate", () => {
+    const ipc = new FakeIpcMain()
+    const servicePorts = services()
+    const occupied = vi.fn(async () => undefined)
+    ipc.handle(IPC_CHANNELS.requests.domainsRename, occupied)
+
+    expect(() =>
+      registerPublisherIpc({
+        ipcMain: ipc,
+        services: servicePorts,
+        isTrustedSender: () => true,
+        eventTargets: () => [],
+        includeBlogManagement: false,
+      }),
+    ).toThrow(`duplicate handler: ${IPC_CHANNELS.requests.domainsRename}`)
+    expect([...ipc.handlers.entries()]).toEqual([[IPC_CHANNELS.requests.domainsRename, occupied]])
+  })
+
   it("validates every request before a service sees it", async () => {
     const { ipc, servicePorts } = setup()
     const invalidRequests: Array<[string, unknown, string]> = [
       [IPC_CHANNELS.requests.workspaceInspect, { workspace: "C:/elsewhere" }, "workspaceInspect"],
+      [IPC_CHANNELS.requests.domainsList, {}, "domainsList"],
+      [
+        IPC_CHANNELS.requests.domainsCreate,
+        { name: "New domain", slug: "New-Domain" },
+        "domainsCreate",
+      ],
+      [
+        IPC_CHANNELS.requests.domainsRename,
+        { slug: "life", name: "Life", extra: true },
+        "domainsRename",
+      ],
+      [IPC_CHANNELS.requests.domainsRemove, { slug: "private" }, "domainsRemove"],
       [IPC_CHANNELS.requests.notesList, {}, "notesList"],
       [IPC_CHANNELS.requests.notesRead, { path: "../private/secret.md" }, "notesRead"],
       [IPC_CHANNELS.requests.notesSave, { path: "content/life/a.md" }, "notesSave"],
@@ -1110,6 +1217,14 @@ class FakeIpcRenderer implements IpcRendererPort {
 }
 
 describe("preload garden API", () => {
+  it("exposes domain management through the shared renderer contract", () => {
+    const api: SharedGardenApi = createGardenApi(new FakeIpcRenderer())
+    void api.domains.list()
+    void api.domains.create({ name: "Artificial Intelligence", slug: "artificial-intelligence" })
+    void api.domains.rename({ slug: "artificial-intelligence", name: "AI" })
+    void api.domains.remove({ slug: "artificial-intelligence" })
+  })
+
   it("is deeply frozen and contains no raw Electron, path, shell, or command capability", () => {
     const api = createGardenApi(new FakeIpcRenderer())
     expect(Object.isFrozen(api)).toBe(true)
@@ -1124,6 +1239,7 @@ describe("preload garden API", () => {
         "changes",
         "history",
         "lifecycle",
+        "domains",
         "notes",
         "preview",
         "publish",
@@ -1157,6 +1273,10 @@ describe("preload garden API", () => {
     await api.workspace.inspectSafety()
     await api.workspace.inspect()
     await api.workspace.repair({ action: "install-dependencies" })
+    await api.domains.list()
+    await api.domains.create({ name: "Artificial Intelligence", slug: "artificial-intelligence" })
+    await api.domains.rename({ slug: "artificial-intelligence", name: "AI" })
+    await api.domains.remove({ slug: "artificial-intelligence" })
     await api.notes.list()
     await api.notes.read({ path: "content/life/a.md" })
     await api.notes.save({
@@ -1209,6 +1329,48 @@ describe("preload garden API", () => {
     expect(ipc.invokes.map(([channel]) => channel).sort()).toEqual(
       Object.values(IPC_CHANNELS.requests).sort(),
     )
+  })
+
+  it("maps domain methods to exact channels and request objects", async () => {
+    const ipc = new FakeIpcRenderer()
+    const api = createGardenApi(ipc)
+    const create = { name: "Artificial Intelligence", slug: "artificial-intelligence" }
+    const rename = { slug: "artificial-intelligence", name: "AI" }
+    const remove = { slug: "artificial-intelligence" }
+
+    await api.domains.list()
+    await api.domains.create(create)
+    await api.domains.rename(rename)
+    await api.domains.remove(remove)
+
+    expect(ipc.invokes).toEqual([
+      [IPC_CHANNELS.requests.domainsList, undefined],
+      [IPC_CHANNELS.requests.domainsCreate, create],
+      [IPC_CHANNELS.requests.domainsRename, rename],
+      [IPC_CHANNELS.requests.domainsRemove, remove],
+    ])
+  })
+
+  it("validates domain results at the preload boundary", async () => {
+    const ipc = new FakeIpcRenderer()
+    ipc.invoke = vi.fn(async () => ({
+      ok: true,
+      value: [
+        {
+          slug: "life",
+          name: "Life",
+          description: "Life notes.",
+          order: 0,
+          publicNotes: -1,
+          privateNotes: 0,
+        },
+      ],
+    }))
+
+    await expect(createGardenApi(ipc).domains.list()).resolves.toEqual({
+      ok: false,
+      error: { code: "INTERNAL_ERROR", message: "The application returned an invalid response." },
+    })
   })
 
   it("replaces malformed main-process envelopes with a fixed internal error", async () => {

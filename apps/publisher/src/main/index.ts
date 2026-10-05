@@ -15,9 +15,10 @@ import {
   runBlogManagementShutdown,
 } from "./blogRuntime"
 import {
+  canRestorePublisherRuntime,
   createPublisherCloseCoordinator,
+  createPublisherRuntimeShutdown,
   createPublisherServices,
-  disposePublisherRuntime,
   type PreviewServicePort,
   type PublisherRuntimeServices,
 } from "./publisherServices"
@@ -55,6 +56,20 @@ let prepareBlogManagementShutdown: (() => Promise<void>) | undefined
 let restoreBlogManagementAfterFailedShutdown: (() => void) | undefined
 let previewManager: (PreviewServicePort & { dispose(): Promise<void> }) | undefined
 let publisherServices: PublisherRuntimeServices | undefined
+
+const runtimeShutdown = createPublisherRuntimeShutdown({
+  getServices: () => publisherServices,
+  getPreview: () => previewManager,
+  getUnregister: () => unregisterIpc,
+  preflight: async (markRestoreUnsafe) => {
+    try {
+      await publisherServices?.assertSwitchSafe()
+    } catch (error) {
+      if (!canRestorePublisherRuntime(error)) markRestoreUnsafe()
+      throw error
+    }
+  },
+})
 
 let pendingClose:
   | {
@@ -109,8 +124,7 @@ const closeCoordinator = createPublisherCloseCoordinator({
           unregisterLifecycleIpc = undefined
           return
         }
-        markRestoreUnsafe()
-        await disposePublisherRuntime(unregister, manager, publisherServices)
+        await runtimeShutdown(markRestoreUnsafe)
         unregisterIpc = undefined
         previewManager = undefined
         publisherServices = undefined
@@ -270,7 +284,7 @@ app.whenReady().then(async () => {
       try {
         await publisherServices?.assertSwitchSafe()
       } catch (error) {
-        blogManagement.restoreAfterFailedShutdown()
+        if (canRestorePublisherRuntime(error)) blogManagement.restoreAfterFailedShutdown()
         throw error
       }
     },
@@ -278,7 +292,7 @@ app.whenReady().then(async () => {
       await blogManagement.prepareForShutdown()
       const manager = previewManager
       if (!manager) return
-      await disposePublisherRuntime(unregisterIpc, manager, publisherServices)
+      await runtimeShutdown(undefined, true)
       unregisterIpc = undefined
       previewManager = undefined
       publisherServices = undefined
@@ -394,9 +408,10 @@ app.whenReady().then(async () => {
         onProgress: relay,
       })
     }
-    publisherServices = createPublisherServices({
+    const trash = createElectronTrashAdapter(shell)
+    publisherServices = await createPublisherServices({
       workspace,
-      trash: createElectronTrashAdapter(shell),
+      trash,
       isTracked,
       preview: previewManager,
       openExternal: (url) => shell.openExternal(url),

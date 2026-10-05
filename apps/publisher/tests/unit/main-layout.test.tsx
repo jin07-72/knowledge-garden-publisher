@@ -174,6 +174,12 @@ function createGardenMock(): GardenApi {
         ok({ action: "install-dependencies" as const, message: "installed" }),
       ),
     },
+    domains: {
+      list: vi.fn(async () => ok([])),
+      create: vi.fn(async () => ok([])),
+      rename: vi.fn(async () => ok([])),
+      remove: vi.fn(async () => ok([])),
+    },
     notes: {
       onRecovery: vi.fn(() => () => undefined),
       list: vi.fn(async () => ok(notes)),
