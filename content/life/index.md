@@ -2,6 +2,8 @@
 title: 生活实验
 date: 2026-09-16
 description: 观察、复盘与实践记录，用小实验改善日常。
+gardenDomain: true
+domainOrder: 4
 tags:
   - life
 ---

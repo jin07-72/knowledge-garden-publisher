@@ -2,6 +2,8 @@
 title: 技术与工具
 date: 2026-09-16
 description: 编程、软件与效率工作流的实验和整理。
+gardenDomain: true
+domainOrder: 2
 tags:
   - technology
 ---

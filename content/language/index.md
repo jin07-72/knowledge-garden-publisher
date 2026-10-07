@@ -2,6 +2,8 @@
 title: 语言学习
 date: 2026-09-16
 description: 词汇、语法、输入与输出练习的持续记录。
+gardenDomain: true
+domainOrder: 3
 tags:
   - language
 ---

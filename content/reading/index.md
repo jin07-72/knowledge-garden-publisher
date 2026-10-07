@@ -2,6 +2,8 @@
 title: 读书与思考
 date: 2026-09-16
 description: 书籍、课程、学习方法与观点的长期整理。
+gardenDomain: true
+domainOrder: 1
 tags:
   - reading
 ---
