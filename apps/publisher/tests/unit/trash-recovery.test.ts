@@ -30,6 +30,10 @@ async function garden(): Promise<string> {
   temporaryDirectories.push(root)
   await mkdir(join(root, "content", "life"), { recursive: true })
   await mkdir(join(root, "private", "life"), { recursive: true })
+  await writeFile(
+    join(root, "content", "life", "index.md"),
+    "---\ngardenDomain: true\ntitle: Life\ndescription: Test domain.\n---\n",
+  )
   return root
 }
 
@@ -110,6 +114,27 @@ async function sortedDirectory(path: string) {
 }
 
 describe("trash recovery directory bounds", () => {
+  it("restores a custom-domain journal only while its domain remains marked", async () => {
+    const root = await garden()
+    await mkdir(join(root, "content", "artificial-intelligence"), { recursive: true })
+    await mkdir(join(root, "private", "artificial-intelligence"), { recursive: true })
+    const landing = join(root, "content", "artificial-intelligence", "index.md")
+    await writeFile(landing, "---\ngardenDomain: true\ntitle: AI\ndescription: Test domain.\n---\n")
+    await writeFile(join(root, "content", "artificial-intelligence", "note.md"), "# Note")
+    const staged = await recycleAndRestore(root, "content/artificial-intelligence/note.md")
+    await expect(
+      trashRecovery.reconcileTrashRecovery(root, () => internalRecoveryKey(root, false)),
+    ).resolves.toMatchObject({ restored: ["content/artificial-intelligence/note.md"] })
+
+    await rm(join(root, "content", "artificial-intelligence", "note.md"))
+    await writeFile(join(root, "content", "artificial-intelligence", "note.md"), "# Again")
+    await recycleAndRestore(root, "content/artificial-intelligence/note.md")
+    await rm(landing)
+    await expect(
+      trashRecovery.reconcileTrashRecovery(root, () => internalRecoveryKey(root, false)),
+    ).resolves.toMatchObject({ restored: [] })
+    expect(staged).toContain("artificial-intelligence")
+  })
   it("stops after the limit plus one entry and closes the directory handle", async () => {
     let yielded = 0
     const close = vi.fn(async () => undefined)

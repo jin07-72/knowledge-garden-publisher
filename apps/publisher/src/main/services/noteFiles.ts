@@ -25,6 +25,11 @@ import type {
   Visibility,
 } from "../../shared/contracts"
 import { prepareTrashRecovery, restoreLocalTrashStage } from "./trashRecovery"
+import {
+  captureNoteDomainSnapshot,
+  revalidateNoteDomains,
+  type NoteDomainSnapshot,
+} from "./noteDomains"
 
 // Transactions are kept in a focused internal module because this service also
 // owns the lower-level 2,500-line atomic save/recovery implementation.
@@ -52,7 +57,6 @@ export {
   type WikiLinkEdit,
 } from "./noteTransactions"
 
-const domains = new Set(["technology", "reading", "language", "life"])
 const slugPattern = /^[a-z0-9]+(?:-[a-z0-9]+)*$/
 const recoveryIdPattern = /^[a-z0-9-]{16,128}$/i
 const recoveryStateDirectory = ".garden-publisher"
@@ -80,8 +84,6 @@ const maximumRecoveryRetentionStateBytes = 256 * 1_024
 const maximumRecoveryManifestBytes = 64 * 1_024
 const maximumRecoveryIntegrityBytes = 128
 
-export type NoteDomain = DomainSlug
-
 export interface NoteRevision {
   readonly mtimeMs: number
   readonly contentHash: string
@@ -107,7 +109,7 @@ export interface RecoveryRetentionPolicy {
 export interface CreateNoteInput {
   readonly workspace: string
   readonly visibility: Visibility
-  readonly domain: NoteDomain
+  readonly domain: DomainSlug
   readonly slug: string
   readonly title: string
   readonly date: string
@@ -198,6 +200,8 @@ export interface NoteFileAdapter {
   readonly lockGraceMs?: number
   readonly heartbeatRetryLimit?: number
   readonly heartbeatRetryDelayMs?: number
+  /** Deterministic seam for a post-classification domain landing race. */
+  readonly afterDomainClassified?: (path: string) => Promise<void> | void
 }
 
 export interface NoteReadAdapter {
@@ -209,6 +213,8 @@ export interface TrashNoteAdapter extends NoteReadAdapter {
   readonly afterStage?: (stagedPath: string, originalPath: string) => Promise<void> | void
   /** Lets a wider multi-path operation hold the exact target lease. */
   readonly lease?: InternalNotePathLease
+  /** Lets a wider multi-path operation retain one immutable domain snapshot. */
+  readonly domainSnapshot?: NoteDomainSnapshot
 }
 
 export interface ReadNoteInput {
@@ -394,7 +400,7 @@ function isNoteError(error: unknown): error is AppError {
 }
 
 function assertMetadata(input: CreateNoteInput): void {
-  if (!domains.has(input.domain) || input.slug === "index" || !slugPattern.test(input.slug))
+  if (!slugPattern.test(input.domain) || input.slug === "index" || !slugPattern.test(input.slug))
     throw invalidPath(".")
   if (
     ![input.title, input.date, input.description].every(
@@ -446,7 +452,7 @@ async function managedRoot(workspace: string, visibility: Visibility): Promise<M
 
 async function checkedDomain(
   root: ManagedRoot,
-  domain: NoteDomain,
+  domain: DomainSlug,
   create: boolean,
 ): Promise<string> {
   const candidate = resolve(root.directory, domain)
@@ -479,7 +485,7 @@ async function checkedDomain(
 function parseManagedPath(
   workspace: string,
   path: string,
-): { visibility: Visibility; domain: NoteDomain; filename: string; displayPath: string } {
+): { visibility: Visibility; domain: DomainSlug; filename: string; displayPath: string } {
   if (
     !path ||
     isAbsolute(path) ||
@@ -494,7 +500,7 @@ function parseManagedPath(
   const [rootNameInput, domain, filename] = parts
   const visibility =
     rootNameInput === "content" ? "public" : rootNameInput === "private" ? "private" : undefined
-  if (visibility === undefined || !domains.has(domain) || !filename.endsWith(".md"))
+  if (visibility === undefined || !slugPattern.test(domain) || !filename.endsWith(".md"))
     throw invalidPath(path)
   const slug = filename.slice(0, -3)
   if (filename === "index.md" || !slugPattern.test(slug)) throw invalidPath(path)
@@ -502,7 +508,39 @@ function parseManagedPath(
   const canonicalDisplayPath = `${root}/${domain}/${filename}`
   if (canonicalDisplayPath !== path || !isInside(workspace, resolve(workspace, path)))
     throw invalidPath(path)
-  return { visibility, domain: domain as NoteDomain, filename, displayPath: canonicalDisplayPath }
+  return { visibility, domain, filename, displayPath: canonicalDisplayPath }
+}
+
+async function noteDomainSnapshot(
+  workspace: string,
+  domain: string,
+  adapter: Pick<NoteFileAdapter, "afterDomainClassified"> = {},
+): Promise<NoteDomainSnapshot> {
+  let snapshot: NoteDomainSnapshot
+  try {
+    snapshot = await captureNoteDomainSnapshot(workspace, {
+      afterDomainClassified: adapter.afterDomainClassified,
+    })
+  } catch (error) {
+    if ((error as { readonly code?: unknown }).code === "DOMAIN_UNSAFE_PATH") {
+      throw unsafePath(`content/${domain}/index.md`)
+    }
+    throw accessFailure("content")
+  }
+  if (!snapshot.has(domain)) throw invalidPath(`content/${domain}/index.md`)
+  return snapshot
+}
+
+async function revalidateNoteDomain(
+  snapshot: NoteDomainSnapshot,
+  domain: string,
+  path: string,
+): Promise<void> {
+  try {
+    await revalidateNoteDomains(snapshot, [domain])
+  } catch {
+    throw unsafePath(path)
+  }
 }
 
 function identity(details: BigIntStats): string {
@@ -518,7 +556,7 @@ async function readCheckedFileState(
   filename: string,
   options: NoteReadAdapter & { readonly maximumBytes?: number } = {},
 ): Promise<CheckedFileState> {
-  const directory = await checkedDomain(root, domain as NoteDomain, false)
+  const directory = await checkedDomain(root, domain, false)
   const candidate = resolve(directory, filename)
   const displayPath = safeRelative(root.workspace, candidate)
   let before: BigIntStats
@@ -618,6 +656,7 @@ export async function readNote(
 ): Promise<NoteDocument> {
   const workspace = await canonicalWorkspace(input.workspace)
   const parsed = parseManagedPath(workspace, input.path)
+  const domains = await noteDomainSnapshot(workspace, parsed.domain)
   const root = await managedRoot(workspace, parsed.visibility)
   const file = await readCheckedFile(root, parsed.domain, parsed.filename, {
     ...adapter,
@@ -629,6 +668,7 @@ export async function readNote(
   } catch {
     throw accessFailure(parsed.displayPath)
   }
+  await revalidateNoteDomain(domains, parsed.domain, parsed.displayPath)
   return { path: parsed.displayPath, markdown, ...file.revision }
 }
 
@@ -640,6 +680,8 @@ export async function trashNote(
     throw invalidInput(input.path || ".")
   const workspace = await canonicalWorkspace(input.workspace)
   const parsed = parseManagedPath(workspace, input.path)
+  const domains = adapter.domainSnapshot ?? (await noteDomainSnapshot(workspace, parsed.domain))
+  if (!domains.has(parsed.domain)) throw invalidPath(parsed.displayPath)
   const root = await managedRoot(workspace, parsed.visibility)
   const ownsLock = adapter.lease === undefined
   const lock = adapter.lease ?? (await acquireTargetLock(workspace, parsed.displayPath, {}))
@@ -674,8 +716,10 @@ export async function trashNote(
       current.stableIdentity,
       current.revision.contentHash,
       trashRecoveryKey,
+      { domainSnapshot: domains },
     )
     try {
+      await revalidateNoteDomain(domains, parsed.domain, parsed.displayPath)
       await nodeRename(target, stage.stagedPath)
       await adapter.afterStage?.(stage.stagedPath, target)
       await assertTrashParents(root.directory, managedRootIdentity, directory, domainIdentity)
@@ -857,6 +901,7 @@ async function exclusiveWrite(
   displayPath: string,
   adapter: NoteFileAdapter,
   assertLockOwned: () => Promise<void>,
+  verifyBeforeCommit: () => Promise<void> = async () => undefined,
 ): Promise<void> {
   const temporary = `${path}.garden-publisher-create-${randomUUID()}`
   let handle
@@ -892,6 +937,7 @@ async function exclusiveWrite(
       throw unsafePath(displayPath)
     }
     await assertLockOwned()
+    await verifyBeforeCommit()
     await link(temporary, path)
     publishedIdentity = temporaryIdentity
     const installed = await lstat(path, { bigint: true })
@@ -2459,7 +2505,7 @@ async function resultFromTarget(
 
 async function verifyUnchanged(
   root: ManagedRoot,
-  domain: NoteDomain,
+  domain: DomainSlug,
   filename: string,
   expected: CheckedFile,
 ): Promise<boolean> {
@@ -2481,15 +2527,23 @@ export async function createNote(
 ): Promise<NoteWriteResult> {
   assertMetadata(input)
   const workspace = await canonicalWorkspace(input.workspace)
+  const domains = await noteDomainSnapshot(workspace, input.domain, adapter)
   const root = await managedRoot(workspace, input.visibility)
-  const directory = await checkedDomain(root, input.domain, true)
+  const directory = await checkedDomain(root, input.domain, root.name === "private")
   const path = `${root.name}/${input.domain}/${input.slug}.md`
   const target = resolve(directory, `${input.slug}.md`)
   const bytes = Buffer.from(markdownFor(input), "utf8")
   const lock = await acquireTargetLock(workspace, path, adapter)
   return preserveOutcomeAcrossLockRelease(lock, "create", async () => {
     await lock.assertOwned()
-    await exclusiveWrite(target, bytes, path, adapter, () => lock.assertOwned())
+    await exclusiveWrite(
+      target,
+      bytes,
+      path,
+      adapter,
+      () => lock.assertOwned(),
+      () => revalidateNoteDomain(domains, input.domain, path),
+    )
     return resultFromTarget(target, path, bytes)
   })
 }
@@ -2511,6 +2565,7 @@ export async function saveNote(
   }
   const workspace = await canonicalWorkspace(input.workspace)
   const parsed = parseManagedPath(workspace, input.path)
+  const domains = await noteDomainSnapshot(workspace, parsed.domain)
   const root = await managedRoot(workspace, parsed.visibility)
   const lock = await acquireTargetLock(workspace, parsed.displayPath, adapter)
   const completed = await preserveOutcomeAcrossLockRelease(lock, "save", async () => {
@@ -2538,6 +2593,7 @@ export async function saveNote(
       adapter,
       () => lock.assertOwned(),
       async () => {
+        await revalidateNoteDomain(domains, parsed.domain, parsed.displayPath)
         if (!(await verifyUnchanged(root, parsed.domain, parsed.filename, current))) {
           throw appError("EXTERNAL_EDIT", "The note changed outside the editor.", {
             path: parsed.displayPath,
@@ -2630,6 +2686,7 @@ async function readRecoveryMetadata(
   root: string,
   key: Buffer,
   directoryName: string,
+  domains?: NoteDomainSnapshot,
 ): Promise<RecoveryMetadata> {
   const retentionMatch = recoveryRetentionQuarantinePattern.exec(directoryName)
   const expectedId = recoveryIdPattern.test(directoryName) ? directoryName : retentionMatch?.[1]
@@ -2709,7 +2766,10 @@ async function readRecoveryMetadata(
   )
     throw appError("RECOVERY_INVALID", "Recovery data is invalid.")
   try {
-    parseManagedPath(workspace, manifest.originalPath)
+    const parsed = parseManagedPath(workspace, manifest.originalPath)
+    if (domains !== undefined && !domains.has(parsed.domain)) {
+      throw new Error("recovery domain is not current")
+    }
     const after = await lstat(directory, { bigint: true })
     if (
       after.isSymbolicLink() ||
@@ -2730,10 +2790,14 @@ async function readRecoveryMetadata(
   }
 }
 
-async function readRecovery(workspace: string, id: string): Promise<RecoveryEntry> {
+async function readRecovery(
+  workspace: string,
+  id: string,
+  domains?: NoteDomainSnapshot,
+): Promise<RecoveryEntry> {
   const root = await recoveryRoot(workspace, false)
   const key = await recoveryKey(dirname(root), false)
-  const metadata = await readRecoveryMetadata(workspace, root, key, id)
+  const metadata = await readRecoveryMetadata(workspace, root, key, id, domains)
   let bytes: Buffer
   try {
     bytes = await readRecoveryFile(metadata.directory, resolve(metadata.directory, "content.md"))
@@ -2846,7 +2910,10 @@ export async function restoreRecovery(
     throw invalidInput(".")
   }
   const workspace = await canonicalWorkspace(input.workspace)
-  const entry = await readRecovery(workspace, input.id)
+  const domains = await captureNoteDomainSnapshot(workspace).catch(() => {
+    throw appError("RECOVERY_INVALID", "Recovery data is invalid.")
+  })
+  const entry = await readRecovery(workspace, input.id, domains)
   const parsed = parseManagedPath(workspace, entry.manifest.originalPath)
   const root = await managedRoot(workspace, parsed.visibility)
   const lock = await acquireTargetLock(workspace, parsed.displayPath, adapter)
@@ -2875,6 +2942,7 @@ export async function restoreRecovery(
       adapter,
       () => lock.assertOwned(),
       async () => {
+        await revalidateNoteDomain(domains, parsed.domain, parsed.displayPath)
         if (current === undefined) {
           const state = await readCheckedFileState(root, parsed.domain, parsed.filename)
           if (state.kind === "absent") return

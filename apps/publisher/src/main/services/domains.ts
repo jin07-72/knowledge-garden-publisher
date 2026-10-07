@@ -127,6 +127,22 @@ interface DomainRenameJournalRecord {
 interface DiscoveredDomain {
   readonly summary: DomainSummary
   readonly hasExplicitOrder: boolean
+  readonly evidence: DiscoveredDomainEvidence
+}
+
+interface DiscoveredDomainEvidence {
+  readonly slug: DomainSlug
+  readonly directory: string
+  readonly directoryIdentity: FileIdentity
+  readonly landing: string
+  readonly landingIdentity: FileIdentity
+}
+
+interface DomainDiscoveryScan {
+  readonly canonical: CanonicalWorkspace
+  readonly content: ManagedRoot
+  readonly privateRoot: ManagedRoot
+  readonly domains: readonly DiscoveredDomain[]
 }
 
 interface DiscoverDomainsOptions {
@@ -136,6 +152,25 @@ interface DiscoverDomainsOptions {
   readonly afterCountReaddir?: (path: string) => Promise<void> | void
   /** Test seam for holding one count while another managed path changes. */
   readonly afterCountComplete?: (path: string) => Promise<void> | void
+  /** Test seam for a mutation after classification but before evidence publication. */
+  readonly afterDomainClassified?: (path: string) => Promise<void> | void
+}
+
+const domainSnapshotEvidence = Symbol("domain-snapshot-evidence")
+
+export interface DomainDiscoverySnapshot {
+  readonly workspace: string
+  readonly slugs: readonly DomainSlug[]
+  readonly [domainSnapshotEvidence]: {
+    readonly canonical: CanonicalWorkspace
+    readonly content: ManagedRoot
+    readonly privateRoot: ManagedRoot
+    readonly domains: readonly DiscoveredDomainEvidence[]
+  }
+}
+
+export interface DiscoverDomainSnapshotOptions {
+  readonly afterDomainClassified?: (path: string) => Promise<void> | void
 }
 
 export interface DomainCatalog {
@@ -787,10 +822,77 @@ async function revalidateMutationBoundaries(
   await Promise.all(boundaries.map((boundary) => revalidateMutatedBoundary(workspace, boundary)))
 }
 
-async function discoverDomainEntries(
+async function revalidateDiscoveredDomainEvidence(
+  workspace: string,
+  evidence: DiscoveredDomainEvidence,
+  exactDirectory: boolean,
+): Promise<void> {
+  const directoryPath = displayPath(workspace, evidence.directory)
+  const landingPath = displayPath(workspace, evidence.landing)
+  try {
+    const [directory, landing, canonicalDirectory, canonicalLanding] = await Promise.all([
+      lstat(evidence.directory, { bigint: true }),
+      lstat(evidence.landing, { bigint: true }),
+      realpath(evidence.directory),
+      realpath(evidence.landing),
+    ])
+    const directoryMatches = exactDirectory
+      ? sameFileIdentity(evidence.directoryIdentity, fileIdentity(directory))
+      : inodeIdentity(directory) === inodeIdentity(evidence.directoryIdentity)
+    if (
+      directory.isSymbolicLink() ||
+      !directory.isDirectory() ||
+      landing.isSymbolicLink() ||
+      !landing.isFile() ||
+      !pathsEqual(evidence.directory, canonicalDirectory) ||
+      !pathsEqual(evidence.landing, canonicalLanding) ||
+      !isInside(evidence.directory, canonicalLanding) ||
+      !directoryMatches ||
+      !sameFileIdentity(evidence.landingIdentity, fileIdentity(landing))
+    ) {
+      throw unsafePath(landingPath)
+    }
+  } catch (error) {
+    if (isDomainDiscoveryError(error)) throw error
+    throw unsafePath(directoryPath)
+  }
+}
+
+async function captureDiscoveredDomainEvidence(
+  workspace: string,
+  directory: string,
+  slug: DomainSlug,
+  landingIdentity: FileIdentity,
+): Promise<DiscoveredDomainEvidence> {
+  const path = displayPath(workspace, directory)
+  try {
+    const details = await lstat(directory, { bigint: true })
+    const canonical = await realpath(directory)
+    if (
+      details.isSymbolicLink() ||
+      !details.isDirectory() ||
+      !pathsEqual(directory, canonical) ||
+      !isInside(workspace, canonical)
+    ) {
+      throw unsafePath(path)
+    }
+    return {
+      slug,
+      directory,
+      directoryIdentity: fileIdentity(details),
+      landing: resolve(directory, "index.md"),
+      landingIdentity,
+    }
+  } catch (error) {
+    if (isDomainDiscoveryError(error)) throw error
+    throw unsafePath(path)
+  }
+}
+
+async function discoverDomainScan(
   workspacePath: string,
   options: DiscoverDomainsOptions = {},
-): Promise<readonly DiscoveredDomain[]> {
+): Promise<DomainDiscoveryScan> {
   const canonical = await canonicalWorkspace(workspacePath)
   const workspace = canonical.directory
   const content = await canonicalManagedRoot(workspace, "content")
@@ -822,6 +924,13 @@ async function discoverDomainEntries(
     if (page === undefined) continue
     const metadata = parseDomainPage(page, entry.name)
     if (metadata === undefined) continue
+    const evidence = await captureDiscoveredDomainEvidence(
+      workspace,
+      candidateDirectory,
+      metadata.slug,
+      page.identity,
+    )
+    await options.afterDomainClassified?.(page.path)
 
     const [publicNotes, privateNotes] = await Promise.all([
       countDirectMarkdown(workspace, content, metadata.slug, options),
@@ -835,15 +944,28 @@ async function discoverDomainEntries(
       publicNotes,
       privateNotes,
     })
-    domains.push({ summary, hasExplicitOrder: metadata.hasExplicitOrder })
+    domains.push({ summary, hasExplicitOrder: metadata.hasExplicitOrder, evidence })
   }
 
   await Promise.all([
     revalidateBoundary(workspace, canonical),
     revalidateBoundary(workspace, content),
     revalidateBoundary(workspace, privateRoot),
+    ...domains.map(({ evidence }) => revalidateDiscoveredDomainEvidence(workspace, evidence, true)),
   ])
-  return domains.sort(compareDomains)
+  return {
+    canonical,
+    content,
+    privateRoot,
+    domains: domains.sort(compareDomains),
+  }
+}
+
+async function discoverDomainEntries(
+  workspacePath: string,
+  options: DiscoverDomainsOptions = {},
+): Promise<readonly DiscoveredDomain[]> {
+  return (await discoverDomainScan(workspacePath, options)).domains
 }
 
 export async function discoverDomains(workspacePath: string): Promise<readonly DomainSummary[]>
@@ -856,6 +978,44 @@ export async function discoverDomains(
 
 export async function discoverDomainSlugs(workspace: string): Promise<ReadonlySet<string>> {
   return new Set((await discoverDomains(workspace)).map(({ slug }) => slug))
+}
+
+export async function discoverDomainSnapshot(
+  workspace: string,
+  options: DiscoverDomainSnapshotOptions = {},
+): Promise<DomainDiscoverySnapshot> {
+  const scan = await discoverDomainScan(workspace, options)
+  const slugs = Object.freeze(scan.domains.map(({ summary }) => summary.slug).sort(compareText))
+  return Object.freeze({
+    workspace: scan.canonical.directory,
+    slugs,
+    [domainSnapshotEvidence]: Object.freeze({
+      canonical: scan.canonical,
+      content: scan.content,
+      privateRoot: scan.privateRoot,
+      domains: Object.freeze(scan.domains.map(({ evidence }) => Object.freeze(evidence))),
+    }),
+  })
+}
+
+export async function revalidateDomainSnapshot(
+  snapshot: DomainDiscoverySnapshot,
+  slugs: Iterable<string> = snapshot.slugs,
+): Promise<void> {
+  const evidence = snapshot[domainSnapshotEvidence]
+  await Promise.all([
+    revalidateMutatedBoundary(snapshot.workspace, evidence.canonical),
+    revalidateMutatedBoundary(snapshot.workspace, evidence.content),
+    revalidateMutatedBoundary(snapshot.workspace, evidence.privateRoot),
+  ])
+  const requested = new Set(slugs)
+  for (const domain of evidence.domains) {
+    if (requested.has(domain.slug)) {
+      await revalidateDiscoveredDomainEvidence(snapshot.workspace, domain, false)
+      requested.delete(domain.slug)
+    }
+  }
+  if (requested.size > 0) throw unsafePath("content")
 }
 
 function isFileSystemError(error: unknown, code: string): boolean {

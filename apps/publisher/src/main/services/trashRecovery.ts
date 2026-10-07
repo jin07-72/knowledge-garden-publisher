@@ -14,12 +14,16 @@ import {
   writeFile,
 } from "node:fs/promises"
 import { dirname, isAbsolute, relative, resolve } from "node:path"
+import {
+  captureNoteDomainSnapshot,
+  revalidateNoteDomains,
+  type NoteDomainSnapshot,
+} from "./noteDomains"
 
 const journalVersion = 1
 const recoveryDirectory = ".garden-publisher/trash-recovery"
 const transactionPattern = /^[a-f0-9-]{36}$/i
-const notePattern =
-  /^(content|private)\/(technology|reading|language|life)\/[a-z0-9]+(?:-[a-z0-9]+)*\.md$/
+const notePattern = /^(content|private)\/([a-z0-9]+(?:-[a-z0-9]+)*)\/[a-z0-9]+(?:-[a-z0-9]+)*\.md$/
 const attachmentPattern = /^(content|private)\/_assets\/[a-z0-9]+(?:-[a-z0-9]+)*$/
 const digestPattern = /^[a-f0-9]{64}$/
 const maximumDirectoryEntries = 10_000
@@ -880,6 +884,7 @@ export interface TrashRecoveryPrepareOptions {
   readonly delay?: (milliseconds: number) => Promise<void>
   readonly isProcessAlive?: (pid: number) => boolean | undefined
   readonly now?: () => number
+  readonly domainSnapshot?: NoteDomainSnapshot
 }
 
 export async function prepareTrashRecovery(
@@ -906,6 +911,16 @@ export async function prepareTrashRecovery(
   ) {
     throw new Error("Trash recovery target is unsafe.")
   }
+  const noteMatch = kind === "file" ? notePattern.exec(normalized) : undefined
+  const noteDomain = noteMatch?.[2]
+  const domains =
+    options.domainSnapshot ?? (await captureNoteDomainSnapshot(workspace).catch(() => undefined))
+  if (domains === undefined || (noteDomain !== undefined && !domains.has(noteDomain))) {
+    throw new Error("Trash recovery domain is unavailable.")
+  }
+  await revalidateNoteDomains(domains, noteDomain === undefined ? [] : [noteDomain]).catch(() => {
+    throw new Error("Trash recovery domain changed.")
+  })
   const id = randomUUID()
   const transactions = resolve(root, indexedTransactionsDirectory)
   const shard = resolve(transactions, id.slice(0, 2))
@@ -1766,6 +1781,8 @@ export async function reconcileTrashRecoveryPass(
   }
   const restored: string[] = []
   const conflicts: string[] = []
+  const domains = await captureNoteDomainSnapshot(storage.workspace).catch(() => undefined)
+  if (domains === undefined) return { restored, conflicts, pending: false }
   const key = await loadKey()
   if (key.length !== 32) throw new Error("Trash recovery key is invalid.")
   const maximumTransactions = Math.max(
@@ -1880,6 +1897,10 @@ export async function reconcileTrashRecoveryPass(
         key,
       )
       if (!journal) continue
+      const noteMatch =
+        journal.kind === "file" ? notePattern.exec(journal.originalRelativePath) : undefined
+      const noteDomain = noteMatch?.[2]
+      if (noteDomain !== undefined && !domains.has(noteDomain)) continue
       const original = resolve(storage.workspace, ...journal.originalRelativePath.split("/"))
       const staged = resolve(transactionPath, ...journal.stagedRelativePath.split("/"))
       if (!isInside(transactionPath, staged) || !isInside(storage.workspace, original)) continue
@@ -1921,6 +1942,13 @@ export async function reconcileTrashRecoveryPass(
       if (!(await matchesExpectedItem(staged, stage, control))) {
         conflicts.push(journal.originalRelativePath)
         continue
+      }
+      if (noteDomain !== undefined) {
+        try {
+          await revalidateNoteDomains(domains, [noteDomain])
+        } catch {
+          continue
+        }
       }
       if (await restoreLocalTrashStage(stage, control)) restored.push(journal.originalRelativePath)
       else conflicts.push(journal.originalRelativePath)

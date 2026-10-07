@@ -23,7 +23,18 @@ async function createGarden(): Promise<string> {
     mkdir(join(root, "content"), { recursive: true }),
     mkdir(join(root, "private"), { recursive: true }),
   ])
+  await Promise.all(
+    ["technology", "reading", "language", "life"].map((domain) => markDomain(root, domain)),
+  )
   return root
+}
+
+async function markDomain(root: string, domain: string): Promise<void> {
+  await mkdir(join(root, "content", domain), { recursive: true })
+  await writeFile(
+    join(root, "content", domain, "index.md"),
+    `---\ngardenDomain: true\ntitle: ${domain}\ndescription: Test domain.\n---\n`,
+  )
 }
 
 async function writeNote(
@@ -73,6 +84,7 @@ describe("scanNotes", () => {
     const fixtureRoot = resolve("tests/fixtures/garden")
     const root = await createGarden()
     await cp(fixtureRoot, root, { recursive: true })
+    await Promise.all([markDomain(root, "technology"), markDomain(root, "life")])
     const journal = join(root, "private", "life", "journal.md")
     const cssGrid = join(root, "content", "technology", "css-grid.md")
     await utimes(
@@ -111,7 +123,7 @@ describe("scanNotes", () => {
     expect(note.path).toBe("content/technology/css-grid.md")
   })
 
-  it("supports every allowed domain", async () => {
+  it("supports every discovered domain", async () => {
     const root = await createGarden()
     const paths = await Promise.all([
       writeNote(
@@ -151,10 +163,50 @@ describe("scanNotes", () => {
     expect(notes.map((note) => note.domain)).toEqual(["technology", "reading", "language", "life"])
   })
 
+  it("indexes a custom marked domain and rejects a note in an unmarked folder", async () => {
+    const root = await createGarden()
+    await markDomain(root, "artificial-intelligence")
+    await writeNote(root, "content", "artificial-intelligence", "transformers.md")
+    await writeNote(root, "private", "artificial-intelligence", "private-models.md")
+    await mkdir(join(root, "content", "unmarked"), { recursive: true })
+    await writeFile(
+      join(root, "content", "unmarked", "hidden.md"),
+      "---\ntitle: Hidden\ndate: 2026-09-18\ndescription: Hidden.\ntags: [test]\n---\n",
+    )
+
+    await expect(scanNotes(root)).rejects.toMatchObject({ code: "NOTE_INDEX_INVALID" })
+    await rm(join(root, "content", "unmarked"), { recursive: true })
+    await expect(scanNotes(root)).resolves.toEqual(
+      expect.arrayContaining([
+        expect.objectContaining({ domain: "artificial-intelligence", slug: "transformers" }),
+        expect.objectContaining({ domain: "artificial-intelligence", slug: "private-models" }),
+      ]),
+    )
+  })
+
+  it("fails closed when a discovered domain landing page is replaced during the scan", async () => {
+    const root = await createGarden()
+    await markDomain(root, "artificial-intelligence")
+    await writeNote(root, "content", "artificial-intelligence", "transformers.md")
+    let replaced = false
+
+    await expect(
+      scanNotes(root, {
+        beforeOpen: async (path) => {
+          if (replaced || !path.endsWith("transformers.md")) return
+          replaced = true
+          const landing = join(root, "content", "artificial-intelligence", "index.md")
+          await rm(landing)
+          await writeFile(landing, "---\ngardenDomain: false\n---\n")
+        },
+      }),
+    ).rejects.toMatchObject({ code: expect.stringMatching(/^NOTE_INDEX_/) })
+    expect(replaced).toBe(true)
+  })
+
   it("excludes the landing page and domain index pages", async () => {
     const root = await createGarden()
     await writeFile(join(root, "content", "index.md"), "not a note")
-    await writeNote(root, "content", "technology", "index.md")
     await writeNote(root, "content", "technology", "css-grid.md")
 
     const notes = await scanNotes(root)

@@ -20,6 +20,7 @@ import { tmpdir } from "node:os"
 import { dirname, join } from "node:path"
 import { afterEach, describe, expect, it, vi } from "vitest"
 import matter from "gray-matter"
+import * as domainService from "../../src/main/services/domains"
 import {
   createDomainCatalog,
   discoverDomains,
@@ -642,6 +643,37 @@ describe("discoverDomains", () => {
 })
 
 describe("discoverDomainSlugs", () => {
+  it("binds classification and landing evidence to the same safe read", async () => {
+    const root = await createGarden()
+    const landing = join(root, "content", "artificial-intelligence", "index.md")
+    await writeFixture(
+      root,
+      "content/artificial-intelligence/index.md",
+      domainPage("Artificial intelligence", "A custom marked domain.", 0),
+    )
+    const discoverSnapshot = (
+      domainService as typeof domainService & {
+        discoverDomainSnapshot?: (
+          workspace: string,
+          options: { afterDomainClassified(path: string): Promise<void> },
+        ) => Promise<{ readonly slugs: readonly string[] }>
+      }
+    ).discoverDomainSnapshot
+
+    expect(discoverSnapshot).toBeTypeOf("function")
+    let flipped = false
+    await expect(
+      discoverSnapshot!(root, {
+        afterDomainClassified: async (path) => {
+          if (flipped || path !== "content/artificial-intelligence/index.md") return
+          flipped = true
+          await rm(landing)
+          await writeFile(landing, "---\ngardenDomain: false\n---\n")
+        },
+      }),
+    ).rejects.toMatchObject({ code: "DOMAIN_UNSAFE_PATH" })
+    expect(flipped).toBe(true)
+  })
   it("returns the discovered domain identities as a read-only set", async () => {
     const root = await createGarden()
     await Promise.all([

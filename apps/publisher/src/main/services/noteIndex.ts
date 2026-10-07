@@ -3,10 +3,11 @@ import { lstat, open, readdir, realpath, stat } from "node:fs/promises"
 import { isAbsolute, relative, resolve } from "node:path"
 import { parse } from "yaml"
 import type { AppError, NoteSummary, SerializableValue, Visibility } from "../../shared/contracts"
-
-type NoteDomain = NoteSummary["domain"]
-
-const noteDomains = new Set<NoteDomain>(["technology", "reading", "language", "life"])
+import {
+  captureNoteDomainSnapshot,
+  revalidateNoteDomains,
+  type NoteDomainSnapshot,
+} from "./noteDomains"
 const slugPattern = /^[a-z0-9]+(?:-[a-z0-9]+)*$/
 
 interface ScanRoot {
@@ -331,14 +332,15 @@ function locationFor(
   root: ScanRoot,
   workspace: string,
   file: string,
-): { domain: NoteDomain; slug: string; path: string } | undefined {
+  domains: Pick<NoteDomainSnapshot, "has">,
+): { domain: string; slug: string; path: string } | undefined {
   const path = indexPath(workspace, file)
   const parts = toForwardSlashes(relative(root.directory, file)).split("/")
   if (root.name === "content" && parts.length === 1 && parts[0] === "index.md") return undefined
-  if (parts.length !== 2 || !noteDomains.has(parts[0] as NoteDomain)) {
+  if (parts.length !== 2 || !domains.has(parts[0])) {
     throw invalidNoteError(path, "notes must be directly inside an allowed domain")
   }
-  const domain = parts[0] as NoteDomain
+  const domain = parts[0]
   if (parts[1] === "index.md") return undefined
   const slug = parts[1].slice(0, -3)
   if (!slugPattern.test(slug)) throw invalidNoteError(path, "slug must be lowercase kebab-case")
@@ -351,6 +353,7 @@ async function scanDirectory(
   directory: string,
   notes: NoteSummary[],
   identities: Set<string>,
+  domains: Pick<NoteDomainSnapshot, "has">,
   options: ScanNotesOptions,
 ): Promise<void> {
   let entries
@@ -381,12 +384,15 @@ async function scanDirectory(
         throw accessError(candidatePath)
       }
       if (!isInside(root.directory, canonicalDirectory)) throw unsafePathError(candidatePath)
-      await scanDirectory(workspace, root, canonicalDirectory, notes, identities, options)
+      await scanDirectory(workspace, root, canonicalDirectory, notes, identities, domains, options)
       continue
     }
     if (!linked.isFile() || !entry.name.endsWith(".md")) continue
 
-    const { canonicalFile, fileDetails, source } = await readCandidateFile(
+    const location = locationFor(root, workspace, candidate, domains)
+    if (location === undefined) continue
+
+    const { fileDetails, source } = await readCandidateFile(
       candidate,
       candidatePath,
       root,
@@ -394,8 +400,6 @@ async function scanDirectory(
       options,
     )
 
-    const location = locationFor(root, workspace, canonicalFile)
-    if (location === undefined) continue
     const identity = `${location.domain}/${location.slug}`
     if (identities.has(identity)) {
       throw appError("NOTE_INDEX_DUPLICATE", "A public and private note share the same identity.", {
@@ -427,6 +431,18 @@ export async function scanNotes(
     throw accessError(".")
   }
 
+  let domainSnapshot: NoteDomainSnapshot
+  try {
+    domainSnapshot = await captureNoteDomainSnapshot(workspace)
+  } catch (error) {
+    if ((error as { readonly code?: unknown }).code === "DOMAIN_UNSAFE_PATH") {
+      const path = (error as { readonly details?: { readonly path?: unknown } }).details?.path
+      const displayPath = typeof path === "string" ? path : "content"
+      if (displayPath === "content" || displayPath === "private") throw accessError(displayPath)
+      throw unsafePathError(displayPath)
+    }
+    throw accessError("content")
+  }
   const roots = [
     await canonicalScanRoot(workspace, "content", "public"),
     await canonicalScanRoot(workspace, "private", "private"),
@@ -434,7 +450,12 @@ export async function scanNotes(
   const notes: NoteSummary[] = []
   const identities = new Set<string>()
   for (const root of roots) {
-    await scanDirectory(workspace, root, root.directory, notes, identities, options)
+    await scanDirectory(workspace, root, root.directory, notes, identities, domainSnapshot, options)
+  }
+  try {
+    await revalidateNoteDomains(domainSnapshot)
+  } catch {
+    throw changedPathError("content")
   }
   return notes.sort(compareNotes)
 }

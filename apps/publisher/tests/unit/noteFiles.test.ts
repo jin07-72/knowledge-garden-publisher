@@ -28,6 +28,7 @@ import {
   RECOVERY_RETENTION_MAX_TRASH_CALLS,
   discardRecovery,
   listRecoveries,
+  readNote,
   restoreRecovery as restoreRecoveryService,
   saveNote as saveNoteService,
   type NoteFileAdapter,
@@ -77,7 +78,23 @@ async function createGarden(): Promise<string> {
       }),
     ),
   )
+  for (const domain of ["technology", "reading", "language", "life"]) {
+    await mkdir(join(root, "content", domain), { recursive: true })
+    await writeFile(
+      join(root, "content", domain, "index.md"),
+      `---\ngardenDomain: true\ntitle: ${domain}\ndescription: Test domain.\n---\n`,
+    )
+  }
   return root
+}
+
+async function markDomain(root: string, domain: string): Promise<void> {
+  await mkdir(join(root, "content", domain), { recursive: true })
+  await mkdir(join(root, "private", domain), { recursive: true })
+  await writeFile(
+    join(root, "content", domain, "index.md"),
+    `---\ngardenDomain: true\ntitle: ${domain}\ndescription: Test domain.\n---\n`,
+  )
 }
 
 function hash(source: string): string {
@@ -150,6 +167,136 @@ async function createPublicNote(root: string, slug = "first-note"): Promise<stri
 }
 
 describe("note files", () => {
+  it("creates, reads, and saves a note in a custom marked domain", async () => {
+    const root = await createGarden()
+    await markDomain(root, "artificial-intelligence")
+    const created = await createNote({
+      workspace: root,
+      visibility: "public",
+      domain: "artificial-intelligence",
+      slug: "transformers",
+      title: "Transformers",
+      date: "2026-10-07",
+      description: "Attention models.",
+      tags: ["ai"],
+      body: "First",
+    })
+    expect(created.path).toBe("content/artificial-intelligence/transformers.md")
+    const document = await readNote({ workspace: root, path: created.path })
+    const current = document.markdown
+    expect(document.path).toBe(created.path)
+    const saved = await saveNote({
+      workspace: root,
+      path: created.path,
+      markdown: `${current}\nSecond`,
+      expectedMtimeMs: created.mtimeMs,
+      expectedContentHash: created.contentHash,
+    })
+    expect(saved.path).toBe(created.path)
+  })
+
+  it("rejects an unmarked or removed domain before creating or saving", async () => {
+    const root = await createGarden()
+    await mkdir(join(root, "content", "unmarked"), { recursive: true })
+    await expect(
+      createNote({
+        workspace: root,
+        visibility: "public",
+        domain: "unmarked",
+        slug: "note",
+        title: "Note",
+        date: "2026-10-07",
+        description: "No marker.",
+        tags: ["test"],
+      }),
+    ).rejects.toMatchObject({ code: "NOTE_FILE_INVALID" })
+
+    await markDomain(root, "artificial-intelligence")
+    const created = await createNote({
+      workspace: root,
+      visibility: "public",
+      domain: "artificial-intelligence",
+      slug: "transformers",
+      title: "Transformers",
+      date: "2026-10-07",
+      description: "Attention models.",
+      tags: ["ai"],
+    })
+    await rm(join(root, "content", "artificial-intelligence", "index.md"))
+    await expect(
+      saveNote({
+        workspace: root,
+        path: created.path,
+        markdown: "changed",
+        expectedMtimeMs: created.mtimeMs,
+        expectedContentHash: created.contentHash,
+      }),
+    ).rejects.toMatchObject({ code: expect.stringMatching(/^NOTE_FILE_/) })
+  })
+
+  it("does not publish into a custom domain whose landing page changes before commit", async () => {
+    const root = await createGarden()
+    await markDomain(root, "artificial-intelligence")
+    const landing = join(root, "content", "artificial-intelligence", "index.md")
+    const target = join(root, "content", "artificial-intelligence", "race.md")
+
+    await expect(
+      createNote(
+        {
+          workspace: root,
+          visibility: "public",
+          domain: "artificial-intelligence",
+          slug: "race",
+          title: "Race",
+          date: "2026-10-07",
+          description: "Domain replacement race.",
+          tags: ["test"],
+        },
+        {
+          beforeCommit: async () => {
+            await rm(landing)
+            await writeFile(landing, "---\ngardenDomain: false\n---\n")
+          },
+        },
+      ),
+    ).rejects.toMatchObject({ code: "NOTE_FILE_UNSAFE_PATH" })
+    await expect(lstat(target)).rejects.toMatchObject({ code: "ENOENT" })
+  })
+
+  it("does not trust an unmarked replacement captured after domain classification", async () => {
+    const root = await createGarden()
+    await markDomain(root, "artificial-intelligence")
+    const landing = join(root, "content", "artificial-intelligence", "index.md")
+    const target = join(root, "content", "artificial-intelligence", "classification-race.md")
+    let flipped = false
+
+    await expect(
+      createNote(
+        {
+          workspace: root,
+          visibility: "public",
+          domain: "artificial-intelligence",
+          slug: "classification-race",
+          title: "Classification race",
+          date: "2026-10-07",
+          description: "Classification evidence race.",
+          tags: ["test"],
+        },
+        {
+          afterDomainClassified: async (path: string) => {
+            if (flipped || path !== "content/artificial-intelligence/index.md") return
+            flipped = true
+            await rm(landing)
+            await writeFile(landing, "---\ngardenDomain: false\n---\n")
+          },
+        } as NoteFileAdapter & {
+          afterDomainClassified(path: string): Promise<void>
+        },
+      ),
+    ).rejects.toMatchObject({ code: expect.stringMatching(/^NOTE_FILE_/) })
+    expect(flipped).toBe(true)
+    await expect(lstat(target)).rejects.toMatchObject({ code: "ENOENT" })
+  })
   it("returns an empty metadata-only list before any recovery exists", async () => {
     const root = await createGarden()
     await expect(listRecoveries(root)).resolves.toEqual([])
@@ -464,7 +611,9 @@ describe("note files", () => {
     ])
     expect(results.filter((result) => result.status === "fulfilled")).toHaveLength(1)
     expect(results.find((result) => result.status === "rejected")).toMatchObject({
-      reason: { code: expect.stringMatching(/^NOTE_(?:ALREADY_EXISTS|FILE_LOCKED)$/) },
+      reason: {
+        code: expect.stringMatching(/^NOTE_(?:ALREADY_EXISTS|FILE_LOCKED|FILE_UNSAFE_PATH)$/),
+      },
     })
     expect(
       (await readdir(join(root, "content", "technology"))).filter((name) =>
@@ -480,6 +629,7 @@ describe("note files", () => {
     const root = await createGarden()
     const outside = await mkdtemp(join(tmpdir(), "garden-note-outside-"))
     temporaryDirectories.push(outside)
+    await rm(join(root, "content", "technology"), { recursive: true })
     try {
       await symlink(
         outside,
@@ -1527,6 +1677,84 @@ describe("note files", () => {
     expect(await listRecoveries(root)).toHaveLength(2)
   })
 
+  it("keeps a custom-domain recovery intact when its domain marker was removed", async () => {
+    const root = await createGarden()
+    await markDomain(root, "artificial-intelligence")
+    const path = join(root, "content", "artificial-intelligence", "recovery-note.md")
+    await createNote({
+      workspace: root,
+      visibility: "public",
+      domain: "artificial-intelligence",
+      slug: "recovery-note",
+      title: "Recovery note",
+      date: "2026-10-07",
+      description: "Custom recovery.",
+      tags: ["test"],
+      body: "original",
+    })
+    await saveNote({
+      workspace: root,
+      path: "content/artificial-intelligence/recovery-note.md",
+      markdown: "current",
+      ...(await revision(path)),
+    })
+    const [recovery] = await listRecoveries(root)
+    const evidence = join(root, ".garden-publisher", "recovery", recovery!.id)
+    await rm(join(root, "content", "artificial-intelligence", "index.md"))
+
+    await expect(
+      restoreRecovery({
+        workspace: root,
+        id: recovery!.id,
+        expectedCurrentHash: hash("current"),
+      }),
+    ).rejects.toMatchObject({
+      code: expect.stringMatching(/^(?:NOTE_FILE_INVALID|RECOVERY_INVALID)$/),
+    })
+    await expect(readFile(path, "utf8")).resolves.toBe("current")
+    await expect(lstat(evidence)).resolves.toMatchObject({ isDirectory: expect.any(Function) })
+  })
+
+  it("blocks custom-domain recovery when its landing page is replaced before commit", async () => {
+    const root = await createGarden()
+    await markDomain(root, "artificial-intelligence")
+    const path = join(root, "content", "artificial-intelligence", "recovery-race.md")
+    const landing = join(root, "content", "artificial-intelligence", "index.md")
+    await createNote({
+      workspace: root,
+      visibility: "public",
+      domain: "artificial-intelligence",
+      slug: "recovery-race",
+      title: "Recovery race",
+      date: "2026-10-07",
+      description: "Custom recovery race.",
+      tags: ["test"],
+      body: "original",
+    })
+    await saveNote({
+      workspace: root,
+      path: "content/artificial-intelligence/recovery-race.md",
+      markdown: "current",
+      ...(await revision(path)),
+    })
+    const [recovery] = await listRecoveries(root)
+    const evidence = join(root, ".garden-publisher", "recovery", recovery!.id)
+
+    await expect(
+      restoreRecovery(
+        { workspace: root, id: recovery!.id, expectedCurrentHash: hash("current") },
+        {
+          beforeReplace: async () => {
+            await rm(landing)
+            await writeFile(landing, "---\ngardenDomain: false\n---\n")
+          },
+        },
+      ),
+    ).rejects.toMatchObject({ code: "NOTE_FILE_UNSAFE_PATH" })
+    await expect(readFile(path, "utf8")).resolves.toBe("current")
+    await expect(lstat(evidence)).resolves.toMatchObject({ isDirectory: expect.any(Function) })
+  })
+
   it.each(["EACCES", "EIO"])(
     "does not treat a target %s read failure as absence during restore",
     async (code) => {
@@ -1548,7 +1776,7 @@ describe("note files", () => {
       let injected = false
       let replacementAttempted = false
       vi.spyOn(prototype, "readFile").mockImplementation(async function (this: typeof prototype) {
-        const bytes = await Reflect.apply(originalReadFile, this, [])
+        const bytes = await Reflect.apply(originalReadFile, this, Array.from(arguments))
         if (!injected && bytes.toString("utf8") === "current target bytes") {
           injected = true
           throw Object.assign(new Error(`injected ${code}`), { code })
@@ -2194,7 +2422,7 @@ describe("note files", () => {
         () => true,
         () => false,
       )
-      const bytes = await Reflect.apply(originalReadFile, this, [])
+      const bytes = await Reflect.apply(originalReadFile, this, Array.from(arguments))
       if (!lockPresent) {
         const text = bytes.toString("utf8")
         if (text.startsWith("stress-version-")) snapshotReadsAfterRelease += 1
@@ -2399,7 +2627,7 @@ describe("note files", () => {
     const originalReadFile = prototype.readFile
     let oversizedBodyReads = 0
     vi.spyOn(prototype, "readFile").mockImplementation(async function (this: typeof prototype) {
-      const bytes = await Reflect.apply(originalReadFile, this, [])
+      const bytes = await Reflect.apply(originalReadFile, this, Array.from(arguments))
       if (bytes.length > 256 * 1_024) oversizedBodyReads += 1
       return bytes
     })
@@ -2429,7 +2657,7 @@ describe("note files", () => {
     const originalReadFile = prototype.readFile
     let oversizedBodyReads = 0
     vi.spyOn(prototype, "readFile").mockImplementation(async function (this: typeof prototype) {
-      const bytes = await Reflect.apply(originalReadFile, this, [])
+      const bytes = await Reflect.apply(originalReadFile, this, Array.from(arguments))
       if (bytes.length > 128 * 1_024) oversizedBodyReads += 1
       return bytes
     })
@@ -2472,7 +2700,7 @@ describe("note files", () => {
     const originalReadFile = prototype.readFile
     let oversizedBodyReads = 0
     vi.spyOn(prototype, "readFile").mockImplementation(async function (this: typeof prototype) {
-      const bytes = await Reflect.apply(originalReadFile, this, [])
+      const bytes = await Reflect.apply(originalReadFile, this, Array.from(arguments))
       if (bytes.length > 64 * 1_024) oversizedBodyReads += 1
       return bytes
     })

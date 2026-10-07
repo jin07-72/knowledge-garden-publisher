@@ -24,8 +24,12 @@ import {
   type InternalNotePathLease,
   type NoteFileAdapter,
 } from "./noteFiles"
+import {
+  captureNoteDomainSnapshot,
+  revalidateNoteDomains,
+  type NoteDomainSnapshot,
+} from "./noteDomains"
 
-const validDomains = new Set<NoteDomain>(["technology", "reading", "language", "life"])
 const slugPattern = /^[a-z0-9]+(?:-[a-z0-9]+)*$/
 const hashPattern = /^[a-f0-9]{64}$/
 const stateName = ".garden-publisher"
@@ -37,8 +41,6 @@ export const DEFAULT_TRANSACTION_GLOBAL_RETENTION = 200
 export const MAX_TRANSACTION_RETENTION_SCAN = 256
 export const MAX_TRANSACTION_RETENTION_TRASH_CALLS = 16
 export const MAX_TRANSACTION_MANIFEST_BYTES = 256 * 1024
-
-export type NoteDomain = DomainSlug
 
 export interface TransactionRevision {
   mtimeMs: number
@@ -91,9 +93,9 @@ export interface VisibilityChangePlan extends TransactionPlanBase {
 export interface RenamePlan extends TransactionPlanBase {
   kind: "rename"
   visibility: Visibility
-  oldDomain: NoteDomain
+  oldDomain: DomainSlug
   oldSlug: string
-  newDomain: NoteDomain
+  newDomain: DomainSlug
   newSlug: string
   alias: string
   linkEdits: WikiLinkEdit[]
@@ -111,9 +113,9 @@ export interface VisibilityChangeInput {
 export interface RenameInput {
   workspace: string
   path: string
-  domain?: NoteDomain
+  domain?: DomainSlug
   slug?: string
-  newDomain?: NoteDomain
+  newDomain?: DomainSlug
   newSlug?: string
 }
 
@@ -197,7 +199,7 @@ interface SafeFile {
 interface ParsedNotePath {
   visibility: Visibility
   root: "content" | "private"
-  domain: NoteDomain
+  domain: DomainSlug
   slug: string
   path: string
 }
@@ -387,7 +389,7 @@ function parseNotePath(path: string): ParsedNotePath {
   const slug = filename?.endsWith(".md") ? filename.slice(0, -3) : ""
   if (
     visibility === undefined ||
-    !validDomains.has(domain as NoteDomain) ||
+    !slugPattern.test(domain) ||
     slug === "index" ||
     !slugPattern.test(slug) ||
     `${root}/${domain}/${slug}.md` !== path
@@ -397,7 +399,7 @@ function parseNotePath(path: string): ParsedNotePath {
   return {
     visibility,
     root: root as "content" | "private",
-    domain: domain as NoteDomain,
+    domain,
     slug,
     path,
   }
@@ -838,6 +840,7 @@ async function assertOwnedReferences(
   workspace: string,
   note: ParsedNotePath,
   markdown: string,
+  domains: NoteDomainSnapshot,
   scannedMarkdown?: readonly ScannedMarkdown[],
 ): Promise<void> {
   const owned = resolve(workspace, note.root, "_assets", note.slug)
@@ -846,7 +849,7 @@ async function assertOwnedReferences(
     if (candidate === undefined) continue
     if (!inside(owned, candidate)) throw blocked("AMBIGUOUS_ATTACHMENT", note.path)
   }
-  for (const scanned of scannedMarkdown ?? (await scanMarkdown(workspace))) {
+  for (const scanned of scannedMarkdown ?? (await scanMarkdown(workspace, domains))) {
     if (scanned.path === note.path) continue
     for (const occurrence of localReferenceOccurrences(
       scanned.file.bytes.toString("utf8"),
@@ -892,8 +895,17 @@ async function buildBase(
   sourceFile: SafeFile
   moves: TransactionMove[]
   collisionChecks: TransactionCollisionCheck[]
+  domains: NoteDomainSnapshot
 }> {
   const { root: workspace, identity: workspaceIdentity } = await canonicalWorkspace(workspaceInput)
+  const domains = await captureNoteDomainSnapshot(workspace).catch(() => {
+    throw blocked("DOMAIN_DISCOVERY_FAILED", "content")
+  })
+  const sourceNote = parseNotePath(sourcePath)
+  const targetNote = parseNotePath(targetPath)
+  if (!domains.has(sourceNote.domain) || !domains.has(targetNote.domain)) {
+    throw blocked("DOMAIN_NOT_FOUND", !domains.has(sourceNote.domain) ? sourcePath : targetPath)
+  }
   const sourceFile = await safeFile(workspace, sourcePath)
   const source = parseNotePath(sourcePath)
   const sourceAttachmentRoot = `${source.root}/_assets/${source.slug}`
@@ -929,6 +941,7 @@ async function buildBase(
     sourceFile,
     moves: [noteMove, ...attachmentMoves],
     collisionChecks,
+    domains,
   }
 }
 
@@ -959,7 +972,12 @@ async function buildVisibilityChangePlan(
     targetAttachmentRoot,
     (path) => `${targetAttachmentRoot}${path.slice(sourceAttachmentRoot.length)}`,
   )
-  await assertOwnedReferences(base.workspace, source, base.sourceFile.bytes.toString("utf8"))
+  await assertOwnedReferences(
+    base.workspace,
+    source,
+    base.sourceFile.bytes.toString("utf8"),
+    base.domains,
+  )
   const historyWarning =
     source.visibility === "public"
       ? await trackedByGit(base.workspace, source.path, input.runner ?? systemCommandRunner)
@@ -973,6 +991,9 @@ async function buildVisibilityChangePlan(
       ]
     : []
   const key = await trustKey(base.workspace, true)
+  await revalidateNoteDomains(base.domains).catch(() => {
+    throw blocked("DOMAIN_CHANGED", source.path)
+  })
   return signPlan(
     {
       version: 1,
@@ -1010,14 +1031,17 @@ interface ScannedMarkdown {
   note: ParsedNotePath
 }
 
-async function scanMarkdown(workspace: string): Promise<ScannedMarkdown[]> {
+async function scanMarkdown(
+  workspace: string,
+  domains: NoteDomainSnapshot,
+): Promise<ScannedMarkdown[]> {
   const scanned: ScannedMarkdown[] = []
   for (const root of ["content", "private"] as const) {
     const rootPath = resolve(workspace, root)
     await ensureSafeDirectory(rootPath, workspace).catch(() => {
       throw blocked("UNSAFE_MARKDOWN_TREE", root)
     })
-    for (const domain of [...validDomains].sort()) {
+    for (const domain of domains.orderedSlugs) {
       const directory = resolve(rootPath, domain)
       try {
         await ensureSafeDirectory(directory, rootPath)
@@ -1233,7 +1257,7 @@ async function buildRenamePlan(input: RenameInput): Promise<RenamePlan> {
   const source = parseNotePath(input.path)
   const newDomain = input.domain ?? input.newDomain ?? source.domain
   const newSlug = input.slug ?? input.newSlug ?? source.slug
-  if (!validDomains.has(newDomain) || !slugPattern.test(newSlug) || newSlug === "index") {
+  if (!slugPattern.test(newDomain) || !slugPattern.test(newSlug) || newSlug === "index") {
     throw transactionError("TRANSACTION_PLAN_INVALID", "The rename target is invalid.", {
       path: source.path,
     })
@@ -1255,8 +1279,8 @@ async function buildRenamePlan(input: RenameInput): Promise<RenamePlan> {
   )
   const sourceMarkdown = base.sourceFile.bytes.toString("utf8")
   assertAliasSupported(sourceMarkdown)
-  const notes = await scanMarkdown(base.workspace)
-  await assertOwnedReferences(base.workspace, source, sourceMarkdown, notes)
+  const notes = await scanMarkdown(base.workspace, base.domains)
+  await assertOwnedReferences(base.workspace, source, sourceMarkdown, base.domains, notes)
   const sameSlug = notes.filter(({ note }) => note.slug === source.slug)
   const oldQualified = `${source.domain}/${source.slug}`
   const newQualified = `${newDomain}/${newSlug}`
@@ -1293,6 +1317,9 @@ async function buildRenamePlan(input: RenameInput): Promise<RenamePlan> {
   )
   const alias = newSlug !== source.slug ? source.slug : oldQualified
   const key = await trustKey(base.workspace, true)
+  await revalidateNoteDomains(base.domains).catch(() => {
+    throw blocked("DOMAIN_CHANGED", source.path)
+  })
   return signPlan(
     {
       version: 1,
@@ -2992,6 +3019,24 @@ async function execute(
   }
   const verified = await verifyPlan(rawPlan, expectedKind, context.workspace)
   const { plan, workspace, key } = verified
+  const domains = await captureNoteDomainSnapshot(workspace).catch(() => {
+    throw transactionError("TRANSACTION_STALE", "The domain catalog is unavailable.")
+  })
+  const affectedDomains = [
+    ...new Set(
+      [plan.source, plan.target, ...plan.linkEdits.map(({ path }) => path)].map(
+        (path) => parseNotePath(path).domain,
+      ),
+    ),
+  ]
+  if (affectedDomains.some((domain) => !domains.has(domain))) {
+    throw transactionError("TRANSACTION_STALE", "A transaction domain no longer exists.")
+  }
+  const revalidateDomains = async (): Promise<void> => {
+    await revalidateNoteDomains(domains, affectedDomains).catch(() => {
+      throw transactionError("TRANSACTION_STALE", "A transaction domain changed.")
+    })
+  }
   const adapter = context.adapter ?? {}
   await ensureStateDirectories(workspace)
   await migrateLegacyTerminalEvidence(workspace, key)
@@ -3055,6 +3100,7 @@ async function execute(
     await locks.assertOwned()
     await updateJournal(journal, "note-publish-intent", key)
     await adapter.beforePublish?.(plan.target)
+    await revalidateDomains()
     await publishExclusive(
       workspace,
       plan.target,
@@ -3084,6 +3130,7 @@ async function execute(
         )
       }
       const updated = Buffer.from(applyWikiEdits(current.bytes.toString("utf8"), edits), "utf8")
+      await revalidateDomains()
       await locks.assertOwned()
       await updateJournal(journal, "link-quarantine-intent", key)
       await replacePlannedFile(
@@ -3108,6 +3155,7 @@ async function execute(
 
     await locks.assertOwned()
     await updateJournal(journal, "attachments-publish-intent", key)
+    await revalidateDomains()
     await publishAttachments(
       workspace,
       plan,
@@ -3123,6 +3171,7 @@ async function execute(
 
     await locks.assertOwned()
     await updateJournal(journal, "source-remove-intent", key)
+    await revalidateDomains()
     await removeSources(workspace, plan, journal.directory, removedSources, adapter)
     if (removedSources.size > 0) mutationStarted = true
     await locks.assertOwned()
@@ -3138,6 +3187,8 @@ async function execute(
       )
     }
 
+    await locks.assertOwned()
+    await revalidateDomains()
     await updateJournal(journal, "complete", key)
     const changedPaths = planPaths(plan).sort((left, right) => left.localeCompare(right))
     const cleanupWarnings = await locks.release()

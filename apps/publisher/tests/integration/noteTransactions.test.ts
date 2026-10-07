@@ -70,6 +70,13 @@ async function garden(options: { git?: boolean } = {}): Promise<string> {
       await mkdir(join(root, top, domain), { recursive: true })
     }
   }
+  for (const domain of ["technology", "reading", "language", "life"]) {
+    await put(
+      root,
+      `content/${domain}/index.md`,
+      `---\ngardenDomain: true\ntitle: ${domain}\ndescription: Test domain.\n---\n`,
+    )
+  }
   if (options.git) await run("git", ["init", "--quiet"], { cwd: root })
   return root
 }
@@ -127,6 +134,113 @@ afterEach(async () => {
 })
 
 describe("note visibility transactions", () => {
+  it("moves visibility and renames across custom discovered domains", async () => {
+    const workspace = await garden({ git: true })
+    for (const domain of ["artificial-intelligence", "machine-learning"]) {
+      await put(
+        workspace,
+        `content/${domain}/index.md`,
+        `---\ngardenDomain: true\ntitle: ${domain}\ndescription: Test domain.\n---\n`,
+      )
+      await mkdir(join(workspace, "private", domain), { recursive: true })
+    }
+    const markdown = "---\ntitle: Transformers\n---\n\n# Transformers"
+    await put(workspace, "content/artificial-intelligence/transformers.md", markdown)
+    const visibility = await planVisibilityChange({
+      workspace,
+      path: "content/artificial-intelligence/transformers.md",
+      visibility: "private",
+    })
+    await executeVisibilityChange(visibility, { workspace })
+    const collision = join(workspace, "private", "machine-learning", "attention.md")
+    await writeFile(collision, "# Existing")
+    await expect(
+      planRename({
+        workspace,
+        path: "private/artificial-intelligence/transformers.md",
+        newDomain: "machine-learning",
+        newSlug: "attention",
+      }),
+    ).rejects.toMatchObject({ code: "TRANSACTION_PLAN_BLOCKED" })
+    await rm(collision)
+    const renamePlan = await planRename({
+      workspace,
+      path: "private/artificial-intelligence/transformers.md",
+      newDomain: "machine-learning",
+      newSlug: "attention",
+    })
+    await executeRename(renamePlan, { workspace })
+    await expect(
+      readFile(join(workspace, "private", "machine-learning", "attention.md"), "utf8"),
+    ).resolves.toContain("# Transformers")
+  })
+
+  it("fails closed when a custom-domain landing page is removed before publication", async () => {
+    const workspace = await garden({ git: true })
+    await put(
+      workspace,
+      "content/artificial-intelligence/index.md",
+      "---\ngardenDomain: true\ntitle: AI\ndescription: Test domain.\n---\n",
+    )
+    await mkdir(join(workspace, "private", "artificial-intelligence"), { recursive: true })
+    await put(workspace, "content/artificial-intelligence/race.md", "# Race")
+    const plan = await planVisibilityChange({
+      workspace,
+      path: "content/artificial-intelligence/race.md",
+      visibility: "private",
+    })
+
+    await expect(
+      executeVisibilityChange(plan, {
+        workspace,
+        adapter: {
+          beforePublish: async () => {
+            await rm(join(workspace, "content", "artificial-intelligence", "index.md"))
+          },
+        },
+      }),
+    ).rejects.toMatchObject({ code: "TRANSACTION_STALE" })
+    await expect(
+      readFile(join(workspace, "content", "artificial-intelligence", "race.md"), "utf8"),
+    ).resolves.toBe("# Race")
+    await expect(
+      lstat(join(workspace, "private", "artificial-intelligence", "race.md")),
+    ).rejects.toMatchObject({ code: "ENOENT" })
+  })
+
+  it("does not commit after a custom-domain landing page is removed after source removal", async () => {
+    const workspace = await garden({ git: true })
+    const landing = join(workspace, "content", "artificial-intelligence", "index.md")
+    await put(
+      workspace,
+      "content/artificial-intelligence/index.md",
+      "---\ngardenDomain: true\ntitle: AI\ndescription: Test domain.\n---\n",
+    )
+    await mkdir(join(workspace, "private", "artificial-intelligence"), { recursive: true })
+    await put(workspace, "content/artificial-intelligence/late-race.md", "# Late race")
+    const plan = await planVisibilityChange({
+      workspace,
+      path: "content/artificial-intelligence/late-race.md",
+      visibility: "private",
+    })
+
+    await expect(
+      executeVisibilityChange(plan, {
+        workspace,
+        adapter: {
+          afterPhase: async (phase) => {
+            if (phase === "source-removed") await rm(landing)
+          },
+        },
+      }),
+    ).rejects.toMatchObject({ code: expect.stringMatching(/^TRANSACTION_(?:STALE|UNCERTAIN)$/) })
+    await expect(
+      readFile(join(workspace, "content", "artificial-intelligence", "late-race.md"), "utf8"),
+    ).resolves.toBe("# Late race")
+    await expect(
+      lstat(join(workspace, "private", "artificial-intelligence", "late-race.md")),
+    ).rejects.toMatchObject({ code: "ENOENT" })
+  })
   it("moves a public note and its nested owned attachments and reports the public deletion", async () => {
     const workspace = await garden({ git: true })
     const markdown = Buffer.from(

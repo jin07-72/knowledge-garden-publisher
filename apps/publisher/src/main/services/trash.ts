@@ -3,7 +3,6 @@ import { lstat, realpath, rename } from "node:fs/promises"
 import { isAbsolute, relative, resolve } from "node:path"
 import {
   MANAGED_NOTE_PATH_PATTERN,
-  NOTE_DOMAINS,
   type AppError,
   type NoteTrashReceipt,
   type TrashAdapter,
@@ -18,6 +17,12 @@ import {
   restoreLocalTrashStage,
   verifyTrashRecoveryStage,
 } from "./trashRecovery"
+import {
+  captureNoteDomainSnapshot,
+  revalidateNoteDomains,
+  sameNoteDomainMembership,
+  type NoteDomainSnapshot,
+} from "./noteDomains"
 
 export interface TrashManagedNoteInput {
   readonly workspace: string
@@ -48,7 +53,7 @@ function entryIdentity(details: BigIntStats): string {
 }
 
 async function ownedAttachmentDirectory(
-  workspaceInput: string,
+  domains: NoteDomainSnapshot,
   notePath: string,
 ): Promise<
   | { readonly kind: "not-found" }
@@ -66,12 +71,7 @@ async function ownedAttachmentDirectory(
   if (!match) {
     throw noteError("NOTE_FILE_INVALID", "Choose a note inside a managed content directory.")
   }
-  let workspace: string
-  try {
-    workspace = await realpath(resolve(workspaceInput))
-  } catch {
-    throw noteError("NOTE_FILE_ACCESS_FAILED", "The knowledge garden workspace is unavailable.")
-  }
+  const workspace = domains.workspace
   const visibilityRoot = match[1]!
   const slug = match[3]!
   const managedRoot = resolve(workspace, visibilityRoot)
@@ -97,7 +97,7 @@ async function ownedAttachmentDirectory(
     throw noteError("NOTE_FILE_ACCESS_FAILED", "Could not validate the owned attachments.")
   }
   const identities: string[] = []
-  for (const domain of NOTE_DOMAINS) {
+  for (const domain of domains.orderedSlugs) {
     const candidate = resolve(managedRoot, domain, `${slug}.md`)
     try {
       const details = await lstat(candidate)
@@ -165,6 +165,7 @@ async function trashOwnedAttachments(
   trash: TrashAdapter,
   adapter: TrashManagedNoteAdapter,
   assertOwnerLeases: () => Promise<void>,
+  domains: NoteDomainSnapshot,
 ): Promise<NoteTrashReceipt["attachmentCleanup"]> {
   try {
     const [assets, directory, canonicalAssets, canonicalDirectory] = await Promise.all([
@@ -202,6 +203,7 @@ async function trashOwnedAttachments(
       owned.directoryIdentity,
       undefined,
       trashRecoveryKey,
+      { domainSnapshot: domains },
     )
     await rename(owned.directory, stage.stagedPath)
     const [staged, canonicalStaged] = await Promise.all([
@@ -219,9 +221,27 @@ async function trashOwnedAttachments(
     if (!(await verifyTrashRecoveryStage(stage))) {
       throw new Error("staged attachment contents changed")
     }
+    const retainForDomainChange = async (): Promise<NoteTrashReceipt["attachmentCleanup"]> => {
+      const restored = await restoreLocalTrashStage(stage)
+      return restored
+        ? {
+            status: "retained-ambiguous",
+            message: "Attachments were retained because garden domain membership changed.",
+          }
+        : {
+            status: "failed",
+            message: "The note was recycled, but domain membership changed during cleanup.",
+          }
+    }
     await adapter.afterAttachmentStage?.()
     await assertOwnerLeases()
-    if (await hasAnotherOwner(owned.workspace, notePath)) {
+    try {
+      await revalidateNoteDomains(domains)
+    } catch {
+      const retained = await retainForDomainChange()
+      return retained
+    }
+    if (await hasAnotherOwner(domains, notePath)) {
       const restored = await restoreLocalTrashStage(stage)
       return restored
         ? {
@@ -234,6 +254,20 @@ async function trashOwnedAttachments(
           }
     }
     await assertOwnerLeases()
+    let membershipStable = false
+    try {
+      const currentDomains = await captureNoteDomainSnapshot(owned.workspace)
+      membershipStable = sameNoteDomainMembership(domains, currentDomains)
+      if (membershipStable) {
+        await Promise.all([revalidateNoteDomains(domains), revalidateNoteDomains(currentDomains)])
+      }
+    } catch {
+      membershipStable = false
+    }
+    if (!membershipStable) {
+      const retained = await retainForDomainChange()
+      return retained
+    }
     try {
       await trash.trashItem(stage.stagedPath)
     } catch {
@@ -279,11 +313,11 @@ async function trashOwnedAttachments(
   }
 }
 
-async function hasAnotherOwner(workspace: string, notePath: string): Promise<boolean> {
+async function hasAnotherOwner(domains: NoteDomainSnapshot, notePath: string): Promise<boolean> {
   const match = MANAGED_NOTE_PATH_PATTERN.exec(notePath)!
-  const managedRoot = resolve(workspace, match[1]!)
+  const managedRoot = resolve(domains.workspace, match[1]!)
   const slug = match[3]!
-  for (const domain of NOTE_DOMAINS) {
+  for (const domain of domains.orderedSlugs) {
     const candidate = resolve(managedRoot, domain, `${slug}.md`)
     try {
       const details = await lstat(candidate)
@@ -313,8 +347,14 @@ export async function trashManagedNote(
   const match = MANAGED_NOTE_PATH_PATTERN.exec(input.path)
   if (!match)
     throw noteError("NOTE_FILE_INVALID", "Choose a note inside a managed content directory.")
+  const domains = await captureNoteDomainSnapshot(input.workspace).catch(() => {
+    throw noteError("NOTE_FILE_ACCESS_FAILED", "The domain catalog is unavailable.")
+  })
+  if (!domains.has(match[2]!)) {
+    throw noteError("NOTE_FILE_INVALID", "Choose a note inside a current garden domain.")
+  }
   const paths = ["content", "private"]
-    .flatMap((root) => NOTE_DOMAINS.map((domain) => `${root}/${domain}/${match[3]}.md`))
+    .flatMap((root) => domains.orderedSlugs.map((domain) => `${root}/${domain}/${match[3]}.md`))
     .sort((left, right) => left.localeCompare(right))
   const leases: Awaited<ReturnType<typeof acquireInternalNotePathLease>>[] = []
   try {
@@ -333,9 +373,9 @@ export async function trashManagedNote(
   }
   try {
     await assertOwnerLeases()
-    const owned = await ownedAttachmentDirectory(input.workspace, input.path)
+    const owned = await ownedAttachmentDirectory(domains, input.path)
     await assertOwnerLeases()
-    const receipt = await trashVerifiedNote(input, { lease: targetLease })
+    const receipt = await trashVerifiedNote(input, { lease: targetLease, domainSnapshot: domains })
     await assertOwnerLeases()
     let attachmentCleanup: NoteTrashReceipt["attachmentCleanup"]
     if (owned.kind === "not-found") {
@@ -349,8 +389,7 @@ export async function trashManagedNote(
     } else {
       const confirmedOwned = owned
       try {
-        const workspace = await realpath(resolve(input.workspace))
-        attachmentCleanup = (await hasAnotherOwner(workspace, input.path))
+        attachmentCleanup = (await hasAnotherOwner(domains, input.path))
           ? {
               status: "retained-ambiguous",
               message: "Attachments were retained because another note now uses this slug.",
@@ -361,6 +400,7 @@ export async function trashManagedNote(
               input.trash,
               adapter,
               assertOwnerLeases,
+              domains,
             )
       } catch {
         attachmentCleanup = {

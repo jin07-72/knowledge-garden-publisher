@@ -1,4 +1,4 @@
-import { mkdir, mkdtemp, readFile, rename, rm, symlink, writeFile } from "node:fs/promises"
+import { mkdir, mkdtemp, readFile, readdir, rename, rm, symlink, writeFile } from "node:fs/promises"
 import { tmpdir } from "node:os"
 import { join } from "node:path"
 import { afterEach, describe, expect, it, vi } from "vitest"
@@ -15,15 +15,61 @@ afterEach(async () => {
 async function garden(): Promise<string> {
   const root = await mkdtemp(join(tmpdir(), "garden-trash-"))
   temporaryDirectories.push(root)
-  await mkdir(join(root, "content", "life"), { recursive: true })
-  await mkdir(join(root, "private", "life"), { recursive: true })
+  for (const domain of ["technology", "reading", "language", "life"]) {
+    await markDomain(root, domain)
+  }
   await mkdir(join(root, "content", "_assets", "daily"), { recursive: true })
   await writeFile(join(root, "content", "life", "daily.md"), "# Daily")
   await writeFile(join(root, "content", "_assets", "daily", "chart.png"), "chart")
   return root
 }
 
+async function markDomain(root: string, domain: string): Promise<void> {
+  await mkdir(join(root, "content", domain), { recursive: true })
+  await mkdir(join(root, "private", domain), { recursive: true })
+  await writeFile(
+    join(root, "content", domain, "index.md"),
+    `---\ngardenDomain: true\ntitle: ${domain}\ndescription: Test domain.\n---\n`,
+  )
+}
+
 describe("safe note trash", () => {
+  it("retains attachments shared by two custom discovered domains", async () => {
+    const root = await garden()
+    await markDomain(root, "artificial-intelligence")
+    await markDomain(root, "machine-learning")
+    await writeFile(join(root, "content", "artificial-intelligence", "daily.md"), "# AI")
+    await writeFile(join(root, "content", "machine-learning", "daily.md"), "# ML")
+    const trashItem = vi.fn(async (target: string) =>
+      rename(target, join(root, "recycled-custom-note.md")),
+    )
+
+    await expect(
+      trashManagedNote({
+        workspace: root,
+        path: "content/artificial-intelligence/daily.md",
+        trash: { trashItem },
+        isTracked: async () => false,
+      }),
+    ).resolves.toMatchObject({ attachmentCleanup: { status: "retained-ambiguous" } })
+    expect(trashItem).toHaveBeenCalledOnce()
+  })
+
+  it("rejects a note after its domain marker is removed", async () => {
+    const root = await garden()
+    await rm(join(root, "content", "life", "index.md"))
+    const trashItem = vi.fn(async () => undefined)
+
+    await expect(
+      trashManagedNote({
+        workspace: root,
+        path: "content/life/daily.md",
+        trash: { trashItem },
+        isTracked: async () => false,
+      }),
+    ).rejects.toMatchObject({ code: "NOTE_FILE_INVALID" })
+    expect(trashItem).not.toHaveBeenCalled()
+  })
   it("rejects paths outside managed note roots before calling the Recycle Bin", async () => {
     const root = await garden()
     const trashItem = vi.fn(async () => undefined)
@@ -199,6 +245,92 @@ describe("safe note trash", () => {
       readFile(join(root, "content", "_assets", "daily", "chart.png"), "utf8"),
     ).resolves.toBe("chart")
   })
+
+  it("retains staged attachments when an existing folder becomes a marked same-slug domain", async () => {
+    const root = await garden()
+    const lateDomain = join(root, "content", "late-domain")
+    await mkdir(lateDomain, { recursive: true })
+    const recycle = await mkdtemp(join(tmpdir(), "garden-late-domain-recycle-"))
+    temporaryDirectories.push(recycle)
+    let calls = 0
+    const trashItem = vi.fn(async (target: string) => {
+      calls += 1
+      await rename(target, join(recycle, `item-${calls}`))
+    })
+
+    const receipt = await trashManagedNote(
+      {
+        workspace: root,
+        path: "content/life/daily.md",
+        trash: { trashItem },
+        isTracked: async () => false,
+      },
+      {
+        afterAttachmentStage: async () => {
+          await writeFile(
+            join(lateDomain, "index.md"),
+            "---\ngardenDomain: true\ntitle: Late domain\ndescription: Newly marked domain.\n---\n",
+          )
+          await writeFile(join(lateDomain, "daily.md"), "# Late owner")
+        },
+      },
+    )
+
+    expect(receipt.attachmentCleanup).toMatchObject({ status: "retained-ambiguous" })
+    expect(trashItem).toHaveBeenCalledOnce()
+    await expect(
+      readFile(join(root, "content", "_assets", "daily", "chart.png"), "utf8"),
+    ).resolves.toBe("chart")
+    await expect(readFile(join(lateDomain, "daily.md"), "utf8")).resolves.toBe("# Late owner")
+  })
+
+  it.each(["removed", "replaced"] as const)(
+    "restores staged attachments when a domain marker is %s",
+    async (mutation) => {
+      const root = await garden()
+      const landing = join(root, "content", "life", "index.md")
+      const recoveryRoot = join(root, ".garden-publisher", "trash-recovery", "indexed-transactions")
+      const recycle = await mkdtemp(join(tmpdir(), `garden-domain-${mutation}-recycle-`))
+      temporaryDirectories.push(recycle)
+      let calls = 0
+      let stagedTransactions = 0
+      const trashItem = vi.fn(async (target: string) => {
+        calls += 1
+        await rename(target, join(recycle, `item-${calls}`))
+      })
+
+      const receipt = await trashManagedNote(
+        {
+          workspace: root,
+          path: "content/life/daily.md",
+          trash: { trashItem },
+          isTracked: async () => false,
+        },
+        {
+          afterAttachmentStage: async () => {
+            stagedTransactions = (await readdir(recoveryRoot, { recursive: true })).filter((path) =>
+              path.endsWith("journal.json"),
+            ).length
+            await rm(landing)
+            if (mutation === "replaced") {
+              await writeFile(landing, "---\ngardenDomain: false\n---\n")
+            }
+          },
+        },
+      )
+
+      expect(receipt.attachmentCleanup).toMatchObject({ status: "retained-ambiguous" })
+      expect(trashItem).toHaveBeenCalledOnce()
+      await expect(
+        readFile(join(root, "content", "_assets", "daily", "chart.png"), "utf8"),
+      ).resolves.toBe("chart")
+      expect(
+        (await readdir(recoveryRoot, { recursive: true })).filter((path) =>
+          path.endsWith("journal.json"),
+        ),
+      ).toHaveLength(stagedTransactions - 1)
+    },
+  )
 
   it("holds every same-slug note lease until attachment ownership cleanup finishes", async () => {
     const root = await garden()
