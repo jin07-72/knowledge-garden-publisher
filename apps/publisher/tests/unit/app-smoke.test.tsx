@@ -8,6 +8,7 @@ import { App } from "../../src/renderer/src/App"
 import type {
   BlogRegistryView,
   BlogRegistryStatus,
+  DomainSummary,
   GardenApi,
   IpcResult,
   PreviewStatus,
@@ -41,6 +42,13 @@ const registry: BlogRegistryStatus = {
 function ok<T>(value: T): IpcResult<T> {
   return { ok: true, value }
 }
+
+const domainSummaries: readonly DomainSummary[] = [
+  { slug: "technology", name: "技术", description: "", order: 1, publicNotes: 0, privateNotes: 0 },
+  { slug: "reading", name: "阅读", description: "", order: 2, publicNotes: 0, privateNotes: 0 },
+  { slug: "language", name: "语言", description: "", order: 3, publicNotes: 0, privateNotes: 0 },
+  { slug: "life", name: "生活", description: "", order: 4, publicNotes: 0, privateNotes: 0 },
+]
 
 function deferred<T>() {
   let resolve!: (value: T) => void
@@ -85,10 +93,10 @@ function gardenApi(): GardenApi {
       repair: vi.fn(),
     },
     domains: {
-      list: vi.fn(async () => ok([])),
-      create: vi.fn(async () => ok([])),
-      rename: vi.fn(async () => ok([])),
-      remove: vi.fn(async () => ok([])),
+      list: vi.fn(async () => ok(domainSummaries)),
+      create: vi.fn(async () => ok(domainSummaries)),
+      rename: vi.fn(async () => ok(domainSummaries)),
+      remove: vi.fn(async () => ok(domainSummaries)),
     },
     notes: {
       onRecovery: vi.fn(() => () => undefined),

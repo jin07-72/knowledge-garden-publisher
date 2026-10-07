@@ -8,6 +8,10 @@ import type {
   BlogRegistryView,
   BlogRegistryStatus,
   ChangeReview,
+  DomainCreateRequest,
+  DomainRemoveRequest,
+  DomainRenameRequest,
+  DomainSummary,
   GardenApi,
   NoteCreateRequest,
   NoteDocument,
@@ -30,6 +34,7 @@ import { FirstRun } from "./components/FirstRun"
 import { DeleteNoteDialog } from "./components/DeleteNoteDialog"
 import { BlogSwitcher } from "./components/BlogSwitcher"
 import { BlogManager, type BlogImportUiState } from "./components/BlogManager"
+import { DomainManager } from "./components/DomainManager"
 import "./app.css"
 
 type LoadState = "loading" | "ready" | "error"
@@ -168,6 +173,7 @@ export function PublisherApp({
 }): React.JSX.Element {
   const [registry, setRegistry] = useState<BlogRegistryView>(initialRegistry)
   const [managerOpen, setManagerOpen] = useState(false)
+  const [domainManagerOpen, setDomainManagerOpen] = useState(false)
   const [blogBusy, setBlogBusy] = useState(false)
   const [switchPreparing, setSwitchPreparing] = useState(false)
   const blogBusyRef = useRef(false)
@@ -176,6 +182,9 @@ export function PublisherApp({
     busy: false,
   })
   const [notes, setNotes] = useState<readonly NoteSummary[]>([])
+  const [domains, setDomains] = useState<readonly DomainSummary[]>([])
+  const [domainsState, setDomainsState] = useState<LoadState>("loading")
+  const [domainError, setDomainError] = useState<string>()
   const [selectedPath, setSelectedPath] = useState<string>()
   const [document, setDocument] = useState<NoteDocument>()
   const [documentError, setDocumentError] = useState<string>()
@@ -216,6 +225,8 @@ export function PublisherApp({
   const workspace = useRef<HTMLDivElement>(null)
   const markdownEditor = useRef<MarkdownEditorHandle>(null)
   const notesRequest = useRef(0)
+  const domainsRequest = useRef(0)
+  const loadedBlogId = useRef(initialRegistry.activeBlogId)
   const previewRequest = useRef(0)
   const changesRequest = useRef(0)
   const previewStart = useRef<ReturnType<GardenApi["preview"]["start"]> | undefined>(undefined)
@@ -387,6 +398,36 @@ export function PublisherApp({
     )
   }, [api])
 
+  const loadDomains = useCallback(async (): Promise<void> => {
+    const request = ++domainsRequest.current
+    setDomainsState("loading")
+    setDomainError(undefined)
+    let result: Awaited<ReturnType<GardenApi["domains"]["list"]>>
+    try {
+      result = await api.domains.list()
+    } catch (error) {
+      if (request !== domainsRequest.current) return
+      setDomainsState("error")
+      setDomainError(error instanceof Error ? error.message : "无法读取领域列表。")
+      return
+    }
+    if (request !== domainsRequest.current) return
+    if (!result.ok) {
+      setDomainsState("error")
+      setDomainError(result.error.message)
+      return
+    }
+    setDomains(result.value)
+    setDomainsState("ready")
+  }, [api])
+
+  useEffect(() => {
+    if (loadedBlogId.current === registry.activeBlogId) return
+    loadedBlogId.current = registry.activeBlogId
+    void loadNotes()
+    void loadDomains()
+  }, [loadDomains, loadNotes, registry.activeBlogId])
+
   const applyPreview = useCallback((next: PreviewStatus): void => {
     setPreview((current) => {
       if (next.generation < current.generation) return current
@@ -444,12 +485,14 @@ export function PublisherApp({
       if (restored.length > 0) {
         setTrashNotice(`已从 Windows 回收站恢复 ${restored.length} 项，笔记列表已更新。`)
         void loadNotes()
+        void loadDomains()
       }
       if (conflicts.length > 0) {
         setTrashNotice(`回收站恢复项与 ${conflicts[0]} 冲突；恢复副本仍安全保留在恢复区。`)
       }
     })
     void loadNotes()
+    void loadDomains()
     const currentPreviewRequest = ++previewRequest.current
     void api.preview
       .status()
@@ -490,11 +533,12 @@ export function PublisherApp({
       unsubscribePreview()
       unsubscribePublish()
       notesRequest.current += 1
+      domainsRequest.current += 1
       previewRequest.current += 1
       changesRequest.current += 1
       void api.changes.cancel()
     }
-  }, [api, applyPreview, loadChanges, loadNotes, startPreview])
+  }, [api, applyPreview, loadChanges, loadDomains, loadNotes, startPreview])
 
   useEffect(() => {
     if (!customPaneSizes) return
@@ -586,6 +630,7 @@ export function PublisherApp({
       mtimeMs: result.value.mtimeMs,
       contentHash: result.value.contentHash,
     })
+    void loadDomains()
     return undefined
   }
 
@@ -628,6 +673,7 @@ export function PublisherApp({
           ? { path: nextPath, messages: consequenceMessages }
           : undefined,
       )
+      void loadDomains()
     } catch (error) {
       if (!appMounted.current) return
       setVisibilityError({
@@ -675,6 +721,7 @@ export function PublisherApp({
           : []),
     ]
     setTrashNotice(deletionMessages.join(" "))
+    void loadDomains()
     void loadChanges()
     return result.value
   }
@@ -771,6 +818,26 @@ export function PublisherApp({
     })
   }
 
+  const applyDomainMutation = async (
+    operation: () => Promise<Awaited<ReturnType<GardenApi["domains"]["list"]>>>,
+  ): Promise<readonly DomainSummary[]> => {
+    domainsRequest.current += 1
+    try {
+      const result = await operation()
+      if (!result.ok) throw new Error(result.error.message)
+      if (appMounted.current) {
+        setDomains(result.value)
+        setDomainsState("ready")
+        setDomainError(undefined)
+        void loadNotes()
+      }
+      return result.value
+    } catch (failure) {
+      if (appMounted.current) void loadDomains()
+      throw failure
+    }
+  }
+
   return (
     <main
       className="app-shell"
@@ -798,6 +865,13 @@ export function PublisherApp({
             setImportState((current) => ({ ...current, view: "list", error: undefined }))
           }}
         />
+        <button
+          type="button"
+          className="secondary-button domain-manager-trigger"
+          onClick={() => setDomainManagerOpen(true)}
+        >
+          管理领域
+        </button>
         <div className="topbar-meta">
           <span className={`status-dot preview-${preview.state}`} />
           {previewLabel[preview.state]}
@@ -821,6 +895,15 @@ export function PublisherApp({
           </button>
         </div>
       ) : null}
+      {domainsState === "error" ? (
+        <div className="global-alert" role="alert">
+          <TriangleAlert size={16} aria-hidden="true" />
+          <span>{domainError ?? "无法读取领域列表。"}</span>
+          <button type="button" onClick={() => void loadDomains()}>
+            重试
+          </button>
+        </div>
+      ) : null}
 
       <div
         ref={workspace}
@@ -836,6 +919,7 @@ export function PublisherApp({
       >
         <NoteSidebar
           notes={notes}
+          domains={domains}
           loadState={notesState}
           message={notesMessage}
           selectedPath={selectedPath}
@@ -919,6 +1003,7 @@ export function PublisherApp({
                   ref={markdownEditor}
                   document={document}
                   notes={notes}
+                  domains={domains}
                   save={api.notes.save}
                   read={() => api.notes.read({ path: document.path })}
                   recovery={{
@@ -1080,6 +1165,21 @@ export function PublisherApp({
             setPendingDelete(undefined)
             requestAnimationFrame(() => postDeleteFocus.current?.focus())
           }}
+        />
+      ) : null}
+      {domainManagerOpen ? (
+        <DomainManager
+          domains={domains}
+          onClose={() => setDomainManagerOpen(false)}
+          onCreate={(request: DomainCreateRequest) =>
+            applyDomainMutation(() => api.domains.create(request))
+          }
+          onRename={(request: DomainRenameRequest) =>
+            applyDomainMutation(() => api.domains.rename(request))
+          }
+          onRemove={(request: DomainRemoveRequest) =>
+            applyDomainMutation(() => api.domains.remove(request))
+          }
         />
       ) : null}
       <BlogManager

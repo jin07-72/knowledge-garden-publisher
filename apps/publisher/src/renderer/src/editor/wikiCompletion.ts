@@ -1,14 +1,16 @@
 import { type CompletionContext, type CompletionResult } from "@codemirror/autocomplete"
-import type { NoteSummary } from "../../../shared/contracts"
+import type { DomainSummary, NoteSummary } from "../../../shared/contracts"
 
-function completionDetail(note: NoteSummary): string {
-  return `${note.domain} · ${note.visibility === "public" ? "公开" : "私密"} · ${note.path}`
+function completionDetail(note: NoteSummary, domains: readonly DomainSummary[]): string {
+  const domainName = domains.find((domain) => domain.slug === note.domain)?.name ?? note.domain
+  return `${domainName} · ${note.visibility === "public" ? "公开" : "私密"} · ${note.path}`
 }
 
 /** Metadata-only completion: never copies descriptions, tags, or note bodies into the UI. */
 export function wikiCompletion(
   notes: readonly NoteSummary[],
   currentDomain?: NoteSummary["domain"],
+  domains: readonly DomainSummary[] = [],
 ) {
   return (context: CompletionContext): CompletionResult | null => {
     const match = context.matchBefore(/\[\[[^\]\n]*$/)
@@ -36,7 +38,7 @@ export function wikiCompletion(
       from: match.from + 2,
       options: ranked.map(({ note }) => ({
         label: note.title,
-        detail: completionDetail(note),
+        detail: completionDetail(note, domains),
         apply: `${note.title}]]`,
         type: "text",
       })),

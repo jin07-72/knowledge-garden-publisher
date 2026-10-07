@@ -19,6 +19,7 @@ import {
 } from "react"
 import type {
   IpcResult,
+  DomainSummary,
   NoteDocument,
   NoteRecovery,
   NoteRecoveryDiscardRequest,
@@ -140,6 +141,7 @@ export const MarkdownEditor = forwardRef<
   {
     readonly document: NoteDocument
     readonly notes: readonly NoteSummary[]
+    readonly domains?: readonly DomainSummary[]
     readonly save: (request: NoteSaveRequest) => Promise<IpcResult<NoteWriteReceipt>>
     readonly read: () => Promise<IpcResult<NoteDocument>>
     readonly recovery: RecoveryPort
@@ -148,7 +150,17 @@ export const MarkdownEditor = forwardRef<
     readonly onSaveStateChange?: (label: string) => void
   }
 >(function MarkdownEditor(
-  { document, notes, save, read, recovery, readOnly = false, onSaved, onSaveStateChange },
+  {
+    document,
+    notes,
+    domains = [],
+    save,
+    read,
+    recovery,
+    readOnly = false,
+    onSaved,
+    onSaveStateChange,
+  },
   ref,
 ) {
   const host = useRef<HTMLDivElement>(null)
@@ -218,7 +230,11 @@ export const MarkdownEditor = forwardRef<
           completion.current.of(
             autocompletion({
               override: [
-                wikiCompletion(notes, document.path.split("/")[1] as NoteSummary["domain"]),
+                wikiCompletion(
+                  notes,
+                  document.path.split("/")[1] as NoteSummary["domain"],
+                  domains,
+                ),
               ],
               activateOnTyping: true,
             }),
@@ -324,12 +340,14 @@ export const MarkdownEditor = forwardRef<
     view.dispatch({
       effects: completion.current.reconfigure(
         autocompletion({
-          override: [wikiCompletion(notes, document.path.split("/")[1] as NoteSummary["domain"])],
+          override: [
+            wikiCompletion(notes, document.path.split("/")[1] as NoteSummary["domain"], domains),
+          ],
           activateOnTyping: true,
         }),
       ),
     })
-  }, [document.path, notes])
+  }, [document.path, notes, domains])
 
   const replace = (next: NoteRecovery): void => {
     const view = editor.current

@@ -12,6 +12,7 @@ import { BlogSwitcher } from "../../src/renderer/src/components/BlogSwitcher"
 import { shanghaiCalendarDate } from "../../src/renderer/src/components/NoteSidebar"
 import type {
   ChangeReview,
+  DomainSummary,
   BlogCandidateInspection,
   BlogImportReceipt,
   BlogRegistryView,
@@ -51,6 +52,13 @@ const notes: readonly NoteSummary[] = [
     updatedAt: "2026-09-23T08:00:00.000Z",
     tags: ["阅读"],
   },
+]
+
+const domainSummaries: readonly DomainSummary[] = [
+  { slug: "technology", name: "技术", description: "", order: 1, publicNotes: 1, privateNotes: 0 },
+  { slug: "reading", name: "阅读", description: "", order: 2, publicNotes: 0, privateNotes: 1 },
+  { slug: "language", name: "语言", description: "", order: 3, publicNotes: 0, privateNotes: 0 },
+  { slug: "life", name: "生活", description: "", order: 4, publicNotes: 0, privateNotes: 0 },
 ]
 
 const documents = new Map<string, NoteDocument>([
@@ -175,10 +183,10 @@ function createGardenMock(): GardenApi {
       ),
     },
     domains: {
-      list: vi.fn(async () => ok([])),
-      create: vi.fn(async () => ok([])),
-      rename: vi.fn(async () => ok([])),
-      remove: vi.fn(async () => ok([])),
+      list: vi.fn(async () => ok(domainSummaries)),
+      create: vi.fn(async () => ok(domainSummaries)),
+      rename: vi.fn(async () => ok(domainSummaries)),
+      remove: vi.fn(async () => ok(domainSummaries)),
     },
     notes: {
       onRecovery: vi.fn(() => () => undefined),
@@ -542,8 +550,178 @@ describe("publisher main layout", () => {
     expect(screen.getByRole("button", { name: /私密阅读札记/ })).toBeVisible()
   })
 
+  it("renders a custom fifth domain in filters and the new-note selector", async () => {
+    const user = userEvent.setup()
+    const customDomains = [
+      ...domainSummaries,
+      { slug: "craft", name: "创作", description: "", order: 5, publicNotes: 0, privateNotes: 0 },
+    ] as const
+    vi.mocked(garden.domains.list).mockResolvedValueOnce(ok(customDomains))
+    render(<App />)
+
+    const navigation = await screen.findByRole("navigation", { name: "笔记" })
+    expect(within(navigation).getByRole("button", { name: "创作" })).toBeVisible()
+    await user.click(within(navigation).getByRole("button", { name: "新建笔记" }))
+    expect(
+      within(screen.getByRole("dialog", { name: "新建笔记" })).getByRole("option", {
+        name: "创作",
+      }),
+    ).toHaveValue("craft")
+  })
+
+  it("treats a custom slug named all as a real domain, not the all sentinel", async () => {
+    const user = userEvent.setup()
+    const customDomains = [
+      ...domainSummaries,
+      { slug: "all", name: "全量资料", description: "", order: 5, publicNotes: 0, privateNotes: 0 },
+    ] as const
+    const customNote: NoteSummary = {
+      path: "content/all/custom.md",
+      domain: "all",
+      slug: "custom",
+      title: "全量资料笔记",
+      date: "2026-09-19",
+      description: "custom slug",
+      visibility: "public",
+      updatedAt: "2026-09-24T08:00:00.000Z",
+      tags: [],
+    }
+    vi.mocked(garden.domains.list).mockResolvedValueOnce(ok(customDomains))
+    vi.mocked(garden.notes.list).mockResolvedValueOnce(ok([...notes, customNote]))
+    render(<App />)
+
+    const navigation = await screen.findByRole("navigation", { name: "笔记" })
+    const customFilter = within(navigation).getByRole("button", { name: "全量资料" })
+    await user.click(customFilter)
+    expect(customFilter).toHaveAttribute("aria-pressed", "true")
+    expect(within(navigation).getByRole("button", { name: /全量资料笔记/ })).toBeVisible()
+    expect(
+      within(navigation).queryByRole("button", { name: /CSS Grid 布局/ }),
+    ).not.toBeInTheDocument()
+    expect(within(navigation).getByRole("button", { name: "全部领域" })).toHaveAttribute(
+      "aria-pressed",
+      "false",
+    )
+  })
+
+  it("reconciles a new-note selection when domains arrive after the dialog opens", async () => {
+    const user = userEvent.setup()
+    const pendingDomains = deferred<IpcResult<readonly DomainSummary[]>>()
+    vi.mocked(garden.domains.list).mockReturnValueOnce(pendingDomains.promise)
+    render(<App />)
+
+    await user.click(screen.getByRole("button", { name: "新建笔记" }))
+    const dialog = screen.getByRole("dialog", { name: "新建笔记" })
+    await user.type(within(dialog).getByRole("textbox", { name: "标题" }), "延迟领域")
+    await user.type(within(dialog).getByRole("textbox", { name: "描述" }), "延迟领域描述")
+    await user.type(within(dialog).getByRole("textbox", { name: "标签" }), "测试")
+    expect(within(dialog).getByRole("button", { name: "创建" })).toBeDisabled()
+
+    pendingDomains.resolve(ok(domainSummaries))
+    await waitFor(() =>
+      expect(within(dialog).getByRole("combobox", { name: "领域" })).toHaveValue("technology"),
+    )
+    await waitFor(() => expect(within(dialog).getByRole("button", { name: "创建" })).toBeEnabled())
+  })
+
+  it("does not let an old domain load overwrite a mutation response", async () => {
+    const user = userEvent.setup()
+    const oldLoad = deferred<IpcResult<readonly DomainSummary[]>>()
+    const createdDomains = [
+      ...domainSummaries,
+      { slug: "craft", name: "创作", description: "", order: 5, publicNotes: 0, privateNotes: 0 },
+    ] as const
+    vi.mocked(garden.domains.list).mockReturnValueOnce(oldLoad.promise)
+    vi.mocked(garden.domains.create).mockResolvedValueOnce(ok(createdDomains))
+    render(<App />)
+
+    await user.click(screen.getByRole("button", { name: "管理领域" }))
+    await user.click(screen.getByRole("button", { name: "新建领域" }))
+    const dialog = screen.getByRole("dialog", { name: "新建领域" })
+    await user.type(within(dialog).getByLabelText("显示名称"), "创作")
+    await user.type(within(dialog).getByLabelText("英文路径"), "craft")
+    await user.click(within(dialog).getByRole("button", { name: "创建领域" }))
+    await waitFor(() => expect(screen.getByRole("article", { name: "创作" })).toBeVisible())
+
+    oldLoad.resolve(ok(domainSummaries))
+    await Promise.resolve()
+    expect(screen.getByRole("article", { name: "创作" })).toBeVisible()
+  })
+
+  it("restarts domain loading after a failed mutation invalidates startup loading", async () => {
+    const user = userEvent.setup()
+    const startup = deferred<IpcResult<readonly DomainSummary[]>>()
+    const replacement = deferred<IpcResult<readonly DomainSummary[]>>()
+    let listRequest = 0
+    vi.mocked(garden.domains.list).mockImplementation(() => {
+      listRequest += 1
+      return listRequest === 1 ? startup.promise : replacement.promise
+    })
+    vi.mocked(garden.domains.create).mockRejectedValueOnce(new Error("创建领域失败"))
+    vi.mocked(garden.domains.create).mockResolvedValueOnce(unavailable("领域服务失败"))
+    render(<App />)
+
+    await user.click(screen.getByRole("button", { name: "管理领域" }))
+    await user.click(screen.getByRole("button", { name: "新建领域" }))
+    const dialog = screen.getByRole("dialog", { name: "新建领域" })
+    await user.type(within(dialog).getByLabelText("显示名称"), "失败领域")
+    await user.type(within(dialog).getByLabelText("英文路径"), "failed-domain")
+    await user.click(within(dialog).getByRole("button", { name: "创建领域" }))
+    expect(await within(dialog).findByRole("alert")).toHaveTextContent("创建领域失败")
+    expect(garden.domains.list).toHaveBeenCalledTimes(2)
+
+    replacement.resolve(ok(domainSummaries))
+    await user.click(screen.getByRole("button", { name: "关闭" }))
+    await waitFor(() => expect(screen.getByRole("button", { name: "技术" })).toBeVisible())
+
+    await user.click(screen.getByRole("button", { name: "管理领域" }))
+    await user.click(screen.getByRole("button", { name: "新建领域" }))
+    const serviceFailureDialog = screen.getByRole("dialog", { name: "新建领域" })
+    await user.type(within(serviceFailureDialog).getByLabelText("显示名称"), "服务失败")
+    await user.type(within(serviceFailureDialog).getByLabelText("英文路径"), "service-failure")
+    await user.click(within(serviceFailureDialog).getByRole("button", { name: "创建领域" }))
+    expect(await within(serviceFailureDialog).findByRole("alert")).toHaveTextContent("领域服务失败")
+    await waitFor(() => expect(garden.domains.list).toHaveBeenCalledTimes(3))
+  })
+
+  it("resets an active filter when a successful remove omits that domain", async () => {
+    const user = userEvent.setup()
+    vi.mocked(garden.domains.remove).mockResolvedValueOnce(ok(domainSummaries.slice(0, 3)))
+    render(<App />)
+
+    const navigation = await screen.findByRole("navigation", { name: "笔记" })
+    await user.click(within(navigation).getByRole("button", { name: "生活" }))
+    await user.click(screen.getByRole("button", { name: "管理领域" }))
+    const manager = screen.getByRole("dialog", { name: "管理领域" })
+    const life = within(manager).getByRole("article", { name: "生活" })
+    await user.click(within(life).getByRole("button", { name: "删除" }))
+    await user.click(
+      within(screen.getByRole("dialog", { name: "确认删除领域？" })).getByRole("button", {
+        name: "确认删除",
+      }),
+    )
+    await waitFor(() => expect(garden.domains.remove).toHaveBeenCalledWith({ slug: "life" }))
+    await user.click(screen.getByRole("button", { name: "关闭" }))
+
+    await waitFor(() =>
+      expect(
+        within(screen.getByRole("navigation", { name: "笔记" })).getByRole("button", {
+          name: "全部领域",
+        }),
+      ).toHaveAttribute("aria-pressed", "true"),
+    )
+  })
+
   it("creates a note through the accessible new-note form", async () => {
     const user = userEvent.setup()
+    let domainRequest = 0
+    const countedDomains = domainSummaries.map((domain) =>
+      domain.slug === "life" ? { ...domain, privateNotes: 1 } : domain,
+    )
+    vi.mocked(garden.domains.list).mockImplementation(async () => {
+      domainRequest += 1
+      return ok(domainRequest === 1 ? domainSummaries : countedDomains)
+    })
     render(<App />)
 
     await user.click(await screen.findByRole("button", { name: "新建笔记" }))
@@ -568,6 +746,9 @@ describe("publisher main layout", () => {
       )
     })
     expect(await screen.findByText("private/life/new-note.md")).toBeVisible()
+    await waitFor(() => expect(garden.domains.list).toHaveBeenCalledTimes(2))
+    await user.click(screen.getByRole("button", { name: "管理领域" }))
+    expect(within(screen.getByRole("article", { name: "生活" })).getByText("私密 1")).toBeVisible()
   })
 
   it("keeps a busy create dialog modal and avoids updates after it unmounts", async () => {
@@ -719,6 +900,7 @@ describe("publisher main layout", () => {
       })
     })
     expect(screen.getByRole("button", { name: "可见性：私密" })).toBeVisible()
+    await waitFor(() => expect(garden.domains.list).toHaveBeenCalledTimes(2))
   })
 
   it("returns focus on Escape and reports a pending public removal after privatizing", async () => {
@@ -1016,6 +1198,7 @@ describe("publisher main layout", () => {
       }),
     )
     await waitFor(() => expect(garden.notes.trash).toHaveBeenCalledWith({ path: notes[0].path }))
+    await waitFor(() => expect(garden.domains.list).toHaveBeenCalledTimes(2))
     expect(await screen.findByText(/在线副本仍会保留/)).toBeVisible()
     expect(screen.getByText(/专属附件仍保留/)).toBeVisible()
     expect(screen.queryByText(notes[0].path)).not.toBeInTheDocument()

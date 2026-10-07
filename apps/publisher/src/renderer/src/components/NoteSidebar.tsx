@@ -1,18 +1,15 @@
 import { useEffect, useMemo, useRef, useState } from "react"
 import { FilePlus2, Search, X } from "lucide-react"
-import type { NoteCreateRequest, NoteSummary, Visibility } from "../../../shared/contracts"
+import type {
+  DomainSummary,
+  NoteCreateRequest,
+  NoteSummary,
+  Visibility,
+} from "../../../shared/contracts"
 import { ModalShell } from "./ModalShell"
 
-type DomainFilter = NoteSummary["domain"] | "all"
+type DomainFilter = NoteSummary["domain"] | null
 type VisibilityFilter = Visibility | "all"
-
-const domains: readonly { value: DomainFilter; label: string }[] = [
-  { value: "all", label: "全部领域" },
-  { value: "technology", label: "技术" },
-  { value: "reading", label: "阅读" },
-  { value: "language", label: "语言" },
-  { value: "life", label: "生活" },
-]
 
 const visibilityFilters: readonly { value: VisibilityFilter; label: string }[] = [
   { value: "all", label: "全部可见性" },
@@ -22,6 +19,7 @@ const visibilityFilters: readonly { value: VisibilityFilter; label: string }[] =
 
 interface NoteSidebarProps {
   readonly notes: readonly NoteSummary[]
+  readonly domains: readonly DomainSummary[]
   readonly loadState: "loading" | "ready" | "error"
   readonly message: string
   readonly selectedPath?: string
@@ -47,15 +45,17 @@ export function shanghaiCalendarDate(date = new Date()): string {
 function NewNoteDialog({
   onClose,
   onCreate,
+  domains,
 }: {
   readonly onClose: () => void
   readonly onCreate: NoteSidebarProps["onCreate"]
+  readonly domains: readonly DomainSummary[]
 }): React.JSX.Element {
   const [title, setTitle] = useState("")
   const [slug, setSlug] = useState("new-note")
   const [description, setDescription] = useState("")
   const [tags, setTags] = useState("")
-  const [domain, setDomain] = useState<NoteSummary["domain"]>("technology")
+  const [domain, setDomain] = useState<NoteSummary["domain"]>(domains[0]?.slug ?? "")
   const [visibility, setVisibility] = useState<Visibility>("public")
   const [error, setError] = useState("")
   const [busy, setBusy] = useState(false)
@@ -68,6 +68,12 @@ function NewNoteDialog({
       mounted.current = false
     }
   }, [])
+
+  useEffect(() => {
+    setDomain((current) =>
+      domains.some((candidate) => candidate.slug === current) ? current : (domains[0]?.slug ?? ""),
+    )
+  }, [domains])
 
   const submit = async (event: React.FormEvent<HTMLFormElement>): Promise<void> => {
     event.preventDefault()
@@ -166,9 +172,9 @@ function NewNoteDialog({
             value={domain}
             onChange={(event) => setDomain(event.target.value as NoteSummary["domain"])}
           >
-            {domains.slice(1).map((item) => (
-              <option key={item.value} value={item.value}>
-                {item.label}
+            {domains.map((item) => (
+              <option key={item.slug} value={item.slug}>
+                {item.name}
               </option>
             ))}
           </select>
@@ -208,7 +214,14 @@ function NewNoteDialog({
           <button
             type="submit"
             className="primary-button"
-            disabled={busy || !title.trim() || !slug.trim() || !description.trim() || !tags.trim()}
+            disabled={
+              busy ||
+              !title.trim() ||
+              !slug.trim() ||
+              !description.trim() ||
+              !tags.trim() ||
+              !domain
+            }
           >
             创建
           </button>
@@ -219,11 +232,17 @@ function NewNoteDialog({
 }
 
 export function NoteSidebar(props: NoteSidebarProps): React.JSX.Element {
-  const [domain, setDomain] = useState<DomainFilter>("all")
+  const [domain, setDomain] = useState<DomainFilter>(null)
   const [visibility, setVisibility] = useState<VisibilityFilter>("all")
   const [query, setQuery] = useState("")
   const [creating, setCreating] = useState(false)
   const createButton = useRef<HTMLButtonElement>(null)
+
+  useEffect(() => {
+    if (domain !== null && !props.domains.some((item) => item.slug === domain)) {
+      setDomain(null)
+    }
+  }, [domain, props.domains])
 
   const closeCreate = (): void => {
     setCreating(false)
@@ -233,7 +252,7 @@ export function NoteSidebar(props: NoteSidebarProps): React.JSX.Element {
   const filteredNotes = useMemo(() => {
     const needle = query.trim().toLocaleLowerCase("zh-CN")
     return props.notes.filter((note) => {
-      if (domain !== "all" && note.domain !== domain) return false
+      if (domain !== null && note.domain !== domain) return false
       if (visibility !== "all" && note.visibility !== visibility) return false
       return (
         !needle ||
@@ -288,9 +307,12 @@ export function NoteSidebar(props: NoteSidebarProps): React.JSX.Element {
       <section className="filter-section" aria-labelledby="domain-filter-title">
         <h3 id="domain-filter-title">领域</h3>
         <div className="filter-list">
-          {domains.map((item) => (
+          {[
+            { value: null, label: "全部领域" },
+            ...props.domains.map((item) => ({ value: item.slug, label: item.name })),
+          ].map((item) => (
             <button
-              key={item.value}
+              key={item.value === null ? "all-filter" : `domain-${item.value}`}
               type="button"
               className={domain === item.value ? "active" : ""}
               aria-pressed={domain === item.value}
@@ -335,7 +357,9 @@ export function NoteSidebar(props: NoteSidebarProps): React.JSX.Element {
               <span className="note-copy">
                 <strong>{note.title}</strong>
                 <small>
-                  {note.domain} · {note.updatedAt.slice(0, 10)}
+                  {(props.domains.find((item) => item.slug === note.domain)?.name ?? note.domain) +
+                    " · " +
+                    note.updatedAt.slice(0, 10)}
                 </small>
               </span>
             </button>
@@ -346,7 +370,9 @@ export function NoteSidebar(props: NoteSidebarProps): React.JSX.Element {
           <li className="list-message">{props.message || "没有符合筛选条件的笔记"}</li>
         ) : null}
       </ul>
-      {creating ? <NewNoteDialog onClose={closeCreate} onCreate={props.onCreate} /> : null}
+      {creating ? (
+        <NewNoteDialog onClose={closeCreate} onCreate={props.onCreate} domains={props.domains} />
+      ) : null}
     </nav>
   )
 }

@@ -1483,6 +1483,146 @@ button {
 .blog-manager-error {
   color: #f5a97f;
 }
+.domain-manager-trigger {
+  min-height: 36px;
+  white-space: nowrap;
+}
+.domain-manager-dialog {
+  display: grid;
+  width: min(620px, 100%);
+  max-height: min(760px, calc(100vh - 48px));
+  grid-template-rows: auto minmax(0, 1fr) auto;
+  overflow: hidden;
+  border: 1px solid #46515e;
+  border-radius: 12px;
+  background: #171c22;
+  box-shadow: 0 24px 70px #000c;
+}
+.domain-manager-header,
+.domain-manager-footer {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 12px;
+  padding: 15px 17px;
+}
+.domain-manager-header {
+  border-bottom: 1px solid #303640;
+}
+.domain-manager-header h2 {
+  margin: 0;
+  font-size: 17px;
+}
+.domain-manager-body {
+  min-height: 220px;
+  overflow: auto;
+  padding: 14px;
+}
+.domain-manager-list {
+  display: grid;
+  gap: 10px;
+}
+.domain-manager-card {
+  display: grid;
+  grid-template-columns: minmax(0, 1fr) auto auto;
+  align-items: center;
+  gap: 12px;
+  padding: 13px;
+  border: 1px solid #313943;
+  border-radius: 9px;
+  background: #1c222a;
+}
+.domain-manager-card-heading {
+  min-width: 0;
+  display: grid;
+  gap: 4px;
+}
+.domain-manager-card-heading code {
+  overflow: hidden;
+  color: #8d98a5;
+  font:
+    10px/1.5 "Cascadia Code",
+    Consolas,
+    monospace;
+  overflow-wrap: anywhere;
+  text-overflow: ellipsis;
+}
+.domain-manager-badges {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 5px;
+}
+.domain-count-badge {
+  padding: 3px 7px;
+  border-radius: 999px;
+  color: #aeb7c2;
+  background: #252d37;
+  font-size: 10px;
+  white-space: nowrap;
+}
+.domain-manager-card-actions {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 7px;
+}
+.domain-manager-card-actions button {
+  min-height: 44px;
+}
+.domain-remove-button:not(:disabled) {
+  color: #f38ba8;
+}
+.domain-manager-footer {
+  justify-content: flex-start;
+  border-top: 1px solid #303640;
+  background: #14191f;
+}
+.domain-manager-form,
+.domain-manager-confirm {
+  display: grid;
+  gap: 12px;
+  padding: 18px;
+}
+.domain-manager-form > label {
+  display: grid;
+  gap: 6px;
+  color: #aeb7c2;
+  font-size: 11px;
+}
+.domain-manager-form input {
+  width: 100%;
+  height: 40px;
+  padding: 0 9px;
+  border: 1px solid #3a424d;
+  border-radius: 6px;
+  color: #edf0f3;
+  background: #101318;
+}
+.domain-manager-form input[readonly] {
+  color: #8d98a5;
+  background: #1c222a;
+}
+.domain-manager-confirm p {
+  margin: 0;
+  line-height: 1.5;
+}
+.domain-manager-empty {
+  margin: 0;
+  color: #8d98a5;
+}
+.form-error {
+  margin: 0;
+  color: #f5a97f;
+  font-size: 12px;
+}
+.domain-manager-confirm .dialog-actions {
+  margin-top: 4px;
+}
+.domain-manager-confirm .danger-button {
+  min-height: 44px;
+  padding: 0 14px;
+  border: 0;
+  border-radius: 7px;
+}
 .new-note-dialog {
   width: min(430px, 100%);
   padding: 18px;
@@ -1804,6 +1944,15 @@ button {
   }
   .blog-manager-dialog {
     max-height: calc(100vh - 20px);
+  }
+  .domain-manager-dialog {
+    max-height: calc(100vh - 20px);
+  }
+  .domain-manager-card {
+    grid-template-columns: 1fr;
+  }
+  .domain-manager-card-actions button {
+    flex: 1;
   }
   .blog-manager-body {
     padding: 10px;
