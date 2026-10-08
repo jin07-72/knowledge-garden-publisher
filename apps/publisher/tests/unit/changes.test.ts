@@ -28,12 +28,45 @@ function expectInvalid(action: () => unknown): void {
   }
 }
 
+function domainPage(title: string, order: number): string {
+  return [
+    "---",
+    "gardenDomain: true",
+    `title: ${title}`,
+    `description: ${title} notes.`,
+    `domainOrder: ${order}`,
+    "---",
+    "",
+    `# ${title}`,
+  ].join("\n")
+}
+
+async function addCommittedDomain(
+  fixture: TemporaryGitRepository,
+  slug: string,
+  title: string,
+  order: number,
+): Promise<void> {
+  await mkdir(join(fixture.root, "content", slug), { recursive: true })
+  await mkdir(join(fixture.root, "private", slug), { recursive: true })
+  await writeFile(join(fixture.root, "content", slug, "index.md"), domainPage(title, order))
+  await git(fixture.root, ["add", `content/${slug}/index.md`])
+  await git(fixture.root, ["commit", "-m", `add ${slug} domain`])
+}
+
 async function repository(): Promise<TemporaryGitRepository> {
   const fixture = await createTemporaryGitRepository()
   repositories.push(fixture)
-  await mkdir(join(fixture.root, "content", "technology"), { recursive: true })
+  for (const [slug, title, order] of [
+    ["technology", "Technology", 0],
+    ["life", "Life", 1],
+    ["reading", "Reading", 2],
+  ] as const) {
+    await mkdir(join(fixture.root, "content", slug), { recursive: true })
+    await mkdir(join(fixture.root, "private", slug), { recursive: true })
+    await writeFile(join(fixture.root, "content", slug, "index.md"), domainPage(title, order))
+  }
   await mkdir(join(fixture.root, "content", "_assets", "css-grid"), { recursive: true })
-  await mkdir(join(fixture.root, "private", "life"), { recursive: true })
   await writeFile(join(fixture.root, "content", "technology", "css-grid.md"), "public")
   await writeFile(join(fixture.root, "content", "technology", "retired.md"), "retired")
   await writeFile(join(fixture.root, "quartz.config.yaml"), "configuration: {}")
@@ -253,6 +286,114 @@ describe("bounded change command runner", () => {
 })
 
 describe("listChanges", () => {
+  it("counts custom-domain additions and modifications as default publication groups", async () => {
+    const fixture = await repository()
+    await addCommittedDomain(fixture, "field-notes", "Field Notes", 3)
+    await writeFile(join(fixture.root, "content", "field-notes", "existing.md"), "original")
+    await git(fixture.root, ["add", "content/field-notes/existing.md"])
+    await git(fixture.root, ["commit", "-m", "add existing custom-domain note"])
+    await writeFile(join(fixture.root, "content", "field-notes", "existing.md"), "changed")
+    await writeFile(join(fixture.root, "content", "field-notes", "new-note.md"), "new")
+
+    const review = await listChanges({ workspace: fixture.root })
+
+    expect(review.groups.filter((group) => group.selection === "default")).toHaveLength(2)
+    expect(review.groups).toEqual(
+      expect.arrayContaining([
+        expect.objectContaining({
+          label: "existing",
+          kind: "modified",
+          selection: "default",
+          paths: ["content/field-notes/existing.md"],
+        }),
+        expect.objectContaining({
+          label: "new-note",
+          kind: "added",
+          selection: "default",
+          paths: ["content/field-notes/new-note.md"],
+        }),
+      ]),
+    )
+  })
+
+  it("keeps both custom-domain paths in one default group when a note is renamed", async () => {
+    const fixture = await repository()
+    await addCommittedDomain(fixture, "field-notes", "Field Notes", 3)
+    await writeFile(join(fixture.root, "content", "field-notes", "old-name.md"), "note")
+    await git(fixture.root, ["add", "content/field-notes/old-name.md"])
+    await git(fixture.root, ["commit", "-m", "add custom-domain note"])
+    await git(fixture.root, [
+      "mv",
+      "content/field-notes/old-name.md",
+      "content/field-notes/new-name.md",
+    ])
+
+    const review = await listChanges({ workspace: fixture.root })
+
+    expect(review.groups).toEqual([
+      expect.objectContaining({
+        label: "new-name",
+        kind: "modified",
+        selection: "default",
+        paths: ["content/field-notes/new-name.md", "content/field-notes/old-name.md"],
+      }),
+    ])
+  })
+
+  it("locks a custom-domain private target and defaults its public origin to unpublish", async () => {
+    const fixture = await repository()
+    await addCommittedDomain(fixture, "field-notes", "Field Notes", 3)
+    await writeFile(join(fixture.root, "private", "field-notes", "draft.md"), "private")
+    const status = raw(
+      `2 R. N... 100644 100644 100644 ${oidA} ${oidA} R100 private/field-notes/draft.md\0content/field-notes/published.md\0`,
+    )
+
+    const review = await listChanges({ workspace: fixture.root, statusOutput: status })
+
+    expect(review.groups).toEqual(
+      expect.arrayContaining([
+        expect.objectContaining({
+          label: "published",
+          kind: "unpublish",
+          selection: "default",
+          paths: ["content/field-notes/published.md"],
+        }),
+        expect.objectContaining({
+          label: "draft",
+          kind: "private",
+          selection: "locked",
+          paths: [],
+        }),
+      ]),
+    )
+  })
+
+  it("groups a custom-domain note modification with its owned attachment", async () => {
+    const fixture = await repository()
+    await addCommittedDomain(fixture, "field-notes", "Field Notes", 3)
+    await writeFile(join(fixture.root, "content", "field-notes", "observations.md"), "original")
+    await git(fixture.root, ["add", "content/field-notes/observations.md"])
+    await git(fixture.root, ["commit", "-m", "add attachment owner"])
+    await writeFile(join(fixture.root, "content", "field-notes", "observations.md"), "changed")
+    await mkdir(join(fixture.root, "content", "_assets", "observations"), { recursive: true })
+    await writeFile(
+      join(fixture.root, "content", "_assets", "observations", "diagram.png"),
+      "image",
+    )
+
+    const review = await listChanges({ workspace: fixture.root })
+
+    expect(review.groups).toEqual([
+      expect.objectContaining({
+        label: "observations",
+        kind: "modified",
+        selection: "default",
+        paths: ["content/field-notes/observations.md", "content/_assets/observations/diagram.png"],
+        attachments: [{ path: "content/_assets/observations/diagram.png", label: "diagram.png" }],
+      }),
+    ])
+  })
+
   it("groups a public note with owned attachments and reports deletions as unpublish", async () => {
     const fixture = await repository()
     await writeFile(join(fixture.root, "content", "technology", "css-grid.md"), "changed")

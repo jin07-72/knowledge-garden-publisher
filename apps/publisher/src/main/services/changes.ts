@@ -5,7 +5,6 @@ import { basename, isAbsolute, relative, resolve, sep } from "node:path"
 import {
   KEBAB_SLUG_SOURCE,
   MANAGED_NOTE_PATH_PATTERN,
-  NOTE_DOMAINS,
   type ChangeAttachment,
   type ChangeGroup,
   type ChangeKind,
@@ -13,6 +12,11 @@ import {
   type ChangeSelection,
 } from "../../shared/contracts"
 import type { PreviewProcess } from "./preview"
+import {
+  captureNoteDomainSnapshot,
+  revalidateNoteDomains,
+  type NoteDomainSnapshot,
+} from "./noteDomains"
 import { createProductionProcessTreeTerminator } from "./previewRuntime"
 
 export const MAX_CHANGE_STATUS_BYTES = 2 * 1024 * 1024
@@ -113,12 +117,23 @@ const modePattern = /^(?:000000|100644|100755|120000|160000)$/
 const oidPattern = /^(?:[0-9a-f]{40}|[0-9a-f]{64})$/
 const scorePattern = /^[RC](?:100|[1-9]?[0-9])$/
 const slugPattern = new RegExp(`^${KEBAB_SLUG_SOURCE}$`)
-const publicNote = new RegExp(`^content\/(${NOTE_DOMAINS.join("|")})\/(${KEBAB_SLUG_SOURCE})\\.md$`)
-const privateNote = new RegExp(
-  `^private\/(${NOTE_DOMAINS.join("|")})\/(${KEBAB_SLUG_SOURCE})\\.md$`,
-)
 const publicAttachment = new RegExp(`^content\/_assets\/(${KEBAB_SLUG_SOURCE})\/(.+)$`)
 const privateAttachment = new RegExp(`^private\/_assets\/(${KEBAB_SLUG_SOURCE})\/(.+)$`)
+
+type ManagedNote = {
+  readonly domain: string
+  readonly slug: string
+}
+
+function managedNote(
+  path: string,
+  root: "content" | "private",
+  domains: NoteDomainSnapshot,
+): ManagedNote | undefined {
+  const match = MANAGED_NOTE_PATH_PATTERN.exec(path)
+  if (match?.[1] !== root || !match[2] || !match[3] || !domains.has(match[2])) return undefined
+  return { domain: match[2], slug: match[3] }
+}
 
 function scanError(code: ChangeScanCode, message: string): ChangeScanError {
   return new ChangeScanError(code, message)
@@ -466,13 +481,15 @@ async function assertManagedPathBoundary(
   }
 }
 
-function hasUnsafeManagedAlias(path: string): boolean {
+function hasUnsafeManagedAlias(path: string, domains: NoteDomainSnapshot): boolean {
   const segments = path.split("/")
   const root = segments[0] ?? ""
   if (/^(?:content|private)$/i.test(root) && root !== root.toLowerCase()) return true
   if (root !== "content" && root !== "private") return false
   const domain = segments[1] ?? ""
-  const canonicalDomain = NOTE_DOMAINS.find((item) => item.toLowerCase() === domain.toLowerCase())
+  const canonicalDomain = domains.orderedSlugs.find(
+    (item) => item.toLowerCase() === domain.toLowerCase(),
+  )
   if (canonicalDomain && domain !== canonicalDomain) return true
   if (domain.toLowerCase() === "_assets" && domain !== "_assets") return true
   if (canonicalDomain && segments.length === 3 && path.toLowerCase().endsWith(".md")) {
@@ -524,10 +541,11 @@ type AttachmentDelta = { slug: string; path: string; label: string }
 async function existingPublicIdentities(
   workspace: string,
   slug: string,
+  domains: NoteDomainSnapshot,
   guard: AwaitGuard,
 ): Promise<string[]> {
   const identities: string[] = []
-  for (const domain of NOTE_DOMAINS) {
+  for (const domain of domains.orderedSlugs) {
     try {
       const info = await guard(lstat(resolve(workspace, "content", domain, `${slug}.md`)))
       if (info.isFile()) identities.push(`${domain}/${slug}`)
@@ -693,14 +711,26 @@ export async function listChanges(options: ListChangesOptions): Promise<ChangeRe
   if (entries.some((entry) => entry.submodule.startsWith("S"))) {
     return { groups: [], blockedReason: "检测到子模块变化，无法安全确定发布内容。" }
   }
+  const noteDomains = await guard(captureNoteDomainSnapshot(workspace))
+  const finishReview = async (review: ChangeReview): Promise<ChangeReview> => {
+    if (Buffer.byteLength(JSON.stringify(review), "utf8") > MAX_CHANGE_REVIEW_BYTES) {
+      throw scanError("CHANGE_SCAN_LIMIT", "Publication review exceeded the safe size limit.")
+    }
+    await guard(revalidateNoteDomains(noteDomains))
+    throwIfStopped()
+    return review
+  }
   if (
     entries.some(
       (entry) =>
-        hasUnsafeManagedAlias(entry.path) ||
-        Boolean(entry.originalPath && hasUnsafeManagedAlias(entry.originalPath)),
+        hasUnsafeManagedAlias(entry.path, noteDomains) ||
+        Boolean(entry.originalPath && hasUnsafeManagedAlias(entry.originalPath, noteDomains)),
     )
   ) {
-    return { groups: [], blockedReason: "检测到大小写不规范或无效的内容路径，请先修正。" }
+    return finishReview({
+      groups: [],
+      blockedReason: "检测到大小写不规范或无效的内容路径，请先修正。",
+    })
   }
 
   const staged = entries.some(
@@ -713,10 +743,10 @@ export async function listChanges(options: ListChangesOptions): Promise<ChangeRe
   const config = makeGroup("config", "repository", "配置修改", "optional", "高级选项，默认不发布")
 
   const addPrivate = (path: string): void => {
-    const note = privateNote.exec(path)
+    const note = managedNote(path, "private", noteDomains)
     const asset = privateAttachment.exec(path)
-    const identity = note ? `${note[1]}/${note[2]}` : asset ? `asset/${asset[1]}` : path
-    const label = note?.[2] ?? asset?.[1] ?? basename(path).replace(/\.[^.]*$/, "")
+    const identity = note ? `${note.domain}/${note.slug}` : asset ? `asset/${asset[1]}` : path
+    const label = note?.slug ?? asset?.[1] ?? basename(path).replace(/\.[^.]*$/, "")
     if (!privateGroups.has(identity)) {
       privateGroups.set(
         identity,
@@ -726,24 +756,25 @@ export async function listChanges(options: ListChangesOptions): Promise<ChangeRe
   }
   const addPublicNote = (
     path: string,
+    note: ManagedNote,
     entry: PorcelainEntry,
     forcedUnpublish = false,
   ): MutableGroup => {
-    const match = publicNote.exec(path)!
-    const identity = `${match[1]}/${match[2]}`
+    const identity = `${note.domain}/${note.slug}`
     const kind: ChangeKind =
       forcedUnpublish || isDeletion(entry) ? "unpublish" : isAddition(entry) ? "added" : "modified"
     let group = publicGroups.get(identity)
     if (!group) {
-      group = makeGroup(kind, identity, match[2]!, "default", publicDescription(kind))
+      group = makeGroup(kind, identity, note.slug, "default", publicDescription(kind))
       publicGroups.set(identity, group)
     }
     addUnique(group.paths, path)
     return group
   }
   const addDelta = (path: string, entry: PorcelainEntry, origin: boolean): void => {
-    if (publicNote.test(path)) {
-      addPublicNote(path, entry, origin)
+    const note = managedNote(path, "content", noteDomains)
+    if (note) {
+      addPublicNote(path, note, entry, origin)
       return
     }
     const attachment = publicAttachment.exec(path)
@@ -762,10 +793,10 @@ export async function listChanges(options: ListChangesOptions): Promise<ChangeRe
     throwIfStopped()
     if (entry.recordType === "ignored" && !entry.path.startsWith("private/")) continue
     if (entry.recordType === "rename" && entry.originalPath) {
-      const currentNote = publicNote.exec(entry.path)
-      const originalNote = publicNote.exec(entry.originalPath)
+      const currentNote = managedNote(entry.path, "content", noteDomains)
+      const originalNote = managedNote(entry.originalPath, "content", noteDomains)
       if (currentNote && originalNote) {
-        const current = addPublicNote(entry.path, entry)
+        const current = addPublicNote(entry.path, currentNote, entry)
         addUnique(current.paths, entry.originalPath)
       } else {
         addDelta(entry.path, entry, false)
@@ -781,10 +812,18 @@ export async function listChanges(options: ListChangesOptions): Promise<ChangeRe
     const changedIdentities = [...publicGroups.keys()].filter((identity) =>
       identity.endsWith(`/${item.slug}`),
     )
-    const existingIdentities = await existingPublicIdentities(workspace, item.slug, guard)
+    const existingIdentities = await existingPublicIdentities(
+      workspace,
+      item.slug,
+      noteDomains,
+      guard,
+    )
     const identities = [...new Set([...changedIdentities, ...existingIdentities])]
     if (identities.length > 1) {
-      return { groups: [], blockedReason: "检测到附件归属不明确，请先确保文章 slug 唯一。" }
+      return finishReview({
+        groups: [],
+        blockedReason: "检测到附件归属不明确，请先确保文章 slug 唯一。",
+      })
     }
     const identity = identities[0] ?? `attachment/${item.slug}`
     let group = publicGroups.get(identity)
@@ -815,10 +854,10 @@ export async function listChanges(options: ListChangesOptions): Promise<ChangeRe
     for (const path of group.paths) {
       const owner = pathOwners.get(path)
       if (owner && owner !== group.id) {
-        return {
+        return finishReview({
           groups: [],
           blockedReason: "检测到同一路径同时属于多个发布选项，无法安全继续。",
-        }
+        })
       }
       pathOwners.set(path, group.id)
     }
@@ -838,11 +877,7 @@ export async function listChanges(options: ListChangesOptions): Promise<ChangeRe
     groups: immutable,
     ...(staged ? { blockedReason: "检测到其他工具已准备中的发布内容，请先处理后再继续。" } : {}),
   }
-  if (Buffer.byteLength(JSON.stringify(review), "utf8") > MAX_CHANGE_REVIEW_BYTES) {
-    throw scanError("CHANGE_SCAN_LIMIT", "Publication review exceeded the safe size limit.")
-  }
-  throwIfStopped()
-  return review
+  return finishReview(review)
 }
 
 export function createChangeScanner(options: {
