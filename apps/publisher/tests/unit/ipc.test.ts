@@ -187,6 +187,53 @@ function setup() {
 }
 
 describe("secure publisher IPC", () => {
+  it.each([
+    [
+      "domainsCreate",
+      { slug: "existing", name: "Existing" },
+      "DOMAIN_ALREADY_EXISTS",
+      "A domain with that name or path already exists.",
+    ],
+    [
+      "domainsRename",
+      { slug: "existing", name: "Other" },
+      "DOMAIN_ALREADY_EXISTS",
+      "A domain with that name or path already exists.",
+    ],
+    [
+      "domainsRemove",
+      { slug: "existing" },
+      "DOMAIN_NOT_EMPTY",
+      "This domain is not empty and cannot be removed.",
+    ],
+    [
+      "domainsRename",
+      { slug: "existing", name: "Other" },
+      "DOMAIN_ROLLBACK_UNCERTAIN",
+      "The domain operation could not be safely recovered. Review the workspace before retrying.",
+    ],
+  ] as const)(
+    "preserves expected %s rejection %s safely",
+    async (operation, request, code, message) => {
+      const { ipc, servicePorts } = setup()
+      servicePorts.calls[operation].mockRejectedValueOnce(
+        Object.assign(new Error("C:/private/secret.md: private note source"), {
+          code,
+          details: { path: "C:/private/secret.md", source: "private note source" },
+          cause: new Error("private cause"),
+        }),
+      )
+
+      await expect(
+        ipc.invoke(IPC_CHANNELS.requests[operation], trustedEvent, request),
+      ).resolves.toEqual({
+        ok: false,
+        error: { code, message },
+      })
+      expect(servicePorts.calls[operation]).toHaveBeenCalledWith(request)
+    },
+  )
+
   it("keeps lifecycle close acknowledgements available in recovery and after workspace IPC disposal", async () => {
     const ipc = new FakeIpcMain()
     const servicePorts = services()

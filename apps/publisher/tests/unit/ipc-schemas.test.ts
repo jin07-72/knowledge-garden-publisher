@@ -2,6 +2,7 @@ import { describe, expect, it } from "vitest"
 import { IPC_CHANNELS } from "../../src/shared/contracts"
 import {
   IPC_SUCCESS_SCHEMAS,
+  appErrorSchema,
   blogAddLocalRequestSchema,
   blogCloneRequestSchema,
   blogIdRequestSchema,
@@ -19,6 +20,36 @@ import {
 } from "../../src/shared/ipcSchemas"
 
 const privateField = { privateSource: "must-not-cross" }
+
+describe("public domain failures", () => {
+  it.each([
+    ["DOMAIN_ALREADY_EXISTS", "A domain with that name or path already exists."],
+    ["DOMAIN_BUSY", "A domain operation is still in progress. Try again when it finishes."],
+    ["DOMAIN_DISPOSED", "Domain management is unavailable. Reopen the workspace."],
+    ["DOMAIN_NOT_FOUND", "The requested domain no longer exists. Refresh the domain list."],
+    ["DOMAIN_NOT_EMPTY", "This domain is not empty and cannot be removed."],
+    ["DOMAIN_ORDER_EXHAUSTED", "No safe domain order remains for a new domain."],
+    [
+      "DOMAIN_ROLLBACK_UNCERTAIN",
+      "The domain operation could not be safely recovered. Review the workspace before retrying.",
+    ],
+    ["DOMAIN_METADATA_INVALID", "A domain page has invalid metadata. Correct it before retrying."],
+    ["DOMAIN_UNSAFE_PATH", "An unsafe or changed domain path was rejected."],
+  ])("accepts %s with a fixed message and no private diagnostics", (code, message) => {
+    const failure = Object.assign(new Error("C:/private/secret.md contains private note text"), {
+      code,
+      details: { path: "C:/private/secret.md", source: "private note text" },
+      cause: new Error("private cause"),
+    })
+    expect(appErrorSchema.safeParse(failure)).toEqual({ success: true, data: { code, message } })
+  })
+
+  it("rejects an unknown domain failure code", () => {
+    expect(
+      appErrorSchema.safeParse({ code: "DOMAIN_INTERNAL_SECRET", message: "private" }).success,
+    ).toBe(false)
+  })
+})
 const capabilities = { files: true, preview: true, git: false, publish: false }
 const note = {
   path: "content/life/daily.md",

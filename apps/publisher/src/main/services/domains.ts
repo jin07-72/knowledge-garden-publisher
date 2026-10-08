@@ -18,6 +18,7 @@ import matter from "gray-matter"
 import { isMap, isScalar, parseDocument, stringify as stringifyYaml } from "yaml"
 import type {
   DomainCreateRequest,
+  DomainPublicErrorCode,
   DomainRemoveRequest,
   DomainRenameRequest,
   DomainSlug,
@@ -214,14 +215,7 @@ export interface DomainCatalogOptions {
   readonly hooks?: DomainCatalogHooks
 }
 
-type DomainCatalogErrorCode =
-  | "DOMAIN_ALREADY_EXISTS"
-  | "DOMAIN_BUSY"
-  | "DOMAIN_DISPOSED"
-  | "DOMAIN_NOT_FOUND"
-  | "DOMAIN_NOT_EMPTY"
-  | "DOMAIN_ORDER_EXHAUSTED"
-  | "DOMAIN_ROLLBACK_UNCERTAIN"
+type DomainCatalogErrorCode = Exclude<DomainPublicErrorCode, DomainDiscoveryCode>
 
 class DomainCatalogError extends Error {
   constructor(

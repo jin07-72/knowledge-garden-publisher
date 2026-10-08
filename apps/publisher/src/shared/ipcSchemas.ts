@@ -6,6 +6,7 @@ import {
   MANAGED_NOTE_PATH_PATTERN,
   parseGitHubRepositoryUrl,
   type AppError,
+  type DomainPublicErrorCode,
   type IpcResult,
 } from "./contracts"
 
@@ -108,6 +109,21 @@ export const blogSwitchRequestSchema = z
   .object({ id: blogIdSchema, editorSaved: z.literal(true) })
   .strict()
 
+// Domain failures may contain workspace paths and transaction diagnostics internally.
+// Main IPC and preload both use this schema, so neither forwards their raw messages.
+const domainPublicErrorMessages: Readonly<Partial<Record<AppError["code"], string>>> = {
+  DOMAIN_ALREADY_EXISTS: "A domain with that name or path already exists.",
+  DOMAIN_BUSY: "A domain operation is still in progress. Try again when it finishes.",
+  DOMAIN_DISPOSED: "Domain management is unavailable. Reopen the workspace.",
+  DOMAIN_NOT_FOUND: "The requested domain no longer exists. Refresh the domain list.",
+  DOMAIN_NOT_EMPTY: "This domain is not empty and cannot be removed.",
+  DOMAIN_ORDER_EXHAUSTED: "No safe domain order remains for a new domain.",
+  DOMAIN_ROLLBACK_UNCERTAIN:
+    "The domain operation could not be safely recovered. Review the workspace before retrying.",
+  DOMAIN_METADATA_INVALID: "A domain page has invalid metadata. Correct it before retrying.",
+  DOMAIN_UNSAFE_PATH: "An unsafe or changed domain path was rejected.",
+} satisfies Record<DomainPublicErrorCode, string>
+
 export const appErrorSchema = z
   .object({
     code: z.enum(APP_ERROR_CODES),
@@ -115,7 +131,13 @@ export const appErrorSchema = z
     details: z.unknown().optional(),
   })
   .strip()
-  .transform(({ code, message }): AppError => ({ code, message }) as AppError)
+  .transform(
+    ({ code, message }): AppError =>
+      ({
+        code,
+        message: domainPublicErrorMessages[code] ?? message,
+      }) as AppError,
+  )
 
 const pathSchema = z.string().min(1).max(512)
 export const managedNotePathSchema = z.string().max(512).regex(MANAGED_NOTE_PATH_PATTERN)

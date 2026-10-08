@@ -3,7 +3,8 @@ import userEvent from "@testing-library/user-event"
 import { useState } from "react"
 import { afterEach, describe, expect, it, vi } from "vitest"
 import { DomainManager } from "../../src/renderer/src/components/DomainManager"
-import type { DomainSummary } from "../../src/shared/contracts"
+import type { DomainSummary, IpcResult } from "../../src/shared/contracts"
+import { createGardenApi } from "../../src/preload/gardenApi"
 
 const domains: readonly DomainSummary[] = [
   { slug: "technology", name: "技术", description: "", order: 1, publicNotes: 2, privateNotes: 1 },
@@ -13,6 +14,73 @@ const domains: readonly DomainSummary[] = [
 afterEach(() => cleanup())
 
 describe("DomainManager", () => {
+  it.each([
+    ["create", "DOMAIN_ALREADY_EXISTS", "A domain with that name or path already exists."],
+    ["rename", "DOMAIN_ALREADY_EXISTS", "A domain with that name or path already exists."],
+    ["remove", "DOMAIN_NOT_EMPTY", "This domain is not empty and cannot be removed."],
+    [
+      "rename",
+      "DOMAIN_ROLLBACK_UNCERTAIN",
+      "The domain operation could not be safely recovered. Review the workspace before retrying.",
+    ],
+  ] as const)(
+    "keeps %s open and displays the public %s rejection",
+    async (operation, code, message) => {
+      const user = userEvent.setup()
+      const invoke = vi.fn(async () => ({ ok: false, error: { code, message } }))
+      const api = createGardenApi({ invoke, on: vi.fn(), removeListener: vi.fn() })
+      const unwrap = async (
+        response: Promise<IpcResult<readonly DomainSummary[]>>,
+      ): Promise<readonly DomainSummary[]> => {
+        const result = await response
+        if (!result.ok) throw new Error(result.error.message)
+        return result.value
+      }
+      render(
+        <DomainManager
+          domains={domains}
+          onClose={vi.fn()}
+          onCreate={(request) => unwrap(api.domains.create(request))}
+          onRename={(request) => unwrap(api.domains.rename(request))}
+          onRemove={(request) => unwrap(api.domains.remove(request))}
+        />,
+      )
+      if (operation === "create") {
+        await user.click(screen.getByRole("button", { name: "新建领域" }))
+        await user.type(screen.getByLabelText("显示名称"), "新领域")
+        await user.type(screen.getByLabelText("英文路径"), "new-domain")
+        await user.click(screen.getByRole("button", { name: "创建领域" }))
+      } else if (operation === "rename") {
+        await user.click(
+          within(screen.getByRole("article", { name: "空领域" })).getByRole("button", {
+            name: "重命名",
+          }),
+        )
+        await user.clear(screen.getByLabelText("显示名称"))
+        await user.type(screen.getByLabelText("显示名称"), "技术")
+        await user.click(screen.getByRole("button", { name: "保存名称" }))
+      } else {
+        await user.click(
+          within(screen.getByRole("article", { name: "空领域" })).getByRole("button", {
+            name: "删除",
+          }),
+        )
+        await user.click(screen.getByRole("button", { name: "确认删除" }))
+      }
+      expect(await screen.findByRole("alert")).toHaveTextContent(message)
+      expect(screen.getByRole("dialog")).toBeInTheDocument()
+      expect(screen.getByRole("button", { name: "关闭" })).toBeEnabled()
+      expect(invoke).toHaveBeenCalledOnce()
+      if (operation !== "remove") {
+        expect(screen.getByLabelText("显示名称")).toHaveValue(
+          operation === "create" ? "新领域" : "技术",
+        )
+      } else {
+        expect(screen.getByRole("button", { name: "确认删除" })).toBeEnabled()
+      }
+    },
+  )
+
   it("creates a domain with trimmed values and returned list", async () => {
     const user = userEvent.setup()
     const onCreate = vi.fn(async () => domains)
