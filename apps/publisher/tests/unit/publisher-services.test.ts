@@ -30,9 +30,14 @@ async function garden(): Promise<string> {
     join(root, "content", "life", "daily.md"),
     "---\ntitle: Daily\ndate: 2026-09-24\ndescription: Daily note\ntags: [life]\n---\n\n# Daily",
   )
+  await writeFile(
+    join(root, "content", "life", "index.md"),
+    "---\ntitle: Life\ndescription: Life domain\ngardenDomain: true\n---\n",
+  )
   await git(root, ["init", "--initial-branch=main", "--object-format=sha1"])
   await git(root, ["config", "user.name", "Garden Test"])
   await git(root, ["config", "user.email", "garden-test@example.invalid"])
+  await git(root, ["add", "content/life/index.md"])
   await git(root, ["commit", "--allow-empty", "-m", "initial"])
   return root
 }

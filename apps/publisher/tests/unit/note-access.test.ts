@@ -24,6 +24,10 @@ async function garden(): Promise<{ root: string; note: string; markdown: string 
     "---\ntitle: Daily\ndate: 2026-09-24\ndescription: Daily note\ntags: [life]\n---\n\n# Daily"
   await mkdir(join(root, "content", "life"), { recursive: true })
   await mkdir(join(root, "private", "life"), { recursive: true })
+  await writeFile(
+    join(root, "content", "life", "index.md"),
+    "---\ntitle: Life\ndescription: Life domain\ngardenDomain: true\n---\n",
+  )
   await writeFile(note, markdown)
   return { root, note, markdown }
 }

@@ -36,6 +36,10 @@ async function garden(): Promise<string> {
     mkdir(join(root, "content", "life"), { recursive: true }),
     mkdir(join(root, "private", "life"), { recursive: true }),
   ])
+  await writeFile(
+    join(root, "content", "life", "index.md"),
+    "---\ntitle: Life\ndescription: Life domain\ngardenDomain: true\n---\n",
+  )
   await writeFile(join(root, path), "# saved\n")
   return root
 }
