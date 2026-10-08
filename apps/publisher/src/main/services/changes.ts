@@ -418,7 +418,7 @@ const productionTerminator = createProductionProcessTreeTerminator()
 const systemChangeCommandRunner = createBoundedChangeCommandRunner({
   spawner: (executable, args, options) =>
     spawn(executable, [...args], options) as unknown as ChangeCommandProcess,
-  terminate: (child) => productionTerminator(child),
+  terminate: async (child) => (await productionTerminator(child)) === "terminated",
 })
 
 function assertRelativePath(path: string): void {

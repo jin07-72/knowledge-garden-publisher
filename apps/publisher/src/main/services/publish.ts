@@ -487,7 +487,7 @@ export function createSystemBoundedCommandRunner(
   return createBoundedPublishCommandRunner({
     spawner: (executable, args, options) =>
       spawn(executable, [...args], options) as unknown as PublishCommandProcess,
-    terminate: (child) => terminate(child),
+    terminate: async (child) => (await terminate(child)) === "terminated",
     commandDeadlineMs: options.commandDeadlineMs,
     terminationDeadlineMs: options.terminationDeadlineMs,
   })

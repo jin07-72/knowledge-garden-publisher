@@ -9,6 +9,7 @@ import {
   type PreviewDependencies,
   type PreviewProcess,
   type PreviewStatus,
+  type PreviewTerminationOutcome,
   type TreeTerminationDependencies,
 } from "../../src/main/services/preview"
 
@@ -118,7 +119,7 @@ function dependencies(overrides: Partial<PreviewDependencies> = {}): TestDepende
     isPortAvailable: async () => true,
     terminate: async (child) => {
       ;(child as FakeProcess).close()
-      return true
+      return "terminated"
     },
     platform: "win32",
     now: clock.now,
@@ -285,7 +286,7 @@ describe("PreviewManager", () => {
   it("stops the old workspace before starting a different canonical workspace", async () => {
     const terminate = vi.fn<PreviewDependencies["terminate"]>(async (child) => {
       ;(child as FakeProcess).close()
-      return true
+      return "terminated"
     })
     const deps = dependencies({ probe: async () => true, terminate })
     const manager = new PreviewManager(deps)
@@ -622,7 +623,7 @@ describe("PreviewManager", () => {
   it("times out deterministically, terminates the child, and exposes only a bounded redacted tail", async () => {
     const terminate = vi.fn<PreviewDependencies["terminate"]>(async (child) => {
       ;(child as FakeProcess).close()
-      return true
+      return "terminated"
     })
     const deps = dependencies({ terminate, readinessTimeoutMs: 20, readinessPollMs: 10 })
     const manager = new PreviewManager(deps)
@@ -676,7 +677,7 @@ describe("PreviewManager", () => {
 
   it("reports a termination failure truthfully when timeout cleanup cannot stop the child", async () => {
     const deps = dependencies({
-      terminate: async () => false,
+      terminate: async () => "failed",
       readinessTimeoutMs: 10,
       readinessPollMs: 10,
     })
@@ -694,7 +695,7 @@ describe("PreviewManager", () => {
   })
 
   it("reports a termination failure truthfully when failed initial-build cleanup cannot stop", async () => {
-    const deps = dependencies({ terminate: async () => false })
+    const deps = dependencies({ terminate: async () => "failed" })
     const manager = new PreviewManager(deps)
     const starting = manager.start({ workspace: "C:\\Garden" })
 
@@ -709,7 +710,7 @@ describe("PreviewManager", () => {
   })
 
   it("preserves the build error when an OS-dead child reports close just after termination", async () => {
-    const terminate = vi.fn<PreviewDependencies["terminate"]>(async () => false)
+    const terminate = vi.fn<PreviewDependencies["terminate"]>(async () => "root-absent")
     const isPortAvailable = vi.fn(async () => true)
     const cleanupOptions = {
       terminate,
@@ -738,7 +739,7 @@ describe("PreviewManager", () => {
   })
 
   it("stops safely when an OS-dead child reports close during the bounded grace", async () => {
-    const terminate = vi.fn<PreviewDependencies["terminate"]>(async () => false)
+    const terminate = vi.fn<PreviewDependencies["terminate"]>(async () => "root-absent")
     const isPortAvailable = vi.fn(async () => true)
     const cleanupOptions = {
       probe: async () => true,
@@ -761,7 +762,7 @@ describe("PreviewManager", () => {
   })
 
   it("fails closed when the child close does not arrive within the bounded grace", async () => {
-    const terminate = vi.fn<PreviewDependencies["terminate"]>(async () => false)
+    const terminate = vi.fn<PreviewDependencies["terminate"]>(async () => "root-absent")
     const isPortAvailable = vi.fn(async () => true)
     const deps = dependencies({
       probe: async () => true,
@@ -793,7 +794,7 @@ describe("PreviewManager", () => {
   })
 
   it("fails closed when a descendant keeps an owned port after the child close", async () => {
-    const terminate = vi.fn<PreviewDependencies["terminate"]>(async () => false)
+    const terminate = vi.fn<PreviewDependencies["terminate"]>(async () => "root-absent")
     const isPortAvailable = vi.fn(async (port: number) => port !== 43121)
     const cleanupOptions = {
       probe: async () => true,
@@ -818,14 +819,82 @@ describe("PreviewManager", () => {
     expect(child.listenerCount("close")).toBe(1)
   })
 
+  it("fails closed when a POSIX descendant group survives a root close with both ports free", async () => {
+    let child: FakeProcess | undefined
+    const signalGroup = vi.fn<TreeTerminationDependencies["signalGroup"]>((_target, signal) => {
+      if (signal === "SIGKILL") child?.close()
+    })
+    const terminate = createProcessTreeTerminator({
+      platform: "linux",
+      isAlive: () => true,
+      signalGroup,
+      runTaskkill: async () => undefined,
+      wait: async () => undefined,
+      gracefulWaitMs: 50,
+      forceWaitMs: 50,
+    })
+    const isPortAvailable = vi.fn(async () => true)
+    const deps = dependencies({
+      probe: async () => true,
+      terminate,
+      isPortAvailable,
+      terminationCloseGraceMs: 50,
+    })
+    const manager = new PreviewManager(deps)
+    await manager.start({ workspace: "C:\\Garden" })
+    child = deps.children[0]
+
+    await expect(manager.stop()).resolves.toMatchObject({
+      state: "error",
+      error: { code: "PREVIEW_STOP_FAILED" },
+    })
+    expect(signalGroup).toHaveBeenCalledTimes(2)
+    expect(isPortAvailable).not.toHaveBeenCalled()
+    expect(child.listenerCount("close")).toBe(1)
+  })
+
+  it("fails closed when a legacy terminator returns generic false after the child closes", async () => {
+    const terminate = (async (child: PreviewProcess) => {
+      ;(child as FakeProcess).close()
+      return false
+    }) as unknown as PreviewDependencies["terminate"]
+    const isPortAvailable = vi.fn(async () => true)
+    const deps = dependencies({ probe: async () => true, terminate, isPortAvailable })
+    const manager = new PreviewManager(deps)
+    await manager.start({ workspace: "C:\\Garden" })
+
+    await expect(manager.stop()).resolves.toMatchObject({
+      state: "error",
+      error: { code: "PREVIEW_STOP_FAILED" },
+    })
+    expect(isPortAvailable).not.toHaveBeenCalled()
+  })
+
+  it("fails closed when the terminator throws after the child closes", async () => {
+    const terminate = vi.fn<PreviewDependencies["terminate"]>(async (child) => {
+      ;(child as FakeProcess).close()
+      throw new Error("termination failed")
+    })
+    const isPortAvailable = vi.fn(async () => true)
+    const deps = dependencies({ probe: async () => true, terminate, isPortAvailable })
+    const manager = new PreviewManager(deps)
+    await manager.start({ workspace: "C:\\Garden" })
+
+    await expect(manager.stop()).resolves.toMatchObject({
+      state: "error",
+      error: { code: "PREVIEW_STOP_FAILED" },
+    })
+    expect(isPortAvailable).not.toHaveBeenCalled()
+  })
+
   it("releases a failed startup cleanup after a later close and permits a fresh generation", async () => {
     let terminateCalls = 0
     const deps = dependencies({
       terminate: async (child) => {
         terminateCalls += 1
-        if (terminateCalls === 1) return false
+        if (terminateCalls === 1) return "failed"
         ;(child as FakeProcess).close()
-        return true
+        return "terminated"
       },
       probe: async () => deps.children.length >= 2,
     })
@@ -853,7 +922,7 @@ describe("PreviewManager", () => {
   })
 
   it("retains a live child after a startup error until a confirmed close", async () => {
-    const terminate = vi.fn<PreviewDependencies["terminate"]>(async () => false)
+    const terminate = vi.fn<PreviewDependencies["terminate"]>(async () => "failed")
     const deps = dependencies({
       terminate,
       probe: async () => deps.children.length >= 2,
@@ -903,7 +972,7 @@ describe("PreviewManager", () => {
   })
 
   it("clears a startup-error child when its missing pid confirms no process was created", async () => {
-    const terminate = vi.fn<PreviewDependencies["terminate"]>(async () => false)
+    const terminate = vi.fn<PreviewDependencies["terminate"]>(async () => "failed")
     const deps = dependencies({
       terminate,
       probe: async () => deps.children.length >= 2,
@@ -959,7 +1028,7 @@ describe("PreviewManager", () => {
   })
 
   it("starts a fresh same-workspace process when restart is requested during stop", async () => {
-    const termination = new Deferred<boolean>()
+    const termination = new Deferred<void>()
     let terminationCalls = 0
     const deps = dependencies({
       probe: async () => deps.children.length >= 2,
@@ -967,7 +1036,7 @@ describe("PreviewManager", () => {
         terminationCalls += 1
         if (terminationCalls === 1) await termination.promise
         ;(child as FakeProcess).close()
-        return true
+        return "terminated"
       },
     })
     const manager = new PreviewManager(deps)
@@ -976,7 +1045,7 @@ describe("PreviewManager", () => {
 
     const stopping = manager.stop()
     const restarted = manager.start({ workspace: "C:\\Garden" })
-    termination.resolve(true)
+    termination.resolve()
 
     await expect(firstStart).resolves.toEqual({ state: "stopped", generation: 1 })
     await expect(stopping).resolves.toEqual({ state: "stopped", generation: 1 })
@@ -1004,7 +1073,7 @@ describe("PreviewManager", () => {
   it("honors request cancellation during readiness and cleans up the process", async () => {
     const terminate = vi.fn<PreviewDependencies["terminate"]>(async (child) => {
       ;(child as FakeProcess).close()
-      return true
+      return "terminated"
     })
     const deps = dependencies({ terminate })
     const controller = new AbortController()
@@ -1020,7 +1089,7 @@ describe("PreviewManager", () => {
   })
 
   it("coalesces concurrent stop calls, removes owned listeners, and disposes subscribers", async () => {
-    const termination = new Deferred<boolean>()
+    const termination = new Deferred<PreviewTerminationOutcome>()
     const terminate = vi.fn<PreviewDependencies["terminate"]>(() => termination.promise)
     const deps = dependencies({ probe: async () => true, terminate })
     const manager = new PreviewManager(deps)
@@ -1041,7 +1110,7 @@ describe("PreviewManager", () => {
       () => expect(manager.getStatus()).toMatchObject({ state: "stopping" }),
       "stopping state",
     )
-    termination.resolve(true)
+    termination.resolve("terminated")
     child.close()
     await expect(first).resolves.toEqual({ state: "stopped", generation: 1 })
     expect(child.stdout.listenerCount("data")).toBe(0)
@@ -1058,11 +1127,11 @@ describe("PreviewManager", () => {
   it.each(["C:\\Garden", "C:\\Other"])(
     "lets a second stop cancel a %s restart queued behind the shared physical stop",
     async (restartWorkspace) => {
-      const termination = new Deferred<boolean>()
+      const termination = new Deferred<void>()
       const terminate = vi.fn<PreviewDependencies["terminate"]>(async (child) => {
         await termination.promise
         ;(child as FakeProcess).close()
-        return true
+        return "terminated"
       })
       const deps = dependencies({ probe: async () => true, terminate })
       const manager = new PreviewManager(deps)
@@ -1073,7 +1142,7 @@ describe("PreviewManager", () => {
       const finalStop = manager.stop()
       expect(finalStop).toBe(firstStop)
 
-      termination.resolve(true)
+      termination.resolve()
       await expect(firstStop).resolves.toEqual({ state: "stopped", generation: 1 })
       await expect(finalStop).resolves.toEqual({ state: "stopped", generation: 1 })
       await expect(queuedRestart).resolves.toEqual({ state: "stopped", generation: 1 })
@@ -1083,13 +1152,16 @@ describe("PreviewManager", () => {
   )
 
   it("shares concurrent dispose and remains retryable with subscribers after cleanup failure", async () => {
-    const firstTermination = new Deferred<boolean>()
-    const outcomes: Array<boolean | Promise<boolean>> = [firstTermination.promise, true]
+    const firstTermination = new Deferred<PreviewTerminationOutcome>()
+    const outcomes: Array<PreviewTerminationOutcome | Promise<PreviewTerminationOutcome>> = [
+      firstTermination.promise,
+      "terminated",
+    ]
     const deps = dependencies({
       probe: async () => true,
       terminate: async (child) => {
-        const outcome = await (outcomes.shift() ?? false)
-        if (outcome) (child as FakeProcess).close()
+        const outcome = await (outcomes.shift() ?? "failed")
+        if (outcome === "terminated") (child as FakeProcess).close()
         return outcome
       },
     })
@@ -1101,7 +1173,7 @@ describe("PreviewManager", () => {
     const first = manager.dispose()
     const concurrent = manager.dispose()
     expect(first).toBe(concurrent)
-    firstTermination.resolve(false)
+    firstTermination.resolve("failed")
     await expect(first).rejects.toBeInstanceOf(PreviewDisposeError)
     expect(manager.getStatus()).toMatchObject({
       state: "error",
@@ -1121,7 +1193,10 @@ describe("PreviewManager", () => {
   })
 
   it("allows dispose to succeed after an unconfirmed child later closes", async () => {
-    const deps = dependencies({ probe: async () => true, terminate: async () => false })
+    const deps = dependencies({
+      probe: async () => true,
+      terminate: async (child) => ((child as FakeProcess).alive ? "failed" : "root-absent"),
+    })
     const manager = new PreviewManager(deps)
     await manager.start({ workspace: "C:\\Garden" })
     const child = deps.children[0]
@@ -1135,10 +1210,10 @@ describe("PreviewManager", () => {
   })
 
   it("keeps a failed-to-stop child tracked so a later stop can retry truthfully", async () => {
-    const outcomes = [false, true]
+    const outcomes: PreviewTerminationOutcome[] = ["failed", "terminated"]
     const terminate = vi.fn<PreviewDependencies["terminate"]>(async (child) => {
-      const result = outcomes.shift() ?? false
-      if (result) (child as FakeProcess).close()
+      const result = outcomes.shift() ?? "failed"
+      if (result === "terminated") (child as FakeProcess).close()
       return result
     })
     const deps = dependencies({ probe: async () => true, terminate })
@@ -1188,11 +1263,14 @@ describe("PreviewManager", () => {
   })
 
   it("does not treat a child error as confirmed exit during failed termination", async () => {
-    const firstTermination = new Deferred<boolean>()
-    const outcomes: Array<boolean | Promise<boolean>> = [firstTermination.promise, true]
+    const firstTermination = new Deferred<PreviewTerminationOutcome>()
+    const outcomes: Array<PreviewTerminationOutcome | Promise<PreviewTerminationOutcome>> = [
+      firstTermination.promise,
+      "terminated",
+    ]
     const terminate = vi.fn<PreviewDependencies["terminate"]>(async (child) => {
-      const outcome = await (outcomes.shift() ?? false)
-      if (outcome) (child as FakeProcess).close()
+      const outcome = await (outcomes.shift() ?? "failed")
+      if (outcome === "terminated") (child as FakeProcess).close()
       return outcome
     })
     const deps = dependencies({ probe: async () => true, terminate })
@@ -1206,7 +1284,7 @@ describe("PreviewManager", () => {
       "error-during-stop state",
     )
     child.emit("error", new Error("kill failed"))
-    firstTermination.resolve(false)
+    firstTermination.resolve("failed")
 
     await expect(stopping).resolves.toMatchObject({
       state: "error",
@@ -1243,7 +1321,7 @@ describe("createProcessTreeTerminator", () => {
     const child = new FakeProcess()
     child.pid = 9876
 
-    await expect(terminate(child)).resolves.toBe(true)
+    await expect(terminate(child)).resolves.toBe("terminated")
     expect(runTaskkill).toHaveBeenNthCalledWith(1, "taskkill.exe", ["/PID", "9876", "/T"], {
       shell: false,
       windowsHide: true,
@@ -1254,13 +1332,13 @@ describe("createProcessTreeTerminator", () => {
     })
   })
 
-  it("fails closed when the Windows root is already gone without tree confirmation", async () => {
+  it("reports an explicit reconciliation outcome when the Windows root is already gone", async () => {
     const runTaskkill = vi.fn<TreeTerminationDependencies["runTaskkill"]>()
     const terminate = createProcessTreeTerminator(
       treeDependencies({ isAlive: () => false, runTaskkill }),
     )
 
-    await expect(terminate(new FakeProcess())).resolves.toBe(false)
+    await expect(terminate(new FakeProcess())).resolves.toBe("root-absent")
     expect(runTaskkill).not.toHaveBeenCalled()
   })
 
@@ -1273,7 +1351,7 @@ describe("createProcessTreeTerminator", () => {
       treeDependencies({ isAlive: () => alive.shift() ?? false, runTaskkill }),
     )
 
-    await expect(terminate(new FakeProcess())).resolves.toBe(false)
+    await expect(terminate(new FakeProcess())).resolves.toBe("failed")
     expect(runTaskkill).toHaveBeenCalledTimes(1)
   })
 
@@ -1288,7 +1366,7 @@ describe("createProcessTreeTerminator", () => {
       treeDependencies({ isAlive: () => alive.shift() ?? false, runTaskkill }),
     )
 
-    await expect(terminate(new FakeProcess())).resolves.toBe(true)
+    await expect(terminate(new FakeProcess())).resolves.toBe("terminated")
     expect(runTaskkill).toHaveBeenNthCalledWith(2, "taskkill.exe", ["/PID", "4242", "/T", "/F"], {
       shell: false,
       windowsHide: true,
@@ -1306,7 +1384,7 @@ describe("createProcessTreeTerminator", () => {
       }),
     )
 
-    await expect(terminate(new FakeProcess())).resolves.toBe(false)
+    await expect(terminate(new FakeProcess())).resolves.toBe("failed")
     expect(runTaskkill).not.toHaveBeenCalled()
   })
 
@@ -1323,7 +1401,7 @@ describe("createProcessTreeTerminator", () => {
     const child = new FakeProcess()
     child.pid = 2468
 
-    await expect(terminate(child)).resolves.toBe(true)
+    await expect(terminate(child)).resolves.toBe("terminated")
     expect(signalGroup).toHaveBeenNthCalledWith(1, -2468, "SIGTERM")
     expect(signalGroup).toHaveBeenNthCalledWith(2, -2468, "SIGKILL")
   })
@@ -1335,7 +1413,7 @@ describe("createProcessTreeTerminator", () => {
     const child = new FakeProcess()
     child.pid = 0
 
-    await expect(terminate(child)).resolves.toBe(false)
+    await expect(terminate(child)).resolves.toBe("failed")
     expect(signalGroup).not.toHaveBeenCalled()
     expect(runTaskkill).not.toHaveBeenCalled()
   })

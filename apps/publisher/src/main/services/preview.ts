@@ -27,6 +27,8 @@ export interface PortRequest {
   readonly exclude: readonly number[]
 }
 
+export type PreviewTerminationOutcome = "terminated" | "root-absent" | "failed"
+
 export interface PreviewDependencies {
   readonly resolveWorkspace: (workspace: string) => Promise<string>
   readonly isDirectory: (path: string) => Promise<boolean>
@@ -41,7 +43,7 @@ export interface PreviewDependencies {
   readonly probe: (url: string, signal: AbortSignal) => Promise<boolean>
   readonly probeWs: (port: number, signal: AbortSignal) => Promise<boolean>
   readonly isPortAvailable: (port: number) => Promise<boolean>
-  readonly terminate: (child: PreviewProcess) => Promise<boolean>
+  readonly terminate: (child: PreviewProcess) => Promise<PreviewTerminationOutcome>
   readonly platform?: NodeJS.Platform
   readonly now?: () => number
   readonly delay?: (milliseconds: number, signal: AbortSignal) => Promise<void>
@@ -229,15 +231,15 @@ function safeAlive(dependencies: TreeTerminationDependencies, target: number): b
 /** Builds a verified process-tree terminator with all platform effects injectable for tests. */
 export function createProcessTreeTerminator(
   dependencies: TreeTerminationDependencies,
-): (child: PreviewProcess) => Promise<boolean> {
-  return async (child): Promise<boolean> => {
+): (child: PreviewProcess) => Promise<PreviewTerminationOutcome> {
+  return async (child): Promise<PreviewTerminationOutcome> => {
     const pid = child.pid
-    if (!Number.isSafeInteger(pid) || pid === undefined || pid <= 0) return false
+    if (!Number.isSafeInteger(pid) || pid === undefined || pid <= 0) return "failed"
 
     if (dependencies.platform === "win32") {
       const initiallyAlive = safeAlive(dependencies, pid)
-      if (initiallyAlive === undefined) return false
-      if (!initiallyAlive) return false
+      if (initiallyAlive === undefined) return "failed"
+      if (!initiallyAlive) return "root-absent"
       let gracefulTreeConfirmed = true
       try {
         await dependencies.runTaskkill("taskkill.exe", ["/PID", String(pid), "/T"], {
@@ -249,8 +251,8 @@ export function createProcessTreeTerminator(
       }
       await dependencies.wait(dependencies.gracefulWaitMs)
       const aliveAfterGrace = safeAlive(dependencies, pid)
-      if (aliveAfterGrace === undefined) return false
-      if (!aliveAfterGrace) return gracefulTreeConfirmed
+      if (aliveAfterGrace === undefined) return "failed"
+      if (!aliveAfterGrace) return gracefulTreeConfirmed ? "terminated" : "failed"
       let forcedTreeConfirmed = true
       try {
         await dependencies.runTaskkill("taskkill.exe", ["/PID", String(pid), "/T", "/F"], {
@@ -262,13 +264,13 @@ export function createProcessTreeTerminator(
       }
       await dependencies.wait(dependencies.forceWaitMs)
       const aliveAfterForce = safeAlive(dependencies, pid)
-      return forcedTreeConfirmed && aliveAfterForce === false
+      return forcedTreeConfirmed && aliveAfterForce === false ? "terminated" : "failed"
     }
 
     const group = -pid
     const initiallyAlive = safeAlive(dependencies, group)
-    if (initiallyAlive === undefined) return false
-    if (!initiallyAlive) return true
+    if (initiallyAlive === undefined) return "failed"
+    if (!initiallyAlive) return "terminated"
     try {
       dependencies.signalGroup(group, "SIGTERM")
     } catch {
@@ -276,8 +278,8 @@ export function createProcessTreeTerminator(
     }
     await dependencies.wait(dependencies.gracefulWaitMs)
     const aliveAfterGrace = safeAlive(dependencies, group)
-    if (aliveAfterGrace === undefined) return false
-    if (!aliveAfterGrace) return true
+    if (aliveAfterGrace === undefined) return "failed"
+    if (!aliveAfterGrace) return "terminated"
     try {
       dependencies.signalGroup(group, "SIGKILL")
     } catch {
@@ -285,7 +287,7 @@ export function createProcessTreeTerminator(
     }
     await dependencies.wait(dependencies.forceWaitMs)
     const aliveAfterForce = safeAlive(dependencies, group)
-    return aliveAfterForce === false
+    return aliveAfterForce === false ? "terminated" : "failed"
   }
 }
 
@@ -1014,18 +1016,22 @@ export class PreviewManager {
   ): Promise<boolean> {
     if (this.session !== session || session.attempt !== attempt) return true
     attempt.stopping = true
-    let terminated = false
+    let outcome: PreviewTerminationOutcome = "failed"
     try {
-      terminated = await this.dependencies.terminate(attempt.child)
+      outcome = await this.dependencies.terminate(attempt.child)
     } catch {
-      terminated = false
+      outcome = "failed"
     }
-    if (!terminated) {
+    if (outcome === "root-absent") {
       if (await this.reconcileClosedAttempt(attempt)) {
         this.detachAttempt(attempt)
         if (session.attempt === attempt) session.attempt = undefined
         return true
       }
+      attempt.stopping = false
+      return false
+    }
+    if (outcome !== "terminated") {
       attempt.stopping = false
       return false
     }
