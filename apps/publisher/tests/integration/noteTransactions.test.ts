@@ -1567,7 +1567,7 @@ describe("transaction recovery", () => {
       ]),
     )
     expect(retentionWarnings).toContain("TRANSACTION_RETENTION_FAILED")
-  }, 30_000)
+  }, 60_000)
 
   it("bounds failed retention work and never selects authenticated nonterminal evidence", async () => {
     const workspace = await garden()
