@@ -851,6 +851,15 @@ describe("PreviewManager", () => {
     expect(signalGroup).toHaveBeenCalledTimes(2)
     expect(isPortAvailable).not.toHaveBeenCalled()
     expect(child.listenerCount("close")).toBe(1)
+
+    child.close()
+    await expect(manager.stop()).resolves.toMatchObject({
+      state: "error",
+      error: { code: "PREVIEW_STOP_FAILED" },
+    })
+    expect(signalGroup).toHaveBeenCalledTimes(4)
+    expect(isPortAvailable).not.toHaveBeenCalled()
+    expect(child.listenerCount("close")).toBe(1)
   })
 
   it("fails closed when a legacy terminator returns generic false after the child closes", async () => {
@@ -887,7 +896,7 @@ describe("PreviewManager", () => {
     expect(isPortAvailable).not.toHaveBeenCalled()
   })
 
-  it("releases a failed startup cleanup after a later close and permits a fresh generation", async () => {
+  it("retains uncertain startup cleanup after a later close until a retry confirms termination", async () => {
     let terminateCalls = 0
     const deps = dependencies({
       terminate: async (child) => {
@@ -911,6 +920,10 @@ describe("PreviewManager", () => {
     })
 
     failedChild.close(1)
+    expect(failedChild.listenerCount("close")).toBe(1)
+    expect(failedChild.listenerCount("error")).toBe(1)
+
+    await expect(manager.stop()).resolves.toMatchObject({ state: "stopped", generation: 1 })
     expect(failedChild.listenerCount("close")).toBe(0)
     expect(failedChild.listenerCount("error")).toBe(0)
 
@@ -921,8 +934,11 @@ describe("PreviewManager", () => {
     expect(deps.children).toHaveLength(2)
   })
 
-  it("retains a live child after a startup error until a confirmed close", async () => {
-    const terminate = vi.fn<PreviewDependencies["terminate"]>(async () => "failed")
+  it("retains cleanup ownership after a startup error until termination is verified", async () => {
+    const outcomes: PreviewTerminationOutcome[] = ["failed", "terminated"]
+    const terminate = vi.fn<PreviewDependencies["terminate"]>(
+      async () => outcomes.shift() ?? "failed",
+    )
     const deps = dependencies({
       terminate,
       probe: async () => deps.children.length >= 2,
@@ -961,6 +977,10 @@ describe("PreviewManager", () => {
     expect(deps.children).toHaveLength(1)
 
     failedChild.close(1)
+    expect(failedChild.listenerCount("error")).toBe(1)
+    expect(failedChild.listenerCount("close")).toBe(1)
+
+    await expect(manager.stop()).resolves.toMatchObject({ state: "stopped", generation: 1 })
     expect(failedChild.listenerCount("error")).toBe(0)
     expect(failedChild.listenerCount("close")).toBe(0)
 

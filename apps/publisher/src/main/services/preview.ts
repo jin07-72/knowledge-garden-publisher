@@ -114,6 +114,7 @@ interface ProcessAttempt {
   stopping: boolean
   buildFailed: boolean
   closeObserved: boolean
+  terminationUncertain: boolean
 }
 
 interface PreviewSession {
@@ -774,6 +775,7 @@ export class PreviewManager {
       stopping: false,
       buildFailed: false,
       closeObserved: false,
+      terminationUncertain: false,
       onStdout: (chunk: unknown): void =>
         this.consumeChunk(session, attempt, String(chunk), "stdout"),
       onStderr: (chunk: unknown): void =>
@@ -831,6 +833,8 @@ export class PreviewManager {
       })
       return
     }
+
+    if (attempt.terminationUncertain) return
 
     this.detachAttempt(attempt)
     attempt.inStartup = false
@@ -1024,17 +1028,21 @@ export class PreviewManager {
     }
     if (outcome === "root-absent") {
       if (await this.reconcileClosedAttempt(attempt)) {
+        attempt.terminationUncertain = false
         this.detachAttempt(attempt)
         if (session.attempt === attempt) session.attempt = undefined
         return true
       }
+      attempt.terminationUncertain = true
       attempt.stopping = false
       return false
     }
     if (outcome !== "terminated") {
+      attempt.terminationUncertain = true
       attempt.stopping = false
       return false
     }
+    attempt.terminationUncertain = false
     this.detachAttempt(attempt)
     if (session.attempt === attempt) session.attempt = undefined
     return true
