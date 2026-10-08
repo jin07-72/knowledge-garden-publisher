@@ -40,12 +40,14 @@ export interface PreviewDependencies {
   readonly allocatePort: (request: PortRequest) => Promise<number>
   readonly probe: (url: string, signal: AbortSignal) => Promise<boolean>
   readonly probeWs: (port: number, signal: AbortSignal) => Promise<boolean>
+  readonly isPortAvailable: (port: number) => Promise<boolean>
   readonly terminate: (child: PreviewProcess) => Promise<boolean>
   readonly platform?: NodeJS.Platform
   readonly now?: () => number
   readonly delay?: (milliseconds: number, signal: AbortSignal) => Promise<void>
   readonly readinessTimeoutMs?: number
   readonly readinessPollMs?: number
+  readonly terminationCloseGraceMs?: number
   readonly maxPortRetries?: number
   readonly safeEnvironment?: Readonly<Record<string, string | undefined>>
 }
@@ -93,6 +95,7 @@ interface ProcessAttempt {
   readonly port: number
   readonly wsPort: number
   readonly events: Deferred<AttemptEvent>
+  readonly closed: Deferred<void>
   readonly onStdout: (chunk: unknown) => void
   readonly onStderr: (chunk: unknown) => void
   readonly onError: () => void
@@ -750,11 +753,13 @@ export class PreviewManager {
     wsPort: number,
   ): ProcessAttempt {
     const events = deferred<AttemptEvent>()
+    const closed = deferred<void>()
     const attempt = {
       child,
       port,
       wsPort,
       events,
+      closed,
       stdoutRemainder: "",
       stderrRemainder: "",
       stdoutParsePrefix: "",
@@ -797,7 +802,10 @@ export class PreviewManager {
   ): void {
     if (this.session !== session || session.attempt !== attempt) return
     const confirmedClose = event.kind === "exit"
-    if (confirmedClose) attempt.closeObserved = true
+    if (confirmedClose) {
+      attempt.closeObserved = true
+      attempt.closed.resolve()
+    }
     this.flushRemainders(session, attempt)
     this.settleAttempt(attempt, event)
     if (attempt.stopping || (attempt.inStartup && attempt.startupWaitActive)) return
@@ -1013,7 +1021,7 @@ export class PreviewManager {
       terminated = false
     }
     if (!terminated) {
-      if (attempt.closeObserved) {
+      if (await this.reconcileClosedAttempt(attempt)) {
         this.detachAttempt(attempt)
         if (session.attempt === attempt) session.attempt = undefined
         return true
@@ -1024,6 +1032,33 @@ export class PreviewManager {
     this.detachAttempt(attempt)
     if (session.attempt === attempt) session.attempt = undefined
     return true
+  }
+
+  private async reconcileClosedAttempt(attempt: ProcessAttempt): Promise<boolean> {
+    if (!attempt.closeObserved) {
+      const graceMs = Math.max(0, this.dependencies.terminationCloseGraceMs ?? 100)
+      if (graceMs === 0) return false
+      const controller = new AbortController()
+      const delay = this.dependencies.delay ?? defaultDelay
+      const closeObserved = attempt.closed.promise.then(() => true)
+      const graceExpired = delay(graceMs, controller.signal).then(
+        () => false,
+        () => false,
+      )
+      const observed = await Promise.race([closeObserved, graceExpired])
+      controller.abort()
+      if (!observed || !attempt.closeObserved) return false
+    }
+
+    try {
+      const released = await Promise.all([
+        this.dependencies.isPortAvailable(attempt.port),
+        this.dependencies.isPortAvailable(attempt.wsPort),
+      ])
+      return released.every(Boolean)
+    } catch {
+      return false
+    }
   }
 
   private stopFailure(session: PreviewSession, port: number): PreviewStatus {

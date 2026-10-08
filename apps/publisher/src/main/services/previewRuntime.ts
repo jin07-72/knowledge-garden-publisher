@@ -135,6 +135,7 @@ export function createProductionPreviewManager(runtimePath: string): PreviewMana
       }
     },
     probeWs: probeTcp,
+    isPortAvailable: isPreviewPortAvailable,
     terminate,
     platform,
     safeEnvironment: {

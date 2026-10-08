@@ -115,6 +115,7 @@ function dependencies(overrides: Partial<PreviewDependencies> = {}): TestDepende
     },
     probe: async () => false,
     probeWs: async () => true,
+    isPortAvailable: async () => true,
     terminate: async (child) => {
       ;(child as FakeProcess).close()
       return true
@@ -124,6 +125,7 @@ function dependencies(overrides: Partial<PreviewDependencies> = {}): TestDepende
     delay: clock.delay,
     readinessTimeoutMs: 1_000,
     readinessPollMs: 10,
+    terminationCloseGraceMs: 0,
     maxPortRetries: 2,
     ...overrides,
   }
@@ -704,6 +706,116 @@ describe("PreviewManager", () => {
       error: { code: "PREVIEW_STOP_FAILED" },
     })
     expect(deps.children[0].alive).toBe(true)
+  })
+
+  it("preserves the build error when an OS-dead child reports close just after termination", async () => {
+    const terminate = vi.fn<PreviewDependencies["terminate"]>(async () => false)
+    const isPortAvailable = vi.fn(async () => true)
+    const cleanupOptions = {
+      terminate,
+      isPortAvailable,
+      terminationCloseGraceMs: 50,
+    }
+    const deps = dependencies(cleanupOptions)
+    const manager = new PreviewManager(deps)
+    const starting = manager.start({ workspace: "C:\\Garden" })
+
+    await until(() => expect(deps.children).toHaveLength(1), "pending-close build-error spawn")
+    const failedChild = deps.children[0]
+    failedChild.stderr.write("Failed to build Quartz. C:\\private\\plugin.ts\n")
+    await until(() => expect(terminate).toHaveBeenCalledTimes(1), "pending-close termination")
+    failedChild.close(1)
+
+    await expect(starting).resolves.toMatchObject({
+      state: "error",
+      generation: 1,
+      error: { code: "PREVIEW_BUILD_FAILED" },
+    })
+    expect(manager.getStatus()).toMatchObject({ error: { code: "PREVIEW_BUILD_FAILED" } })
+    expect(isPortAvailable).toHaveBeenCalledWith(43120)
+    expect(isPortAvailable).toHaveBeenCalledWith(43121)
+    expect(failedChild.listenerCount("close")).toBe(0)
+  })
+
+  it("stops safely when an OS-dead child reports close during the bounded grace", async () => {
+    const terminate = vi.fn<PreviewDependencies["terminate"]>(async () => false)
+    const isPortAvailable = vi.fn(async () => true)
+    const cleanupOptions = {
+      probe: async () => true,
+      terminate,
+      isPortAvailable,
+      terminationCloseGraceMs: 50,
+    }
+    const deps = dependencies(cleanupOptions)
+    const manager = new PreviewManager(deps)
+    await manager.start({ workspace: "C:\\Garden" })
+    const child = deps.children[0]
+
+    const stopping = manager.stop()
+    await until(() => expect(terminate).toHaveBeenCalledTimes(1), "pending-close stop")
+    child.close()
+
+    await expect(stopping).resolves.toEqual({ state: "stopped", generation: 1 })
+    expect(isPortAvailable).toHaveBeenCalledTimes(2)
+    expect(child.listenerCount("close")).toBe(0)
+  })
+
+  it("fails closed when the child close does not arrive within the bounded grace", async () => {
+    const terminate = vi.fn<PreviewDependencies["terminate"]>(async () => false)
+    const isPortAvailable = vi.fn(async () => true)
+    const deps = dependencies({
+      probe: async () => true,
+      terminate,
+      isPortAvailable,
+      terminationCloseGraceMs: 50,
+    })
+    const manager = new PreviewManager(deps)
+    await manager.start({ workspace: "C:\\Garden" })
+    const child = deps.children[0]
+
+    const stopping = manager.stop()
+    let settled = false
+    void stopping.then(() => {
+      settled = true
+    })
+    await until(() => expect(terminate).toHaveBeenCalledTimes(1), "missing-close stop")
+    await deps.clock.advance(49)
+    expect(settled).toBe(false)
+    await deps.clock.advance(1)
+
+    await expect(stopping).resolves.toMatchObject({
+      state: "error",
+      error: { code: "PREVIEW_STOP_FAILED" },
+    })
+    expect(isPortAvailable).not.toHaveBeenCalled()
+    expect(child.alive).toBe(true)
+    expect(child.listenerCount("close")).toBe(1)
+  })
+
+  it("fails closed when a descendant keeps an owned port after the child close", async () => {
+    const terminate = vi.fn<PreviewDependencies["terminate"]>(async () => false)
+    const isPortAvailable = vi.fn(async (port: number) => port !== 43121)
+    const cleanupOptions = {
+      probe: async () => true,
+      terminate,
+      isPortAvailable,
+      terminationCloseGraceMs: 50,
+    }
+    const deps = dependencies(cleanupOptions)
+    const manager = new PreviewManager(deps)
+    await manager.start({ workspace: "C:\\Garden" })
+    const child = deps.children[0]
+
+    const stopping = manager.stop()
+    await until(() => expect(terminate).toHaveBeenCalledTimes(1), "descendant-port stop")
+    child.close()
+
+    await expect(stopping).resolves.toMatchObject({
+      state: "error",
+      error: { code: "PREVIEW_STOP_FAILED" },
+    })
+    expect(isPortAvailable).toHaveBeenCalledWith(43121)
+    expect(child.listenerCount("close")).toBe(1)
   })
 
   it("releases a failed startup cleanup after a later close and permits a fresh generation", async () => {
