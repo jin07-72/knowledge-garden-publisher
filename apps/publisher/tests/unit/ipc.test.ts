@@ -693,6 +693,32 @@ describe("secure publisher IPC", () => {
     }
   })
 
+  it("routes note creation for a valid custom domain", async () => {
+    const { ipc, servicePorts } = setup()
+    const request = {
+      visibility: "public" as const,
+      domain: "artificial-intelligence",
+      slug: "public-ai-note",
+      title: "公开 AI 笔记",
+      date: "2026-10-08",
+      description: "公开人工智能笔记",
+      tags: ["AI", "公开"],
+      body: "# 公开 AI 笔记\n",
+    }
+    const receipt = {
+      path: "content/artificial-intelligence/public-ai-note.md",
+      updatedAt: "2026-10-08T00:00:00.000Z",
+      mtimeMs: 1,
+      contentHash: "a".repeat(64),
+    }
+    servicePorts.calls.notesCreate.mockResolvedValueOnce(receipt)
+
+    await expect(
+      ipc.invoke(IPC_CHANNELS.requests.notesCreate, trustedEvent, request),
+    ).resolves.toEqual({ ok: true, value: receipt })
+    expect(servicePorts.calls.notesCreate).toHaveBeenCalledWith(request)
+  })
+
   it("rolls back every earlier domain handler when registration finds a duplicate", () => {
     const ipc = new FakeIpcMain()
     const servicePorts = services()

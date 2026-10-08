@@ -62,6 +62,13 @@ export interface QuartzGardenFixture extends TemporaryGitRepository {
   readonly noteTitle: string
 }
 
+export interface QuartzGardenFixtureDomain {
+  readonly slug: string
+  readonly name: string
+  readonly description?: string
+  readonly order?: number
+}
+
 const fixtureNote = (title: string, body: string): string => `---
 title: ${title}
 date: 2026-10-02
@@ -75,17 +82,43 @@ tags:
 ${body}
 `
 
+export const markedDomainIndex = (
+  domain: QuartzGardenFixtureDomain,
+  fallbackOrder: number,
+): string => `---
+title: ${domain.name}
+date: 2026-10-02
+description: ${domain.description ?? `${domain.name}领域的测试记录。`}
+tags:
+  - ${domain.slug}
+gardenDomain: true
+domainOrder: ${domain.order ?? fallbackOrder}
+---
+
+# ${domain.name}
+`
+
 export async function createQuartzGardenFixture(options: {
   readonly directoryName: string
   readonly noteTitle: string
   readonly noteBody: string
+  readonly domains?: readonly QuartzGardenFixtureDomain[]
 }): Promise<QuartzGardenFixture> {
+  const domains = options.domains ?? [{ slug: "life", name: "生活", order: 1 }]
+  if (domains.length === 0) throw new Error("A garden fixture requires at least one domain.")
   const repository = await createTemporaryGitRepository()
   const root = join(repository.root, "..", options.directoryName)
   await rename(repository.root, root)
-  const notePath = "content/life/fixture.md"
+  const notePath = `content/${domains[0]!.slug}/fixture.md`
   await Promise.all([
     writeFixtureFile(root, notePath, fixtureNote(options.noteTitle, options.noteBody)),
+    ...domains.map((domain, index) =>
+      writeFixtureFile(
+        root,
+        `content/${domain.slug}/index.md`,
+        markedDomainIndex(domain, index + 1),
+      ),
+    ),
     writeFixtureFile(root, "scripts/validate-content.mjs", "process.exit(0)\n"),
     writeFixtureFile(root, "private/.gitkeep", ""),
     writeFixtureFile(root, "quartz/bootstrap-cli.mjs", ""),
@@ -117,7 +150,10 @@ export async function createQuartzGardenFixture(options: {
   await git(root, ["add", "."])
   await git(root, ["commit", "-m", `Create ${options.directoryName}`])
   await git(root, ["push", "-u", "origin", "main"])
-  await mkdir(join(root, "node_modules"), { recursive: true })
+  await Promise.all([
+    mkdir(join(root, "node_modules"), { recursive: true }),
+    ...domains.map((domain) => mkdir(join(root, "private", domain.slug), { recursive: true })),
+  ])
   await writeFile(
     join(root, "node_modules", ".package-lock.json"),
     JSON.stringify({

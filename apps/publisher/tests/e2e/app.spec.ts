@@ -1,8 +1,13 @@
 import { _electron as electron, expect, test } from "@playwright/test"
 import type { ChildProcess } from "node:child_process"
 import { mkdir, readFile, writeFile } from "node:fs/promises"
-import { dirname, join, resolve } from "node:path"
-import { createQuartzGardenFixture, createTemporaryGitRepository, git } from "../helpers/git"
+import { basename, dirname, join, resolve } from "node:path"
+import {
+  createQuartzGardenFixture,
+  createTemporaryGitRepository,
+  git,
+  markedDomainIndex,
+} from "../helpers/git"
 import {
   createE2eRuntime,
   createTemporaryDirectory,
@@ -100,6 +105,70 @@ async function launchApplication(
   return application
 }
 
+async function captureTrashTargets(
+  application: ElectronApplication,
+  receipt: string,
+): Promise<void> {
+  await application.evaluate(({ shell }, receiptPath) => {
+    const originalTrashItem = shell.trashItem.bind(shell)
+    shell.trashItem = async (target: string): Promise<void> => {
+      const fileSystem = process.getBuiltinModule("node:fs/promises")
+      await fileSystem.appendFile(receiptPath, `${target}\n`, "utf8")
+      await originalTrashItem(target)
+    }
+  }, receipt)
+}
+
+async function createNote(
+  page: Awaited<ReturnType<ElectronApplication["firstWindow"]>>,
+  options: {
+    readonly title: string
+    readonly slug: string
+    readonly description: string
+    readonly tags: string
+    readonly domain: string
+    readonly visibility: "public" | "private"
+  },
+): Promise<void> {
+  await page.getByRole("button", { name: "新建笔记" }).click()
+  const dialog = page.getByRole("dialog", { name: "新建笔记" })
+  await dialog.getByRole("textbox", { name: "标题" }).fill(options.title)
+  await dialog.getByRole("textbox", { name: "文件名" }).fill(options.slug)
+  await dialog.getByRole("textbox", { name: "描述" }).fill(options.description)
+  await dialog.getByRole("textbox", { name: "标签" }).fill(options.tags)
+  await dialog.getByRole("combobox", { name: "领域" }).selectOption(options.domain)
+  await dialog
+    .getByRole("radio", { name: options.visibility === "public" ? "公开" : "私密" })
+    .check()
+  await dialog.getByRole("button", { name: "创建" }).click()
+  const outcome = await Promise.race([
+    dialog.waitFor({ state: "detached" }).then(() => ({ kind: "created" as const })),
+    dialog
+      .getByRole("alert")
+      .waitFor({ state: "visible" })
+      .then(async () => ({
+        kind: "error" as const,
+        message: (await dialog.getByRole("alert").textContent())?.trim() ?? "unknown error",
+      })),
+  ])
+  if (outcome.kind === "error") throw new Error(`Note creation failed: ${outcome.message}`)
+}
+
+async function createDomain(
+  page: Awaited<ReturnType<ElectronApplication["firstWindow"]>>,
+  name: string,
+  slug: string,
+): Promise<void> {
+  await page.getByRole("button", { name: "管理领域" }).click()
+  await page.getByRole("button", { name: "新建领域" }).click()
+  const dialog = page.getByRole("dialog", { name: "新建领域" })
+  await dialog.getByRole("textbox", { name: "显示名称" }).fill(name)
+  await dialog.getByRole("textbox", { name: "英文路径" }).fill(slug)
+  await dialog.getByRole("button", { name: "创建领域" }).click()
+  await expect(page.getByRole("article", { name })).toBeVisible()
+  await page.getByRole("button", { name: "关闭" }).click()
+}
+
 test.afterAll(async () => {
   const survivors: string[] = []
   for (const child of launchedChildren) {
@@ -140,6 +209,11 @@ test("edits, changes visibility, and publishes only the selected public note", a
       writeGardenFile(repository.root, "content/life/alpha.md", note("Alpha", "original alpha")),
       writeGardenFile(repository.root, "content/life/beta.md", note("Beta", "original beta")),
       writeGardenFile(repository.root, "content/life/gamma.md", note("Gamma", "original gamma")),
+      writeGardenFile(
+        repository.root,
+        "content/life/index.md",
+        markedDomainIndex({ slug: "life", name: "生活", order: 1 }, 1),
+      ),
       writeGardenFile(repository.root, "scripts/validate-content.mjs", "process.exit(0)\n"),
       writeGardenFile(repository.root, "quartz/bootstrap-cli.mjs", ""),
       writeGardenFile(repository.root, "private/.gitkeep", ""),
@@ -371,6 +445,178 @@ test("manages independent blogs across safe application restarts", async () => {
     await expect(page.getByRole("dialog", { name: "管理博客" })).toBeVisible()
     await page.getByRole("button", { name: "关闭博客管理" }).click()
     await expect(page.getByRole("button", { name: "切换博客：Second Garden" })).toBeVisible()
+  } finally {
+    await closeApplication(application)
+    await Promise.all([first.cleanup(), second.cleanup()])
+    await removeTemporaryDirectory(stateRoot)
+  }
+})
+
+test("manages custom domains across restarts and blogs", async () => {
+  const first = await createQuartzGardenFixture({
+    directoryName: "Blog A",
+    noteTitle: "Blog A Note",
+    noteBody: "blog a only",
+  })
+  const second = await createQuartzGardenFixture({
+    directoryName: "Blog B",
+    noteTitle: "Blog B Note",
+    noteBody: "blog b only",
+  })
+  const stateRoot = await createTemporaryDirectory("garden-publisher-e2e-domains-")
+  const registry = join(stateRoot, "blogs.json")
+  const relaunchMarker = join(stateRoot, "relaunch-requested")
+  const trashReceipt = join(stateRoot, "trash-receipt.txt")
+  const runtimeRoot = await createE2eRuntime(stateRoot)
+  const environment = {
+    ...process.env,
+    GARDEN_PUBLISHER_E2E: "1",
+    GARDEN_PUBLISHER_E2E_WORKSPACE: first.root,
+    GARDEN_PUBLISHER_E2E_RUNTIME: runtimeRoot,
+    GARDEN_PUBLISHER_E2E_REGISTRY: registry,
+    GARDEN_PUBLISHER_E2E_CHOOSE_LOCAL: second.root,
+    GARDEN_PUBLISHER_E2E_RELAUNCH_MARKER: relaunchMarker,
+  }
+  const publicPath = "content/artificial-intelligence/public-ai-note.md"
+  const privatePath = "private/artificial-intelligence/private-ai-note.md"
+  let application: ElectronApplication | undefined
+  try {
+    application = await launchApplication(stateRoot, environment)
+    let page = await application.firstWindow()
+    await expect(page.getByRole("button", { name: "切换博客：Blog A" })).toBeVisible()
+
+    await createDomain(page, "人工智能", "artificial-intelligence")
+    await createNote(page, {
+      title: "公开 AI 笔记",
+      slug: "public-ai-note",
+      description: "公开人工智能笔记",
+      tags: "AI,公开",
+      domain: "artificial-intelligence",
+      visibility: "public",
+    })
+    await createNote(page, {
+      title: "私密 AI 笔记",
+      slug: "private-ai-note",
+      description: "私密人工智能笔记",
+      tags: "AI,私密",
+      domain: "artificial-intelligence",
+      visibility: "private",
+    })
+
+    const notes = page.getByRole("navigation", { name: "笔记" })
+    const unrelatedNote = notes.getByRole("button", { name: "Blog A Note，公开", exact: true })
+    await expect(unrelatedNote).toBeVisible()
+    await notes.getByRole("button", { name: "人工智能", exact: true }).click()
+    await expect(unrelatedNote).toHaveCount(0)
+    const publicNote = notes.getByRole("button", { name: "公开 AI 笔记，公开", exact: true })
+    const privateNote = notes.getByRole("button", { name: "私密 AI 笔记，私密", exact: true })
+    await expect(publicNote).toBeVisible()
+    await expect(privateNote).toBeVisible()
+    await publicNote.click()
+    await expect(page.getByRole("region", { name: "Markdown 编辑器" })).toContainText(publicPath)
+    await privateNote.click()
+    await expect(page.getByRole("region", { name: "Markdown 编辑器" })).toContainText(privatePath)
+    expect(await exists(join(first.root, ...publicPath.split("/")))).toBe(true)
+    expect(await exists(join(first.root, ...privatePath.split("/")))).toBe(true)
+
+    await page.getByRole("button", { name: "管理领域" }).click()
+    let manager = page.getByRole("dialog", { name: "管理领域" })
+    const nonEmptyDomain = manager.getByRole("article", { name: "人工智能" })
+    await expect(nonEmptyDomain).toContainText("公开 1")
+    await expect(nonEmptyDomain).toContainText("私密 1")
+    await expect(
+      nonEmptyDomain.getByRole("button", { name: "删除（公开 1，私密 1）" }),
+    ).toBeDisabled()
+    await manager.getByRole("button", { name: "关闭" }).click()
+
+    await closeApplication(application)
+    application = undefined
+    application = await launchApplication(stateRoot, environment)
+    page = await application.firstWindow()
+    await expect(page.getByRole("button", { name: "人工智能" })).toBeVisible()
+    await expect(page.getByRole("button", { name: "公开 AI 笔记，公开" })).toBeVisible()
+    await expect(page.getByRole("button", { name: "私密 AI 笔记，私密" })).toBeVisible()
+
+    await page.getByRole("button", { name: "切换博客：Blog A" }).click()
+    await page.getByRole("menuitem", { name: "添加本地博客" }).click()
+    const local = page.getByRole("region", { name: "添加本地博客" })
+    await local.getByLabel("显示名称").fill("Blog B")
+    await local.getByRole("button", { name: "添加此博客" }).click()
+    await expect(page.getByRole("article", { name: "Blog B" })).toBeVisible()
+    await page.getByRole("button", { name: "关闭博客管理" }).click()
+
+    let closed = application.waitForEvent("close")
+    await page.getByRole("button", { name: "切换博客：Blog A" }).click()
+    await page.getByRole("menuitemradio", { name: /Blog B/ }).click()
+    await closed
+    application = undefined
+    application = await launchApplication(stateRoot, environment)
+    page = await application.firstWindow()
+    await expect(page.getByRole("button", { name: "切换博客：Blog B" })).toBeVisible()
+    const blogBNotes = page.getByRole("navigation", { name: "笔记" })
+    await expect(blogBNotes.getByRole("button", { name: "生活", exact: true })).toBeVisible()
+    const blogBFixtureNote = blogBNotes.getByRole("button", {
+      name: "Blog B Note，公开",
+      exact: true,
+    })
+    await expect(blogBFixtureNote).toBeVisible()
+    await blogBFixtureNote.click()
+    await expect(page.getByRole("region", { name: "Markdown 编辑器" })).toContainText(
+      second.notePath,
+    )
+    await expect(blogBNotes.getByRole("button", { name: "人工智能", exact: true })).toHaveCount(0)
+
+    closed = application.waitForEvent("close")
+    await page.getByRole("button", { name: "切换博客：Blog B" }).click()
+    await page.getByRole("menuitemradio", { name: /Blog A/ }).click()
+    await closed
+    application = undefined
+    application = await launchApplication(stateRoot, environment)
+    page = await application.firstWindow()
+    await expect(page.getByRole("button", { name: "切换博客：Blog A" })).toBeVisible()
+    const returnedNotes = page.getByRole("navigation", { name: "笔记" })
+    await expect(returnedNotes.getByRole("button", { name: "人工智能", exact: true })).toBeVisible()
+    const returnedPublicNote = returnedNotes.getByRole("button", {
+      name: "公开 AI 笔记，公开",
+      exact: true,
+    })
+    await expect(returnedPublicNote).toBeVisible()
+    await expect(
+      returnedNotes.getByRole("button", { name: "私密 AI 笔记，私密", exact: true }),
+    ).toBeVisible()
+    await returnedPublicNote.click()
+    await expect(page.getByRole("region", { name: "Markdown 编辑器" })).toContainText(publicPath)
+
+    await captureTrashTargets(application, trashReceipt)
+    await createDomain(page, "待删除领域", "temporary-domain")
+    await page.getByRole("button", { name: "管理领域" }).click()
+    manager = page.getByRole("dialog", { name: "管理领域" })
+    await manager
+      .getByRole("article", { name: "待删除领域" })
+      .getByRole("button", { name: "删除" })
+      .click()
+    const confirmation = page.getByRole("dialog", { name: "确认删除领域？" })
+    await confirmation.getByRole("button", { name: "确认删除" }).click()
+    await expect(page.getByRole("article", { name: "待删除领域" })).toHaveCount(0)
+    await manager.getByRole("button", { name: "关闭" }).click()
+
+    expect(await exists(join(first.root, "content", "temporary-domain"))).toBe(false)
+    expect(await exists(join(first.root, "private", "temporary-domain"))).toBe(false)
+    await expect
+      .poll(async () =>
+        (await readFile(trashReceipt, "utf8")).trim().split(/\r?\n/).filter(Boolean),
+      )
+      .toHaveLength(1)
+    const targets = (await readFile(trashReceipt, "utf8")).trim().split(/\r?\n/).filter(Boolean)
+    expect(targets).toHaveLength(1)
+    expect(
+      samePath(dirname(targets[0]!), join(first.root, ".garden-publisher", "domain-transactions")),
+    ).toBe(true)
+    expect(basename(targets[0]!)).toMatch(
+      /^[0-9a-f]{8}-[0-9a-f]{4}-[1-8][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i,
+    )
+    expect(await exists(join(first.root, ...publicPath.split("/")))).toBe(true)
+    expect(await exists(join(first.root, ...privatePath.split("/")))).toBe(true)
   } finally {
     await closeApplication(application)
     await Promise.all([first.cleanup(), second.cleanup()])

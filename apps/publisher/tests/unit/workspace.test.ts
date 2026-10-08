@@ -18,6 +18,7 @@ import {
 } from "../../src/main/services/workspace"
 import { exists, removeTemporaryDirectory } from "../helpers/fs"
 import {
+  createQuartzGardenFixture,
   createTemporaryGitRepository,
   git,
   type GitFixtureDependencies,
@@ -840,5 +841,34 @@ describe("createTemporaryGitRepository", () => {
 
     await expect(repository).rejects.toThrow("git init failed")
     expect(await exists(base)).toBe(false)
+  })
+})
+
+describe("createQuartzGardenFixture", () => {
+  it("rejects an empty domain list before allocating a temporary repository", async () => {
+    const sandbox = await mkdtemp(join(tmpdir(), "garden-fixture-validation-"))
+    temporaryDirectories.push(sandbox)
+    const previous = {
+      TEMP: process.env.TEMP,
+      TMP: process.env.TMP,
+      TMPDIR: process.env.TMPDIR,
+    }
+    Object.assign(process.env, { TEMP: sandbox, TMP: sandbox, TMPDIR: sandbox })
+    try {
+      await expect(
+        createQuartzGardenFixture({
+          directoryName: "Invalid Fixture",
+          noteTitle: "Unused",
+          noteBody: "unused",
+          domains: [],
+        }),
+      ).rejects.toThrow("A garden fixture requires at least one domain.")
+      expect(await readdir(sandbox)).toEqual([])
+    } finally {
+      for (const [name, value] of Object.entries(previous)) {
+        if (value === undefined) delete process.env[name]
+        else process.env[name] = value
+      }
+    }
   })
 })

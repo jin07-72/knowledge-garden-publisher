@@ -67,6 +67,7 @@ import {
   domainCreateSchema,
   domainRemoveSchema,
   domainRenameSchema,
+  domainSlugSchema,
   markdownSchema,
   previewProgressSchema,
   publishProgressSchema,
@@ -174,7 +175,7 @@ const noRequestSchema = z.undefined()
 const workspaceRepairSchema = z.object({ action: z.literal("install-dependencies") }).strict()
 const notePathSchema = z.string().max(512).regex(MANAGED_NOTE_PATH_PATTERN)
 const notePathRequestSchema = z.object({ path: notePathSchema }).strict()
-const domainSchema = z.enum(["technology", "reading", "language", "life"])
+const domainSchema = domainSlugSchema
 const slugSchema = z
   .string()
   .max(128)
