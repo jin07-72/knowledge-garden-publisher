@@ -119,7 +119,10 @@ export const appErrorSchema = z
 
 const pathSchema = z.string().min(1).max(512)
 export const managedNotePathSchema = z.string().max(512).regex(MANAGED_NOTE_PATH_PATTERN)
-export const noteSlugSchema = z.string().max(128).regex(new RegExp(`^${KEBAB_SLUG_SOURCE}$`))
+export const noteSlugSchema = z
+  .string()
+  .max(128)
+  .regex(new RegExp(`^${KEBAB_SLUG_SOURCE}$`))
 const hashSchema = z.string().regex(/^[a-f0-9]{64}$/)
 const warningSchema = z
   .object({ code: z.string().min(1).max(128), message: z.string().min(1).max(1_000) })

@@ -203,12 +203,16 @@ describe("IPC success schemas", () => {
     for (const slug of ["index", "content", "private", "garden-publisher"])
       expect(() => domainCreateSchema.parse({ name: "人工智能", slug })).toThrow()
     expect(() => domainCreateSchema.parse({ name: "x".repeat(81), slug: "custom" })).toThrow()
-    expect(() => domainCreateSchema.parse({ name: "人工智能", slug: "custom", extra: true })).toThrow()
-    expect(() => domainRenameSchema.parse({ slug: "artificial-intelligence", name: "" })).toThrow()
-    expect(
-      () => domainRenameSchema.parse({ slug: "artificial-intelligence", name: "重命名", extra: true }),
+    expect(() =>
+      domainCreateSchema.parse({ name: "人工智能", slug: "custom", extra: true }),
     ).toThrow()
-    expect(() => domainRemoveSchema.parse({ slug: "artificial-intelligence", force: true })).toThrow()
+    expect(() => domainRenameSchema.parse({ slug: "artificial-intelligence", name: "" })).toThrow()
+    expect(() =>
+      domainRenameSchema.parse({ slug: "artificial-intelligence", name: "重命名", extra: true }),
+    ).toThrow()
+    expect(() =>
+      domainRemoveSchema.parse({ slug: "artificial-intelligence", force: true }),
+    ).toThrow()
     expect(
       IPC_SUCCESS_SCHEMAS[IPC_CHANNELS.requests.domainsList].safeParse([
         { ...customDomain, extra: true },
@@ -261,12 +265,11 @@ describe("IPC success schemas", () => {
     for (const slug of ["../outside", "Content", "bad_slug"])
       expect(() => noteCreateSchema.parse({ ...createRequest, slug })).toThrow()
     for (const slug of ["../outside", "Content", "bad_slug"])
-      expect(
-        () =>
-          noteRenameSchema.parse({
-            path: "content/artificial-intelligence/transformers.md",
-            newSlug: slug,
-          }),
+      expect(() =>
+        noteRenameSchema.parse({
+          path: "content/artificial-intelligence/transformers.md",
+          newSlug: slug,
+        }),
       ).toThrow()
     for (const path of [
       "content/../outside/transformers.md",
