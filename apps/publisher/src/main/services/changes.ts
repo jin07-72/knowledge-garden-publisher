@@ -117,6 +117,7 @@ const modePattern = /^(?:000000|100644|100755|120000|160000)$/
 const oidPattern = /^(?:[0-9a-f]{40}|[0-9a-f]{64})$/
 const scorePattern = /^[RC](?:100|[1-9]?[0-9])$/
 const slugPattern = new RegExp(`^${KEBAB_SLUG_SOURCE}$`)
+const removedDomainLanding = new RegExp(`^content\/(${KEBAB_SLUG_SOURCE})\/index\.md$`)
 const publicAttachment = new RegExp(`^content\/_assets\/(${KEBAB_SLUG_SOURCE})\/(.+)$`)
 const privateAttachment = new RegExp(`^private\/_assets\/(${KEBAB_SLUG_SOURCE})\/(.+)$`)
 
@@ -612,6 +613,7 @@ export async function listChanges(options: ListChangesOptions): Promise<ChangeRe
   }
   throwIfStopped()
   const workspace = await guard(realpath(resolve(options.workspace)))
+  const noteDomains = await guard(captureNoteDomainSnapshot(workspace))
   throwIfStopped()
   let output: Buffer | undefined = options.statusOutput
   let ignoredPrivateOutput: Buffer = Buffer.alloc(0)
@@ -711,7 +713,6 @@ export async function listChanges(options: ListChangesOptions): Promise<ChangeRe
   if (entries.some((entry) => entry.submodule.startsWith("S"))) {
     return { groups: [], blockedReason: "检测到子模块变化，无法安全确定发布内容。" }
   }
-  const noteDomains = await guard(captureNoteDomainSnapshot(workspace))
   const finishReview = async (review: ChangeReview): Promise<ChangeReview> => {
     if (Buffer.byteLength(JSON.stringify(review), "utf8") > MAX_CHANGE_REVIEW_BYTES) {
       throw scanError("CHANGE_SCAN_LIMIT", "Publication review exceeded the safe size limit.")
@@ -775,6 +776,11 @@ export async function listChanges(options: ListChangesOptions): Promise<ChangeRe
     const note = managedNote(path, "content", noteDomains)
     if (note) {
       addPublicNote(path, note, entry, origin)
+      return
+    }
+    const landing = isDeletion(entry) ? removedDomainLanding.exec(path) : null
+    if (landing?.[1]) {
+      addPublicNote(path, { domain: landing[1], slug: "index" }, entry, true)
       return
     }
     const attachment = publicAttachment.exec(path)

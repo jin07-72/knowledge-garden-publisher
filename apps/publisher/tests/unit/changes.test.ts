@@ -1,4 +1,4 @@
-import { mkdir, symlink, writeFile } from "node:fs/promises"
+import { mkdir, symlink, unlink, writeFile } from "node:fs/promises"
 import { EventEmitter } from "node:events"
 import { join } from "node:path"
 import { PassThrough } from "node:stream"
@@ -286,6 +286,53 @@ describe("bounded change command runner", () => {
 })
 
 describe("listChanges", () => {
+  it("keeps a removed custom-domain landing page in the default unpublish selection", async () => {
+    const fixture = await repository()
+    await addCommittedDomain(fixture, "field-notes", "Field Notes", 3)
+    await unlink(join(fixture.root, "content", "field-notes", "index.md"))
+
+    const review = await listChanges({ workspace: fixture.root })
+
+    expect(review.groups).toEqual([
+      expect.objectContaining({
+        label: "index",
+        kind: "unpublish",
+        selection: "default",
+        paths: ["content/field-notes/index.md"],
+      }),
+    ])
+  })
+
+  it("does not expand publication classification when a domain appears after discovery", async () => {
+    const fixture = await repository()
+    await mkdir(join(fixture.root, "content", "field-notes"), { recursive: true })
+    await writeFile(join(fixture.root, "content", "field-notes", "observations.md"), "notes")
+    const run = vi
+      .fn<ChangeCommandRunner["run"]>()
+      .mockImplementationOnce(async () => {
+        await writeFile(
+          join(fixture.root, "content", "field-notes", "index.md"),
+          domainPage("Field Notes", 3),
+        )
+        return {
+          exitCode: 0,
+          stdout: raw("? content/field-notes/observations.md\0"),
+          stderr: Buffer.alloc(0),
+        }
+      })
+      .mockResolvedValueOnce({ exitCode: 0, stdout: Buffer.alloc(0), stderr: Buffer.alloc(0) })
+
+    const review = await listChanges({ workspace: fixture.root, runner: { run } })
+
+    expect(review.groups).toEqual([
+      expect.objectContaining({
+        kind: "config",
+        selection: "optional",
+        paths: ["content/field-notes/observations.md"],
+      }),
+    ])
+  })
+
   it("counts custom-domain additions and modifications as default publication groups", async () => {
     const fixture = await repository()
     await addCommittedDomain(fixture, "field-notes", "Field Notes", 3)
@@ -589,7 +636,7 @@ describe("listChanges", () => {
         workspace: fixture.root,
         statusOutput: raw("? content/linked/escaped.md\0"),
       }),
-    ).rejects.toThrow(/symbolic link/i)
+    ).rejects.toMatchObject({ code: "DOMAIN_UNSAFE_PATH" })
   })
 
   it("blocks dirty submodules and non-canonical or invalid managed note paths", async () => {
