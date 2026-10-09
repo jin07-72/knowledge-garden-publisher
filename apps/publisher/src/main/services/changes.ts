@@ -11,6 +11,7 @@ import {
   type ChangeReview,
   type ChangeSelection,
 } from "../../shared/contracts"
+import { domainSlugSchema } from "../../shared/ipcSchemas"
 import type { PreviewProcess } from "./preview"
 import {
   captureNoteDomainSnapshot,
@@ -133,6 +134,17 @@ function managedNote(
 ): ManagedNote | undefined {
   const match = MANAGED_NOTE_PATH_PATTERN.exec(path)
   if (match?.[1] !== root || !match[2] || !match[3] || !domains.has(match[2])) return undefined
+  return { domain: match[2], slug: match[3] }
+}
+
+function removedDomainPublicNote(
+  path: string,
+  removedDomains: ReadonlySet<string>,
+): ManagedNote | undefined {
+  const match = MANAGED_NOTE_PATH_PATTERN.exec(path)
+  if (match?.[1] !== "content" || !match[2] || !match[3] || !removedDomains.has(match[2])) {
+    return undefined
+  }
   return { domain: match[2], slug: match[3] }
 }
 
@@ -713,6 +725,14 @@ export async function listChanges(options: ListChangesOptions): Promise<ChangeRe
   if (entries.some((entry) => entry.submodule.startsWith("S"))) {
     return { groups: [], blockedReason: "检测到子模块变化，无法安全确定发布内容。" }
   }
+  const removedDomains = new Set<string>()
+  for (const entry of entries) {
+    if (!isDeletion(entry)) continue
+    const landing = removedDomainLanding.exec(entry.path)
+    if (landing?.[1] && domainSlugSchema.safeParse(landing[1]).success) {
+      removedDomains.add(landing[1])
+    }
+  }
   const finishReview = async (review: ChangeReview): Promise<ChangeReview> => {
     if (Buffer.byteLength(JSON.stringify(review), "utf8") > MAX_CHANGE_REVIEW_BYTES) {
       throw scanError("CHANGE_SCAN_LIMIT", "Publication review exceeded the safe size limit.")
@@ -773,13 +793,15 @@ export async function listChanges(options: ListChangesOptions): Promise<ChangeRe
     return group
   }
   const addDelta = (path: string, entry: PorcelainEntry, origin: boolean): void => {
-    const note = managedNote(path, "content", noteDomains)
+    const note =
+      managedNote(path, "content", noteDomains) ??
+      (origin || isDeletion(entry) ? removedDomainPublicNote(path, removedDomains) : undefined)
     if (note) {
       addPublicNote(path, note, entry, origin)
       return
     }
     const landing = isDeletion(entry) ? removedDomainLanding.exec(path) : null
-    if (landing?.[1]) {
+    if (landing?.[1] && removedDomains.has(landing[1])) {
       addPublicNote(path, { domain: landing[1], slug: "index" }, entry, true)
       return
     }
@@ -800,7 +822,9 @@ export async function listChanges(options: ListChangesOptions): Promise<ChangeRe
     if (entry.recordType === "ignored" && !entry.path.startsWith("private/")) continue
     if (entry.recordType === "rename" && entry.originalPath) {
       const currentNote = managedNote(entry.path, "content", noteDomains)
-      const originalNote = managedNote(entry.originalPath, "content", noteDomains)
+      const originalNote =
+        managedNote(entry.originalPath, "content", noteDomains) ??
+        removedDomainPublicNote(entry.originalPath, removedDomains)
       if (currentNote && originalNote) {
         const current = addPublicNote(entry.path, currentNote, entry)
         addUnique(current.paths, entry.originalPath)

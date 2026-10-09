@@ -303,6 +303,39 @@ describe("listChanges", () => {
     ])
   })
 
+  it("keeps a note's removed-domain origin in the default selection when its landing is deleted", async () => {
+    const fixture = await repository()
+    await addCommittedDomain(fixture, "field-notes", "Field Notes", 3)
+    await writeFile(join(fixture.root, "content", "field-notes", "observations.md"), "notes")
+    await git(fixture.root, ["add", "content/field-notes/observations.md"])
+    await git(fixture.root, ["commit", "-m", "add field notes observation"])
+    await git(fixture.root, [
+      "mv",
+      "content/field-notes/observations.md",
+      "content/technology/observations.md",
+    ])
+    await unlink(join(fixture.root, "content", "field-notes", "index.md"))
+
+    const review = await listChanges({ workspace: fixture.root })
+
+    expect(review.groups).toEqual(
+      expect.arrayContaining([
+        expect.objectContaining({
+          label: "observations",
+          kind: "modified",
+          selection: "default",
+          paths: ["content/technology/observations.md", "content/field-notes/observations.md"],
+        }),
+        expect.objectContaining({
+          label: "index",
+          kind: "unpublish",
+          selection: "default",
+          paths: ["content/field-notes/index.md"],
+        }),
+      ]),
+    )
+  })
+
   it("does not expand publication classification when a domain appears after discovery", async () => {
     const fixture = await repository()
     await mkdir(join(fixture.root, "content", "field-notes"), { recursive: true })
