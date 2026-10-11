@@ -118,7 +118,7 @@ const modePattern = /^(?:000000|100644|100755|120000|160000)$/
 const oidPattern = /^(?:[0-9a-f]{40}|[0-9a-f]{64})$/
 const scorePattern = /^[RC](?:100|[1-9]?[0-9])$/
 const slugPattern = new RegExp(`^${KEBAB_SLUG_SOURCE}$`)
-const removedDomainLanding = new RegExp(`^content\/(${KEBAB_SLUG_SOURCE})\/index\.md$`)
+const removedDomainLanding = new RegExp(`^content\/(${KEBAB_SLUG_SOURCE})\/index\\.md$`)
 const publicAttachment = new RegExp(`^content\/_assets\/(${KEBAB_SLUG_SOURCE})\/(.+)$`)
 const privateAttachment = new RegExp(`^private\/_assets\/(${KEBAB_SLUG_SOURCE})\/(.+)$`)
 

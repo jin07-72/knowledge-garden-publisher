@@ -336,6 +336,27 @@ describe("listChanges", () => {
     )
   })
 
+  it("does not treat a similarly named deleted file as removed-domain evidence", async () => {
+    const fixture = await repository()
+    const status = raw(
+      [
+        `1 .D N... 100644 100644 100644 ${oidA} ${oidA} content/field-notes/indexXmd`,
+        `1 .D N... 100644 100644 100644 ${oidA} ${oidA} content/field-notes/old-note.md`,
+        "",
+      ].join("\0"),
+    )
+
+    const review = await listChanges({ workspace: fixture.root, statusOutput: status })
+
+    expect(review.groups).toEqual([
+      expect.objectContaining({
+        kind: "config",
+        selection: "optional",
+        paths: ["content/field-notes/indexXmd", "content/field-notes/old-note.md"],
+      }),
+    ])
+  })
+
   it("does not expand publication classification when a domain appears after discovery", async () => {
     const fixture = await repository()
     await mkdir(join(fixture.root, "content", "field-notes"), { recursive: true })
