@@ -36,6 +36,7 @@ import { DeleteNoteDialog } from "./components/DeleteNoteDialog"
 import { BlogSwitcher } from "./components/BlogSwitcher"
 import { BlogManager, type BlogImportUiState } from "./components/BlogManager"
 import { DomainManager } from "./components/DomainManager"
+import { publishedDeploymentStatus } from "./publishDeploymentStatus"
 import "./app.css"
 
 type LoadState = "loading" | "ready" | "error"
@@ -49,6 +50,12 @@ const MIN_EDITOR = 360
 const MAX_EDITOR = 900
 const MIN_PREVIEW = 360
 const COMPACT_PANE_BREAKPOINT = 1050
+let publishDeploymentRequestSequence = 0
+
+function nextPublishDeploymentRequestId(): string {
+  publishDeploymentRequestSequence += 1
+  return `publish-deployment-${Date.now().toString(36)}-${publishDeploymentRequestSequence.toString(36)}`
+}
 
 type PaneSizes = { sidebar: number; editor: number }
 
@@ -200,6 +207,7 @@ export function PublisherApp({
   const [publishMessage, setPublishMessage] = useState("正在检查可发布变化…")
   const [publishSubmitError, setPublishSubmitError] = useState<AppError>()
   const [publishProgress, setPublishProgress] = useState<PublishProgress>()
+  const [publishActionsUrl, setPublishActionsUrl] = useState<string>()
   const [saveStateLabel, setSaveStateLabel] = useState("已保存")
   const [visibilityBusy, setVisibilityBusy] = useState(false)
   const [visibilityError, setVisibilityError] = useState<{
@@ -229,11 +237,28 @@ export function PublisherApp({
   const notesRequest = useRef(0)
   const domainsRequest = useRef(0)
   const loadedBlogId = useRef(initialRegistry.activeBlogId)
+  const publishBlogId = useRef(initialRegistry.activeBlogId)
   const previewRequest = useRef(0)
   const changesRequest = useRef(0)
   const pendingPublishRequest = useRef<PublishRequest | undefined>(undefined)
   const publishAttempt = useRef(0)
   const previewStart = useRef<ReturnType<GardenApi["preview"]["start"]> | undefined>(undefined)
+  const publishDeploymentGeneration = useRef(0)
+  const publishDeploymentRequest = useRef<string | undefined>(undefined)
+  const publishCompletionHandled = useRef(false)
+
+  const cancelPublishDeployment = useCallback((): void => {
+    const requestId = publishDeploymentRequest.current
+    publishDeploymentGeneration.current += 1
+    publishDeploymentRequest.current = undefined
+    publishCompletionHandled.current = false
+    if (requestId) {
+      void Promise.resolve()
+        .then(() => api.history.cancel({ requestId }))
+        .catch(() => undefined)
+    }
+  }, [api])
+
   const safePaneSizes = useMemo(
     () => clampPaneSizes(paneSizes, workspaceWidth),
     [paneSizes, workspaceWidth],
@@ -293,6 +318,9 @@ export function PublisherApp({
   const switchBlog = useCallback(
     (id: string): void => {
       if (id === registry.activeBlogId || blogBusyRef.current) return
+      cancelPublishDeployment()
+      setPublishProgress(undefined)
+      setPublishActionsUrl(undefined)
       void runBlogOperation(async () => {
         flushSync(() => setSwitchPreparing(true))
         let restoreEditing = true
@@ -307,7 +335,7 @@ export function PublisherApp({
         }
       })
     },
-    [api, registry.activeBlogId, runBlogOperation],
+    [api, cancelPublishDeployment, registry.activeBlogId, runBlogOperation],
   )
 
   useEffect(
@@ -468,39 +496,121 @@ export function PublisherApp({
     return previewStart.current
   }, [api])
 
-  const loadChanges = useCallback(async (): Promise<void> => {
-    const request = ++changesRequest.current
+  const loadChanges = useCallback(
+    async (expectedPublishGeneration?: number): Promise<void> => {
+      const request = ++changesRequest.current
+      const stale = (): boolean =>
+        request !== changesRequest.current ||
+        (expectedPublishGeneration !== undefined &&
+          expectedPublishGeneration !== publishDeploymentGeneration.current)
+      pendingPublishRequest.current = undefined
+      setPublishSubmitError(undefined)
+      setChangeReviewState("loading")
+      let result: Awaited<ReturnType<GardenApi["changes"]["list"]>>
+      try {
+        result = await api.changes.list()
+      } catch (error) {
+        if (stale()) return
+        setChangeReview(undefined)
+        setChangeCount(undefined)
+        setChangeReviewState("error")
+        setPublishMessage(error instanceof Error ? error.message : "无法检查可发布变化")
+        return
+      }
+      if (stale()) return
+      if (!result.ok) {
+        setChangeReview(undefined)
+        setChangeCount(undefined)
+        setChangeReviewState("error")
+        setPublishMessage(messageFor(result.error, "发布检查暂不可用。"))
+        return
+      }
+      setChangeReview(result.value)
+      setChangeReviewState("ready")
+      const publishable = result.value.groups.filter(
+        (group) => group.selection === "default",
+      ).length
+      setChangeCount(publishable)
+      setPublishMessage(
+        result.value.blockedReason ??
+          (result.value.groups.length === 0 ? "当前没有可发布变化" : "可查看并选择要发布的变化"),
+      )
+    },
+    [api],
+  )
+
+  useEffect(() => {
+    if (publishBlogId.current === registry.activeBlogId) return
+    publishBlogId.current = registry.activeBlogId
+    publishAttempt.current += 1
+    changesRequest.current += 1
     pendingPublishRequest.current = undefined
-    setPublishSubmitError(undefined)
+    cancelPublishDeployment()
+    setPublishProgress(undefined)
+    setPublishActionsUrl(undefined)
+    setChangeReview(undefined)
+    setChangeCount(undefined)
+    setChangeReviewOpen(false)
     setChangeReviewState("loading")
-    let result: Awaited<ReturnType<GardenApi["changes"]["list"]>>
-    try {
-      result = await api.changes.list()
-    } catch (error) {
-      if (request !== changesRequest.current) return
-      setChangeReview(undefined)
-      setChangeCount(undefined)
-      setChangeReviewState("error")
-      setPublishMessage(error instanceof Error ? error.message : "无法检查可发布变化")
-      return
-    }
-    if (request !== changesRequest.current) return
-    if (!result.ok) {
-      setChangeReview(undefined)
-      setChangeCount(undefined)
-      setChangeReviewState("error")
-      setPublishMessage(messageFor(result.error, "发布检查暂不可用。"))
-      return
-    }
-    setChangeReview(result.value)
-    setChangeReviewState("ready")
-    const publishable = result.value.groups.filter((group) => group.selection === "default").length
-    setChangeCount(publishable)
-    setPublishMessage(
-      result.value.blockedReason ??
-        (result.value.groups.length === 0 ? "当前没有可发布变化" : "可查看并选择要发布的变化"),
-    )
-  }, [api])
+    setPublishMessage("正在检查可发布变化…")
+
+    const activeBlogId = registry.activeBlogId
+    void Promise.resolve()
+      .then(() => api.changes.cancel())
+      .catch(() => undefined)
+      .then(() => {
+        if (!appMounted.current || publishBlogId.current !== activeBlogId) return
+        void loadChanges()
+      })
+  }, [api, cancelPublishDeployment, loadChanges, registry.activeBlogId])
+
+  const applyPublishProgress = useCallback(
+    (next: PublishProgress): void => {
+      if (next.phase === "complete" && publishCompletionHandled.current) return
+      if (next.phase === "validating") {
+        cancelPublishDeployment()
+        setPublishActionsUrl(undefined)
+      }
+      setPublishProgress(next)
+      if (next.phase !== "complete") return
+
+      publishCompletionHandled.current = true
+      const generation = ++publishDeploymentGeneration.current
+      const requestId = nextPublishDeploymentRequestId()
+      publishDeploymentRequest.current = requestId
+      setPublishProgress({ phase: "deploying", message: "发布成功，正在部署…", percent: 100 })
+      void loadChanges(generation)
+      void Promise.allSettled([
+        api.history.git({ limit: 1, requestId }),
+        api.history.deployments({ limit: 20, requestId }),
+      ]).then(([gitOutcome, deploymentsOutcome]) => {
+        if (
+          !appMounted.current ||
+          generation !== publishDeploymentGeneration.current ||
+          requestId !== publishDeploymentRequest.current
+        ) {
+          return
+        }
+        publishDeploymentRequest.current = undefined
+        const git = gitOutcome.status === "fulfilled" ? gitOutcome.value : undefined
+        const deployments =
+          deploymentsOutcome.status === "fulfilled" ? deploymentsOutcome.value : undefined
+        if (deployments?.ok) setPublishActionsUrl(deployments.value.actionsUrl)
+        if (!git?.ok || !deployments?.ok) {
+          setPublishProgress({
+            phase: "complete",
+            message: "发布成功，暂时无法确认部署状态。",
+            percent: 100,
+          })
+          return
+        }
+        const status = publishedDeploymentStatus(git.value[0], deployments.value)
+        setPublishActionsUrl(status.actionsUrl)
+        setPublishProgress(status.progress)
+      })
+    },
+    [api, cancelPublishDeployment, loadChanges],
+  )
 
   useEffect(() => {
     const unsubscribeRecovery = api.notes.onRecovery(({ restored, conflicts }) => {
@@ -550,7 +660,7 @@ export function PublisherApp({
       })
     void loadChanges()
     const unsubscribePreview = api.preview.onProgress(applyPreview)
-    const unsubscribePublish = api.publish.onProgress(setPublishProgress)
+    const unsubscribePublish = api.publish.onProgress(applyPublishProgress)
     return () => {
       unsubscribeRecovery()
       unsubscribePreview()
@@ -560,8 +670,18 @@ export function PublisherApp({
       previewRequest.current += 1
       changesRequest.current += 1
       void api.changes.cancel()
+      cancelPublishDeployment()
     }
-  }, [api, applyPreview, loadChanges, loadDomains, loadNotes, startPreview])
+  }, [
+    api,
+    applyPreview,
+    applyPublishProgress,
+    cancelPublishDeployment,
+    loadChanges,
+    loadDomains,
+    loadNotes,
+    startPreview,
+  ])
 
   useEffect(() => {
     if (!customPaneSizes) return
@@ -770,7 +890,7 @@ export function PublisherApp({
   const openHistoryLink = useCallback(
     async (url: string): Promise<void> => {
       const result = await api.history.openLink({ url })
-      if (!result.ok) throw new Error(messageFor(result.error, "无法打开链接。"))
+      if (!result.ok) throw new Error(result.error.message || "无法打开链接。")
     },
     [api],
   )
@@ -1096,6 +1216,31 @@ export function PublisherApp({
             <GitBranch size={14} aria-hidden="true" />
             <span>可发布变化：{changeCount === undefined ? "暂不可用" : changeCount}</span>
             <small>{publishProgress?.message ?? publishMessage}</small>
+            {publishActionsUrl ? (
+              <button
+                className="publish-actions-link"
+                type="button"
+                onClick={() => {
+                  const linkGeneration = publishDeploymentGeneration.current
+                  void openHistoryLink(publishActionsUrl).catch((error: unknown) => {
+                    if (
+                      !appMounted.current ||
+                      linkGeneration !== publishDeploymentGeneration.current
+                    ) {
+                      return
+                    }
+                    const failureMessage =
+                      error instanceof Error ? error.message : "无法打开 Actions 链接。"
+                    setPublishProgress((current) => {
+                      if (!current || current.message.includes(failureMessage)) return current
+                      return { ...current, message: `${current.message} ${failureMessage}` }
+                    })
+                  })
+                }}
+              >
+                查看 Actions
+              </button>
+            ) : null}
           </div>
         </div>
         <button
@@ -1150,6 +1295,9 @@ export function PublisherApp({
             )
           }}
           onPublish={async (changeGroupIds) => {
+            cancelPublishDeployment()
+            setPublishProgress(undefined)
+            setPublishActionsUrl(undefined)
             const attempt = ++publishAttempt.current
             try {
               const saved = (await markdownEditor.current?.flush()) ?? true
@@ -1186,6 +1334,9 @@ export function PublisherApp({
           onRepairAndPublish={async () => {
             const request = pendingPublishRequest.current
             if (!request) return
+            cancelPublishDeployment()
+            setPublishProgress(undefined)
+            setPublishActionsUrl(undefined)
             const attempt = ++publishAttempt.current
             try {
               const repaired = await api.publish.repairBranch()

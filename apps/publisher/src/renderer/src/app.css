@@ -1231,6 +1231,18 @@ button {
   text-overflow: ellipsis;
   white-space: nowrap;
 }
+.publish-actions-link {
+  padding: 0;
+  border: 0;
+  color: #8bd5ca;
+  background: transparent;
+  font: inherit;
+  text-decoration: underline;
+  cursor: pointer;
+}
+.publish-actions-link:hover {
+  color: #b7eee7;
+}
 .publish-button {
   min-height: 29px;
   padding: 0 13px;
@@ -1658,11 +1670,19 @@ button {
   display: grid;
   gap: 12px;
 }
-.new-note-dialog form > label {
+.new-note-dialog form > label,
+.new-note-field {
   display: grid;
   gap: 6px;
   color: #aeb7c2;
   font-size: 11px;
+}
+.new-note-field > label {
+  color: inherit;
+}
+.form-hint {
+  color: #8d98a5;
+  font-size: 10px;
 }
 .new-note-dialog input:not([type="radio"]),
 .new-note-dialog select {
@@ -1946,7 +1966,10 @@ button {
   margin-top: 3px;
   overflow: hidden;
   color: #8d98a5;
-  font: 10px/1.4 "Cascadia Code", Consolas, monospace;
+  font:
+    10px/1.4 "Cascadia Code",
+    Consolas,
+    monospace;
   text-overflow: ellipsis;
   white-space: nowrap;
 }
@@ -2230,6 +2253,9 @@ button {
     padding: 7px 10px;
   }
   .publish-summary small {
+    display: none;
+  }
+  .publish-actions-link {
     display: none;
   }
 }

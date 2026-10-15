@@ -81,6 +81,12 @@ function NewNoteDialog({
     if (!title.trim() || !slug.trim()) return
     setBusy(true)
     setError("")
+    const normalizedDescription = description.trim() || "无"
+    const normalizedTags = tags
+      .split(/[,，]/)
+      .map((tag) => tag.trim())
+      .filter(Boolean)
+    const requestTags = normalizedTags.length > 0 ? normalizedTags : ["无"]
     let result: string | undefined
     try {
       result = await onCreate({
@@ -89,11 +95,8 @@ function NewNoteDialog({
         domain,
         visibility,
         date: shanghaiCalendarDate(),
-        description: description.trim(),
-        tags: tags
-          .split(/[,，]/)
-          .map((tag) => tag.trim())
-          .filter(Boolean),
+        description: normalizedDescription,
+        tags: requestTags,
         body: `# ${title.trim()}\n`,
       })
     } catch (caught) {
@@ -149,23 +152,31 @@ function NewNoteDialog({
             pattern="[a-z0-9][a-z0-9-]*"
           />
         </label>
-        <label>
-          描述
+        <div className="new-note-field">
+          <label htmlFor="new-note-description">描述</label>
           <input
+            id="new-note-description"
             value={description}
             onChange={(event) => setDescription(event.target.value)}
-            required
+            aria-describedby="new-note-description-hint"
           />
-        </label>
-        <label>
-          标签
+          <small id="new-note-description-hint" className="form-hint">
+            不填写默认为无
+          </small>
+        </div>
+        <div className="new-note-field">
+          <label htmlFor="new-note-tags">标签</label>
           <input
+            id="new-note-tags"
             value={tags}
             onChange={(event) => setTags(event.target.value)}
             placeholder="用逗号分隔"
-            required
+            aria-describedby="new-note-tags-hint"
           />
-        </label>
+          <small id="new-note-tags-hint" className="form-hint">
+            不填写默认为无
+          </small>
+        </div>
         <label>
           领域
           <select
@@ -214,14 +225,7 @@ function NewNoteDialog({
           <button
             type="submit"
             className="primary-button"
-            disabled={
-              busy ||
-              !title.trim() ||
-              !slug.trim() ||
-              !description.trim() ||
-              !tags.trim() ||
-              !domain
-            }
+            disabled={busy || !title.trim() || !slug.trim() || !domain}
           >
             创建
           </button>
