@@ -1,4 +1,5 @@
 import { z } from "zod"
+import type { AppearanceSettings } from "./appearance"
 import {
   APP_ERROR_CODES,
   IMAGE_LIBRARY_MAX_GALLERY_THUMBNAIL_TOTAL_LENGTH,
@@ -15,6 +16,14 @@ import {
   KEBAB_SLUG_SOURCE,
   MANAGED_NOTE_PATH_PATTERN,
   parseGitHubRepositoryUrl,
+  type AppearanceApplyReceipt,
+  type AppearanceApplyRequest,
+  type AppearanceBackgroundSelection,
+  type AppearanceClearPreviewRequest,
+  type AppearancePreviewReceipt,
+  type AppearancePreviewRequest,
+  type AppearanceSnapshot,
+  type AppearanceUndoRequest,
   type AppError,
   type DomainPublicErrorCode,
   type IpcResult,
@@ -250,7 +259,9 @@ export const noteSlugSchema = z
   .max(128)
   .regex(new RegExp(`^${KEBAB_SLUG_SOURCE}$`))
 const hashSchema = z.string().regex(/^[a-f0-9]{64}$/)
-const imageNameSchema = z
+const windowsDeviceNamePattern =
+  /^(?:con|prn|aux|nul|com(?:[1-9]|[¹²³])|lpt(?:[1-9]|[¹²³]))(?:\.|$)/i
+const safeBitmapImageNameSchema = z
   .string()
   .min(1)
   .max(IMAGE_LIBRARY_MAX_NAME_LENGTH)
@@ -258,10 +269,92 @@ const imageNameSchema = z
   .refine((value) => !/[<>:"/\\|?*]/.test(value))
   .refine((value) => !controlCharacterPattern.test(value))
   .refine((value) => !/[. ]$/.test(value))
-  .refine(
-    (value) => !/^(?:con|prn|aux|nul|com(?:[1-9]|[¹²³])|lpt(?:[1-9]|[¹²³]))(?:\.|$)/i.test(value),
+  .refine((value) => !windowsDeviceNamePattern.test(value))
+  .regex(/^.+\.(?:png|jpe?g|gif|webp|avif)$/i)
+const appearanceColorSchema = z.string().regex(/^#[0-9a-fA-F]{6}$/)
+const appearanceFontSchema = z
+  .string()
+  .min(1)
+  .max(128)
+  .refine((value) => value === value.trim())
+  .regex(
+    /^(?:"[A-Za-z0-9][A-Za-z0-9 -]*"|'[A-Za-z0-9][A-Za-z0-9 -]*'|[A-Za-z][A-Za-z0-9 -]*)(?:,\s*(?:"[A-Za-z0-9][A-Za-z0-9 -]*"|'[A-Za-z0-9][A-Za-z0-9 -]*'|[A-Za-z][A-Za-z0-9 -]*))*$/,
   )
-  .regex(/\.(?:png|jpe?g|gif|webp|avif)$/i)
+const appearanceImageNameSchema = safeBitmapImageNameSchema
+const appearanceAssetShape = {
+  managed: { source: z.literal("managed"), name: appearanceImageNameSchema },
+  staged: {
+    source: z.literal("staged"),
+    token: z.string().uuid(),
+    name: appearanceImageNameSchema,
+  },
+} as const
+const appearanceBackgroundSchema = z.discriminatedUnion("kind", [
+  z.object({ kind: z.literal("solid"), color: appearanceColorSchema }).strict(),
+  z
+    .object({
+      kind: z.literal("gradient"),
+      start: appearanceColorSchema,
+      end: appearanceColorSchema,
+      angle: z.number().finite().min(0).max(360),
+    })
+    .strict(),
+  z
+    .object({
+      kind: z.literal("image"),
+      asset: z.discriminatedUnion("source", [
+        z.object(appearanceAssetShape.managed).strict(),
+        z.object(appearanceAssetShape.staged).strict(),
+      ]),
+      overlay: appearanceColorSchema,
+      opacity: z.number().finite().min(0).max(1),
+      position: z.enum(["center", "top", "bottom"]),
+      fixed: z.boolean(),
+    })
+    .strict(),
+])
+const appearanceColorsSchema = z
+  .object({
+    page: appearanceColorSchema,
+    surface: appearanceColorSchema,
+    text: appearanceColorSchema,
+    heading: appearanceColorSchema,
+    accent: appearanceColorSchema,
+    secondary: appearanceColorSchema,
+    border: appearanceColorSchema,
+    code: appearanceColorSchema,
+  })
+  .strict()
+const appearanceTypographySchema = z
+  .object({
+    header: appearanceFontSchema,
+    body: appearanceFontSchema,
+    code: appearanceFontSchema,
+    baseSizePx: z.number().finite().min(10).max(32),
+    lineHeight: z.number().finite().min(1).max(3),
+  })
+  .strict()
+const appearanceLayoutSchema = z
+  .object({
+    articleWidthCh: z.number().finite().min(32).max(120),
+    pageWidthPx: z.number().finite().min(640).max(2_560),
+    sidebarWidthPx: z.number().finite().min(160).max(640),
+    sidebars: z.enum(["both", "left", "none"]),
+    gapPx: z.number().finite().min(0).max(128),
+  })
+  .strict()
+export const appearanceSettingsSchema: z.ZodType<AppearanceSettings> = z
+  .object({
+    schemaVersion: z.literal(1),
+    preset: z.enum(["knowledge-garden", "paper", "minimal", "custom"]),
+    background: appearanceBackgroundSchema,
+    colors: appearanceColorsSchema,
+    typography: appearanceTypographySchema,
+    layout: appearanceLayoutSchema,
+    customCss: z.string().refine((value) => utf8ByteLength(value) <= 64 * 1024),
+  })
+  .strict()
+const imageNameSchema = safeBitmapImageNameSchema
 const imageDataUrlHeaderPattern = /^data:image\/(?:png|jpeg|gif|webp|avif);base64,/
 const base64PayloadPattern = /^[A-Za-z0-9+/]*={0,2}$/
 const base64Alphabet = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/"
@@ -606,13 +699,106 @@ const noteTrashReceiptSchema = z
     ]),
   })
   .strip()
+const literalLoopbackAuthorityPattern = /^http:\/\/127\.0\.0\.1(?::([0-9]+))?(?:[/?#]|$)/
 const loopbackUrlSchema = z
   .string()
+  .refine((value) => utf8ByteLength(value) <= 2_048)
   .url()
   .refine((value) => {
-    const url = new URL(value)
-    return url.protocol === "http:" && url.hostname === "127.0.0.1"
+    const authority = literalLoopbackAuthorityPattern.exec(value)
+    if (authority === null) return false
+    const rawPort = authority[1]
+    if (rawPort !== undefined) {
+      const port = Number(rawPort)
+      if (!Number.isInteger(port) || port < 1 || port > 65_535) return false
+    }
+    try {
+      const url = new URL(value)
+      return (
+        url.protocol === "http:" &&
+        url.hostname === "127.0.0.1" &&
+        url.username === "" &&
+        url.password === ""
+      )
+    } catch {
+      return false
+    }
   })
+const appearanceResponseAssetSchema = z.discriminatedUnion("source", [
+  z.object(appearanceAssetShape.managed).strip(),
+  z.object(appearanceAssetShape.staged).strip(),
+])
+const appearanceResponseBackgroundSchema = z.discriminatedUnion("kind", [
+  z.object({ kind: z.literal("solid"), color: appearanceColorSchema }).strip(),
+  z
+    .object({
+      kind: z.literal("gradient"),
+      start: appearanceColorSchema,
+      end: appearanceColorSchema,
+      angle: z.number().finite().min(0).max(360),
+    })
+    .strip(),
+  z
+    .object({
+      kind: z.literal("image"),
+      asset: appearanceResponseAssetSchema,
+      overlay: appearanceColorSchema,
+      opacity: z.number().finite().min(0).max(1),
+      position: z.enum(["center", "top", "bottom"]),
+      fixed: z.boolean(),
+    })
+    .strip(),
+])
+const appearanceResponseSettingsSchema: z.ZodType<AppearanceSettings> = z
+  .object({
+    schemaVersion: z.literal(1),
+    preset: z.enum(["knowledge-garden", "paper", "minimal", "custom"]),
+    background: appearanceResponseBackgroundSchema,
+    colors: appearanceColorsSchema.strip(),
+    typography: appearanceTypographySchema.strip(),
+    layout: appearanceLayoutSchema.strip(),
+    customCss: z.string().refine((value) => utf8ByteLength(value) <= 64 * 1024),
+  })
+  .strip()
+const appearanceSnapshotSchema: z.ZodType<AppearanceSnapshot> = z
+  .object({
+    framework: z.enum(["quartz", "hugo", "hexo", "unknown"]),
+    supported: z.boolean(),
+    settings: appearanceResponseSettingsSchema,
+    baselineHash: hashSchema,
+    canUndo: z.boolean(),
+    message: z.string().min(1).max(1_000).optional(),
+  })
+  .strip()
+const appearanceBackgroundSelectionSchema: z.ZodType<AppearanceBackgroundSelection> = z
+  .object({
+    source: z.literal("staged"),
+    token: z.string().uuid(),
+    name: appearanceImageNameSchema,
+  })
+  .strip()
+const appearancePreviewReceiptSchema: z.ZodType<AppearancePreviewReceipt> = z
+  .object({ sessionId: z.string().uuid() })
+  .strip()
+const appearanceApplyReceiptSchema: z.ZodType<AppearanceApplyReceipt> = z
+  .object({ snapshot: appearanceSnapshotSchema })
+  .strip()
+export const appearancePreviewRequestSchema: z.ZodType<AppearancePreviewRequest> = z
+  .object({
+    url: loopbackUrlSchema,
+    sessionId: z.string().uuid(),
+    settings: appearanceSettingsSchema,
+  })
+  .strict()
+export const appearanceClearPreviewRequestSchema: z.ZodType<AppearanceClearPreviewRequest> = z
+  .object({ sessionId: z.string().uuid() })
+  .strict()
+export const appearanceApplyRequestSchema: z.ZodType<AppearanceApplyRequest> = z
+  .object({ settings: appearanceSettingsSchema, baselineHash: hashSchema })
+  .strict()
+export const appearanceUndoRequestSchema: z.ZodType<AppearanceUndoRequest> = z
+  .object({ baselineHash: hashSchema })
+  .strict()
 const previewStatusSchema = z
   .object({
     state: z.enum(["stopped", "starting", "ready", "building", "error", "stopping"]),
@@ -814,6 +1000,12 @@ export const IPC_SUCCESS_SCHEMAS = {
   [IPC_CHANNELS.requests.previewStop]: previewStatusSchema,
   [IPC_CHANNELS.requests.previewStatus]: previewStatusSchema,
   [IPC_CHANNELS.requests.previewRevealSelection]: z.enum(["found", "not-found", "not-ready"]),
+  [IPC_CHANNELS.requests.appearanceRead]: appearanceSnapshotSchema,
+  [IPC_CHANNELS.requests.appearanceChooseBackground]: appearanceBackgroundSelectionSchema.optional(),
+  [IPC_CHANNELS.requests.appearancePreview]: appearancePreviewReceiptSchema,
+  [IPC_CHANNELS.requests.appearanceClearPreview]: z.undefined(),
+  [IPC_CHANNELS.requests.appearanceApply]: appearanceApplyReceiptSchema,
+  [IPC_CHANNELS.requests.appearanceUndo]: appearanceApplyReceiptSchema,
   [IPC_CHANNELS.requests.changesList]: changeReviewSchema,
   [IPC_CHANNELS.requests.changesCancel]: z.undefined(),
   [IPC_CHANNELS.requests.publishStart]: publishStartReceiptSchema,

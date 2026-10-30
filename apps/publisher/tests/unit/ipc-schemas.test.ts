@@ -1,4 +1,5 @@
 import { describe, expect, it } from "vitest"
+import { DEFAULT_APPEARANCE } from "../../src/shared/appearance"
 import {
   type AppError,
   IMAGE_LIBRARY_MAX_GALLERY_THUMBNAIL_TOTAL_LENGTH,
@@ -120,6 +121,15 @@ const transaction = {
   ...privateField,
 }
 const preview = { state: "stopped", generation: 0, ...privateField }
+const appearanceSessionId = "22222222-2222-4222-8222-222222222222"
+const appearanceSnapshot = {
+  framework: "quartz",
+  supported: true,
+  settings: DEFAULT_APPEARANCE,
+  baselineHash: "d".repeat(64),
+  canUndo: true,
+  ...privateField,
+}
 const blogId = "11111111-1111-4111-8111-111111111111"
 const blog = {
   id: blogId,
@@ -241,6 +251,20 @@ const validByChannel: Record<string, unknown> = {
   [IPC_CHANNELS.requests.previewStop]: preview,
   [IPC_CHANNELS.requests.previewStatus]: preview,
   [IPC_CHANNELS.requests.previewRevealSelection]: "found",
+  [IPC_CHANNELS.requests.appearanceRead]: appearanceSnapshot,
+  [IPC_CHANNELS.requests.appearanceChooseBackground]: {
+    source: "staged",
+    token: appearanceSessionId,
+    name: "background.webp",
+    ...privateField,
+  },
+  [IPC_CHANNELS.requests.appearancePreview]: {
+    sessionId: appearanceSessionId,
+    ...privateField,
+  },
+  [IPC_CHANNELS.requests.appearanceClearPreview]: undefined,
+  [IPC_CHANNELS.requests.appearanceApply]: { snapshot: appearanceSnapshot, ...privateField },
+  [IPC_CHANNELS.requests.appearanceUndo]: { snapshot: appearanceSnapshot, ...privateField },
   [IPC_CHANNELS.requests.changesList]: {
     groups: [
       {

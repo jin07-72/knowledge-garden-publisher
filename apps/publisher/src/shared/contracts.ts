@@ -1,3 +1,7 @@
+import type { AppearanceSettings, BlogFramework } from "./appearance"
+
+export type { AppearanceBackground, AppearanceSettings, BlogFramework } from "./appearance"
+
 export type Visibility = "public" | "private"
 
 export type SerializableValue =
@@ -115,6 +119,13 @@ export const APP_ERROR_CODES = [
   "PREVIEW_START_FAILED",
   "PREVIEW_EXITED",
   "PREVIEW_STOP_FAILED",
+  "APPEARANCE_UNSUPPORTED",
+  "APPEARANCE_INVALID",
+  "APPEARANCE_CHANGED",
+  "APPEARANCE_CONFLICT",
+  "APPEARANCE_PREVIEW_UNAVAILABLE",
+  "APPEARANCE_TRANSACTION_FAILED",
+  "APPEARANCE_TRANSACTION_UNCERTAIN",
   ...DOMAIN_PUBLIC_ERROR_CODES,
   ...BLOG_IMPORT_PUBLIC_ERROR_CODES,
   "BLOG_SWITCH_BUSY",
@@ -458,6 +469,48 @@ export interface BlogImportProgress {
   readonly message: string
 }
 
+export interface AppearanceSnapshot {
+  readonly framework: BlogFramework
+  readonly supported: boolean
+  readonly settings: AppearanceSettings
+  readonly baselineHash: string
+  readonly canUndo: boolean
+  readonly message?: string
+}
+
+export interface AppearanceBackgroundSelection {
+  readonly source: "staged"
+  readonly token: string
+  readonly name: string
+}
+
+export interface AppearancePreviewRequest {
+  readonly url: string
+  readonly sessionId: string
+  readonly settings: AppearanceSettings
+}
+
+export interface AppearancePreviewReceipt {
+  readonly sessionId: string
+}
+
+export interface AppearanceClearPreviewRequest {
+  readonly sessionId: string
+}
+
+export interface AppearanceApplyRequest {
+  readonly settings: AppearanceSettings
+  readonly baselineHash: string
+}
+
+export interface AppearanceUndoRequest {
+  readonly baselineHash: string
+}
+
+export interface AppearanceApplyReceipt {
+  readonly snapshot: AppearanceSnapshot
+}
+
 export const IPC_CHANNELS = {
   requests: {
     workspaceInspectSafety: "garden:workspace:inspect-safety",
@@ -488,6 +541,12 @@ export const IPC_CHANNELS = {
     previewStop: "garden:preview:stop",
     previewStatus: "garden:preview:status",
     previewRevealSelection: "garden:preview:reveal-selection",
+    appearanceRead: "garden:appearance:read",
+    appearanceChooseBackground: "garden:appearance:choose-background",
+    appearancePreview: "garden:appearance:preview",
+    appearanceClearPreview: "garden:appearance:clear-preview",
+    appearanceApply: "garden:appearance:apply",
+    appearanceUndo: "garden:appearance:undo",
     changesList: "garden:changes:list",
     changesCancel: "garden:changes:cancel",
     publishStart: "garden:publish:start",
