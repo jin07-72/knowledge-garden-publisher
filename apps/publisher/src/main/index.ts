@@ -65,6 +65,11 @@ import {
   type BlogImportService,
 } from "./services/blogImport"
 import { createElectronImageLibraryAdapter } from "./services/imageLibraryElectron"
+import {
+  createAppearanceAssetPicker,
+  createAppearanceDecodeSemaphore,
+  type AppearanceAssetPicker,
+} from "./services/appearance/appearanceAssets"
 import { createPublishBranchRepair } from "./services/publishBranchRepair"
 import { revealSelectionInPreviewFrames } from "./previewFrameNavigation"
 
@@ -77,6 +82,17 @@ let prepareBlogManagementShutdown: (() => Promise<void>) | undefined
 let restoreBlogManagementAfterFailedShutdown: (() => void) | undefined
 let previewManager: (PreviewServicePort & { dispose(): Promise<void> }) | undefined
 let publisherServices: PublisherRuntimeServices | undefined
+
+const appearanceDecodeSemaphore = createAppearanceDecodeSemaphore()
+
+export function createProductionAppearanceAssetPicker(): AppearanceAssetPicker {
+  return createAppearanceAssetPicker<BrowserWindow>({
+    getWindow: () => mainWindow,
+    showOpenDialog: (window, options) => dialog.showOpenDialog(window, options),
+    createImageFromBuffer: (bytes) => nativeImage.createFromBuffer(bytes),
+    decodeSemaphore: appearanceDecodeSemaphore,
+  })
+}
 
 async function revealSelectionInCurrentPreview(
   request: PreviewRevealRequest,

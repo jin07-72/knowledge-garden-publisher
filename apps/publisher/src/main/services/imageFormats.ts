@@ -12,6 +12,15 @@ export type ImageFormat =
   | { readonly extension: ".webp"; readonly mime: "image/webp" }
   | { readonly extension: ".avif"; readonly mime: "image/avif" }
 
+export const IMAGE_FILE_EXTENSIONS = Object.freeze([
+  ".png",
+  ".jpg",
+  ".jpeg",
+  ".gif",
+  ".webp",
+  ".avif",
+] as const)
+
 type Signature = "png" | "jpeg" | "gif" | "webp" | "avif"
 type FormatDefinition = ImageFormat & { readonly signature: Signature }
 
@@ -157,6 +166,15 @@ function boundedDimensions(
   )
     throw imageTooLarge()
   return { width, height, mime }
+}
+
+/** Applies the same allocation limits used by the bounded container readers. */
+export function validateBoundedImageDimensions(
+  width: number,
+  height: number,
+  mime: ImageFormat["mime"],
+): BoundedImageMetadata {
+  return boundedDimensions(width, height, mime)
 }
 
 function boundedFrame(
