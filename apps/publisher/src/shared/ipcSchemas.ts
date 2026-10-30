@@ -343,6 +343,11 @@ const appearanceLayoutSchema = z
     gapPx: z.number().finite().min(0).max(128),
   })
   .strict()
+const appearanceCustomCssSchema = z
+  .string()
+  .refine((value) => utf8ByteLength(value) <= 64 * 1024)
+  .refine((value) => !value.includes("\u0000"))
+  .refine((value) => !/<\/style/i.test(value))
 export const appearanceSettingsSchema: z.ZodType<AppearanceSettings> = z
   .object({
     schemaVersion: z.literal(1),
@@ -351,7 +356,7 @@ export const appearanceSettingsSchema: z.ZodType<AppearanceSettings> = z
     colors: appearanceColorsSchema,
     typography: appearanceTypographySchema,
     layout: appearanceLayoutSchema,
-    customCss: z.string().refine((value) => utf8ByteLength(value) <= 64 * 1024),
+    customCss: appearanceCustomCssSchema,
   })
   .strict()
 const imageNameSchema = safeBitmapImageNameSchema
@@ -757,7 +762,7 @@ const appearanceResponseSettingsSchema: z.ZodType<AppearanceSettings> = z
     colors: appearanceColorsSchema.strip(),
     typography: appearanceTypographySchema.strip(),
     layout: appearanceLayoutSchema.strip(),
-    customCss: z.string().refine((value) => utf8ByteLength(value) <= 64 * 1024),
+    customCss: appearanceCustomCssSchema,
   })
   .strip()
 const appearanceSnapshotSchema: z.ZodType<AppearanceSnapshot> = z

@@ -111,6 +111,25 @@ describe("appearance bridge contracts", () => {
     ).toBe(false)
   })
 
+  it("rejects custom CSS that could break the managed style context", () => {
+    for (const customCss of [
+      "body { color: red; }\u0000",
+      "body::after { content: '</style>'; }",
+      "</StYlE media=all>",
+    ])
+      expect(
+        appearanceSettingsSchema.safeParse({ ...DEFAULT_APPEARANCE, customCss }).success,
+        JSON.stringify(customCss),
+      ).toBe(false)
+
+    expect(
+      appearanceSettingsSchema.safeParse({
+        ...DEFAULT_APPEARANCE,
+        customCss: "body::after { content: '<style>'; }",
+      }).success,
+    ).toBe(true)
+  })
+
   it("rejects a staged background whose token is not a UUID", () => {
     expect(
       appearanceSettingsSchema.safeParse({
