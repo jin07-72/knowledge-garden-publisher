@@ -11,6 +11,7 @@ import { ModalShell } from "./ModalShell"
 interface AppearanceDesignerProps {
   readonly api: GardenApi["appearance"]
   readonly previewUrl?: string
+  readonly externalError?: string
   readonly onClose: () => void
   readonly onChanged?: () => void
 }
@@ -66,6 +67,7 @@ function resultError<T>(result: IpcResult<T>): AppError | undefined {
 export function AppearanceDesigner({
   api,
   previewUrl,
+  externalError,
   onClose,
   onChanged,
 }: AppearanceDesignerProps): React.JSX.Element {
@@ -141,8 +143,25 @@ export function AppearanceDesigner({
       window.clearTimeout(previewTimer.current)
       previewTimer.current = undefined
     }
-    await api.clearPreview({ sessionId: sessionId.current }).catch(() => undefined)
-    if (mounted.current) onClose()
+    try {
+      const result = await api.clearPreview({ sessionId: sessionId.current })
+      if (!mounted.current) return
+      if (!result.ok) {
+        closing.current = false
+        setBusy(undefined)
+        setNotice({ kind: "error", message: `无法关闭外观设置：${result.error.message}` })
+        return
+      }
+      onClose()
+    } catch (failure) {
+      if (!mounted.current) return
+      closing.current = false
+      setBusy(undefined)
+      setNotice({
+        kind: "error",
+        message: `无法关闭外观设置：${failure instanceof Error ? failure.message : "预览清理失败"}`,
+      })
+    }
   }
 
   const chooseBackground = async (): Promise<void> => {
@@ -244,6 +263,11 @@ export function AppearanceDesigner({
         </div>
       </header>
 
+      {externalError ? (
+        <div className="appearance-state" role="alert">
+          {externalError}
+        </div>
+      ) : null}
       {loadState.kind === "loading" ? (
         <div className="appearance-state" role="status">
           正在读取外观设置…

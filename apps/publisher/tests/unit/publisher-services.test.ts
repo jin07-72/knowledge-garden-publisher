@@ -712,6 +712,83 @@ describe("publisher service wiring", () => {
     await services.dispose()
   })
 
+  it("reports the real active publication without exposing publisher internals", async () => {
+    const workspace = await garden()
+    let finishPublish!: () => void
+    const publishing = new Promise<void>((resolve) => {
+      finishPublish = resolve
+    })
+    const services = await createPublisherServices({
+      workspace,
+      trash: { trashItem: async () => undefined },
+      isTracked: async () => false,
+      preview: preview(),
+      changeScanner: {
+        list: async () => ({
+          groups: [
+            {
+              id: "note:daily",
+              label: "Daily",
+              kind: "modified",
+              selection: "default",
+              description: "changed",
+              paths: ["content/life/daily.md"],
+              attachments: [],
+            },
+          ],
+        }),
+        cancel: async () => undefined,
+      },
+      publisherFactory: () => ({
+        publish: () => publishing,
+        cancel: async () => undefined,
+        dispose: async () => undefined,
+      }),
+    })
+
+    expect(services.publish.status()).toEqual({ active: false })
+    const receipt = await services.publish.start({ changeGroupIds: ["note:daily"] })
+    expect(services.publish.status()).toEqual({
+      active: true,
+      operationId: receipt.operationId,
+    })
+    finishPublish()
+    await vi.waitFor(() => expect(services.publish.status()).toEqual({ active: false }))
+    await services.dispose()
+  })
+
+  it("reports publication preparation while the change scan is pending", async () => {
+    const workspace = await garden()
+    let finishScan!: () => void
+    const scanPending = new Promise<void>((resolve) => {
+      finishScan = resolve
+    })
+    const list = vi.fn(async () => {
+      await scanPending
+      return { groups: [] }
+    })
+    const services = await createPublisherServices({
+      workspace,
+      trash: { trashItem: async () => undefined },
+      isTracked: async () => false,
+      preview: preview(),
+      changeScanner: { list, cancel: vi.fn(async () => undefined) },
+      publisherFactory: () => ({
+        publish: vi.fn(async () => undefined),
+        cancel: vi.fn(async () => undefined),
+        dispose: vi.fn(async () => undefined),
+      }),
+    })
+
+    const preparing = services.publish.start({ changeGroupIds: ["note:daily"] })
+    await vi.waitFor(() => expect(list).toHaveBeenCalledOnce())
+    expect(services.publish.status()).toEqual({ active: true })
+    finishScan()
+    await expect(preparing).rejects.toMatchObject({ code: "INVALID_INPUT" })
+    expect(services.publish.status()).toEqual({ active: false })
+    await services.dispose()
+  })
+
   it("rejects a repairable branch before scanning changes or starting publication", async () => {
     const workspace = await garden()
     const scan = vi.fn(async () => ({ groups: [] }))
@@ -807,13 +884,16 @@ describe("publisher service wiring", () => {
 
     const preparing = services.publish.start({ changeGroupIds: ["note:daily"] })
     await vi.waitFor(() => expect(repair.inspect).toHaveBeenCalledOnce())
+    expect(services.publish.status()).toEqual({ active: true })
     await expect(services.publish.repairBranch()).rejects.toMatchObject({ code: "INVALID_INPUT" })
     finishInspect()
     await expect(preparing).rejects.toMatchObject({ code: "INVALID_INPUT" })
+    expect(services.publish.status()).toEqual({ active: false })
 
     const repairing = services.publish.repairBranch()
     const sameRepair = services.publish.repairBranch()
     await vi.waitFor(() => expect(repair.repair).toHaveBeenCalledOnce())
+    expect(services.publish.status()).toEqual({ active: true })
     await expect(services.publish.start({ changeGroupIds: ["note:daily"] })).rejects.toMatchObject({
       code: "INVALID_INPUT",
     })
@@ -822,6 +902,7 @@ describe("publisher service wiring", () => {
       { branch: "main", upstream: "origin/main", head: "a".repeat(40) },
       { branch: "main", upstream: "origin/main", head: "a".repeat(40) },
     ])
+    expect(services.publish.status()).toEqual({ active: false })
     await services.dispose()
   })
 

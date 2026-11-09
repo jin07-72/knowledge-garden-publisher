@@ -550,6 +550,7 @@ export const IPC_CHANNELS = {
     changesList: "garden:changes:list",
     changesCancel: "garden:changes:cancel",
     publishStart: "garden:publish:start",
+    publishStatus: "garden:publish:status",
     publishRepairBranch: "garden:publish:repair-branch",
     publishCancel: "garden:publish:cancel",
     historyGit: "garden:history:git",
@@ -755,6 +756,10 @@ export interface PublishStartReceipt {
   readonly operationId: string
 }
 
+export type PublishStatus =
+  | { readonly active: false; readonly operationId?: never }
+  | { readonly active: true; readonly operationId?: string }
+
 export interface PublishBranchRepairReceipt {
   readonly branch: "main"
   readonly upstream: "origin/main"
@@ -860,6 +865,7 @@ export interface GardenApi {
   }
   readonly publish: {
     start(request: PublishRequest): Promise<IpcResult<PublishStartReceipt>>
+    status(): Promise<IpcResult<PublishStatus>>
     repairBranch(): Promise<IpcResult<PublishBranchRepairReceipt>>
     cancel(request: PublishCancelRequest): Promise<IpcResult<void>>
     onProgress(listener: (progress: PublishProgress) => void): Unsubscribe

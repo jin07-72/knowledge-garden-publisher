@@ -488,6 +488,12 @@ export async function createPublisherServices(
       cancel: () => changeScanner.cancel(),
     },
     publish: {
+      status: () =>
+        activePublish
+          ? { active: true as const, operationId: activePublish }
+          : preparingPublish > 0 || repairingBranch
+            ? { active: true as const }
+            : { active: false as const },
       start: async (request) => {
         if (switchPreparing) throw switchBusy()
         if (!publisher) return reject("Publishing")

@@ -10,7 +10,9 @@ import { createPublisherCloseCoordinator } from "../../src/main/publisherService
 import { App as StartupApp, PublisherApp } from "../../src/renderer/src/App"
 import { BlogSwitcher } from "../../src/renderer/src/components/BlogSwitcher"
 import { shanghaiCalendarDate } from "../../src/renderer/src/components/NoteSidebar"
+import { APPEARANCE_PRESETS } from "../../src/shared/appearance"
 import type {
+  AppearanceSnapshot,
   ChangeReview,
   DomainSummary,
   BlogCandidateInspection,
@@ -334,6 +336,7 @@ function createGardenMock(): GardenApi {
     },
     publish: {
       start: vi.fn(),
+      status: vi.fn(async () => ok({ active: false as const })),
       repairBranch: vi.fn(),
       cancel: vi.fn(),
       onProgress: vi.fn(() => () => undefined),
@@ -532,6 +535,479 @@ describe("publisher main layout", () => {
     cleanup()
     vi.restoreAllMocks()
     vi.unstubAllGlobals()
+  })
+
+  function enableAppearance(api: GardenApi): AppearanceSnapshot {
+    const snapshot: AppearanceSnapshot = {
+      framework: "quartz",
+      supported: true,
+      settings: APPEARANCE_PRESETS.paper,
+      baselineHash: "a".repeat(64),
+      canUndo: true,
+    }
+    vi.mocked(api.appearance.read).mockResolvedValue(ok(snapshot))
+    vi.mocked(api.appearance.preview).mockImplementation(async ({ sessionId }) => ok({ sessionId }))
+    vi.mocked(api.appearance.clearPreview).mockResolvedValue(ok(undefined))
+    vi.mocked(api.appearance.apply).mockResolvedValue(
+      ok({ snapshot: { ...snapshot, baselineHash: "b".repeat(64) } }),
+    )
+    vi.mocked(api.appearance.undo).mockResolvedValue(
+      ok({ snapshot: { ...snapshot, baselineHash: "b".repeat(64), canUndo: false } }),
+    )
+    return snapshot
+  }
+
+  it("places the active-blog appearance entry beside domains and uses only the last good preview", async () => {
+    const user = userEvent.setup()
+    enableAppearance(garden)
+    vi.mocked(garden.preview.status).mockResolvedValue(
+      ok({
+        state: "building",
+        generation: 7,
+        url: "http://127.0.0.1:8080/current-build/",
+        lastSuccessfulUrl: "http://127.0.0.1:8080/last-good/",
+      }),
+    )
+    render(<App />)
+
+    const domains = screen.getByRole("button", { name: "管理领域" })
+    const appearance = screen.getByRole("button", { name: "外观" })
+    expect(domains.nextElementSibling).toBe(appearance)
+    await user.click(appearance)
+
+    expect(await screen.findByRole("dialog", { name: "外观设置" })).toBeVisible()
+    expect(garden.appearance.read).toHaveBeenCalledOnce()
+    await waitFor(() =>
+      expect(garden.appearance.preview).toHaveBeenCalledWith(
+        expect.objectContaining({ url: "http://127.0.0.1:8080/last-good/" }),
+      ),
+    )
+    expect(garden.appearance.preview).not.toHaveBeenCalledWith(
+      expect.objectContaining({ url: "http://127.0.0.1:8080/current-build/" }),
+    )
+  })
+
+  it("flushes the current Markdown before appearance apply and invalidates changes without publishing", async () => {
+    const user = userEvent.setup()
+    enableAppearance(garden)
+    vi.mocked(garden.changes.list).mockResolvedValue(
+      ok({
+        groups: [
+          {
+            id: "note:appearance",
+            label: "Appearance",
+            kind: "modified",
+            selection: "default",
+            description: "外观变化",
+            paths: ["quartz/styles/custom.scss"],
+            attachments: [],
+          },
+        ],
+      }),
+    )
+    vi.mocked(garden.notes.save).mockImplementation(async (request) =>
+      ok({
+        path: request.path,
+        updatedAt: "2026-10-30T10:00:00.000Z",
+        mtimeMs: 3,
+        contentHash: markdownHash(request.markdown),
+      }),
+    )
+    render(<App />)
+
+    await user.click(await screen.findByRole("button", { name: /CSS Grid 布局/ }))
+    const textbox = await screen.findByRole("textbox")
+    const editor = EditorView.findFromDOM(textbox)
+    if (!editor) throw new Error("CodeMirror view not found")
+    act(() => editor.dispatch({ changes: { from: editor.state.doc.length, insert: "\nchanged" } }))
+
+    await user.click(screen.getByRole("button", { name: "外观" }))
+    fireEvent.change(await screen.findByLabelText("强调色"), { target: { value: "#112233" } })
+    await user.click(screen.getByRole("button", { name: "一键应用" }))
+
+    await waitFor(() => expect(garden.appearance.apply).toHaveBeenCalledOnce())
+    expect(garden.notes.save).toHaveBeenCalledWith(
+      expect.objectContaining({ markdown: expect.stringContaining("changed") }),
+    )
+    expect(vi.mocked(garden.notes.save).mock.invocationCallOrder[0]).toBeLessThan(
+      vi.mocked(garden.appearance.apply).mock.invocationCallOrder[0],
+    )
+    expect(garden.publish.start).not.toHaveBeenCalled()
+    expect(screen.getByText("可发布变化：暂不可用")).toBeVisible()
+    expect(garden.changes.list).toHaveBeenCalledTimes(1)
+  })
+
+  it("disables appearance while publication is preparing the current Markdown", async () => {
+    const user = userEvent.setup()
+    const saving = deferred<Awaited<ReturnType<GardenApi["notes"]["save"]>>>()
+    vi.mocked(garden.notes.save).mockReturnValue(saving.promise)
+    vi.mocked(garden.changes.list).mockResolvedValue(
+      ok({
+        groups: [
+          {
+            id: "note:publish",
+            label: "Publish",
+            kind: "modified",
+            selection: "default",
+            description: "待发布笔记",
+            paths: [notes[0].path],
+            attachments: [],
+          },
+        ],
+      }),
+    )
+    vi.mocked(garden.publish.start).mockResolvedValue(ok({ operationId: "publish-appearance" }))
+    render(<App />)
+
+    await user.click(await screen.findByRole("button", { name: /CSS Grid 布局/ }))
+    const textbox = await screen.findByRole("textbox")
+    const editor = EditorView.findFromDOM(textbox)
+    if (!editor) throw new Error("CodeMirror view not found")
+    act(() => editor.dispatch({ changes: { from: editor.state.doc.length, insert: "\npublish" } }))
+    await user.click(screen.getByRole("button", { name: "检查并发布" }))
+    await user.click(await screen.findByRole("button", { name: "验证并发布" }))
+
+    expect(screen.getByRole("button", { name: "外观", hidden: true })).toBeDisabled()
+    saving.resolve(
+      ok({
+        path: notes[0].path,
+        updatedAt: "2026-10-30T10:00:00.000Z",
+        mtimeMs: 3,
+        contentHash: "c".repeat(64),
+      }),
+    )
+    await act(async () => void (await saving.promise))
+  })
+
+  it("disables appearance while repairing the branch before a publication retry", async () => {
+    const user = userEvent.setup()
+    const repairing = deferred<Awaited<ReturnType<GardenApi["publish"]["repairBranch"]>>>()
+    vi.mocked(garden.changes.list).mockResolvedValue(
+      ok({
+        groups: [
+          {
+            id: "note:repair",
+            label: "Repair",
+            kind: "modified",
+            selection: "default",
+            description: "待修复分支后发布",
+            paths: [notes[0].path],
+            attachments: [],
+          },
+        ],
+      }),
+    )
+    vi.mocked(garden.publish.start)
+      .mockResolvedValueOnce({
+        ok: false,
+        error: {
+          code: "PUBLISH_BRANCH_REPAIR_REQUIRED",
+          message: "需要安全切换到 main。",
+        },
+      })
+      .mockResolvedValueOnce(ok({ operationId: "publish-after-repair" }))
+    vi.mocked(garden.publish.repairBranch).mockReturnValue(repairing.promise)
+    render(<App />)
+
+    await user.click(screen.getByRole("button", { name: "检查并发布" }))
+    await user.click(await screen.findByRole("button", { name: "验证并发布" }))
+    await user.click(await screen.findByRole("button", { name: "安全切换到 main 并继续" }))
+
+    expect(screen.getByRole("button", { name: "外观", hidden: true })).toBeDisabled()
+    repairing.resolve(ok({ branch: "main", upstream: "origin/main", head: "a".repeat(40) }))
+    await waitFor(() => expect(garden.publish.start).toHaveBeenCalledTimes(2))
+  })
+
+  it.each([
+    ["complete", "发布成功", 100],
+    ["failed", "发布失败", undefined],
+    ["failed", "发布已取消", undefined],
+  ] as const)(
+    "keeps appearance disabled for the active publish operation until %s: %s",
+    async (phase, message, percent) => {
+      const user = userEvent.setup()
+      const progress = capturePublishProgress(garden)
+      enableAppearance(garden)
+      vi.mocked(garden.changes.list).mockResolvedValue(
+        ok({
+          groups: [
+            {
+              id: "note:active-publish",
+              label: "Active publish",
+              kind: "modified",
+              selection: "default",
+              description: "正在发布",
+              paths: [notes[0].path],
+              attachments: [],
+            },
+          ],
+        }),
+      )
+      vi.mocked(garden.publish.start).mockResolvedValue(ok({ operationId: "publish-active" }))
+      render(<App />)
+
+      await user.click(screen.getByRole("button", { name: "检查并发布" }))
+      await user.click(await screen.findByRole("button", { name: "验证并发布" }))
+      await waitFor(() => expect(garden.publish.start).toHaveBeenCalledOnce())
+
+      const appearance = screen.getByRole("button", { name: "外观" })
+      expect(appearance).toBeDisabled()
+      fireEvent.click(appearance)
+      expect(garden.appearance.read).not.toHaveBeenCalled()
+
+      progress.emit({ phase, message, ...(percent === undefined ? {} : { percent }) })
+      await waitFor(() => expect(appearance).toBeEnabled())
+    },
+  )
+
+  it("restores the active publish interlock after the renderer remounts", async () => {
+    enableAppearance(garden)
+    vi.mocked(garden.publish.status).mockResolvedValue(
+      ok({ active: true as const, operationId: "publish-remount" }),
+    )
+
+    const first = render(<App />)
+    await waitFor(() => expect(screen.getByRole("button", { name: "外观" })).toBeDisabled())
+    first.unmount()
+
+    render(<App />)
+    await waitFor(() => expect(garden.publish.status).toHaveBeenCalledTimes(2))
+    expect(screen.getByRole("button", { name: "外观", hidden: true })).toBeDisabled()
+  })
+
+  it("does not let a stale active status overwrite a newer terminal publish event", async () => {
+    enableAppearance(garden)
+    const status = deferred<Awaited<ReturnType<GardenApi["publish"]["status"]>>>()
+    vi.mocked(garden.publish.status).mockReturnValue(status.promise)
+    const progress = capturePublishProgress(garden)
+    render(<App />)
+    await waitFor(() => expect(garden.publish.status).toHaveBeenCalledOnce())
+
+    progress.emit({ phase: "failed", message: "发布已取消" })
+    status.resolve(ok({ active: true as const, operationId: "stale-operation" }))
+    await act(async () => void (await status.promise))
+
+    expect(screen.getByRole("button", { name: "外观" })).toBeEnabled()
+  })
+
+  it("does not let a stale inactive status overwrite a newer active publish event", async () => {
+    enableAppearance(garden)
+    const status = deferred<Awaited<ReturnType<GardenApi["publish"]["status"]>>>()
+    vi.mocked(garden.publish.status).mockReturnValue(status.promise)
+    const progress = capturePublishProgress(garden)
+    render(<App />)
+    await waitFor(() => expect(garden.publish.status).toHaveBeenCalledOnce())
+
+    progress.emit({ phase: "pushing", message: "正在推送…", percent: 80 })
+    status.resolve(ok({ active: false as const }))
+    await act(async () => void (await status.promise))
+
+    expect(screen.getByRole("button", { name: "外观" })).toBeDisabled()
+  })
+
+  it("keeps the interlock when start reports that a publication is already running", async () => {
+    const user = userEvent.setup()
+    enableAppearance(garden)
+    vi.mocked(garden.publish.start).mockResolvedValue({
+      ok: false,
+      error: { code: "INVALID_INPUT", message: "A publication is already running." },
+    })
+    vi.mocked(garden.publish.status)
+      .mockResolvedValueOnce(ok({ active: false as const }))
+      .mockResolvedValueOnce(ok({ active: true as const, operationId: "publish-existing" }))
+    vi.mocked(garden.changes.list).mockResolvedValue(
+      ok({
+        groups: [
+          {
+            id: "note:existing-publish",
+            label: "Existing publish",
+            kind: "modified",
+            selection: "default",
+            description: "changed",
+            paths: [notes[0].path],
+            attachments: [],
+          },
+        ],
+      }),
+    )
+    render(<App />)
+    await waitFor(() => expect(garden.publish.status).toHaveBeenCalledOnce())
+
+    await user.click(screen.getByRole("button", { name: "检查并发布" }))
+    await user.click(await screen.findByRole("button", { name: "验证并发布" }))
+    await waitFor(() => expect(garden.publish.status).toHaveBeenCalledTimes(2))
+
+    expect(screen.getByRole("button", { name: "外观", hidden: true })).toBeDisabled()
+  })
+
+  it("releases the interlock when a rejected start is confirmed inactive", async () => {
+    const user = userEvent.setup()
+    enableAppearance(garden)
+    vi.mocked(garden.publish.start).mockResolvedValue({
+      ok: false,
+      error: { code: "INVALID_INPUT", message: "The publication selection is invalid." },
+    })
+    vi.mocked(garden.publish.status).mockResolvedValue(ok({ active: false as const }))
+    vi.mocked(garden.changes.list).mockResolvedValue(
+      ok({
+        groups: [
+          {
+            id: "note:rejected-publish",
+            label: "Rejected publish",
+            kind: "modified",
+            selection: "default",
+            description: "changed",
+            paths: [notes[0].path],
+            attachments: [],
+          },
+        ],
+      }),
+    )
+    render(<App />)
+    await waitFor(() => expect(garden.publish.status).toHaveBeenCalledOnce())
+
+    await user.click(screen.getByRole("button", { name: "检查并发布" }))
+    await user.click(await screen.findByRole("button", { name: "验证并发布" }))
+    await waitFor(() => expect(garden.publish.status).toHaveBeenCalledTimes(2))
+
+    expect(screen.getByRole("button", { name: "外观", hidden: true })).toBeEnabled()
+  })
+
+  it("refreshes an already-open publication review after undo without publishing", async () => {
+    const user = userEvent.setup()
+    enableAppearance(garden)
+    vi.mocked(garden.changes.list).mockResolvedValue(ok({ groups: [] }))
+    render(<App />)
+
+    await user.click(screen.getByRole("button", { name: "检查并发布" }))
+    await screen.findByRole("dialog", { name: "检查并发布" })
+    const beforeUndo = vi.mocked(garden.changes.list).mock.calls.length
+    fireEvent.click(screen.getByRole("button", { name: "外观", hidden: true }))
+    await screen.findByRole("dialog", { name: "外观设置" })
+    await user.click(screen.getByRole("button", { name: "撤销上次应用" }))
+
+    await waitFor(() => expect(garden.changes.list).toHaveBeenCalledTimes(beforeUndo + 1))
+    expect(garden.publish.start).not.toHaveBeenCalled()
+  })
+
+  it("does not apply an appearance flush that became stale during a blog switch", async () => {
+    const user = userEvent.setup()
+    enableAppearance(garden)
+    const saving = deferred<Awaited<ReturnType<GardenApi["notes"]["save"]>>>()
+    vi.mocked(garden.notes.save).mockReturnValue(saving.promise)
+    vi.mocked(garden.blogs.switch).mockResolvedValue(ok(undefined))
+    render(<PublisherApp api={garden} initialRegistry={twoBlogRegistry} />)
+
+    await user.click(await screen.findByRole("button", { name: /CSS Grid 布局/ }))
+    const textbox = await screen.findByRole("textbox")
+    const editor = EditorView.findFromDOM(textbox)
+    if (!editor) throw new Error("CodeMirror view not found")
+    act(() => editor.dispatch({ changes: { from: editor.state.doc.length, insert: "\nstale" } }))
+    await user.click(screen.getByRole("button", { name: "外观" }))
+    fireEvent.change(await screen.findByLabelText("强调色"), { target: { value: "#112233" } })
+    await user.click(screen.getByRole("button", { name: "一键应用" }))
+    await waitFor(() => expect(garden.notes.save).toHaveBeenCalledOnce())
+
+    fireEvent.click(
+      screen.getByRole("button", { name: /切换博客：Knowledge Garden/, hidden: true }),
+    )
+    fireEvent.click(screen.getByRole("menuitemradio", { name: /Study Garden/, hidden: true }))
+    saving.resolve(
+      ok({
+        path: notes[0].path,
+        updatedAt: "2026-10-30T10:00:00.000Z",
+        mtimeMs: 3,
+        contentHash: markdownHash(`${documents.get(notes[0].path)!.markdown}\nstale`),
+      }),
+    )
+
+    await waitFor(() => expect(garden.blogs.switch).toHaveBeenCalledOnce())
+    expect(garden.appearance.apply).not.toHaveBeenCalled()
+  })
+
+  it("closes and clears an appearance session before switching blogs", async () => {
+    const user = userEvent.setup()
+    enableAppearance(garden)
+    const order: string[] = []
+    vi.mocked(garden.appearance.clearPreview).mockImplementation(async () => {
+      order.push("clear")
+      return ok(undefined)
+    })
+    const switching = deferred<IpcResult<void>>()
+    vi.mocked(garden.blogs.switch).mockImplementation(() => {
+      order.push("switch")
+      return switching.promise
+    })
+    render(<PublisherApp api={garden} initialRegistry={twoBlogRegistry} />)
+
+    await user.click(screen.getByRole("button", { name: "外观" }))
+    await waitFor(() => expect(garden.appearance.preview).toHaveBeenCalledOnce())
+    fireEvent.click(
+      screen.getByRole("button", { name: /切换博客：Knowledge Garden/, hidden: true }),
+    )
+    fireEvent.click(screen.getByRole("menuitemradio", { name: /Study Garden/, hidden: true }))
+
+    await waitFor(() => expect(garden.blogs.switch).toHaveBeenCalledOnce())
+    expect(screen.queryByRole("dialog", { name: "外观设置" })).not.toBeInTheDocument()
+    expect(order).toEqual(["clear", "switch"])
+    expect(screen.getByRole("button", { name: "外观", hidden: true })).toBeDisabled()
+    expect(garden.publish.start).not.toHaveBeenCalled()
+    switching.resolve(ok(undefined))
+  })
+
+  it("keeps the appearance session open and aborts a blog switch when preview cleanup fails", async () => {
+    const user = userEvent.setup()
+    enableAppearance(garden)
+    vi.mocked(garden.appearance.clearPreview).mockResolvedValue({
+      ok: false,
+      error: { code: "INTERNAL_ERROR", message: "无法清理旧外观预览" },
+    })
+    render(<PublisherApp api={garden} initialRegistry={twoBlogRegistry} />)
+
+    await user.click(screen.getByRole("button", { name: "外观" }))
+    await waitFor(() => expect(garden.appearance.preview).toHaveBeenCalledOnce())
+    fireEvent.click(
+      screen.getByRole("button", { name: /切换博客：Knowledge Garden/, hidden: true }),
+    )
+    fireEvent.click(screen.getByRole("menuitemradio", { name: /Study Garden/, hidden: true }))
+
+    expect(await screen.findByRole("alert")).toHaveTextContent("无法清理旧外观预览")
+    expect(screen.getByRole("dialog", { name: "外观设置" })).toBeVisible()
+    expect(garden.blogs.switch).not.toHaveBeenCalled()
+    expect(garden.appearance.clearPreview).toHaveBeenCalledOnce()
+  })
+
+  it("invalidates a pending appearance apply and clears its preview when App unmounts", async () => {
+    const user = userEvent.setup()
+    enableAppearance(garden)
+    const saving = deferred<Awaited<ReturnType<GardenApi["notes"]["save"]>>>()
+    vi.mocked(garden.notes.save).mockReturnValue(saving.promise)
+    const view = render(<App />)
+
+    await user.click(await screen.findByRole("button", { name: /CSS Grid 布局/ }))
+    const textbox = await screen.findByRole("textbox")
+    const editor = EditorView.findFromDOM(textbox)
+    if (!editor) throw new Error("CodeMirror view not found")
+    act(() => editor.dispatch({ changes: { from: editor.state.doc.length, insert: "\nunmount" } }))
+    await user.click(screen.getByRole("button", { name: "外观" }))
+    fireEvent.change(await screen.findByLabelText("强调色"), { target: { value: "#112233" } })
+    await waitFor(() => expect(garden.appearance.preview).toHaveBeenCalledOnce())
+    const sessionId = vi.mocked(garden.appearance.preview).mock.calls[0]![0].sessionId
+    await user.click(screen.getByRole("button", { name: "一键应用" }))
+    await waitFor(() => expect(garden.notes.save).toHaveBeenCalledOnce())
+
+    view.unmount()
+    expect(garden.appearance.clearPreview).toHaveBeenCalledWith({ sessionId })
+    saving.resolve(
+      ok({
+        path: notes[0].path,
+        updatedAt: "2026-10-30T10:00:00.000Z",
+        mtimeMs: 3,
+        contentHash: markdownHash(`${documents.get(notes[0].path)!.markdown}\nunmount`),
+      }),
+    )
+    await act(async () => void (await saving.promise))
+    expect(garden.appearance.apply).not.toHaveBeenCalled()
   })
 
   it("keeps modal isolation and focus stable under StrictMode effect replay", async () => {

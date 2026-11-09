@@ -126,6 +126,7 @@ function services(): PublisherIpcServices & {
     changes: { list: call("changesList"), cancel: call("changesCancel") },
     publish: {
       start: call("publishStart"),
+      status: call("publishStatus"),
       repairBranch: call("publishRepairBranch"),
       cancel: call("publishCancel"),
       subscribe(listener) {
@@ -376,6 +377,42 @@ describe("secure publisher IPC", () => {
       ipc.invoke(IPC_CHANNELS.requests.publishRepairBranch, trustedEvent),
     ).resolves.toEqual({ ok: true, value: receipt })
     expect(servicePorts.calls.publishRepairBranch).toHaveBeenCalledWith()
+  })
+
+  it("routes the strict publish status snapshot only for a trusted sender", async () => {
+    const { ipc, servicePorts } = setup()
+    servicePorts.calls.publishStatus.mockResolvedValueOnce({
+      active: true,
+      operationId: "publish-1",
+    })
+
+    await expect(ipc.invoke(IPC_CHANNELS.requests.publishStatus, trustedEvent)).resolves.toEqual({
+      ok: true,
+      value: { active: true, operationId: "publish-1" },
+    })
+    await expect(
+      ipc.invoke(IPC_CHANNELS.requests.publishStatus, trustedEvent, {}),
+    ).resolves.toMatchObject({ ok: false, error: { code: "INVALID_INPUT" } })
+    await expect(
+      ipc.invoke(IPC_CHANNELS.requests.publishStatus, { sender: { id: 99 } }),
+    ).resolves.toMatchObject({ ok: false, error: { code: "IPC_UNAUTHORIZED" } })
+    expect(servicePorts.calls.publishStatus).toHaveBeenCalledOnce()
+  })
+
+  it("rejects a malformed publish status returned by the service", async () => {
+    const { ipc, servicePorts } = setup()
+    servicePorts.calls.publishStatus.mockResolvedValueOnce({
+      active: false,
+      operationId: "must-not-leak",
+    })
+
+    await expect(ipc.invoke(IPC_CHANNELS.requests.publishStatus, trustedEvent)).resolves.toEqual({
+      ok: false,
+      error: {
+        code: "INTERNAL_ERROR",
+        message: "The application could not complete the request.",
+      },
+    })
   })
 
   it("rejects branch repair from an untrusted sender", async () => {
@@ -2057,6 +2094,19 @@ describe("preload garden API", () => {
     )
   })
 
+  it("exposes publish status as a frozen no-argument preload method", async () => {
+    const ipc = new FakeIpcRenderer()
+    ipc.invoke = vi.fn(async () => ({ ok: true, value: { active: false } }))
+    const api = createGardenApi(ipc)
+
+    await expect(api.publish.status()).resolves.toEqual({ ok: true, value: { active: false } })
+    expect(ipc.invoke).toHaveBeenCalledExactlyOnceWith(
+      IPC_CHANNELS.requests.publishStatus,
+      undefined,
+    )
+    expect(Object.isFrozen(api.publish)).toBe(true)
+  })
+
   it("maps every image method to its exact allowlisted channel and request", async () => {
     const ipc = new FakeIpcRenderer()
     const api = createGardenApi(ipc)
@@ -2232,6 +2282,7 @@ describe("preload garden API", () => {
     await api.changes.list()
     await api.changes.cancel()
     await api.publish.start({ changeGroupIds: ["note:a"], message: "Publish A" })
+    await api.publish.status()
     await api.publish.repairBranch()
     await api.publish.cancel({ operationId: "publish-1" })
     await api.history.git({ limit: 20, requestId: "history-1" })

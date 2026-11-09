@@ -312,7 +312,9 @@ describe("BlogSwitcher", () => {
         onManage={vi.fn()}
       />,
     )
-    expect(screen.getByRole("button", { name: /切换博客/ })).toBeDisabled()
+    const trigger = screen.getByRole("button", { name: /切换博客/ })
+    expect(trigger).toBeDisabled()
+    expect(trigger).toHaveAttribute("aria-expanded", "false")
     expect(screen.queryByRole("menu")).not.toBeInTheDocument()
   })
 

@@ -348,6 +348,40 @@ describe("AppearanceDesigner", () => {
     await waitFor(() => expect(order).toEqual(["clear", "close"]))
   })
 
+  it.each(["result", "rejection"] as const)(
+    "keeps the designer open when preview cleanup fails by %s and retries through the same close path",
+    async (failure) => {
+      const clearPreview =
+        failure === "result"
+          ? vi
+              .fn()
+              .mockResolvedValueOnce({
+                ok: false,
+                error: { code: "INTERNAL_ERROR", message: "预览清理失败" },
+              })
+              .mockResolvedValueOnce(success(undefined))
+          : vi
+              .fn()
+              .mockRejectedValueOnce(new Error("预览通道断开"))
+              .mockResolvedValueOnce(success(undefined))
+      const api = appearanceApi({ clearPreview })
+      const onClose = vi.fn()
+      renderDesigner({ api, onClose })
+
+      await userEvent.setup().click(await screen.findByRole("button", { name: "取消" }))
+      expect(screen.getByRole("dialog", { name: "外观设置" })).toBeVisible()
+      expect(screen.getByRole("alert")).toHaveTextContent(
+        failure === "result" ? "预览清理失败" : "预览通道断开",
+      )
+      expect(onClose).not.toHaveBeenCalled()
+      expect(screen.getByRole("button", { name: "取消" })).toBeEnabled()
+
+      await userEvent.setup().keyboard("{Escape}")
+      await waitFor(() => expect(onClose).toHaveBeenCalledOnce())
+      expect(clearPreview).toHaveBeenCalledTimes(2)
+    },
+  )
+
   it("disables apply for invalid drafts and while busy, then updates the baseline on success", async () => {
     let finishApply!: (value: IpcResult<{ snapshot: AppearanceSnapshot }>) => void
     const api = appearanceApi({

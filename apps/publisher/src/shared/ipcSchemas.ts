@@ -835,6 +835,19 @@ const changeReviewSchema = z
   .strip()
   .refine((value) => utf8ByteLength(JSON.stringify(value)) <= 512 * 1024)
 const publishStartReceiptSchema = z.object({ operationId: z.string().min(1).max(128) }).strip()
+const publishStatusSchema = z.discriminatedUnion("active", [
+  z.object({ active: z.literal(false) }).strict(),
+  z
+    .object({
+      active: z.literal(true),
+      operationId: z
+        .string()
+        .max(128)
+        .regex(/^[a-zA-Z0-9][a-zA-Z0-9._:-]*$/)
+        .optional(),
+    })
+    .strict(),
+])
 const publishBranchRepairReceiptSchema = z
   .object({
     branch: z.literal("main"),
@@ -1006,7 +1019,8 @@ export const IPC_SUCCESS_SCHEMAS = {
   [IPC_CHANNELS.requests.previewStatus]: previewStatusSchema,
   [IPC_CHANNELS.requests.previewRevealSelection]: z.enum(["found", "not-found", "not-ready"]),
   [IPC_CHANNELS.requests.appearanceRead]: appearanceSnapshotSchema,
-  [IPC_CHANNELS.requests.appearanceChooseBackground]: appearanceBackgroundSelectionSchema.optional(),
+  [IPC_CHANNELS.requests.appearanceChooseBackground]:
+    appearanceBackgroundSelectionSchema.optional(),
   [IPC_CHANNELS.requests.appearancePreview]: appearancePreviewReceiptSchema,
   [IPC_CHANNELS.requests.appearanceClearPreview]: z.undefined(),
   [IPC_CHANNELS.requests.appearanceApply]: appearanceApplyReceiptSchema,
@@ -1014,6 +1028,7 @@ export const IPC_SUCCESS_SCHEMAS = {
   [IPC_CHANNELS.requests.changesList]: changeReviewSchema,
   [IPC_CHANNELS.requests.changesCancel]: z.undefined(),
   [IPC_CHANNELS.requests.publishStart]: publishStartReceiptSchema,
+  [IPC_CHANNELS.requests.publishStatus]: publishStatusSchema,
   [IPC_CHANNELS.requests.publishRepairBranch]: publishBranchRepairReceiptSchema,
   [IPC_CHANNELS.requests.publishCancel]: z.undefined(),
   [IPC_CHANNELS.requests.historyGit]: z.array(gitCommitSchema).max(500),

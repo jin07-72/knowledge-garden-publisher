@@ -1,6 +1,15 @@
 import { useCallback, useEffect, useMemo, useRef, useState } from "react"
 import { flushSync } from "react-dom"
-import { BookOpen, Check, Eye, GitBranch, LoaderCircle, Trash2, TriangleAlert } from "lucide-react"
+import {
+  BookOpen,
+  Check,
+  Eye,
+  GitBranch,
+  LoaderCircle,
+  Palette,
+  Trash2,
+  TriangleAlert,
+} from "lucide-react"
 import type {
   AppError,
   BlogAddLocalRequest,
@@ -39,6 +48,7 @@ import { DeleteNoteDialog } from "./components/DeleteNoteDialog"
 import { BlogSwitcher } from "./components/BlogSwitcher"
 import { BlogManager, type BlogImportUiState } from "./components/BlogManager"
 import { DomainManager } from "./components/DomainManager"
+import { AppearanceDesigner } from "./components/AppearanceDesigner"
 import { publishedDeploymentStatus } from "./publishDeploymentStatus"
 import type { PreviewNavigationRequest, PreviewNavigationResult } from "./previewNavigation"
 import "./app.css"
@@ -188,8 +198,12 @@ export function PublisherApp({
   const [registry, setRegistry] = useState<BlogRegistryView>(initialRegistry)
   const [managerOpen, setManagerOpen] = useState(false)
   const [domainManagerOpen, setDomainManagerOpen] = useState(false)
+  const [appearanceOpen, setAppearanceOpen] = useState(false)
+  const [appearanceClearError, setAppearanceClearError] = useState<string>()
   const [blogBusy, setBlogBusy] = useState(false)
   const [switchPreparing, setSwitchPreparing] = useState(false)
+  const [publishPreparing, setPublishPreparing] = useState(false)
+  const [publishOperationActive, setPublishOperationActive] = useState(false)
   const blogBusyRef = useRef(false)
   const registryRequest = useRef(0)
   const [importState, setImportState] = useState<BlogImportUiState>({
@@ -248,6 +262,8 @@ export function PublisherApp({
   const appMounted = useRef(true)
   const workspace = useRef<HTMLDivElement>(null)
   const markdownEditor = useRef<MarkdownEditorHandle>(null)
+  const appearanceGeneration = useRef(0)
+  const appearanceSession = useRef<string | undefined>(undefined)
   const notesRequest = useRef(0)
   const domainsRequest = useRef(0)
   const loadedBlogId = useRef(initialRegistry.activeBlogId)
@@ -259,6 +275,7 @@ export function PublisherApp({
   const hasChangeReview = useRef(false)
   const pendingPublishRequest = useRef<PublishRequest | undefined>(undefined)
   const publishAttempt = useRef(0)
+  const publishStatusGeneration = useRef(0)
   const previewStart = useRef<ReturnType<GardenApi["preview"]["start"]> | undefined>(undefined)
   const publishDeploymentGeneration = useRef(0)
   const publishDeploymentRequest = useRef<string | undefined>(undefined)
@@ -343,9 +360,51 @@ export function PublisherApp({
     return result.value
   }, [api])
 
+  const clearAppearancePreview = useCallback(
+    async (request: Parameters<GardenApi["appearance"]["clearPreview"]>[0]) => {
+      const result = await api.appearance.clearPreview(request)
+      if (result.ok && appearanceSession.current === request.sessionId) {
+        appearanceSession.current = undefined
+      }
+      return result
+    },
+    [api],
+  )
+
+  const appearanceApi = useMemo<GardenApi["appearance"]>(
+    () => ({
+      ...api.appearance,
+      preview: async (request) => {
+        appearanceSession.current = request.sessionId
+        return api.appearance.preview(request)
+      },
+      clearPreview: clearAppearancePreview,
+      apply: async (request) => {
+        const generation = appearanceGeneration.current
+        const saved = (await markdownEditor.current?.flush()) ?? true
+        if (!saved || !appMounted.current || generation !== appearanceGeneration.current) {
+          return {
+            ok: false,
+            error: {
+              code: "INTERNAL_ERROR",
+              message: saved
+                ? "外观会话已结束，请重新打开后再应用。"
+                : "当前笔记保存失败，未应用外观。",
+            },
+          }
+        }
+        return api.appearance.apply(request)
+      },
+    }),
+    [api, clearAppearancePreview],
+  )
+
   const switchBlog = useCallback(
     (id: string): void => {
       if (id === registry.activeBlogId || blogBusyRef.current) return
+      appearanceGeneration.current += 1
+      setAppearanceClearError(undefined)
+      const appearanceSessionId = appearanceSession.current
       cancelPublishDeployment()
       setPublishProgress(undefined)
       setPublishActionsUrl(undefined)
@@ -353,6 +412,24 @@ export function PublisherApp({
         flushSync(() => setSwitchPreparing(true))
         let restoreEditing = true
         try {
+          if (appearanceSessionId) {
+            let cleared: Awaited<ReturnType<GardenApi["appearance"]["clearPreview"]>>
+            try {
+              cleared = await clearAppearancePreview({ sessionId: appearanceSessionId })
+            } catch (failure) {
+              if (appMounted.current) {
+                setAppearanceClearError(
+                  failure instanceof Error ? failure.message : "无法清理旧外观预览。",
+                )
+              }
+              return
+            }
+            if (!cleared.ok) {
+              if (appMounted.current) setAppearanceClearError(cleared.error.message)
+              return
+            }
+          }
+          if (appMounted.current) setAppearanceOpen(false)
           const editorSaved = (await markdownEditor.current?.flushSave()) ?? true
           if (!editorSaved) throw new Error("当前笔记保存失败，未切换博客。")
           const result = await api.blogs.switch({ id, editorSaved: true })
@@ -363,7 +440,7 @@ export function PublisherApp({
         }
       })
     },
-    [api, cancelPublishDeployment, registry.activeBlogId, runBlogOperation],
+    [api, cancelPublishDeployment, clearAppearancePreview, registry.activeBlogId, runBlogOperation],
   )
 
   useEffect(
@@ -479,12 +556,16 @@ export function PublisherApp({
     })
     return () => {
       appMounted.current = false
+      appearanceGeneration.current += 1
+      const sessionId = appearanceSession.current
+      if (sessionId) void clearAppearancePreview({ sessionId }).catch(() => undefined)
       publishAttempt.current += 1
+      publishStatusGeneration.current += 1
       pendingPublishRequest.current = undefined
       unsubscribeBeforeClose()
       unsubscribeCloseBlocked()
     }
-  }, [api])
+  }, [api, clearAppearancePreview])
 
   useEffect(() => {
     const updateWidth = (width: number): void => {
@@ -647,6 +728,15 @@ export function PublisherApp({
     [api],
   )
 
+  const appearanceChanged = useCallback(
+    (generation: number): void => {
+      if (generation !== appearanceGeneration.current) return
+      setChangeCount(undefined)
+      if (changeReviewOpen) void loadChanges()
+    },
+    [changeReviewOpen, loadChanges],
+  )
+
   useEffect(() => {
     if (publishBlogId.current === registry.activeBlogId) return
     publishBlogId.current = registry.activeBlogId
@@ -676,6 +766,8 @@ export function PublisherApp({
 
   const applyPublishProgress = useCallback(
     (next: PublishProgress): void => {
+      publishStatusGeneration.current += 1
+      setPublishOperationActive(next.phase !== "complete" && next.phase !== "failed")
       if (next.phase === "complete" && publishCompletionHandled.current) return
       if (next.phase === "validating") {
         cancelPublishDeployment()
@@ -744,6 +836,18 @@ export function PublisherApp({
     [api, cancelPublishDeployment, loadChanges],
   )
 
+  const refreshPublishStatus = useCallback(async (): Promise<void> => {
+    const generation = publishStatusGeneration.current
+    let result: Awaited<ReturnType<GardenApi["publish"]["status"]>>
+    try {
+      result = await api.publish.status()
+    } catch {
+      return
+    }
+    if (!appMounted.current || generation !== publishStatusGeneration.current || !result.ok) return
+    setPublishOperationActive(result.value.active)
+  }, [api])
+
   useEffect(() => {
     const unsubscribeRecovery = api.notes.onRecovery(({ restored, conflicts }) => {
       if (!appMounted.current) return
@@ -793,6 +897,7 @@ export function PublisherApp({
     void loadChanges()
     const unsubscribePreview = api.preview.onProgress(applyPreview)
     const unsubscribePublish = api.publish.onProgress(applyPublishProgress)
+    void refreshPublishStatus()
     return () => {
       unsubscribeRecovery()
       unsubscribePreview()
@@ -812,6 +917,7 @@ export function PublisherApp({
     loadChanges,
     loadDomains,
     loadNotes,
+    refreshPublishStatus,
     startPreview,
   ])
 
@@ -1153,6 +1259,8 @@ export function PublisherApp({
     }
   }
 
+  const renderedAppearanceGeneration = appearanceGeneration.current
+
   return (
     <main
       className="app-shell"
@@ -1187,6 +1295,20 @@ export function PublisherApp({
           onClick={() => setDomainManagerOpen(true)}
         >
           管理领域
+        </button>
+        <button
+          type="button"
+          className="secondary-button appearance-trigger"
+          disabled={blogBusy || switchPreparing || publishPreparing || publishOperationActive}
+          onClick={() => {
+            appearanceGeneration.current += 1
+            appearanceSession.current = undefined
+            setAppearanceClearError(undefined)
+            setAppearanceOpen(true)
+          }}
+        >
+          <Palette size={16} aria-hidden="true" />
+          外观
         </button>
         <div className="topbar-meta">
           <span className={`status-dot preview-${preview.state}`} />
@@ -1485,6 +1607,7 @@ export function PublisherApp({
             setPublishProgress(undefined)
             setPublishActionsUrl(undefined)
             const attempt = ++publishAttempt.current
+            setPublishPreparing(true)
             try {
               const saved = (await markdownEditor.current?.flush()) ?? true
               if (attempt !== publishAttempt.current) return
@@ -1502,7 +1625,10 @@ export function PublisherApp({
                 changeGroupIds: Object.freeze([...changeGroupIds]),
               })
               pendingPublishRequest.current = request
+              publishStatusGeneration.current += 1
+              setPublishOperationActive(true)
               const result = await api.publish.start(request)
+              if (!result.ok) void refreshPublishStatus()
               if (attempt !== publishAttempt.current) return
               if (!result.ok) {
                 showPublishError(result.error, "无法开始发布。")
@@ -1513,8 +1639,11 @@ export function PublisherApp({
               setPublishMessage("正在验证所选公开变化…")
               setChangeReviewOpen(false)
             } catch (error) {
+              void refreshPublishStatus()
               if (attempt !== publishAttempt.current) return
               showUnexpectedPublishError(error, "无法开始发布。")
+            } finally {
+              if (appMounted.current) setPublishPreparing(false)
             }
           }}
           onRepairAndPublish={async () => {
@@ -1524,6 +1653,7 @@ export function PublisherApp({
             setPublishProgress(undefined)
             setPublishActionsUrl(undefined)
             const attempt = ++publishAttempt.current
+            setPublishPreparing(true)
             try {
               const repaired = await api.publish.repairBranch()
               if (attempt !== publishAttempt.current) return
@@ -1531,7 +1661,10 @@ export function PublisherApp({
                 showPublishError(repaired.error, "无法安全切换到 main。")
                 return
               }
+              publishStatusGeneration.current += 1
+              setPublishOperationActive(true)
               const retried = await api.publish.start(request)
+              if (!retried.ok) void refreshPublishStatus()
               if (attempt !== publishAttempt.current) return
               if (!retried.ok) {
                 showPublishError(retried.error, "无法继续发布。")
@@ -1542,8 +1675,11 @@ export function PublisherApp({
               setPublishMessage("正在验证所选公开变化…")
               setChangeReviewOpen(false)
             } catch (error) {
+              void refreshPublishStatus()
               if (attempt !== publishAttempt.current) return
               showUnexpectedPublishError(error, "无法安全切换分支并继续发布。")
+            } finally {
+              if (appMounted.current) setPublishPreparing(false)
             }
           }}
         />
@@ -1614,6 +1750,20 @@ export function PublisherApp({
           onRemove={(request: DomainRemoveRequest) =>
             applyDomainMutation(() => api.domains.remove(request))
           }
+        />
+      ) : null}
+      {appearanceOpen ? (
+        <AppearanceDesigner
+          api={appearanceApi}
+          previewUrl={preview.lastSuccessfulUrl ?? preview.url}
+          externalError={appearanceClearError}
+          onClose={() => {
+            appearanceGeneration.current += 1
+            appearanceSession.current = undefined
+            setAppearanceClearError(undefined)
+            setAppearanceOpen(false)
+          }}
+          onChanged={() => appearanceChanged(renderedAppearanceGeneration)}
         />
       ) : null}
       <BlogManager

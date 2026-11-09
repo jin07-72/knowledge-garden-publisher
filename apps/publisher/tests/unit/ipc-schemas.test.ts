@@ -281,6 +281,7 @@ const validByChannel: Record<string, unknown> = {
     ...privateField,
   },
   [IPC_CHANNELS.requests.publishStart]: { operationId: "publish-1", ...privateField },
+  [IPC_CHANNELS.requests.publishStatus]: { active: true, operationId: "publish-1" },
   [IPC_CHANNELS.requests.publishRepairBranch]: {
     branch: "main",
     upstream: "origin/main",
@@ -790,6 +791,20 @@ describe("image library IPC schemas", () => {
 })
 
 describe("IPC success schemas", () => {
+  it("defines a strict minimal publish status contract", () => {
+    expect(IPC_CHANNELS.requests.publishStatus).toBe("garden:publish:status")
+    const schema = IPC_SUCCESS_SCHEMAS[IPC_CHANNELS.requests.publishStatus]
+
+    expect(schema.parse({ active: false })).toEqual({ active: false })
+    expect(schema.parse({ active: true, operationId: "publish-1" })).toEqual({
+      active: true,
+      operationId: "publish-1",
+    })
+    expect(schema.parse({ active: true })).toEqual({ active: true })
+    expect(schema.safeParse({ active: false, operationId: "publish-1" }).success).toBe(false)
+    expect(schema.safeParse({ active: false, privatePath: "C:/private" }).success).toBe(false)
+  })
+
   it("defines the publish branch repair request channel", () => {
     expect(IPC_CHANNELS.requests.publishRepairBranch).toBe("garden:publish:repair-branch")
   })

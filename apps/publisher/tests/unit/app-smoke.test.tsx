@@ -186,6 +186,7 @@ function gardenApi(): GardenApi {
     },
     publish: {
       start: vi.fn(),
+      status: vi.fn(async () => ok({ active: false as const })),
       repairBranch: vi.fn(),
       cancel: vi.fn(),
       onProgress: vi.fn(() => () => undefined),
