@@ -48,6 +48,15 @@ import {
   type ImageLibraryService,
 } from "./services/imageLibrary"
 import type { PublishBranchRepairService } from "./services/publishBranchRepair"
+import { createAppearanceAdapter } from "./services/appearance/appearanceAdapter"
+import {
+  createAppearanceAssetService,
+  type AppearanceAssetPicker,
+} from "./services/appearance/appearanceAssets"
+import {
+  createAppearanceService,
+  type AppearanceService,
+} from "./services/appearance/appearanceService"
 
 export interface PreviewServicePort {
   start(request: {
@@ -59,11 +68,72 @@ export interface PreviewServicePort {
   subscribe(listener: (status: PreviewStatus) => void): () => void
 }
 
+export function createE2ePreviewService(): PreviewServicePort & { dispose(): Promise<void> } {
+  let status: PreviewStatus = {
+    state: "ready",
+    generation: 1,
+    port: 8080,
+    url: "http://127.0.0.1:8080",
+  }
+  let disposed = false
+  const listeners = new Set<(status: PreviewStatus) => void>()
+  const transition = (next: PreviewStatus): PreviewStatus => {
+    status = next
+    for (const listener of listeners) listener(status)
+    return status
+  }
+  return {
+    start: async () => {
+      if (disposed || status.state === "ready") return status
+      return transition({
+        state: "ready",
+        generation: status.generation + 1,
+        port: 8080,
+        url: "http://127.0.0.1:8080",
+      })
+    },
+    stop: async () => {
+      if (status.state === "stopped") return status
+      return transition({ state: "stopped", generation: status.generation })
+    },
+    getStatus: () => status,
+    subscribe: (listener) => {
+      if (disposed) return () => undefined
+      listeners.add(listener)
+      return () => listeners.delete(listener)
+    },
+    dispose: async () => {
+      if (disposed) return
+      await Promise.resolve().then(() => {
+        if (status.state !== "stopped") {
+          transition({ state: "stopped", generation: status.generation })
+        }
+      })
+      disposed = true
+      listeners.clear()
+    },
+  }
+}
+
 export interface PublisherServiceDependencies {
   readonly workspace: string
   readonly trash: TrashAdapter
   readonly isTracked: (workspace: string, path: string) => Promise<boolean>
   readonly preview: PreviewServicePort
+  readonly appearanceFactory?: (options: {
+    readonly workspace: string
+    readonly preview: PreviewServicePort
+  }) => Promise<AppearanceService>
+  readonly appearanceAssetPicker?: AppearanceAssetPicker
+  readonly installAppearancePreview?: (request: {
+    readonly url: string
+    readonly sessionId: string
+    readonly css: string
+  }) => Promise<boolean>
+  readonly removeAppearancePreview?: (request: {
+    readonly url: string
+    readonly sessionId: string
+  }) => Promise<boolean>
   readonly imageLibraryAdapter?: ImageLibraryAdapter
   readonly imageLibraryFactory?: (options: {
     readonly workspace: string
@@ -155,6 +225,7 @@ export async function createPublisherServices(
   let domains: DomainCatalog | undefined
   let deploymentHistory: DeploymentHistoryService | undefined
   let images: ImageLibraryService | undefined
+  let appearance: AppearanceService | undefined
   let publisher:
     ReturnType<NonNullable<PublisherServiceDependencies["publisherFactory"]>> | undefined
 
@@ -173,6 +244,13 @@ export async function createPublisherServices(
     if (publisher) {
       try {
         await publisher.dispose()
+      } catch (error) {
+        failures.push(error)
+      }
+    }
+    if (appearance) {
+      try {
+        await appearance.dispose()
       } catch (error) {
         failures.push(error)
       }
@@ -229,6 +307,34 @@ export async function createPublisherServices(
       workspace,
       adapter: imageLibraryAdapter,
     })
+    appearance = await (
+      dependencies.appearanceFactory ??
+      (async () => {
+        const assets = createAppearanceAssetService({
+          picker:
+            dependencies.appearanceAssetPicker ??
+            ({
+              chooseImage: async () => undefined,
+              decodePreview: async () => Promise.reject(unavailable("Image decoding")),
+            } satisfies AppearanceAssetPicker),
+          now: Date.now,
+          createToken: randomUUID,
+        })
+        try {
+          return await createAppearanceService({
+            workspace,
+            adapter: await createAppearanceAdapter(workspace),
+            assets,
+            preview,
+            installPreview: dependencies.installAppearancePreview ?? (async () => false),
+            removePreview: dependencies.removeAppearancePreview ?? (async () => false),
+          })
+        } catch (error) {
+          assets.dispose()
+          throw error
+        }
+      })
+    )({ workspace, preview })
     reject = async <T>(name: string): Promise<T> => Promise.reject(unavailable(name))
     publishListeners = new Set<(progress: PublishProgress) => void>()
     emitPublish = (progress: PublishProgress): void => {
@@ -241,7 +347,8 @@ export async function createPublisherServices(
   const catalog = domains
   const history = deploymentHistory
   const imageLibrary = images
-  if (!catalog || !history || !imageLibrary)
+  const appearanceService = appearance
+  if (!catalog || !history || !imageLibrary || !appearanceService)
     return rollbackConstruction(new Error("Publisher services failed to initialize."))
   let activePublish: string | undefined
   let preparingPublish = 0
@@ -314,6 +421,7 @@ export async function createPublisherServices(
       switchPreparing = true
       await imageLibrary.dispose()
       await catalog.dispose()
+      await appearanceService.dispose()
       recoveryDisposed = true
       if (recoveryTimer) clearTimeout(recoveryTimer)
       recoveryAbort?.abort()
@@ -374,6 +482,7 @@ export async function createPublisherServices(
       status: () => preview.getStatus(),
       subscribe: (listener) => preview.subscribe(listener),
     },
+    appearance: appearanceService,
     changes: {
       list: () => (switchPreparing ? Promise.reject(switchBusy()) : changeScanner.list()),
       cancel: () => changeScanner.cancel(),

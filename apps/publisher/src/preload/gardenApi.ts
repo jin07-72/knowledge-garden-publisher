@@ -1,5 +1,13 @@
 import {
   IPC_CHANNELS,
+  type AppearanceApplyReceipt,
+  type AppearanceApplyRequest,
+  type AppearanceBackgroundSelection,
+  type AppearanceClearPreviewRequest,
+  type AppearancePreviewReceipt,
+  type AppearancePreviewRequest,
+  type AppearanceSnapshot,
+  type AppearanceUndoRequest,
   type BlogAddLocalRequest,
   type BlogCandidateInspection,
   type BlogCandidateSelection,
@@ -15,7 +23,7 @@ import {
   type BlogRenameRequest,
   type BlogSwitchRequest,
   type BlogWebsiteUpdateRequest,
-  type GardenApi as BaseGardenApi,
+  type GardenApi,
   type ChangeReview,
   type BeforeCloseRequest,
   type CloseAckRequest,
@@ -75,7 +83,7 @@ import {
 } from "../shared/ipcSchemas"
 import { z } from "zod"
 
-export type GardenApi = BaseGardenApi
+export type { GardenApi } from "../shared/contracts"
 
 declare global {
   interface Window {
@@ -250,6 +258,22 @@ export function createGardenApi(ipc: IpcRendererPort): GardenApi {
     onProgress: (listener: (status: PreviewStatus) => void) =>
       subscription(ipc, IPC_CHANNELS.events.previewProgress, previewProgressSchema, listener),
   })
+  const appearance = Object.freeze({
+    read: () => invoke<AppearanceSnapshot>(ipc, IPC_CHANNELS.requests.appearanceRead),
+    chooseBackground: () =>
+      invoke<AppearanceBackgroundSelection | undefined>(
+        ipc,
+        IPC_CHANNELS.requests.appearanceChooseBackground,
+      ),
+    preview: (request: AppearancePreviewRequest) =>
+      invoke<AppearancePreviewReceipt>(ipc, IPC_CHANNELS.requests.appearancePreview, request),
+    clearPreview: (request: AppearanceClearPreviewRequest) =>
+      invoke<void>(ipc, IPC_CHANNELS.requests.appearanceClearPreview, request),
+    apply: (request: AppearanceApplyRequest) =>
+      invoke<AppearanceApplyReceipt>(ipc, IPC_CHANNELS.requests.appearanceApply, request),
+    undo: (request: AppearanceUndoRequest) =>
+      invoke<AppearanceApplyReceipt>(ipc, IPC_CHANNELS.requests.appearanceUndo, request),
+  })
   const changes = Object.freeze({
     list: () => invoke<ChangeReview>(ipc, IPC_CHANNELS.requests.changesList),
     cancel: () => invoke<void>(ipc, IPC_CHANNELS.requests.changesCancel),
@@ -283,6 +307,7 @@ export function createGardenApi(ipc: IpcRendererPort): GardenApi {
     notes,
     images,
     preview,
+    appearance,
     changes,
     publish,
     history,

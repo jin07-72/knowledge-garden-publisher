@@ -29,6 +29,7 @@ import {
 } from "./blogRuntime"
 import {
   canRestorePublisherRuntime,
+  createE2ePreviewService,
   createPublisherCloseCoordinator,
   createPublisherRuntimeShutdown,
   createPublisherServices,
@@ -53,7 +54,6 @@ import {
 import type {
   PreviewRevealRequest,
   PreviewRevealResult,
-  PreviewStatus,
   PublishProgress,
 } from "../shared/contracts"
 import { resolveMainRuntimeFiles } from "./mainRuntime"
@@ -281,22 +281,6 @@ function mapPublishProgress(progress: PublishProgressEvent): PublishProgress | u
   return { phase, message: progress.message }
 }
 
-function e2ePreview(): PreviewServicePort & { dispose(): Promise<void> } {
-  const status: PreviewStatus = {
-    state: "ready",
-    generation: 1,
-    port: 8080,
-    url: "http://127.0.0.1:8080",
-  }
-  return {
-    start: async () => status,
-    stop: async () => ({ state: "stopped", generation: 2 }),
-    getStatus: () => status,
-    subscribe: () => () => undefined,
-    dispose: async () => undefined,
-  }
-}
-
 app.whenReady().then(async () => {
   const e2e = !app.isPackaged && process.env.GARDEN_PUBLISHER_E2E === "1"
   const requestedWorkspace = process.env.GARDEN_PUBLISHER_E2E_WORKSPACE
@@ -462,7 +446,7 @@ app.whenReady().then(async () => {
   }
 
   try {
-    previewManager = e2e ? e2ePreview() : createProductionPreviewManager(runtimePath)
+    previewManager = e2e ? createE2ePreviewService() : createProductionPreviewManager(runtimePath)
     const publisherFactory = (onProgress: (progress: PublishProgress) => void) => {
       const relay = (progress: PublishProgressEvent): void => {
         const mapped = mapPublishProgress(progress)
@@ -507,6 +491,9 @@ app.whenReady().then(async () => {
       trash,
       isTracked,
       preview: previewManager,
+      appearanceAssetPicker: createProductionAppearanceAssetPicker(),
+      installAppearancePreview: previewAppearance,
+      removeAppearancePreview: clearAppearancePreview,
       imageLibraryAdapter,
       openExternal: (url) => shell.openExternal(url),
       clearHttpCache: () => session.defaultSession.clearCache(),

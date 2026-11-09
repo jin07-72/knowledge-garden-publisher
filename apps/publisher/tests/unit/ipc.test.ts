@@ -7,6 +7,7 @@ import {
   type PreviewStatus,
   type PublishProgress,
 } from "../../src/shared/contracts"
+import { DEFAULT_APPEARANCE } from "../../src/shared/appearance"
 import {
   registerBlogManagementIpc,
   registerLifecycleIpc,
@@ -113,6 +114,14 @@ function services(): PublisherIpcServices & {
         previewListeners.add(listener)
         return () => previewListeners.delete(listener)
       },
+    },
+    appearance: {
+      read: call("appearanceRead"),
+      chooseBackground: call("appearanceChooseBackground"),
+      preview: call("appearancePreview"),
+      clearPreview: call("appearanceClearPreview"),
+      apply: call("appearanceApply"),
+      undo: call("appearanceUndo"),
     },
     changes: { list: call("changesList"), cancel: call("changesCancel") },
     publish: {
@@ -926,6 +935,82 @@ describe("secure publisher IPC", () => {
     expect(ipc.handlers.has("fs.readFile")).toBe(false)
     dispose()
     expect(ipc.handlers.size).toBe(0)
+  })
+
+  it("routes all six appearance requests through strict trusted handlers", async () => {
+    const { ipc, servicePorts } = setup()
+    const snapshot = {
+      framework: "quartz" as const,
+      supported: true,
+      settings: DEFAULT_APPEARANCE,
+      baselineHash: "a".repeat(64),
+      canUndo: true,
+    }
+    const previewRequest = {
+      url: "http://127.0.0.1:4173/",
+      sessionId: blogId,
+      settings: DEFAULT_APPEARANCE,
+    }
+    const clearRequest = { sessionId: blogId }
+    const applyRequest = { settings: DEFAULT_APPEARANCE, baselineHash: "a".repeat(64) }
+    const undoRequest = { baselineHash: "a".repeat(64) }
+    servicePorts.calls.appearanceRead.mockResolvedValueOnce(snapshot)
+    servicePorts.calls.appearanceChooseBackground.mockResolvedValueOnce({
+      source: "staged",
+      token: blogId,
+      name: "hero.png",
+    })
+    servicePorts.calls.appearancePreview.mockResolvedValueOnce({ sessionId: blogId })
+    servicePorts.calls.appearanceClearPreview.mockResolvedValueOnce(undefined)
+    servicePorts.calls.appearanceApply.mockResolvedValueOnce({ snapshot })
+    servicePorts.calls.appearanceUndo.mockResolvedValueOnce({ snapshot })
+
+    await expect(ipc.invoke(IPC_CHANNELS.requests.appearanceRead, trustedEvent)).resolves.toEqual({
+      ok: true,
+      value: snapshot,
+    })
+    await expect(
+      ipc.invoke(IPC_CHANNELS.requests.appearanceChooseBackground, trustedEvent),
+    ).resolves.toMatchObject({ ok: true, value: { source: "staged", name: "hero.png" } })
+    await expect(
+      ipc.invoke(IPC_CHANNELS.requests.appearancePreview, trustedEvent, previewRequest),
+    ).resolves.toEqual({ ok: true, value: { sessionId: blogId } })
+    await expect(
+      ipc.invoke(IPC_CHANNELS.requests.appearanceClearPreview, trustedEvent, clearRequest),
+    ).resolves.toEqual({ ok: true, value: undefined })
+    await expect(
+      ipc.invoke(IPC_CHANNELS.requests.appearanceApply, trustedEvent, applyRequest),
+    ).resolves.toEqual({ ok: true, value: { snapshot } })
+    await expect(
+      ipc.invoke(IPC_CHANNELS.requests.appearanceUndo, trustedEvent, undoRequest),
+    ).resolves.toEqual({ ok: true, value: { snapshot } })
+  })
+
+  it("rejects untrusted and malformed appearance requests before dispatch", async () => {
+    const { ipc, servicePorts } = setup()
+    const valid = {
+      url: "http://127.0.0.1:4173/",
+      sessionId: blogId,
+      settings: DEFAULT_APPEARANCE,
+    }
+
+    await expect(
+      ipc.invoke(IPC_CHANNELS.requests.appearancePreview, {}, valid),
+    ).resolves.toMatchObject({ ok: false, error: { code: "IPC_UNAUTHORIZED" } })
+    await expect(
+      ipc.invoke(IPC_CHANNELS.requests.appearancePreview, trustedEvent, {
+        ...valid,
+        extra: true,
+      }),
+    ).resolves.toMatchObject({ ok: false, error: { code: "INVALID_INPUT" } })
+    await expect(
+      ipc.invoke(IPC_CHANNELS.requests.appearanceApply, trustedEvent, {
+        settings: DEFAULT_APPEARANCE,
+        baselineHash: "short",
+      }),
+    ).resolves.toMatchObject({ ok: false, error: { code: "INVALID_INPUT" } })
+    expect(servicePorts.calls.appearancePreview).not.toHaveBeenCalled()
+    expect(servicePorts.calls.appearanceApply).not.toHaveBeenCalled()
   })
 
   it("routes the exact domain request pairs and validates every successful result", async () => {
@@ -1910,7 +1995,9 @@ describe("preload garden API", () => {
   })
 
   it("exposes domain management through the shared renderer contract", () => {
+    const appearanceIsRequired: {} extends Pick<SharedGardenApi, "appearance"> ? false : true = true
     const api: SharedGardenApi = createGardenApi(new FakeIpcRenderer())
+    expect(appearanceIsRequired).toBe(true)
     void api.domains.list()
     void api.domains.create({ name: "Artificial Intelligence", slug: "artificial-intelligence" })
     void api.domains.rename({ slug: "artificial-intelligence", name: "AI" })
@@ -1955,6 +2042,7 @@ describe("preload garden API", () => {
     }
     expect(Object.keys(api).sort()).toEqual(
       [
+        "appearance",
         "blogs",
         "changes",
         "history",
@@ -2005,6 +2093,36 @@ describe("preload garden API", () => {
       [IPC_CHANNELS.requests.imagesPreview, requests.preview],
       [IPC_CHANNELS.requests.imagesDelete, requests.delete],
       [IPC_CHANNELS.requests.imagesCopyMarkdown, requests.copyMarkdown],
+    ])
+  })
+
+  it("exposes a frozen appearance bridge on the six exact channels", async () => {
+    const ipc = new FakeIpcRenderer()
+    const api = createGardenApi(ipc)
+    const previewRequest = {
+      url: "http://127.0.0.1:4173/",
+      sessionId: blogId,
+      settings: DEFAULT_APPEARANCE,
+    }
+    const clearRequest = { sessionId: blogId }
+    const applyRequest = { settings: DEFAULT_APPEARANCE, baselineHash: "a".repeat(64) }
+    const undoRequest = { baselineHash: "a".repeat(64) }
+
+    await api.appearance.read()
+    await api.appearance.chooseBackground()
+    await api.appearance.preview(previewRequest)
+    await api.appearance.clearPreview(clearRequest)
+    await api.appearance.apply(applyRequest)
+    await api.appearance.undo(undoRequest)
+
+    expect(Object.isFrozen(api.appearance)).toBe(true)
+    expect(ipc.invokes).toEqual([
+      [IPC_CHANNELS.requests.appearanceRead, undefined],
+      [IPC_CHANNELS.requests.appearanceChooseBackground, undefined],
+      [IPC_CHANNELS.requests.appearancePreview, previewRequest],
+      [IPC_CHANNELS.requests.appearanceClearPreview, clearRequest],
+      [IPC_CHANNELS.requests.appearanceApply, applyRequest],
+      [IPC_CHANNELS.requests.appearanceUndo, undoRequest],
     ])
   })
 
@@ -2098,6 +2216,19 @@ describe("preload garden API", () => {
       text: "目标",
       positionRatio: 0.5,
     })
+    await api.appearance.read()
+    await api.appearance.chooseBackground()
+    await api.appearance.preview({
+      url: "http://127.0.0.1:4173/",
+      sessionId: blogId,
+      settings: DEFAULT_APPEARANCE,
+    })
+    await api.appearance.clearPreview({ sessionId: blogId })
+    await api.appearance.apply({
+      settings: DEFAULT_APPEARANCE,
+      baselineHash: "a".repeat(64),
+    })
+    await api.appearance.undo({ baselineHash: "a".repeat(64) })
     await api.changes.list()
     await api.changes.cancel()
     await api.publish.start({ changeGroupIds: ["note:a"], message: "Publish A" })

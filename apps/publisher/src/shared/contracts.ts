@@ -846,6 +846,14 @@ export interface GardenApi {
     revealSelection?(request: PreviewRevealRequest): Promise<IpcResult<PreviewRevealResult>>
     onProgress(listener: (status: PreviewStatus) => void): Unsubscribe
   }
+  readonly appearance: {
+    read(): Promise<IpcResult<AppearanceSnapshot>>
+    chooseBackground(): Promise<IpcResult<AppearanceBackgroundSelection | undefined>>
+    preview(request: AppearancePreviewRequest): Promise<IpcResult<AppearancePreviewReceipt>>
+    clearPreview(request: AppearanceClearPreviewRequest): Promise<IpcResult<void>>
+    apply(request: AppearanceApplyRequest): Promise<IpcResult<AppearanceApplyReceipt>>
+    undo(request: AppearanceUndoRequest): Promise<IpcResult<AppearanceApplyReceipt>>
+  }
   readonly changes: {
     list(): Promise<IpcResult<ChangeReview>>
     cancel(): Promise<IpcResult<void>>

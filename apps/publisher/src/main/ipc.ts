@@ -3,6 +3,14 @@ import {
   IPC_CHANNELS,
   MANAGED_NOTE_PATH_PATTERN,
   type AppError,
+  type AppearanceApplyReceipt,
+  type AppearanceApplyRequest,
+  type AppearanceBackgroundSelection,
+  type AppearanceClearPreviewRequest,
+  type AppearancePreviewReceipt,
+  type AppearancePreviewRequest,
+  type AppearanceSnapshot,
+  type AppearanceUndoRequest,
   type BlogAddLocalRequest,
   type BlogCandidateInspection,
   type BlogCandidateSelection,
@@ -67,6 +75,10 @@ import {
 import {
   IPC_SUCCESS_SCHEMAS,
   appErrorSchema,
+  appearanceApplyRequestSchema,
+  appearanceClearPreviewRequestSchema,
+  appearancePreviewRequestSchema,
+  appearanceUndoRequestSchema,
   blogAddLocalRequestSchema,
   blogCloneRequestSchema,
   blogIdRequestSchema,
@@ -150,6 +162,14 @@ export interface PublisherIpcServices {
     status(): Promise<PreviewStatus> | PreviewStatus
     revealSelection?(request: PreviewRevealRequest): Promise<PreviewRevealResult>
     subscribe(listener: (status: PreviewStatus) => void): () => void
+  }
+  readonly appearance: {
+    read(): Promise<AppearanceSnapshot>
+    chooseBackground(): Promise<AppearanceBackgroundSelection | undefined>
+    preview(request: AppearancePreviewRequest): Promise<AppearancePreviewReceipt>
+    clearPreview(request: AppearanceClearPreviewRequest): Promise<void>
+    apply(request: AppearanceApplyRequest): Promise<AppearanceApplyReceipt>
+    undo(request: AppearanceUndoRequest): Promise<AppearanceApplyReceipt>
   }
   readonly changes: {
     list(): Promise<ChangeReview>
@@ -1017,6 +1037,57 @@ export function registerPublisherIpc(options: RegisterPublisherIpcOptions): () =
         previewRevealRequestSchema,
         isTrustedSender,
         (request) => services.preview.revealSelection?.(request) ?? "not-ready",
+      ),
+    ],
+    [
+      IPC_CHANNELS.requests.appearanceRead,
+      secureHandler(IPC_CHANNELS.requests.appearanceRead, noRequestSchema, isTrustedSender, () =>
+        services.appearance.read(),
+      ),
+    ],
+    [
+      IPC_CHANNELS.requests.appearanceChooseBackground,
+      secureHandler(
+        IPC_CHANNELS.requests.appearanceChooseBackground,
+        noRequestSchema,
+        isTrustedSender,
+        () => services.appearance.chooseBackground(),
+      ),
+    ],
+    [
+      IPC_CHANNELS.requests.appearancePreview,
+      secureHandler(
+        IPC_CHANNELS.requests.appearancePreview,
+        appearancePreviewRequestSchema,
+        isTrustedSender,
+        (request) => services.appearance.preview(request),
+      ),
+    ],
+    [
+      IPC_CHANNELS.requests.appearanceClearPreview,
+      secureHandler(
+        IPC_CHANNELS.requests.appearanceClearPreview,
+        appearanceClearPreviewRequestSchema,
+        isTrustedSender,
+        (request) => services.appearance.clearPreview(request),
+      ),
+    ],
+    [
+      IPC_CHANNELS.requests.appearanceApply,
+      secureHandler(
+        IPC_CHANNELS.requests.appearanceApply,
+        appearanceApplyRequestSchema,
+        isTrustedSender,
+        (request) => services.appearance.apply(request),
+      ),
+    ],
+    [
+      IPC_CHANNELS.requests.appearanceUndo,
+      secureHandler(
+        IPC_CHANNELS.requests.appearanceUndo,
+        appearanceUndoRequestSchema,
+        isTrustedSender,
+        (request) => services.appearance.undo(request),
       ),
     ],
     [

@@ -169,6 +169,14 @@ function gardenApi(): GardenApi {
       status: vi.fn(async () => ok(ready)),
       onProgress: vi.fn(() => () => undefined),
     },
+    appearance: {
+      read: vi.fn(),
+      chooseBackground: vi.fn(),
+      preview: vi.fn(),
+      clearPreview: vi.fn(),
+      apply: vi.fn(),
+      undo: vi.fn(),
+    },
     changes: {
       list: vi.fn(async () => ({
         ok: false as const,

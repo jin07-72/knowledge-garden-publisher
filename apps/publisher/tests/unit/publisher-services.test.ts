@@ -4,6 +4,7 @@ import { join } from "node:path"
 import { afterEach, describe, expect, it, vi } from "vitest"
 import {
   createPublisherCloseCoordinator,
+  createE2ePreviewService,
   createPublisherRuntimeShutdown,
   createPublisherQuitCoordinator,
   createPublisherServices,
@@ -14,6 +15,7 @@ import type { DomainCatalog } from "../../src/main/services/domains"
 import type { PreviewStatus } from "../../src/shared/contracts"
 import type { ImageLibraryAdapter, ImageLibraryService } from "../../src/main/services/imageLibrary"
 import type { PublishBranchRepairService } from "../../src/main/services/publishBranchRepair"
+import type { AppearanceService } from "../../src/main/services/appearance/appearanceService"
 import { git } from "../helpers/git"
 
 const temporaryDirectories: string[] = []
@@ -97,6 +99,19 @@ function imageService(overrides: Partial<ImageLibraryService> = {}): ImageLibrar
   }
 }
 
+function appearanceService(overrides: Partial<AppearanceService> = {}): AppearanceService {
+  return {
+    read: vi.fn(),
+    chooseBackground: vi.fn(),
+    preview: vi.fn(),
+    clearPreview: vi.fn(),
+    apply: vi.fn(),
+    undo: vi.fn(),
+    dispose: vi.fn(async () => undefined),
+    ...overrides,
+  }
+}
+
 describe("publisher service wiring", () => {
   function branchRepair(
     overrides: Partial<PublishBranchRepairService> = {},
@@ -112,6 +127,21 @@ describe("publisher service wiring", () => {
       ...overrides,
     }
   }
+
+  it("advances the E2E preview generation across a verified restart", async () => {
+    const manager = createE2ePreviewService()
+    const before = manager.getStatus()
+
+    await expect(manager.stop()).resolves.toMatchObject({ state: "stopped" })
+    const firstRestart = await manager.start({ workspace: "C:/fixture" })
+    await expect(manager.stop()).resolves.toMatchObject({ state: "stopped" })
+    const secondRestart = await manager.start({ workspace: "C:/fixture" })
+
+    expect(firstRestart).toMatchObject({ state: "ready" })
+    expect(firstRestart.generation).toBeGreaterThan(before.generation)
+    expect(secondRestart.generation).toBeGreaterThan(firstRestart.generation)
+    expect(manager.getStatus()).toEqual(secondRestart)
+  })
 
   it("creates exactly one workspace-bound image service and exposes it unchanged", async () => {
     const workspace = await garden()
@@ -131,6 +161,77 @@ describe("publisher service wiring", () => {
     expect(services.images).toBe(images)
     await services.dispose()
     expect(images.dispose).toHaveBeenCalledOnce()
+  })
+
+  it("constructs one required appearance service and disposes it before preview teardown", async () => {
+    const workspace = await garden()
+    const order: string[] = []
+    const appearance = appearanceService({
+      dispose: vi.fn(async () => {
+        order.push("appearance")
+      }),
+    })
+    const images = imageService({
+      dispose: vi.fn(async () => {
+        order.push("images")
+      }),
+    })
+    const catalog = domainCatalog({
+      dispose: vi.fn(async () => {
+        order.push("domains")
+      }),
+    })
+    const appearanceFactory = vi.fn(async () => appearance)
+    const services = await createPublisherServices({
+      workspace,
+      trash: { trashItem: async () => undefined },
+      isTracked: async () => false,
+      preview: preview(),
+      imageLibraryAdapter: imageAdapter(),
+      imageLibraryFactory: () => images,
+      domainCatalogFactory: () => catalog,
+      appearanceFactory,
+    })
+
+    expect(appearanceFactory).toHaveBeenCalledExactlyOnceWith({
+      workspace,
+      preview: expect.any(Object),
+    })
+    expect(services.appearance).toBe(appearance)
+    await services.dispose()
+    expect(order.slice(0, 3)).toEqual(["images", "domains", "appearance"])
+  })
+
+  it("rolls back a constructed appearance service when later construction fails", async () => {
+    const workspace = await garden()
+    const order: string[] = []
+    const appearance = appearanceService({
+      dispose: vi.fn(async () => {
+        order.push("appearance")
+      }),
+    })
+    const images = imageService({
+      dispose: vi.fn(async () => {
+        order.push("images")
+      }),
+    })
+    const primary = new Error("publisher construction failed")
+
+    await expect(
+      createPublisherServices({
+        workspace,
+        trash: { trashItem: async () => undefined },
+        isTracked: async () => false,
+        preview: preview(),
+        imageLibraryAdapter: imageAdapter(),
+        imageLibraryFactory: () => images,
+        appearanceFactory: async () => appearance,
+        publisherFactory: () => {
+          throw primary
+        },
+      }),
+    ).rejects.toBe(primary)
+    expect(order.slice(0, 2)).toEqual(["appearance", "images"])
   })
 
   it("invalidates and drains the image service before disposing workspace services", async () => {
