@@ -72,6 +72,13 @@ import {
 } from "./services/appearance/appearanceAssets"
 import { createPublishBranchRepair } from "./services/publishBranchRepair"
 import { revealSelectionInPreviewFrames } from "./previewFrameNavigation"
+import {
+  clearAppearancePreview as clearAppearancePreviewInFrames,
+  previewAppearance as previewAppearanceInFrames,
+  type AppearanceFrameClearRequest,
+  type AppearanceFramePreviewRequest,
+  type PreviewFramePort,
+} from "./previewAppearance"
 
 let mainWindow: BrowserWindow | undefined
 let mainWindowTrust: RendererTrustPolicy | undefined
@@ -100,6 +107,25 @@ async function revealSelectionInCurrentPreview(
   const window = mainWindow
   if (!window || window.isDestroyed() || window.webContents.isDestroyed()) return "not-ready"
   return revealSelectionInPreviewFrames([...window.webContents.mainFrame.framesInSubtree], request)
+}
+
+function appearanceFrames(): readonly PreviewFramePort[] {
+  const window = mainWindow
+  if (!window || window.isDestroyed() || window.webContents.isDestroyed()) return []
+  return [...window.webContents.mainFrame.framesInSubtree].map((frame) => ({
+    get url() {
+      return frame.url
+    },
+    executeJavaScript: (source, userGesture) => frame.executeJavaScript(source, userGesture),
+  }))
+}
+
+export function previewAppearance(request: AppearanceFramePreviewRequest): Promise<boolean> {
+  return previewAppearanceInFrames(appearanceFrames, request)
+}
+
+export function clearAppearancePreview(request: AppearanceFrameClearRequest): Promise<boolean> {
+  return clearAppearancePreviewInFrames(appearanceFrames, request)
 }
 
 const runtimeShutdown = createPublisherRuntimeShutdown({
