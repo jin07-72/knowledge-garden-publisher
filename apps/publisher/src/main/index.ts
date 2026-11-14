@@ -446,7 +446,33 @@ app.whenReady().then(async () => {
   }
 
   try {
-    previewManager = e2e ? createE2ePreviewService() : createProductionPreviewManager(runtimePath)
+    // Keep the default E2E stub unless this one workflow explicitly proves the production manager.
+    const e2eRealPreview = e2e && process.env.GARDEN_PUBLISHER_E2E_REAL_PREVIEW === "1"
+    previewManager =
+      e2e && !e2eRealPreview
+        ? createE2ePreviewService()
+        : createProductionPreviewManager(runtimePath)
+    if (e2eRealPreview) {
+      const transitions: {
+        state: string
+        generation: number
+        port?: number
+        url?: string
+      }[] = []
+      ;(
+        globalThis as typeof globalThis & {
+          __GARDEN_PUBLISHER_E2E_REAL_PREVIEW_STATES__?: readonly {
+            readonly state: string
+            readonly generation: number
+            readonly port?: number
+            readonly url?: string
+          }[]
+        }
+      ).__GARDEN_PUBLISHER_E2E_REAL_PREVIEW_STATES__ = transitions
+      previewManager.subscribe(({ state, generation, port, url }) =>
+        transitions.push({ state, generation, port, url }),
+      )
+    }
     const publisherFactory = (onProgress: (progress: PublishProgress) => void) => {
       const relay = (progress: PublishProgressEvent): void => {
         const mapped = mapPublishProgress(progress)

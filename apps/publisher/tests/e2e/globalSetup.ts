@@ -1,8 +1,8 @@
 import { mkdir, mkdtemp, rm } from "node:fs/promises"
 import { basename, dirname, join, resolve } from "node:path"
 
-const publisherRoot = resolve(import.meta.dirname, "../..")
-const e2eTempParent = join(publisherRoot, ".garden-publisher", "e2e-temp")
+const sourceRoot = resolve(import.meta.dirname, "../../../..")
+const e2eTempParent = join(dirname(sourceRoot), ".garden-publisher-e2e")
 const runPrefix = "run-"
 
 export default async function globalSetup(): Promise<() => Promise<void>> {

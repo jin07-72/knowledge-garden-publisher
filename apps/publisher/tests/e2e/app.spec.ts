@@ -1,9 +1,11 @@
 import { _electron as electron, expect, test, type Locator } from "@playwright/test"
-import type { ChildProcess } from "node:child_process"
+import { execFile, type ChildProcess } from "node:child_process"
 import { mkdir, readFile, readdir, writeFile } from "node:fs/promises"
+import { createServer, type Server } from "node:net"
 import { basename, dirname, join, resolve } from "node:path"
 import { deflateSync } from "node:zlib"
 import matter from "gray-matter"
+import { parse } from "yaml"
 import {
   createQuartzGardenFixture,
   createTemporaryGitRepository,
@@ -145,7 +147,18 @@ async function terminateLaunchedChild(child: ChildProcess): Promise<boolean> {
   // Use the original ChildProcess handle rather than a raw PID. This avoids
   // targeting an unrelated process if Windows has already recycled the PID.
   try {
-    child.kill("SIGKILL")
+    if (process.platform === "win32" && Number.isSafeInteger(child.pid) && child.pid! > 0) {
+      await new Promise<void>((resolvePromise) => {
+        execFile(
+          "taskkill.exe",
+          ["/PID", String(child.pid), "/T", "/F"],
+          { windowsHide: true },
+          () => resolvePromise(),
+        )
+      })
+    } else {
+      child.kill("SIGKILL")
+    }
   } catch {
     // The original child may have exited between the state check and kill.
   }
@@ -156,12 +169,99 @@ async function closeApplication(application: ElectronApplication | undefined): P
   if (!application) return
   const child = application.process()
   const close = application.close()
-  if (!(await bounded(close, 5_000))) await terminateLaunchedChild(child)
-  await bounded(close, 5_000)
-  if (!(await waitForChildExit(child)) && !(await terminateLaunchedChild(child))) {
-    throw new Error(`Electron process ${child.pid ?? "unknown"} remained after forced termination.`)
+  let timer: ReturnType<typeof setTimeout> | undefined
+  const outcome = await Promise.race([
+    close.then(
+      async () =>
+        (await waitForChildExit(child, 45_000))
+          ? { kind: "closed" as const }
+          : { kind: "timeout" as const },
+      (error: unknown) => ({ kind: "rejected" as const, error }),
+    ),
+    new Promise<{ readonly kind: "timeout" }>((resolvePromise) => {
+      // The application may spend 10 seconds flushing renderer state before it can
+      // dispose the preview workspace and its Quartz child process.
+      timer = setTimeout(() => resolvePromise({ kind: "timeout" }), 45_000)
+    }),
+  ])
+  if (timer) clearTimeout(timer)
+
+  if (outcome.kind !== "closed") {
+    const terminated = await terminateLaunchedChild(child)
+    launchedChildren.delete(child)
+    if (!terminated) {
+      throw new Error(
+        `Electron process ${child.pid ?? "unknown"} remained after graceful close failed and forced termination was attempted.`,
+      )
+    }
+    if (outcome.kind === "timeout") {
+      throw new Error("Electron application.close() exceeded the 45 second graceful-close limit.")
+    }
+    throw new Error("Electron application.close() rejected during graceful shutdown.", {
+      cause: outcome.error,
+    })
   }
   launchedChildren.delete(child)
+}
+
+async function holdLoopbackPortIfAvailable(port: number): Promise<Server | undefined> {
+  const server = createServer()
+  return new Promise((resolvePromise, reject) => {
+    server.once("error", (error: NodeJS.ErrnoException) => {
+      if (error.code === "EADDRINUSE") resolvePromise(undefined)
+      else reject(error)
+    })
+    server.listen({ host: "127.0.0.1", port, exclusive: true }, () => resolvePromise(server))
+  })
+}
+
+async function closeServer(server: Server | undefined): Promise<void> {
+  if (!server?.listening) return
+  await new Promise<void>((resolvePromise, reject) => {
+    server.close((error) => (error ? reject(error) : resolvePromise()))
+  })
+}
+
+async function loopbackPortAvailable(port: number): Promise<boolean> {
+  const server = createServer()
+  return new Promise((resolvePromise) => {
+    const finish = (available: boolean): void => {
+      server.removeAllListeners()
+      resolvePromise(available)
+    }
+    server.once("error", () => finish(false))
+    server.listen({ host: "127.0.0.1", port, exclusive: true }, () => {
+      server.close((error) => finish(!error))
+    })
+  })
+}
+
+async function previewWorkspaceDirectories(root: string): Promise<string[]> {
+  return (await readdir(root, { withFileTypes: true }))
+    .filter((entry) => entry.isDirectory() && entry.name.startsWith("knowledge-garden-preview-"))
+    .map((entry) => entry.name)
+    .sort()
+}
+
+async function removeTemporaryDirectoryEventually(path: string): Promise<void> {
+  let lastError: unknown
+  await expect
+    .poll(
+      async () => {
+        try {
+          await removeTemporaryDirectory(path)
+          return true
+        } catch (error) {
+          lastError = error
+          return false
+        }
+      },
+      { timeout: 15_000 },
+    )
+    .toBe(true)
+    .catch(() => {
+      throw lastError
+    })
 }
 
 function samePath(left: string, right: string): boolean {
@@ -664,6 +764,126 @@ tags:
 ${body}
 `
 
+const quartzAppearanceConfiguration = `configuration:
+  pageTitle: Appearance Garden
+  keepMe: unchanged
+  theme:
+    fontOrigin: local
+    typography:
+      header: Existing Header
+      body: Existing Body
+      code: Existing Code
+    colors:
+      lightMode:
+        light: "#101010"
+        lightgray: "#202020"
+        gray: "#303030"
+        darkgray: "#d0d0d0"
+        dark: "#f0f0f0"
+        secondary: "#22d3ee"
+        tertiary: "#94a3b8"
+        highlight: "rgba(0, 0, 0, 0.1)"
+        textHighlight: "rgba(0, 0, 0, 0.2)"
+      darkMode:
+        light: "#101010"
+        lightgray: "#202020"
+        gray: "#303030"
+        darkgray: "#d0d0d0"
+        dark: "#f0f0f0"
+        secondary: "#22d3ee"
+        tertiary: "#94a3b8"
+        highlight: "rgba(34, 211, 238, 0.1)"
+        textHighlight: "rgba(148, 163, 184, 0.2)"
+plugins:
+  - source: fixture-plugin
+    enabled: true
+`
+
+const quartzPreviewCli = `import { existsSync, mkdirSync, watch, writeFileSync } from "node:fs"
+import { createServer as createHttpServer } from "node:http"
+import { createServer as createTcpServer } from "node:net"
+import { dirname, join } from "node:path"
+
+const value = (name) => process.argv[process.argv.indexOf(name) + 1]
+const port = Number(value("--port"))
+const wsPort = Number(value("--wsPort"))
+const host = process.env.QUARTZ_PREVIEW_LOOPBACK ?? "127.0.0.1"
+const target = join(process.cwd(), "quartz", "styles", "publisher-appearance.scss")
+const marker = join(process.cwd(), ".garden-publisher", "appearance-e2e-rebuild.json")
+let recorded = false
+const recordRebuild = () => {
+  if (recorded || !existsSync(target)) return
+  recorded = true
+  process.stdout.write("Detected change, rebuilding\\n")
+  process.stdout.write("Done rebuilding\\n")
+  mkdirSync(dirname(marker), { recursive: true })
+  writeFileSync(marker, JSON.stringify({ target }) + "\\n")
+}
+const watcher = watch(join(process.cwd(), "quartz", "styles"), () => queueMicrotask(recordRebuild))
+const http = createHttpServer((_request, response) => {
+  response.writeHead(200, { "Content-Type": "text/html; charset=utf-8" })
+  response.end("<!doctype html><html><head></head><body><main>Quartz preview</main></body></html>")
+})
+const websocket = createTcpServer(() => undefined)
+await Promise.all([
+  new Promise((resolvePromise, reject) => {
+    http.once("error", reject)
+    http.listen(port, host, resolvePromise)
+  }),
+  new Promise((resolvePromise, reject) => {
+    websocket.once("error", reject)
+    websocket.listen(wsPort, host, resolvePromise)
+  }),
+])
+const shutdown = () => {
+  watcher.close()
+  http.close()
+  websocket.close()
+}
+process.once("SIGINT", shutdown)
+process.once("SIGTERM", shutdown)
+`
+
+async function extendQuartzAppearanceFixture(root: string): Promise<void> {
+  const packagePath = join(root, "package.json")
+  const manifest = JSON.parse(await readFile(packagePath, "utf8")) as {
+    name: string
+    scripts: Record<string, string>
+  }
+  await Promise.all([
+    writeFile(
+      packagePath,
+      JSON.stringify(
+        {
+          ...manifest,
+          name: "@jackyzha0/quartz",
+          scripts: { ...manifest.scripts, quartz: "./quartz/bootstrap-cli.mjs" },
+        },
+        null,
+        2,
+      ) + "\n",
+    ),
+    writeGardenFile(root, "quartz.config.yaml", quartzAppearanceConfiguration),
+    writeGardenFile(
+      root,
+      "quartz/styles/custom.scss",
+      '@use "./variables.scss" as *;\n\n.fixture { color: #abcdef; }\n',
+    ),
+    writeGardenFile(root, "quartz/bootstrap-cli.mjs", quartzPreviewCli),
+    writeGardenFile(root, "quartz/static/.gitkeep", ""),
+  ])
+  await gitOutput(root, [
+    "add",
+    "package.json",
+    "quartz.config.yaml",
+    "quartz/bootstrap-cli.mjs",
+    "quartz/styles/custom.scss",
+    "quartz/static/.gitkeep",
+  ])
+  await gitOutput(root, ["commit", "-m", "Add Quartz appearance fixture"])
+  await gitOutput(root, ["push", "origin", "main"])
+}
+
 test("locates selected editor text in the current preview", async () => {
   const garden = await createQuartzGardenFixture({
     directoryName: "Preview Navigation Garden",
@@ -721,6 +941,289 @@ test("locates selected editor text in the current preview", async () => {
     await closeApplication(application)
     await garden.cleanup()
     await removeTemporaryDirectory(stateRoot)
+  }
+})
+
+test("appearance designer previews, applies, persists, and undoes without publishing", async () => {
+  const garden = await createQuartzGardenFixture({
+    directoryName: "Appearance Garden",
+    noteTitle: "Appearance Note",
+    noteBody: "appearance workflow fixture",
+  })
+  await extendQuartzAppearanceFixture(garden.root)
+  const stateRoot = await createTemporaryDirectory("garden-publisher-e2e-appearance-")
+  const registry = join(stateRoot, "blogs.json")
+  const runtimeRoot = await createE2eRuntime(stateRoot)
+  const environment = {
+    ...process.env,
+    GARDEN_PUBLISHER_E2E: "1",
+    GARDEN_PUBLISHER_E2E_WORKSPACE: garden.root,
+    GARDEN_PUBLISHER_E2E_RUNTIME: runtimeRoot,
+    GARDEN_PUBLISHER_E2E_REGISTRY: registry,
+    GARDEN_PUBLISHER_E2E_REAL_PREVIEW: "1",
+  }
+  const configPath = join(garden.root, "quartz.config.yaml")
+  const customPath = join(garden.root, "quartz", "styles", "custom.scss")
+  const manifestPath = join(garden.root, "quartz", "styles", "publisher-appearance.json")
+  const stylesheetPath = join(garden.root, "quartz", "styles", "publisher-appearance.scss")
+  const configBefore = await readFile(configPath)
+  const customBefore = await readFile(customPath)
+  const remoteBefore = await gitOutput(garden.root, ["rev-parse", "origin/main"])
+  const rebuildMarker = join(garden.root, ".garden-publisher", "appearance-e2e-rebuild.json")
+  const fixtureBase = dirname(garden.root)
+  const tempRoot = resolve(process.env.TEMP ?? process.env.TMP ?? fixtureBase)
+  const previewWorkspacesBefore = await previewWorkspaceDirectories(tempRoot)
+  const preferredPortHolder = await holdLoopbackPortIfAvailable(8080)
+  const previewPorts = new Set<number>()
+  let application: ElectronApplication | undefined
+
+  const realPreviewTransitions = async (): Promise<
+    readonly {
+      readonly state: string
+      readonly generation: number
+      readonly port?: number
+      readonly url?: string
+    }[]
+  > =>
+    application!.evaluate(async ({ BrowserWindow }) => {
+      void BrowserWindow
+      const transitions = (
+        globalThis as typeof globalThis & {
+          __GARDEN_PUBLISHER_E2E_REAL_PREVIEW_STATES__?: readonly {
+            readonly state: string
+            readonly generation: number
+            readonly port?: number
+            readonly url?: string
+          }[]
+        }
+      ).__GARDEN_PUBLISHER_E2E_REAL_PREVIEW_STATES__
+      return transitions ? [...transitions] : []
+    })
+
+  const expectPreviewReleased = async (): Promise<void> => {
+    for (const port of previewPorts) {
+      await expect.poll(() => loopbackPortAvailable(port), { timeout: 15_000 }).toBe(true)
+    }
+    const current = await previewWorkspaceDirectories(tempRoot)
+    for (const name of current.filter((entry) => !previewWorkspacesBefore.includes(entry))) {
+      if (basename(name) !== name || !name.startsWith("knowledge-garden-preview-")) {
+        throw new Error(`Refusing to clean an unexpected preview workspace: ${name}`)
+      }
+      await removeTemporaryDirectoryEventually(join(tempRoot, name))
+    }
+    await expect
+      .poll(() => previewWorkspaceDirectories(tempRoot), { timeout: 15_000 })
+      .toEqual(previewWorkspacesBefore)
+  }
+
+  const expectPreviewPort = async (
+    page: Awaited<ReturnType<ElectronApplication["firstWindow"]>>,
+  ): Promise<number> => {
+    const source = await page.getByTitle("Appearance Note的 Quartz 精确预览").getAttribute("src")
+    if (!source) throw new Error("The exact Quartz preview iframe did not expose its URL.")
+    const iframePort = Number(new URL(source).port)
+    expect(iframePort).not.toBe(8080)
+    await expect
+      .poll(async () => {
+        const ready = [...(await realPreviewTransitions())]
+          .reverse()
+          .find((transition) => transition.state === "ready" && transition.port === iframePort)
+        return ready?.port
+      })
+      .toBe(iframePort)
+    previewPorts.add(iframePort)
+    return iframePort
+  }
+
+  const editDraft = async (
+    page: Awaited<ReturnType<ElectronApplication["firstWindow"]>>,
+  ): Promise<void> => {
+    const dialog = page.getByRole("dialog", { name: "外观设置" })
+    await dialog.getByLabel("背景类型").selectOption("gradient")
+    await dialog.getByLabel("强调色").fill("#123456")
+    await dialog.getByLabel("正文宽度").fill("76")
+    await expect(dialog.getByText("实时预览已更新", { exact: true })).toBeVisible()
+    const appearanceDocument = page.getByTitle("博客外观实时预览").contentFrame()
+    const previewStyle = appearanceDocument.locator("style[data-publisher-appearance-preview]")
+    await expect.poll(() => previewStyle.textContent()).toContain("--publisher-accent: #123456")
+    await expect.poll(() => previewStyle.textContent()).toContain("--publisher-article-width: 76ch")
+    await expect.poll(() => previewStyle.textContent()).toContain("linear-gradient(135deg")
+    await expect(
+      page
+        .getByTitle("Appearance Note的 Quartz 精确预览")
+        .contentFrame()
+        .locator("style[data-publisher-appearance-preview]"),
+    ).toHaveCount(0)
+  }
+
+  try {
+    application = await launchApplication(stateRoot, environment)
+    let page = await application.firstWindow()
+    await expect(page.locator('main[data-workspace-diagnostics="ready"]')).toBeVisible()
+    await expect(page.getByTitle("Appearance Note的 Quartz 精确预览")).toBeVisible()
+    await expect(page.getByTitle("Appearance Note的 Quartz 精确预览")).toHaveAttribute(
+      "src",
+      /^http:\/\/127\.0\.0\.1:\d+\/[a-f0-9]{32}\//,
+    )
+    const firstPreviewPort = await expectPreviewPort(page)
+    await expect
+      .poll(
+        () =>
+          application!.evaluate(({ BrowserWindow }) =>
+            BrowserWindow.getAllWindows()[0].webContents.mainFrame.framesInSubtree.map(
+              (frame) => frame.url,
+            ),
+          ),
+        { timeout: 30_000 },
+      )
+      .toContainEqual(expect.stringContaining("/life/fixture"))
+
+    await page.getByRole("button", { name: "外观" }).click()
+    await expect(page.getByTitle("博客外观实时预览")).toBeVisible()
+    const appearanceSource = await page.getByTitle("博客外观实时预览").getAttribute("src")
+    if (!appearanceSource) throw new Error("The appearance preview iframe did not expose its URL.")
+    expect(Number(new URL(appearanceSource).port)).toBe(firstPreviewPort)
+    await editDraft(page)
+    await page
+      .getByRole("dialog", { name: "外观设置" })
+      .getByRole("button", { name: "取消" })
+      .click()
+    await expect(page.getByRole("dialog", { name: "外观设置" })).toHaveCount(0)
+    expect(await readFile(configPath)).toEqual(configBefore)
+    expect(await readFile(customPath)).toEqual(customBefore)
+    expect(await exists(manifestPath)).toBe(false)
+    expect(await exists(stylesheetPath)).toBe(false)
+    await expect(
+      page
+        .getByTitle("博客外观实时预览")
+        .contentFrame()
+        .locator("style[data-publisher-appearance-preview]"),
+    ).toHaveCount(0)
+
+    await page.getByRole("button", { name: "外观" }).click()
+    await editDraft(page)
+    const appearance = page.getByRole("dialog", { name: "外观设置" })
+    const transitionsBeforeApply = await realPreviewTransitions()
+    const rebuildStateStart = transitionsBeforeApply.length
+    const generationBeforeApply = transitionsBeforeApply.at(-1)?.generation
+    expect(generationBeforeApply).toBeDefined()
+    await appearance.getByRole("button", { name: "一键应用" }).click()
+    await expect(appearance.getByText(/外观已应用/)).toBeVisible()
+    await appearance.getByRole("button", { name: "取消" }).click()
+    await expect(appearance).toHaveCount(0)
+    await expect(page.getByRole("status", { name: "发布状态" })).toContainText("预览就绪")
+    await expect.poll(async () => exists(manifestPath)).toBe(true)
+    await expect.poll(async () => exists(stylesheetPath)).toBe(true)
+    expect(await readFile(stylesheetPath, "utf8")).toContain("--publisher-accent: #123456")
+    expect(await readFile(stylesheetPath, "utf8")).toContain("--publisher-article-width: 76ch")
+    expect(await readFile(customPath, "utf8")).toContain("publisher-appearance:start")
+    const appliedConfiguration = parse(await readFile(configPath, "utf8")) as {
+      configuration: {
+        keepMe: string
+        theme: {
+          typography: { header: string; body: string; code: string }
+          colors: {
+            lightMode: { secondary: string; tertiary: string }
+            darkMode: { secondary: string; tertiary: string }
+          }
+        }
+      }
+    }
+    expect(appliedConfiguration.configuration.keepMe).toBe("unchanged")
+    expect(appliedConfiguration.configuration.theme.typography).toEqual({
+      header: "Existing Header",
+      body: "Existing Body",
+      code: "Existing Code",
+    })
+    expect(appliedConfiguration.configuration.theme.colors.lightMode.secondary).toBe("#123456")
+    expect(appliedConfiguration.configuration.theme.colors.darkMode.secondary).toBe("#123456")
+    expect(appliedConfiguration.configuration.theme.colors.lightMode.tertiary).toBe("#94a3b8")
+    expect(appliedConfiguration.configuration.theme.colors.darkMode.tertiary).toBe("#94a3b8")
+    expect(JSON.parse(await readFile(manifestPath, "utf8"))).toMatchObject({
+      schemaVersion: 1,
+      settings: {
+        background: { kind: "gradient" },
+        colors: { accent: "#123456" },
+        layout: { articleWidthCh: 76 },
+      },
+    })
+    await expect.poll(async () => exists(rebuildMarker)).toBe(true)
+    await expect
+      .poll(async () =>
+        (await realPreviewTransitions())
+          .slice(rebuildStateStart)
+          .map(({ state }) => state)
+          .join(" -> "),
+      )
+      .toMatch(/building(?: -> [a-z]+)* -> ready/)
+    await expect
+      .poll(async () => (await realPreviewTransitions()).at(-1)?.generation ?? -1)
+      .toBeGreaterThan(generationBeforeApply!)
+    expect(await gitOutput(garden.root, ["rev-parse", "origin/main"])).toBe(remoteBefore)
+
+    await closeApplication(application)
+    application = undefined
+    await expectPreviewReleased()
+    application = await launchApplication(stateRoot, environment)
+    page = await application.firstWindow()
+    await expect(page.locator('main[data-workspace-diagnostics="ready"]')).toBeVisible()
+    await expect(page.getByTitle("Appearance Note的 Quartz 精确预览")).toBeVisible()
+    await expectPreviewPort(page)
+    await expect(page.locator(".publish-summary")).not.toContainText("正在检查可发布变化")
+    await page.getByRole("button", { name: "外观" }).click()
+    const persisted = page.getByRole("dialog", { name: "外观设置" })
+    await expect(persisted.getByLabel("背景类型")).toHaveValue("gradient")
+    await expect(persisted.getByLabel("强调色")).toHaveValue("#123456")
+    await expect(persisted.getByLabel("正文宽度")).toHaveValue("76")
+    await expect(persisted.getByRole("button", { name: "撤销上次应用" })).toBeEnabled()
+    await persisted.getByRole("button", { name: "取消" }).click()
+
+    await page.getByRole("button", { name: "外观" }).click()
+    const undo = page.getByRole("dialog", { name: "外观设置" })
+    await undo.getByRole("button", { name: "撤销上次应用" }).click()
+    await expect(undo.getByText(/已撤销上次应用/)).toBeVisible()
+    await expect.poll(async () => exists(manifestPath)).toBe(false)
+    await expect.poll(async () => exists(stylesheetPath)).toBe(false)
+    expect(await readFile(configPath)).toEqual(configBefore)
+    expect(await readFile(customPath)).toEqual(customBefore)
+    expect(await gitOutput(garden.root, ["status", "--porcelain"])).toBe("")
+    expect(await gitOutput(garden.root, ["rev-parse", "origin/main"])).toBe(remoteBefore)
+    await undo.getByRole("button", { name: "取消" }).click()
+    await expect(undo).toHaveCount(0)
+    await expect(page.getByRole("status", { name: "发布状态" })).toContainText("预览就绪")
+  } finally {
+    const cleanupErrors: unknown[] = []
+    for (const cleanup of [
+      () => closeApplication(application),
+      expectPreviewReleased,
+      () => garden.cleanup(),
+      () => removeTemporaryDirectoryEventually(stateRoot),
+      () => closeServer(preferredPortHolder),
+    ]) {
+      try {
+        await cleanup()
+      } catch (error) {
+        cleanupErrors.push(error)
+      }
+    }
+    for (const path of [fixtureBase, stateRoot]) {
+      try {
+        expect(await exists(path), `E2E cleanup left ${path}`).toBe(false)
+      } catch (error) {
+        cleanupErrors.push(error)
+      }
+    }
+    try {
+      expect(launchedChildren.size, "E2E cleanup left an owned Electron process").toBe(0)
+      if (preferredPortHolder) {
+        await expect.poll(() => loopbackPortAvailable(8080), { timeout: 15_000 }).toBe(true)
+      }
+    } catch (error) {
+      cleanupErrors.push(error)
+    }
+    if (cleanupErrors.length > 0) {
+      throw new AggregateError(cleanupErrors, "Appearance E2E cleanup did not complete safely.")
+    }
   }
 })
 

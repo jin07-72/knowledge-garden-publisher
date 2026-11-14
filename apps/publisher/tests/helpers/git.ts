@@ -1,6 +1,6 @@
-import { mkdir, mkdtemp, rename, writeFile } from "node:fs/promises"
+import { mkdir, mkdtemp, writeFile } from "node:fs/promises"
 import { tmpdir } from "node:os"
-import { join } from "node:path"
+import { basename, join } from "node:path"
 import {
   runCommand,
   type CommandRequest,
@@ -106,9 +106,10 @@ export async function createQuartzGardenFixture(options: {
 }): Promise<QuartzGardenFixture> {
   const domains = options.domains ?? [{ slug: "life", name: "生活", order: 1 }]
   if (domains.length === 0) throw new Error("A garden fixture requires at least one domain.")
-  const repository = await createTemporaryGitRepository()
-  const root = join(repository.root, "..", options.directoryName)
-  await rename(repository.root, root)
+  const repository = await createTemporaryGitRepository({
+    workspaceDirectoryName: options.directoryName,
+  })
+  const root = repository.root
   const notePath = `content/${domains[0]!.slug}/fixture.md`
   await Promise.all([
     writeFixtureFile(root, notePath, fixtureNote(options.noteTitle, options.noteBody)),
@@ -168,15 +169,35 @@ export async function createQuartzGardenFixture(options: {
 export interface GitFixtureDependencies {
   readonly createTempDirectory?: () => Promise<string>
   readonly runGit?: (request: CommandRequest) => Promise<CommandResult>
+  readonly workspaceDirectoryName?: string
+}
+
+function isSafeWorkspaceDirectoryName(name: string): boolean {
+  if (
+    name.length === 0 ||
+    name.length > 80 ||
+    name === "." ||
+    name === ".." ||
+    basename(name) !== name ||
+    /[<>:"/\\|?*\u0000-\u001f]/u.test(name) ||
+    /[. ]$/u.test(name)
+  ) {
+    return false
+  }
+  return !/^(?:con|prn|aux|nul|com[1-9]|lpt[1-9])(?:\.|$)/iu.test(name)
 }
 
 export async function createTemporaryGitRepository(
   dependencies: GitFixtureDependencies = {},
 ): Promise<TemporaryGitRepository> {
+  const workspaceDirectoryName = dependencies.workspaceDirectoryName ?? "workspace"
+  if (!isSafeWorkspaceDirectoryName(workspaceDirectoryName)) {
+    throw new Error("A repository workspace directory name must be a safe basename.")
+  }
   const base = await (dependencies.createTempDirectory?.() ??
     mkdtemp(join(tmpdir(), "garden-git-")))
   try {
-    const root = join(base, "workspace")
+    const root = join(base, workspaceDirectoryName)
     const remote = join(base, "origin.git")
     const emptyGlobalConfig = join(base, "empty-global.gitconfig")
     const env = isolatedGitEnvironment(undefined, emptyGlobalConfig)

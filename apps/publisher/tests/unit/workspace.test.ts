@@ -1,7 +1,7 @@
 import { mkdir, mkdtemp, readdir, rm, symlink, writeFile } from "node:fs/promises"
 import { EventEmitter } from "node:events"
 import { tmpdir } from "node:os"
-import { join } from "node:path"
+import { basename, join } from "node:path"
 import { PassThrough } from "node:stream"
 import { afterEach, describe, expect, it, vi } from "vitest"
 import {
@@ -730,6 +730,29 @@ describe("runCommand", () => {
 })
 
 describe("createTemporaryGitRepository", () => {
+  it.each(["..", "nested/workspace", "nested\\workspace", "CON", "workspace."])(
+    "rejects unsafe workspace basename %j before running Git",
+    async (workspaceDirectoryName) => {
+      const runGit = vi.fn(async () => ({ exitCode: 0, stdout: "", stderr: "" }))
+
+      await expect(
+        createTemporaryGitRepository({ workspaceDirectoryName, runGit }),
+      ).rejects.toThrow("A repository workspace directory name must be a safe basename.")
+      expect(runGit).not.toHaveBeenCalled()
+    },
+  )
+
+  it("creates a requested workspace basename directly without a later rename", async () => {
+    const repository = await createTemporaryGitRepository({
+      workspaceDirectoryName: "Appearance Garden",
+    })
+    temporaryRepositories.push(repository)
+
+    expect(basename(repository.root)).toBe("Appearance Garden")
+    expect(await exists(join(repository.root, ".git"))).toBe(true)
+    expect(await exists(join(repository.root, "..", "workspace"))).toBe(false)
+  })
+
   it("uses an isolated configuration and explicit Git initialization options", async () => {
     const requests: Parameters<NonNullable<GitFixtureDependencies["runGit"]>>[0][] = []
     const repository = await createTemporaryGitRepository({
