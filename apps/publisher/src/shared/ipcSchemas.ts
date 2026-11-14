@@ -818,7 +818,15 @@ const changeGroupSchema = z
   .object({
     id: z.string().min(1).max(128),
     label: z.string().min(1).max(512),
-    kind: z.enum(["added", "modified", "unpublish", "attachment", "private", "config"]),
+    kind: z.enum([
+      "added",
+      "modified",
+      "unpublish",
+      "attachment",
+      "private",
+      "appearance",
+      "config",
+    ]),
     selection: z.enum(["default", "optional", "locked"]),
     description: z.string().min(1).max(1_000),
     paths: z.array(pathSchema).max(500),

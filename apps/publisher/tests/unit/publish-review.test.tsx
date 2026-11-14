@@ -34,6 +34,15 @@ const review: ChangeReview = {
       attachments: [],
     },
     {
+      id: "appearance:publisher-appearance",
+      label: "外观修改",
+      kind: "appearance",
+      selection: "optional",
+      description: "博客背景、主题配色与排版；选择后发布到线上站点。",
+      paths: ["quartz/styles/publisher-appearance.json", "quartz/styles/publisher-appearance.scss"],
+      attachments: [],
+    },
+    {
       id: "config:quartz",
       label: "配置修改",
       kind: "config",
@@ -66,11 +75,16 @@ describe("PublishReview", () => {
     const publicBox = within(dialog).getByRole("checkbox", { name: /修改.*CSS Grid/ })
     const unpublishBox = within(dialog).getByRole("checkbox", { name: /下线.*Retired/ })
     const configBox = within(dialog).getByRole("checkbox", { name: /配置.*配置修改/ })
+    const appearanceBox = within(dialog).getByRole("checkbox", { name: /外观.*外观修改/ })
     expect(publicBox).toBeChecked()
     expect(unpublishBox).toBeChecked()
     expect(within(dialog).queryByText("Journal")).not.toBeInTheDocument()
     expect(within(dialog).queryByText("只保留在本机，不会发布")).not.toBeInTheDocument()
     expect(configBox).not.toBeChecked()
+    expect(appearanceBox).not.toBeChecked()
+    expect(
+      within(dialog).getByText("博客背景、主题配色与排版；选择后发布到线上站点。"),
+    ).toBeVisible()
     expect(within(dialog).getByRole("heading", { name: "高级选项" })).toBeVisible()
     expect(
       within(dialog).getByText("项目配置与其他非笔记文件；默认不发布。仅在明确知道影响时选择。"),
@@ -80,13 +94,15 @@ describe("PublishReview", () => {
     expect(within(dialog).getByText("将从公开网站移除")).toBeVisible()
     expect(within(dialog).getByText("diagram.png")).toBeVisible()
     expect(within(dialog).getByText("2 篇文章，1 个附件")).toBeVisible()
+    await user.click(appearanceBox)
+    expect(within(dialog).getByText("2 篇文章，1 个附件")).toBeVisible()
     const publish = within(dialog).getByRole("button", { name: "验证并发布" })
     expect(publish).toBeEnabled()
 
     await user.click(publicBox)
     expect(within(dialog).getByText("1 篇文章，0 个附件")).toBeVisible()
     await user.click(publish)
-    expect(onPublish).toHaveBeenCalledWith(["note:retired"])
+    expect(onPublish).toHaveBeenCalledWith(["note:retired", "appearance:publisher-appearance"])
     await user.keyboard("{Escape}")
     expect(onClose).toHaveBeenCalledOnce()
   })

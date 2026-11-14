@@ -22,6 +22,7 @@ const kindLabel: Record<ChangeKind, string> = {
   unpublish: "下线",
   attachment: "附件",
   private: "私密",
+  appearance: "外观",
   config: "配置",
 }
 
@@ -73,8 +74,10 @@ export function PublishReview({
   const counts = useMemo(() => {
     const chosen = review?.groups.filter((group) => selected.has(group.id)) ?? []
     return {
-      notes: chosen.filter((group) => group.kind !== "attachment" && group.kind !== "config")
-        .length,
+      notes: chosen.filter(
+        (group) =>
+          group.kind !== "attachment" && group.kind !== "appearance" && group.kind !== "config",
+      ).length,
       attachments: chosen.reduce((total, group) => total + group.attachments.length, 0),
     }
   }, [review, selected])

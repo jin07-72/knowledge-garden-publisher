@@ -272,7 +272,8 @@ export const MANAGED_NOTE_PATH_PATTERN = new RegExp(
   `^(content|private)/(${KEBAB_SLUG_SOURCE})/(${KEBAB_SLUG_SOURCE})\\.md$`,
 )
 
-export type ChangeKind = "added" | "modified" | "unpublish" | "attachment" | "private" | "config"
+export type ChangeKind =
+  "added" | "modified" | "unpublish" | "attachment" | "private" | "appearance" | "config"
 export type ChangeSelection = "default" | "optional" | "locked"
 
 export interface ChangeAttachment {

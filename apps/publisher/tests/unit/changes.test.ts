@@ -13,6 +13,8 @@ import {
   type ChangeCommandRunner,
   type ChangeCommandProcess,
 } from "../../src/main/services/changes"
+import { IPC_CHANNELS } from "../../src/shared/contracts"
+import { IPC_SUCCESS_SCHEMAS } from "../../src/shared/ipcSchemas"
 
 const repositories: TemporaryGitRepository[] = []
 const oidA = "a".repeat(40)
@@ -286,6 +288,97 @@ describe("bounded change command runner", () => {
 })
 
 describe("listChanges", () => {
+  it("groups only exact managed appearance paths without duplicate ownership", async () => {
+    const fixture = await repository()
+    const status = raw(
+      [
+        "? quartz/styles/publisher-appearance.json",
+        "? quartz/styles/publisher-appearance.scss",
+        `1 .M N... 100644 100644 100644 ${oidA} ${oidA} quartz/styles/custom.scss`,
+        `1 .M N... 100644 100644 100644 ${oidA} ${oidA} quartz.config.yaml`,
+        "? quartz/static/publisher/hero-dark.WEBP",
+        "? package-lock.json",
+        "",
+      ].join("\0"),
+    )
+
+    const review = await listChanges({ workspace: fixture.root, statusOutput: status })
+
+    expect(review.groups).toEqual([
+      expect.objectContaining({
+        kind: "appearance",
+        label: "外观修改",
+        selection: "optional",
+        description: "博客背景、主题配色与排版；选择后发布到线上站点。",
+        paths: [
+          "quartz/styles/publisher-appearance.json",
+          "quartz/styles/publisher-appearance.scss",
+          "quartz/styles/custom.scss",
+          "quartz.config.yaml",
+          "quartz/static/publisher/hero-dark.WEBP",
+        ],
+      }),
+      expect.objectContaining({
+        kind: "config",
+        paths: ["package-lock.json"],
+      }),
+    ])
+    const allPaths = review.groups.flatMap((group) => group.paths)
+    expect(new Set(allPaths).size).toBe(allPaths.length)
+    expect(IPC_SUCCESS_SCHEMAS[IPC_CHANNELS.requests.changesList].safeParse(review).success).toBe(
+      true,
+    )
+  })
+
+  it("keeps the custom stylesheet under config until both ownership files are present", async () => {
+    const fixture = await repository()
+
+    for (const status of [
+      `1 .M N... 100644 100644 100644 ${oidA} ${oidA} quartz/styles/custom.scss\0`,
+      `? quartz/styles/publisher-appearance.json\0? quartz/styles/custom.scss\0`,
+      `? quartz/styles/publisher-appearance.scss\0? quartz/styles/custom.scss\0`,
+    ]) {
+      const review = await listChanges({ workspace: fixture.root, statusOutput: raw(status) })
+      expect(review.groups.find((group) => group.kind === "config")?.paths).toContain(
+        "quartz/styles/custom.scss",
+      )
+      expect(review.groups.find((group) => group.kind === "appearance")?.paths ?? []).not.toContain(
+        "quartz/styles/custom.scss",
+      )
+    }
+  })
+
+  it("keeps casing aliases, near misses, nested assets, and unsafe names under config", async () => {
+    const fixture = await repository()
+    const paths = [
+      "Quartz/styles/publisher-appearance.json",
+      "quartz/styles/Publisher-appearance.scss",
+      "quartz.config.yaml.bak",
+      "quartz/static/Publisher/hero.webp",
+      "quartz/static/publisher/nested/hero.webp",
+      "quartz/static/publisher/.hidden.webp",
+      "quartz/static/publisher/CON.webp",
+      "quartz/static/publisher/trailing.webp.",
+      "quartz/static/publisher/theme.scss",
+    ]
+    const review = await listChanges({
+      workspace: fixture.root,
+      statusOutput: raw(`${paths.map((path) => `? ${path}`).join("\0")}\0`),
+    })
+
+    expect(review.groups).toEqual([expect.objectContaining({ kind: "config", paths })])
+  })
+
+  it("rejects traversal instead of treating it as an appearance asset", async () => {
+    const fixture = await repository()
+    await expect(
+      listChanges({
+        workspace: fixture.root,
+        statusOutput: raw("? quartz/static/publisher/../secret.webp\0"),
+      }),
+    ).rejects.toMatchObject({ code: "CHANGE_SCAN_INVALID" })
+  })
+
   it("keeps a removed custom-domain landing page in the default unpublish selection", async () => {
     const fixture = await repository()
     await addCommittedDomain(fixture, "field-notes", "Field Notes", 3)
@@ -557,8 +650,8 @@ describe("listChanges", () => {
           paths: [],
         }),
         expect.objectContaining({
-          label: "配置修改",
-          kind: "config",
+          label: "外观修改",
+          kind: "appearance",
           selection: "optional",
           paths: ["quartz.config.yaml"],
         }),

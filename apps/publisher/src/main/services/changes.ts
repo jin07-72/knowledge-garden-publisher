@@ -121,6 +121,30 @@ const slugPattern = new RegExp(`^${KEBAB_SLUG_SOURCE}$`)
 const removedDomainLanding = new RegExp(`^content\/(${KEBAB_SLUG_SOURCE})\/index\\.md$`)
 const publicAttachment = new RegExp(`^content\/_assets\/(${KEBAB_SLUG_SOURCE})\/(.+)$`)
 const privateAttachment = new RegExp(`^private\/_assets\/(${KEBAB_SLUG_SOURCE})\/(.+)$`)
+const managedAppearanceManifest = "quartz/styles/publisher-appearance.json"
+const managedAppearanceStylesheet = "quartz/styles/publisher-appearance.scss"
+const managedAppearanceCustomStylesheet = "quartz/styles/custom.scss"
+const managedAppearanceConfig = "quartz.config.yaml"
+const managedAppearanceAsset = /^quartz\/static\/publisher\/([^/]+)$/
+const windowsDeviceNamePattern =
+  /^(?:con|prn|aux|nul|com(?:[1-9]|[¹²³])|lpt(?:[1-9]|[¹²³]))(?:\.|$)/i
+
+function managedAppearancePath(path: string): boolean {
+  if (
+    path === managedAppearanceManifest ||
+    path === managedAppearanceStylesheet ||
+    path === managedAppearanceConfig
+  ) {
+    return true
+  }
+  const name = managedAppearanceAsset.exec(path)?.[1]
+  return Boolean(
+    name &&
+    Buffer.byteLength(name, "utf8") <= 255 &&
+    /^[a-z0-9][a-z0-9._-]*\.(?:png|jpe?g|gif|webp|avif)$/i.test(name) &&
+    !windowsDeviceNamePattern.test(name),
+  )
+}
 
 type ManagedNote = {
   readonly domain: string
@@ -761,7 +785,21 @@ export async function listChanges(options: ListChangesOptions): Promise<ChangeRe
   const publicGroups = new Map<string, MutableGroup>()
   const privateGroups = new Map<string, MutableGroup>()
   const attachments: AttachmentDelta[] = []
+  const appearance = makeGroup(
+    "appearance",
+    "publisher-appearance",
+    "外观修改",
+    "optional",
+    "博客背景、主题配色与排版；选择后发布到线上站点。",
+  )
   const config = makeGroup("config", "repository", "配置修改", "optional", "高级选项，默认不发布")
+  const changedPaths = new Set(
+    entries.flatMap((entry) =>
+      entry.originalPath ? [entry.path, entry.originalPath] : [entry.path],
+    ),
+  )
+  const ownsCustomStylesheet =
+    changedPaths.has(managedAppearanceManifest) && changedPaths.has(managedAppearanceStylesheet)
 
   const addPrivate = (path: string): void => {
     const note = managedNote(path, "private", noteDomains)
@@ -812,6 +850,13 @@ export async function listChanges(options: ListChangesOptions): Promise<ChangeRe
     }
     if (path.startsWith("private/")) {
       addPrivate(path)
+      return
+    }
+    if (
+      managedAppearancePath(path) ||
+      (path === managedAppearanceCustomStylesheet && ownsCustomStylesheet)
+    ) {
+      addUnique(appearance.paths, path)
       return
     }
     addUnique(config.paths, path)
@@ -876,6 +921,7 @@ export async function listChanges(options: ListChangesOptions): Promise<ChangeRe
   const groups = [
     ...publicGroups.values(),
     ...privateGroups.values(),
+    ...(appearance.paths.length > 0 ? [appearance] : []),
     ...(config.paths.length > 0 ? [config] : []),
   ]
   const pathOwners = new Map<string, string>()
@@ -899,7 +945,8 @@ export async function listChanges(options: ListChangesOptions): Promise<ChangeRe
       unpublish: 2,
       attachment: 3,
       private: 4,
-      config: 5,
+      appearance: 5,
+      config: 6,
     }
     return order[left.kind] - order[right.kind] || left.label.localeCompare(right.label, "zh-CN")
   })
