@@ -348,6 +348,24 @@ describe("listChanges", () => {
     }
   })
 
+  it("keeps the Quartz config under config until both appearance ownership files are present", async () => {
+    const fixture = await repository()
+
+    for (const status of [
+      `1 .M N... 100644 100644 100644 ${oidA} ${oidA} quartz.config.yaml\0`,
+      `? quartz/styles/publisher-appearance.json\0? quartz.config.yaml\0`,
+      `? quartz/styles/publisher-appearance.scss\0? quartz.config.yaml\0`,
+    ]) {
+      const review = await listChanges({ workspace: fixture.root, statusOutput: raw(status) })
+      expect(review.groups.find((group) => group.kind === "config")?.paths).toContain(
+        "quartz.config.yaml",
+      )
+      expect(review.groups.find((group) => group.kind === "appearance")?.paths ?? []).not.toContain(
+        "quartz.config.yaml",
+      )
+    }
+  })
+
   it("keeps casing aliases, near misses, nested assets, and unsafe names under config", async () => {
     const fixture = await repository()
     const paths = [
@@ -650,8 +668,8 @@ describe("listChanges", () => {
           paths: [],
         }),
         expect.objectContaining({
-          label: "外观修改",
-          kind: "appearance",
+          label: "配置修改",
+          kind: "config",
           selection: "optional",
           paths: ["quartz.config.yaml"],
         }),

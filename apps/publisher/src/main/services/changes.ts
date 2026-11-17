@@ -130,11 +130,7 @@ const windowsDeviceNamePattern =
   /^(?:con|prn|aux|nul|com(?:[1-9]|[¹²³])|lpt(?:[1-9]|[¹²³]))(?:\.|$)/i
 
 function managedAppearancePath(path: string): boolean {
-  if (
-    path === managedAppearanceManifest ||
-    path === managedAppearanceStylesheet ||
-    path === managedAppearanceConfig
-  ) {
+  if (path === managedAppearanceManifest || path === managedAppearanceStylesheet) {
     return true
   }
   const name = managedAppearanceAsset.exec(path)?.[1]
@@ -798,7 +794,7 @@ export async function listChanges(options: ListChangesOptions): Promise<ChangeRe
       entry.originalPath ? [entry.path, entry.originalPath] : [entry.path],
     ),
   )
-  const ownsCustomStylesheet =
+  const ownsAppearanceTransaction =
     changedPaths.has(managedAppearanceManifest) && changedPaths.has(managedAppearanceStylesheet)
 
   const addPrivate = (path: string): void => {
@@ -854,7 +850,8 @@ export async function listChanges(options: ListChangesOptions): Promise<ChangeRe
     }
     if (
       managedAppearancePath(path) ||
-      (path === managedAppearanceCustomStylesheet && ownsCustomStylesheet)
+      ((path === managedAppearanceCustomStylesheet || path === managedAppearanceConfig) &&
+        ownsAppearanceTransaction)
     ) {
       addUnique(appearance.paths, path)
       return
