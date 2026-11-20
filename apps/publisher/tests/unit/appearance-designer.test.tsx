@@ -92,7 +92,9 @@ describe("AppearanceDesigner", () => {
     const view = renderDesigner()
     expect(await screen.findByRole("heading", { name: "外观设置" })).toBeVisible()
     const frame = screen.getByTitle("博客外观实时预览")
-    expect(frame).toHaveAttribute("src", PREVIEW_URL)
+    const frameUrl = new URL(frame.getAttribute("src")!)
+    expect(`${frameUrl.origin}${frameUrl.pathname}`).toBe(PREVIEW_URL)
+    expect(frameUrl.searchParams.has("kgpAppearance")).toBe(true)
     expect(frame).toHaveAttribute("sandbox", "allow-same-origin allow-scripts")
     cleanup()
 
@@ -101,6 +103,30 @@ describe("AppearanceDesigner", () => {
     expect(screen.queryByTitle("博客外观实时预览")).not.toBeInTheDocument()
     expect(screen.getByRole("button", { name: "一键应用" })).toBeDisabled()
     expect(view.api.read).toHaveBeenCalledOnce()
+  })
+
+  it("uses one stable UUID-tagged URL for the appearance iframe and preview requests", async () => {
+    vi.useFakeTimers()
+    const { api } = renderDesigner()
+    await vi.runAllTicks()
+    await vi.advanceTimersByTimeAsync(100)
+
+    const frame = screen.getByTitle("博客外观实时预览")
+    const first = vi.mocked(api.preview).mock.calls[0]![0]
+    const sessionPreviewUrl = new URL(first.url)
+    expect(frame).toHaveAttribute("src", first.url)
+    expect(sessionPreviewUrl.searchParams.get("kgpAppearance")).toBe(first.sessionId)
+    expect(first.sessionId).toMatch(
+      /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i,
+    )
+
+    fireEvent.change(screen.getByLabelText("强调色"), { target: { value: "#111111" } })
+    await vi.advanceTimersByTimeAsync(100)
+
+    const latest = vi.mocked(api.preview).mock.calls.at(-1)![0]
+    expect(latest.url).toBe(first.url)
+    expect(latest.sessionId).toBe(first.sessionId)
+    expect(frame).toHaveAttribute("src", latest.url)
   })
 
   it("renders unsupported frameworks read-only with the adapter message", async () => {

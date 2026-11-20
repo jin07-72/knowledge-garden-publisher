@@ -577,14 +577,17 @@ describe("publisher main layout", () => {
 
     expect(await screen.findByRole("dialog", { name: "外观设置" })).toBeVisible()
     expect(garden.appearance.read).toHaveBeenCalledOnce()
-    await waitFor(() =>
-      expect(garden.appearance.preview).toHaveBeenCalledWith(
-        expect.objectContaining({ url: "http://127.0.0.1:8080/last-good/" }),
-      ),
-    )
-    expect(garden.appearance.preview).not.toHaveBeenCalledWith(
-      expect.objectContaining({ url: "http://127.0.0.1:8080/current-build/" }),
-    )
+    await waitFor(() => expect(garden.appearance.preview).toHaveBeenCalledOnce())
+    const previewRequest = vi.mocked(garden.appearance.preview).mock.calls[0]![0]
+    const previewUrl = new URL(previewRequest.url)
+    expect(`${previewUrl.origin}${previewUrl.pathname}`).toBe("http://127.0.0.1:8080/last-good/")
+    expect(previewUrl.searchParams.get("kgpAppearance")).toBe(previewRequest.sessionId)
+    expect(
+      vi.mocked(garden.appearance.preview).mock.calls.map(([request]) => {
+        const url = new URL(request.url)
+        return `${url.origin}${url.pathname}`
+      }),
+    ).not.toContain("http://127.0.0.1:8080/current-build/")
   })
 
   it("flushes the current Markdown before appearance apply and invalidates changes without publishing", async () => {

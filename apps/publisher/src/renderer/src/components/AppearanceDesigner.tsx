@@ -84,6 +84,12 @@ export function AppearanceDesigner({
   const previewRequestId = useRef(0)
   const previewTimer = useRef<number | undefined>(undefined)
   const activePreviewUrl = useMemo(() => loopbackPreviewUrl(previewUrl), [previewUrl])
+  const sessionPreviewUrl = useMemo(() => {
+    if (!activePreviewUrl) return undefined
+    const url = new URL(activePreviewUrl)
+    url.searchParams.set("kgpAppearance", sessionId.current)
+    return url.href
+  }, [activePreviewUrl])
   const snapshot = loadState.kind === "ready" ? loadState.snapshot : undefined
   const validation = useMemo(
     () => (draft ? appearanceSettingsSchema.safeParse(draft) : undefined),
@@ -112,7 +118,7 @@ export function AppearanceDesigner({
 
   useEffect(() => {
     const requestId = ++previewRequestId.current
-    if (!snapshot?.supported || !activePreviewUrl || !draft || !validation?.success) {
+    if (!snapshot?.supported || !sessionPreviewUrl || !draft || !validation?.success) {
       setPreviewState("idle")
       return
     }
@@ -121,7 +127,7 @@ export function AppearanceDesigner({
       if (previewTimer.current === timer) previewTimer.current = undefined
       if (closing.current || requestId !== previewRequestId.current) return
       void api
-        .preview({ url: activePreviewUrl, sessionId: sessionId.current, settings: draft })
+        .preview({ url: sessionPreviewUrl, sessionId: sessionId.current, settings: draft })
         .then((result) => {
           if (!mounted.current || requestId !== previewRequestId.current) return
           setPreviewState(result.ok ? "ready" : "error")
@@ -132,7 +138,7 @@ export function AppearanceDesigner({
       window.clearTimeout(timer)
       if (previewTimer.current === timer) previewTimer.current = undefined
     }
-  }, [activePreviewUrl, api, draft, snapshot?.supported, validation?.success])
+  }, [api, draft, sessionPreviewUrl, snapshot?.supported, validation?.success])
 
   const close = async (): Promise<void> => {
     if (busy || closing.current) return
@@ -295,7 +301,7 @@ export function AppearanceDesigner({
             }}
             onChooseBackground={() => void chooseBackground()}
           />
-          <AppearancePreview previewUrl={activePreviewUrl} state={previewState} />
+          <AppearancePreview previewUrl={sessionPreviewUrl} state={previewState} />
         </div>
       ) : null}
 
