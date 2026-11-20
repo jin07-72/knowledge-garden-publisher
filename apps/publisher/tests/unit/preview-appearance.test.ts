@@ -1,6 +1,7 @@
 import { beforeEach, describe, expect, it, vi } from "vitest"
 import {
   clearAppearancePreview,
+  installAppearancePreviewInFrame,
   previewAppearance,
   type PreviewFramePort,
 } from "../../src/main/previewAppearance"
@@ -28,7 +29,7 @@ describe("appearance preview frame boundary", () => {
 
     await expect(
       previewAppearance([unrelated, preview], {
-        url: "http://127.0.0.1:8080/technology/css-grid?draft=1",
+        url: "http://127.0.0.1:8080/technology/css-grid",
         sessionId: "session-1",
         css: "body { color: teal; }",
       }),
@@ -76,12 +77,12 @@ describe("appearance preview frame boundary", () => {
     expect(malformed.executeJavaScript).not.toHaveBeenCalled()
   })
 
-  it("rejects a frame whose current document loses the requested session query", async () => {
+  it("exact frame injection rejects a current document that loses the requested session query", async () => {
     const taggedUrl = "http://127.0.0.1:8080/note?appearanceSession=session-1"
     const preview = executableFrame(taggedUrl, "http://127.0.0.1:8080/note")
 
     await expect(
-      previewAppearance([preview], {
+      installAppearancePreviewInFrame(preview, {
         url: taggedUrl,
         sessionId: "session-1",
         css: "body {}",
@@ -214,7 +215,7 @@ describe("appearance preview frame boundary", () => {
 
   it("clears only the matching session in the exact frame", async () => {
     const unrelated = executableFrame("http://127.0.0.1:8080/other")
-    const preview = executableFrame("http://127.0.0.1:8080/note/")
+    const preview = executableFrame("http://127.0.0.1:8080/note/?draft=1")
     for (const sessionId of ["session-1", "session-2"]) {
       const style = document.createElement("style")
       style.dataset.publisherAppearancePreview = sessionId

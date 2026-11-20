@@ -21,11 +21,17 @@ export interface AppearanceFrameClearRequest {
   readonly sessionId: string
 }
 
-export function normalizedAppearancePreviewUrl(value: string): string | undefined {
+type AppearancePreviewQueryMatch = "exact" | "ignore"
+
+function normalizeAppearancePreviewUrl(
+  value: string,
+  queryMatch: AppearancePreviewQueryMatch,
+): string | undefined {
   try {
     const url = new URL(value)
     if (url.protocol !== "http:" || url.hostname !== "127.0.0.1") return undefined
     url.hash = ""
+    if (queryMatch === "ignore") url.search = ""
     url.pathname = url.pathname.replace(/\/+$/, "") || "/"
     return url.toString()
   } catch {
@@ -33,16 +39,26 @@ export function normalizedAppearancePreviewUrl(value: string): string | undefine
   }
 }
 
+export function normalizedAppearancePreviewUrl(value: string): string | undefined {
+  return normalizeAppearancePreviewUrl(value, "exact")
+}
+
+function normalizedLegacyAppearancePreviewUrl(value: string): string | undefined {
+  return normalizeAppearancePreviewUrl(value, "ignore")
+}
+
 function installPreviewStyle(payload: {
   expectedUrl: string
   sessionId: string
   css: string
+  exactQuery: boolean
 }): boolean {
   const normalize = (value: string): string | undefined => {
     try {
       const url = new URL(value)
       if (url.protocol !== "http:" || url.hostname !== "127.0.0.1") return undefined
       url.hash = ""
+      if (!payload.exactQuery) url.search = ""
       url.pathname = url.pathname.replace(/\/+$/, "") || "/"
       return url.toString()
     } catch {
@@ -60,12 +76,17 @@ function installPreviewStyle(payload: {
   return true
 }
 
-function clearPreviewStyle(payload: { expectedUrl: string; sessionId: string }): boolean {
+function clearPreviewStyle(payload: {
+  expectedUrl: string
+  sessionId: string
+  exactQuery: boolean
+}): boolean {
   const normalize = (value: string): string | undefined => {
     try {
       const url = new URL(value)
       if (url.protocol !== "http:" || url.hostname !== "127.0.0.1") return undefined
       url.hash = ""
+      if (!payload.exactQuery) url.search = ""
       url.pathname = url.pathname.replace(/\/+$/, "") || "/"
       return url.toString()
     } catch {
@@ -85,17 +106,17 @@ function scriptFor<Payload>(operation: (payload: Payload) => boolean, payload: P
   return `(${operation.toString()})(${JSON.stringify(payload)})`
 }
 
-async function executeInExactFrame(
+async function executeInLegacyFrame(
   frameSource: PreviewFrameSource,
   url: string,
   execute: (frame: PreviewFramePort) => Promise<boolean>,
 ): Promise<boolean> {
   try {
-    const requestedUrl = normalizedAppearancePreviewUrl(url)
+    const requestedUrl = normalizedLegacyAppearancePreviewUrl(url)
     if (!requestedUrl) return false
     const frames = typeof frameSource === "function" ? frameSource() : frameSource
     const frame = frames.find(
-      (candidate) => normalizedAppearancePreviewUrl(candidate.url) === requestedUrl,
+      (candidate) => normalizedLegacyAppearancePreviewUrl(candidate.url) === requestedUrl,
     )
     if (!frame) return false
     return execute(frame)
@@ -104,19 +125,23 @@ async function executeInExactFrame(
   }
 }
 
-export async function installAppearancePreviewInFrame(
+async function installAppearancePreviewInFrameMatchingQuery(
   frame: PreviewFramePort,
   request: AppearanceFramePreviewRequest,
+  queryMatch: AppearancePreviewQueryMatch,
 ): Promise<boolean> {
   try {
-    const expectedUrl = normalizedAppearancePreviewUrl(request.url)
-    if (!expectedUrl || normalizedAppearancePreviewUrl(frame.url) !== expectedUrl) return false
+    const expectedUrl = normalizeAppearancePreviewUrl(request.url, queryMatch)
+    if (!expectedUrl || normalizeAppearancePreviewUrl(frame.url, queryMatch) !== expectedUrl) {
+      return false
+    }
     return (
       (await frame.executeJavaScript(
         scriptFor(installPreviewStyle, {
           expectedUrl,
           sessionId: request.sessionId,
           css: request.css,
+          exactQuery: queryMatch === "exact",
         }),
         true,
       )) === true
@@ -126,18 +151,29 @@ export async function installAppearancePreviewInFrame(
   }
 }
 
-export async function removeAppearancePreviewFromFrame(
+export function installAppearancePreviewInFrame(
+  frame: PreviewFramePort,
+  request: AppearanceFramePreviewRequest,
+): Promise<boolean> {
+  return installAppearancePreviewInFrameMatchingQuery(frame, request, "exact")
+}
+
+async function removeAppearancePreviewFromFrameMatchingQuery(
   frame: PreviewFramePort,
   request: AppearanceFrameClearRequest,
+  queryMatch: AppearancePreviewQueryMatch,
 ): Promise<boolean> {
   try {
-    const expectedUrl = normalizedAppearancePreviewUrl(request.url)
-    if (!expectedUrl || normalizedAppearancePreviewUrl(frame.url) !== expectedUrl) return false
+    const expectedUrl = normalizeAppearancePreviewUrl(request.url, queryMatch)
+    if (!expectedUrl || normalizeAppearancePreviewUrl(frame.url, queryMatch) !== expectedUrl) {
+      return false
+    }
     return (
       (await frame.executeJavaScript(
         scriptFor(clearPreviewStyle, {
           expectedUrl,
           sessionId: request.sessionId,
+          exactQuery: queryMatch === "exact",
         }),
         true,
       )) === true
@@ -145,14 +181,21 @@ export async function removeAppearancePreviewFromFrame(
   } catch {
     return false
   }
+}
+
+export function removeAppearancePreviewFromFrame(
+  frame: PreviewFramePort,
+  request: AppearanceFrameClearRequest,
+): Promise<boolean> {
+  return removeAppearancePreviewFromFrameMatchingQuery(frame, request, "exact")
 }
 
 export function previewAppearance(
   frames: PreviewFrameSource,
   request: AppearanceFramePreviewRequest,
 ): Promise<boolean> {
-  return executeInExactFrame(frames, request.url, (frame) =>
-    installAppearancePreviewInFrame(frame, request),
+  return executeInLegacyFrame(frames, request.url, (frame) =>
+    installAppearancePreviewInFrameMatchingQuery(frame, request, "ignore"),
   )
 }
 
@@ -160,7 +203,7 @@ export function clearAppearancePreview(
   frames: PreviewFrameSource,
   request: AppearanceFrameClearRequest,
 ): Promise<boolean> {
-  return executeInExactFrame(frames, request.url, (frame) =>
-    removeAppearancePreviewFromFrame(frame, request),
+  return executeInLegacyFrame(frames, request.url, (frame) =>
+    removeAppearancePreviewFromFrameMatchingQuery(frame, request, "ignore"),
   )
 }
