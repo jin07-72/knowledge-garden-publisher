@@ -40,11 +40,7 @@ interface InstallIntent {
 function exactLoopbackOrigin(value: string): string | undefined {
   try {
     const url = new URL(value)
-    if (
-      url.protocol !== "http:" ||
-      url.hostname !== "127.0.0.1" ||
-      url.port.length === 0
-    ) {
+    if (url.protocol !== "http:" || url.hostname !== "127.0.0.1" || url.port.length === 0) {
       return undefined
     }
     return url.origin
@@ -183,7 +179,17 @@ export function createAppearancePreviewController({
             const installed = await installAppearancePreviewInFrame(frame, request)
             if (!installed) return false
             if (disposed || operationRevision !== revision) {
-              await rollbackInstalledPreview(target, retained)
+              const successor = latestInstall
+              if (
+                !disposed &&
+                !retained &&
+                successor?.sessionId === target.sessionId &&
+                successor.revision === revision
+              ) {
+                bound = target
+              } else {
+                await rollbackInstalledPreview(target, retained)
+              }
               return false
             }
             if (retained && retained.frameTreeNodeId !== target.frameTreeNodeId) {

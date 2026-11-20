@@ -38,7 +38,11 @@ function frame(frameTreeNodeId: number, initialUrl: string) {
       const executionDocument = currentDocument
       const executionUrl = currentUrl
       const run = () =>
-        Function("document", "location", `return ${source}`)(executionDocument, {
+        Function(
+          "document",
+          "location",
+          `return ${source}`,
+        )(executionDocument, {
           href: executionUrl,
         })
       const behavior = nextExecution
@@ -129,7 +133,11 @@ describe("appearance preview controller", () => {
   it("reinjects into the bound frame after a finished navigation on the exact origin", async () => {
     const target = frame(22, firstUrl)
     const controller = createAppearancePreviewController({ frames: () => [target.port] })
-    await controller.install({ url: firstUrl, sessionId: "session-1", css: "body { color: teal; }" })
+    await controller.install({
+      url: firstUrl,
+      sessionId: "session-1",
+      css: "body { color: teal; }",
+    })
 
     target.navigate(secondUrl)
     await controller.didNavigate(navigation(22, secondUrl))
@@ -159,6 +167,37 @@ describe("appearance preview controller", () => {
     await expect(installing).resolves.toBe(true)
     await navigating
     expect(target.style?.textContent).toBe("body { color: teal; }")
+  })
+
+  it("keeps proven frame identity when navigation and newer CSS supersede the first install", async () => {
+    const firstExecution = deferred<void>()
+    const taggedUrl = `${firstUrl}?appearanceSession=session-1`
+    const target = frame(22, taggedUrl)
+    target.deferNextExecutionAfterMutation(firstExecution.promise)
+    const controller = createAppearancePreviewController({ frames: () => [target.port] })
+
+    const installing = controller.install({
+      url: taggedUrl,
+      sessionId: "session-1",
+      css: "body { color: red; }",
+    })
+    await vi.waitFor(() => expect(target.port.executeJavaScript).toHaveBeenCalledOnce())
+    expect(target.style?.textContent).toBe("body { color: red; }")
+
+    target.navigate(secondUrl)
+    const navigating = controller.didNavigate(navigation(22, secondUrl))
+    const updating = controller.install({
+      url: taggedUrl,
+      sessionId: "session-1",
+      css: "body { color: blue; }",
+    })
+    firstExecution.resolve()
+
+    await expect(installing).resolves.toBe(false)
+    await navigating
+    await expect(updating).resolves.toBe(true)
+    expect(target.style?.dataset.publisherAppearancePreview).toBe("session-1")
+    expect(target.style?.textContent).toBe("body { color: blue; }")
   })
 
   it("reinjects the retained CSS when navigation outlives a failed pending replacement", async () => {
@@ -211,7 +250,11 @@ describe("appearance preview controller", () => {
     await controller.install({ url: firstUrl, sessionId: "session-1", css: "body { color: red; }" })
 
     target.navigate(secondUrl)
-    await controller.install({ url: firstUrl, sessionId: "session-1", css: "body { color: blue; }" })
+    await controller.install({
+      url: firstUrl,
+      sessionId: "session-1",
+      css: "body { color: blue; }",
+    })
     expect(target.style?.textContent).toBe("body { color: blue; }")
 
     target.navigate(firstUrl)
