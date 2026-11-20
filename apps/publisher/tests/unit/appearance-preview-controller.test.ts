@@ -61,22 +61,27 @@ describe("appearance preview controller", () => {
     document.head.replaceChildren()
   })
 
-  it("binds the stable frame only after the exact requested URL installs successfully", async () => {
-    const unrelated = frame(11, "http://127.0.0.1:4173/notes/unrelated")
-    const target = frame(22, `${firstUrl}/?draft=1#heading`)
-    const frames = [unrelated.port, target.port]
+  it("binds only the frame whose URL has the exact requested session query", async () => {
+    const untagged = frame(11, firstUrl)
+    const taggedUrl = `${firstUrl}?appearanceSession=session-1`
+    const target = frame(22, `${firstUrl}/?appearanceSession=session-1#heading`)
+    const frames = [untagged.port, target.port]
     const controller = createAppearancePreviewController({ frames: () => frames })
 
     await expect(
-      controller.install({ url: firstUrl, sessionId: "session-1", css: "body { color: teal; }" }),
+      controller.install({
+        url: taggedUrl,
+        sessionId: "session-1",
+        css: "body { color: teal; }",
+      }),
     ).resolves.toBe(true)
 
-    expect(unrelated.port.executeJavaScript).not.toHaveBeenCalled()
+    expect(untagged.port.executeJavaScript).not.toHaveBeenCalled()
     expect(target.port.executeJavaScript).toHaveBeenCalledOnce()
-    frames.splice(0, frames.length, unrelated.port)
-    unrelated.navigate(secondUrl)
-    await controller.didNavigate(navigation(11, secondUrl))
-    expect(unrelated.port.executeJavaScript).not.toHaveBeenCalled()
+    target.navigate(secondUrl)
+    await controller.didNavigate(navigation(22, secondUrl))
+    expect(target.port.executeJavaScript).toHaveBeenCalledTimes(2)
+    expect(untagged.port.executeJavaScript).not.toHaveBeenCalled()
   })
 
   it("reinjects into the bound frame after a finished navigation on the exact origin", async () => {
@@ -120,6 +125,66 @@ describe("appearance preview controller", () => {
     target.navigate(firstUrl)
     await controller.didNavigate(navigation(22, firstUrl))
     expect(document.head.querySelector("style")?.textContent).toBe("body { color: blue; }")
+  })
+
+  it("retains the bound session after an update fails while its frame is temporarily external", async () => {
+    const target = frame(22, firstUrl)
+    const controller = createAppearancePreviewController({ frames: () => [target.port] })
+    await controller.install({
+      url: firstUrl,
+      sessionId: "session-1",
+      css: "body { color: teal; }",
+    })
+
+    target.navigate("https://example.com/temporary")
+    await expect(
+      controller.install({
+        url: firstUrl,
+        sessionId: "session-1",
+        css: "body { color: blue; }",
+      }),
+    ).resolves.toBe(false)
+    target.navigate(secondUrl)
+    await controller.didNavigate(navigation(22, secondUrl))
+
+    expect(document.head.querySelector("style")?.textContent).toBe("body { color: teal; }")
+  })
+
+  it("does not invalidate the active session when removing a different session", async () => {
+    const target = frame(22, firstUrl)
+    const controller = createAppearancePreviewController({ frames: () => [target.port] })
+    await controller.install({ url: firstUrl, sessionId: "session-1", css: "body {}" })
+
+    await expect(controller.remove({ url: firstUrl, sessionId: "session-2" })).resolves.toBe(true)
+    target.navigate(secondUrl)
+    await controller.didNavigate(navigation(22, secondUrl))
+
+    expect(target.port.executeJavaScript).toHaveBeenCalledTimes(2)
+    expect(document.head.querySelector("style")?.dataset.publisherAppearancePreview).toBe(
+      "session-1",
+    )
+  })
+
+  it("retains the active session when a replacement fails to install", async () => {
+    const target = frame(22, firstUrl)
+    const controller = createAppearancePreviewController({ frames: () => [target.port] })
+    await controller.install({
+      url: firstUrl,
+      sessionId: "session-1",
+      css: "body { color: teal; }",
+    })
+    vi.mocked(target.port.executeJavaScript).mockResolvedValueOnce(false)
+
+    await expect(
+      controller.install({ url: firstUrl, sessionId: "session-2", css: "body { color: blue; }" }),
+    ).resolves.toBe(false)
+    target.navigate(secondUrl)
+    await controller.didNavigate(navigation(22, secondUrl))
+
+    expect(document.head.querySelector("style")?.textContent).toBe("body { color: teal; }")
+    expect(document.head.querySelector("style")?.dataset.publisherAppearancePreview).toBe(
+      "session-1",
+    )
   })
 
   it("removes from the bound frame's current document, forgets state, and is idempotent", async () => {
@@ -219,7 +284,7 @@ describe("appearance preview controller", () => {
     await controller.install({ url: firstUrl, sessionId: "session-1", css: "body {}" })
     detached.detach()
 
-    await expect(controller.remove({ url: firstUrl, sessionId: "session-1" })).resolves.toBe(false)
+    await expect(controller.remove({ url: firstUrl, sessionId: "session-1" })).resolves.toBe(true)
     await expect(controller.remove({ url: firstUrl, sessionId: "session-1" })).resolves.toBe(true)
 
     const destroyed = {

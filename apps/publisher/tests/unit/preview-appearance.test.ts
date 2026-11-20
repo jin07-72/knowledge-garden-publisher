@@ -28,7 +28,7 @@ describe("appearance preview frame boundary", () => {
 
     await expect(
       previewAppearance([unrelated, preview], {
-        url: "http://127.0.0.1:8080/technology/css-grid",
+        url: "http://127.0.0.1:8080/technology/css-grid?draft=1",
         sessionId: "session-1",
         css: "body { color: teal; }",
       }),
@@ -74,6 +74,20 @@ describe("appearance preview frame boundary", () => {
     expect(localhost.executeJavaScript).not.toHaveBeenCalled()
     expect(online.executeJavaScript).not.toHaveBeenCalled()
     expect(malformed.executeJavaScript).not.toHaveBeenCalled()
+  })
+
+  it("rejects a frame whose current document loses the requested session query", async () => {
+    const taggedUrl = "http://127.0.0.1:8080/note?appearanceSession=session-1"
+    const preview = executableFrame(taggedUrl, "http://127.0.0.1:8080/note")
+
+    await expect(
+      previewAppearance([preview], {
+        url: taggedUrl,
+        sessionId: "session-1",
+        css: "body {}",
+      }),
+    ).resolves.toBe(false)
+    expect(document.head.querySelector("style")).toBeNull()
   })
 
   it("fails closed for malformed results and frames that navigate during execution", async () => {

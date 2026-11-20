@@ -32,6 +32,11 @@ interface BoundPreview {
   readonly revision: number
 }
 
+interface InstallIntent {
+  readonly sessionId: string
+  readonly revision: number
+}
+
 function exactLoopbackOrigin(value: string): string | undefined {
   try {
     const url = new URL(value)
@@ -64,6 +69,7 @@ export function createAppearancePreviewController({
 }: AppearancePreviewControllerOptions): AppearancePreviewController {
   let bound: BoundPreview | undefined
   let pending: BoundPreview | undefined
+  let latestInstall: InstallIntent | undefined
   let revision = 0
   let disposed = false
   let disposal: Promise<void> | undefined
@@ -119,65 +125,75 @@ export function createAppearancePreviewController({
     install(request) {
       if (disposed) return Promise.resolve(false)
       const operationRevision = ++revision
+      const intent: InstallIntent = { sessionId: request.sessionId, revision: operationRevision }
+      latestInstall = intent
       return enqueue(async () => {
-        if (disposed || operationRevision !== revision) return false
+        try {
+          if (disposed || operationRevision !== revision) return false
 
-        const existing = bound
-        if (existing?.sessionId === request.sessionId) {
-          const frame = frameById(existing.frameTreeNodeId)
+          const existing = bound
+          if (existing?.sessionId === request.sessionId) {
+            const frame = frameById(existing.frameTreeNodeId)
+            if (!frame) return false
+            const current = readableFrame(frame)
+            if (!current || exactLoopbackOrigin(current.url) !== existing.origin) return false
+            const installed = await installAppearancePreviewInFrame(frame, {
+              url: current.url,
+              sessionId: request.sessionId,
+              css: request.css,
+            })
+            if (!installed || disposed || operationRevision !== revision) return false
+            bound = { ...existing, css: request.css, revision: operationRevision }
+            return true
+          }
+
+          const origin = exactLoopbackOrigin(request.url)
+          if (!origin) return false
+          const frame = frameByUrl(request.url)
           if (!frame) return false
           const current = readableFrame(frame)
-          if (!current || exactLoopbackOrigin(current.url) !== existing.origin) return false
-          const installed = await installAppearancePreviewInFrame(frame, {
-            url: current.url,
+          if (!current) return false
+          const target: BoundPreview = {
             sessionId: request.sessionId,
             css: request.css,
-          })
-          if (!installed || disposed || operationRevision !== revision) return false
-          bound = { ...existing, css: request.css, revision: operationRevision }
-          return true
-        }
-
-        const origin = exactLoopbackOrigin(request.url)
-        if (!origin) return false
-        const frame = frameByUrl(request.url)
-        if (!frame) return false
-        const current = readableFrame(frame)
-        if (!current) return false
-        const target: BoundPreview = {
-          sessionId: request.sessionId,
-          css: request.css,
-          origin,
-          frameTreeNodeId: current.id,
-          revision: operationRevision,
-        }
-        pending = target
-        try {
-          const installed = await installAppearancePreviewInFrame(frame, request)
-          if (!installed || disposed || operationRevision !== revision) return false
-          bound = target
-          return true
+            origin,
+            frameTreeNodeId: current.id,
+            revision: operationRevision,
+          }
+          pending = target
+          try {
+            const installed = await installAppearancePreviewInFrame(frame, request)
+            if (!installed || disposed || operationRevision !== revision) return false
+            bound = target
+            return true
+          } finally {
+            if (pending === target) pending = undefined
+          }
         } finally {
-          if (pending === target) pending = undefined
+          if (latestInstall === intent) latestInstall = undefined
         }
       })
     },
 
     remove(request) {
       if (disposed) return Promise.resolve(true)
-      const operationRevision = ++revision
       const preview =
         bound?.sessionId === request.sessionId
           ? bound
           : pending?.sessionId === request.sessionId
             ? pending
             : undefined
+      const matchesInstall = latestInstall?.sessionId === request.sessionId
+      if (!preview && !matchesInstall) return Promise.resolve(true)
+      const operationRevision = ++revision
+      latestInstall = undefined
       if (preview === bound) bound = undefined
       if (preview === pending) pending = undefined
       return enqueue(async () => {
         if (operationRevision !== revision) return true
         if (!preview) return true
-        return clearBoundPreview(preview)
+        await clearBoundPreview(preview)
+        return true
       })
     },
 
@@ -186,7 +202,6 @@ export function createAppearancePreviewController({
         disposed ||
         !event.finished ||
         !bound ||
-        bound.revision !== revision ||
         event.frameTreeNodeId !== bound.frameTreeNodeId ||
         exactLoopbackOrigin(event.url) !== bound.origin
       ) {
@@ -219,6 +234,7 @@ export function createAppearancePreviewController({
       if (disposal) return disposal
       disposed = true
       ++revision
+      latestInstall = undefined
       const previews = [bound, pending].filter(
         (preview): preview is BoundPreview => preview !== undefined,
       )

@@ -26,7 +26,6 @@ export function normalizedAppearancePreviewUrl(value: string): string | undefine
     const url = new URL(value)
     if (url.protocol !== "http:" || url.hostname !== "127.0.0.1") return undefined
     url.hash = ""
-    url.search = ""
     url.pathname = url.pathname.replace(/\/+$/, "") || "/"
     return url.toString()
   } catch {
@@ -44,7 +43,6 @@ function installPreviewStyle(payload: {
       const url = new URL(value)
       if (url.protocol !== "http:" || url.hostname !== "127.0.0.1") return undefined
       url.hash = ""
-      url.search = ""
       url.pathname = url.pathname.replace(/\/+$/, "") || "/"
       return url.toString()
     } catch {
@@ -68,7 +66,6 @@ function clearPreviewStyle(payload: { expectedUrl: string; sessionId: string }):
       const url = new URL(value)
       if (url.protocol !== "http:" || url.hostname !== "127.0.0.1") return undefined
       url.hash = ""
-      url.search = ""
       url.pathname = url.pathname.replace(/\/+$/, "") || "/"
       return url.toString()
     } catch {
