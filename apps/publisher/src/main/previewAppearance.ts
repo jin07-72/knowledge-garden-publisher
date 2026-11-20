@@ -3,6 +3,11 @@ export interface PreviewFramePort {
   executeJavaScript(source: string, userGesture?: boolean): Promise<unknown>
 }
 
+export interface AppearancePreviewFramePort extends PreviewFramePort {
+  readonly frameTreeNodeId: number
+  readonly detached: boolean
+}
+
 export type PreviewFrameSource = readonly PreviewFramePort[] | (() => readonly PreviewFramePort[])
 
 export interface AppearanceFramePreviewRequest {
@@ -16,7 +21,7 @@ export interface AppearanceFrameClearRequest {
   readonly sessionId: string
 }
 
-function normalizedLoopbackUrl(value: string): string | undefined {
+export function normalizedAppearancePreviewUrl(value: string): string | undefined {
   try {
     const url = new URL(value)
     if (url.protocol !== "http:" || url.hostname !== "127.0.0.1") return undefined
@@ -86,15 +91,60 @@ function scriptFor<Payload>(operation: (payload: Payload) => boolean, payload: P
 async function executeInExactFrame(
   frameSource: PreviewFrameSource,
   url: string,
-  source: (expectedUrl: string) => string,
+  execute: (frame: PreviewFramePort) => Promise<boolean>,
 ): Promise<boolean> {
   try {
-    const requestedUrl = normalizedLoopbackUrl(url)
+    const requestedUrl = normalizedAppearancePreviewUrl(url)
     if (!requestedUrl) return false
     const frames = typeof frameSource === "function" ? frameSource() : frameSource
-    const frame = frames.find((candidate) => normalizedLoopbackUrl(candidate.url) === requestedUrl)
+    const frame = frames.find(
+      (candidate) => normalizedAppearancePreviewUrl(candidate.url) === requestedUrl,
+    )
     if (!frame) return false
-    return (await frame.executeJavaScript(source(requestedUrl), true)) === true
+    return execute(frame)
+  } catch {
+    return false
+  }
+}
+
+export async function installAppearancePreviewInFrame(
+  frame: PreviewFramePort,
+  request: AppearanceFramePreviewRequest,
+): Promise<boolean> {
+  try {
+    const expectedUrl = normalizedAppearancePreviewUrl(request.url)
+    if (!expectedUrl || normalizedAppearancePreviewUrl(frame.url) !== expectedUrl) return false
+    return (
+      (await frame.executeJavaScript(
+        scriptFor(installPreviewStyle, {
+          expectedUrl,
+          sessionId: request.sessionId,
+          css: request.css,
+        }),
+        true,
+      )) === true
+    )
+  } catch {
+    return false
+  }
+}
+
+export async function removeAppearancePreviewFromFrame(
+  frame: PreviewFramePort,
+  request: AppearanceFrameClearRequest,
+): Promise<boolean> {
+  try {
+    const expectedUrl = normalizedAppearancePreviewUrl(request.url)
+    if (!expectedUrl || normalizedAppearancePreviewUrl(frame.url) !== expectedUrl) return false
+    return (
+      (await frame.executeJavaScript(
+        scriptFor(clearPreviewStyle, {
+          expectedUrl,
+          sessionId: request.sessionId,
+        }),
+        true,
+      )) === true
+    )
   } catch {
     return false
   }
@@ -104,12 +154,8 @@ export function previewAppearance(
   frames: PreviewFrameSource,
   request: AppearanceFramePreviewRequest,
 ): Promise<boolean> {
-  return executeInExactFrame(frames, request.url, (expectedUrl) =>
-    scriptFor(installPreviewStyle, {
-      expectedUrl,
-      sessionId: request.sessionId,
-      css: request.css,
-    }),
+  return executeInExactFrame(frames, request.url, (frame) =>
+    installAppearancePreviewInFrame(frame, request),
   )
 }
 
@@ -117,10 +163,7 @@ export function clearAppearancePreview(
   frames: PreviewFrameSource,
   request: AppearanceFrameClearRequest,
 ): Promise<boolean> {
-  return executeInExactFrame(frames, request.url, (expectedUrl) =>
-    scriptFor(clearPreviewStyle, {
-      expectedUrl,
-      sessionId: request.sessionId,
-    }),
+  return executeInExactFrame(frames, request.url, (frame) =>
+    removeAppearancePreviewFromFrame(frame, request),
   )
 }
