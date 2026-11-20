@@ -121,6 +121,26 @@ export function createAppearancePreviewController({
     })
   }
 
+  async function installBoundPreview(preview: BoundPreview): Promise<boolean> {
+    const frame = frameById(preview.frameTreeNodeId)
+    if (!frame) return false
+    const current = readableFrame(frame)
+    if (!current || exactLoopbackOrigin(current.url) !== preview.origin) return false
+    return installAppearancePreviewInFrame(frame, {
+      url: current.url,
+      sessionId: preview.sessionId,
+      css: preview.css,
+    })
+  }
+
+  async function rollbackInstalledPreview(
+    installed: BoundPreview,
+    retained: BoundPreview | undefined,
+  ): Promise<void> {
+    await clearBoundPreview(installed)
+    if (!disposed && retained && bound === retained) await installBoundPreview(retained)
+  }
+
   return {
     install(request) {
       if (disposed) return Promise.resolve(false)
@@ -133,20 +153,18 @@ export function createAppearancePreviewController({
 
           const existing = bound
           if (existing?.sessionId === request.sessionId) {
-            const frame = frameById(existing.frameTreeNodeId)
-            if (!frame) return false
-            const current = readableFrame(frame)
-            if (!current || exactLoopbackOrigin(current.url) !== existing.origin) return false
-            const installed = await installAppearancePreviewInFrame(frame, {
-              url: current.url,
-              sessionId: request.sessionId,
-              css: request.css,
-            })
-            if (!installed || disposed || operationRevision !== revision) return false
-            bound = { ...existing, css: request.css, revision: operationRevision }
+            const target = { ...existing, css: request.css, revision: operationRevision }
+            const installed = await installBoundPreview(target)
+            if (!installed) return false
+            if (disposed || operationRevision !== revision) {
+              await rollbackInstalledPreview(target, existing)
+              return false
+            }
+            bound = target
             return true
           }
 
+          const retained = bound
           const origin = exactLoopbackOrigin(request.url)
           if (!origin) return false
           const frame = frameByUrl(request.url)
@@ -163,7 +181,18 @@ export function createAppearancePreviewController({
           pending = target
           try {
             const installed = await installAppearancePreviewInFrame(frame, request)
-            if (!installed || disposed || operationRevision !== revision) return false
+            if (!installed) return false
+            if (disposed || operationRevision !== revision) {
+              await rollbackInstalledPreview(target, retained)
+              return false
+            }
+            if (retained && retained.frameTreeNodeId !== target.frameTreeNodeId) {
+              await clearBoundPreview(retained)
+              if (disposed || operationRevision !== revision) {
+                await rollbackInstalledPreview(target, retained)
+                return false
+              }
+            }
             bound = target
             return true
           } finally {
@@ -198,12 +227,17 @@ export function createAppearancePreviewController({
     },
 
     didNavigate(event) {
+      const preview =
+        pending?.frameTreeNodeId === event.frameTreeNodeId
+          ? pending
+          : bound?.frameTreeNodeId === event.frameTreeNodeId
+            ? bound
+            : undefined
       if (
         disposed ||
         !event.finished ||
-        !bound ||
-        event.frameTreeNodeId !== bound.frameTreeNodeId ||
-        exactLoopbackOrigin(event.url) !== bound.origin
+        !preview ||
+        exactLoopbackOrigin(event.url) !== preview.origin
       ) {
         return Promise.resolve()
       }
