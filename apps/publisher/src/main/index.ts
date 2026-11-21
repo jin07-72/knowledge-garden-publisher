@@ -179,11 +179,11 @@ const appearancePreviewWindowRuntime = createAppearancePreviewWindowRuntimeManag
   onError: (error) => console.error("Previous appearance preview cleanup failed.", error),
 })
 
-function installAppearancePreview(request: AppearanceFramePreviewRequest): Promise<boolean> {
+export function previewAppearance(request: AppearanceFramePreviewRequest): Promise<boolean> {
   return appearancePreviewWindowRuntime.install(request)
 }
 
-function removeAppearancePreview(request: AppearanceFrameClearRequest): Promise<boolean> {
+export function clearAppearancePreview(request: AppearanceFrameClearRequest): Promise<boolean> {
   return appearancePreviewWindowRuntime.remove(request)
 }
 
@@ -597,8 +597,8 @@ app.whenReady().then(async () => {
       isTracked,
       preview: previewManager,
       appearanceAssetPicker: createProductionAppearanceAssetPicker(),
-      installAppearancePreview,
-      removeAppearancePreview,
+      installAppearancePreview: previewAppearance,
+      removeAppearancePreview: clearAppearancePreview,
       imageLibraryAdapter,
       openExternal: (url) => shell.openExternal(url),
       clearHttpCache: () => session.defaultSession.clearCache(),
