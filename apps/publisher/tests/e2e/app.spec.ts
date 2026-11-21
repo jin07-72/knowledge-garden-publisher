@@ -1126,6 +1126,54 @@ test("appearance designer previews, applies, persists, and undoes without publis
           .textContent(),
       )
       .toContain("--publisher-accent: #123456")
+    const inPageAppearanceUrl = new URL(navigatedAppearanceUrl)
+    inPageAppearanceUrl.hash = "appearance-history"
+    await application.evaluate(
+      async ({ BrowserWindow }, { frameTreeNodeId, targetUrl, sessionId }) => {
+        const frame = BrowserWindow.getAllWindows()[0].webContents.mainFrame.framesInSubtree.find(
+          (candidate) => candidate.frameTreeNodeId === frameTreeNodeId,
+        )
+        if (!frame) throw new Error("The appearance preview frame was detached before pushState.")
+        await frame.executeJavaScript(`(() => {
+          document.querySelector('style[data-publisher-appearance-preview="${sessionId}"]')?.remove()
+          history.pushState({}, "", ${JSON.stringify(targetUrl)})
+        })()`)
+      },
+      {
+        frameTreeNodeId: appearanceFrameTreeNodeId,
+        targetUrl: inPageAppearanceUrl.href,
+        sessionId: appearanceSessionId!,
+      },
+    )
+    await expect
+      .poll(() =>
+        application!.evaluate(
+          ({ BrowserWindow }, frameTreeNodeId) =>
+            BrowserWindow.getAllWindows()[0].webContents.mainFrame.framesInSubtree.find(
+              (frame) => frame.frameTreeNodeId === frameTreeNodeId,
+            )?.url,
+          appearanceFrameTreeNodeId,
+        ),
+      )
+      .toBe(inPageAppearanceUrl.href)
+    await expect
+      .poll(() =>
+        application!.evaluate(
+          async ({ BrowserWindow }, { frameTreeNodeId, sessionId }) => {
+            const frame =
+              BrowserWindow.getAllWindows()[0].webContents.mainFrame.framesInSubtree.find(
+                (candidate) => candidate.frameTreeNodeId === frameTreeNodeId,
+              )
+            if (!frame || frame.detached) return undefined
+            return frame.executeJavaScript(`(() => {
+              const styles = [...document.querySelectorAll('style[data-publisher-appearance-preview="${sessionId}"]')]
+              return { count: styles.length, css: styles[0]?.textContent ?? "" }
+            })()`)
+          },
+          { frameTreeNodeId: appearanceFrameTreeNodeId, sessionId: appearanceSessionId! },
+        ),
+      )
+      .toEqual({ count: 1, css: expect.stringContaining("--publisher-accent: #123456") })
     await page
       .getByRole("dialog", { name: "外观设置" })
       .getByRole("button", { name: "取消" })
