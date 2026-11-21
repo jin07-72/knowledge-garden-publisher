@@ -94,13 +94,14 @@ let prepareBlogManagementShutdown: (() => Promise<void>) | undefined
 let restoreBlogManagementAfterFailedShutdown: (() => void) | undefined
 let previewManager: (PreviewServicePort & { dispose(): Promise<void> }) | undefined
 let publisherServices: PublisherRuntimeServices | undefined
-let appearancePreviewNavigation:
-  | {
-      readonly window: BrowserWindow
-      remove(): void
-    }
-  | undefined
-let appearancePreviewRuntimeActive = false
+
+interface AppearancePreviewWindowRuntime {
+  readonly window: BrowserWindow
+  readonly controller: AppearancePreviewController
+  dispose(): Promise<void>
+}
+
+let appearancePreviewRuntime: AppearancePreviewWindowRuntime | undefined
 
 const appearanceDecodeSemaphore = createAppearanceDecodeSemaphore()
 
@@ -121,8 +122,7 @@ async function revealSelectionInCurrentPreview(
   return revealSelectionInPreviewFrames([...window.webContents.mainFrame.framesInSubtree], request)
 }
 
-function appearanceFrames(): readonly AppearancePreviewFramePort[] {
-  const window = mainWindow
+function appearanceFrames(window = mainWindow): readonly AppearancePreviewFramePort[] {
   if (!window || window.isDestroyed() || window.webContents.isDestroyed()) return []
   return [...window.webContents.mainFrame.framesInSubtree].map((frame) => ({
     get frameTreeNodeId() {
@@ -138,25 +138,15 @@ function appearanceFrames(): readonly AppearancePreviewFramePort[] {
   }))
 }
 
-const appearancePreviewController: AppearancePreviewController = createAppearancePreviewController({
-  frames: appearanceFrames,
-})
-
-function removeAppearancePreviewNavigation(window?: BrowserWindow): void {
-  const navigation = appearancePreviewNavigation
-  if (!navigation || (window && navigation.window !== window)) return
-  navigation.remove()
-  if (appearancePreviewNavigation === navigation) appearancePreviewNavigation = undefined
-}
-
-function installAppearancePreviewNavigation(window: BrowserWindow): void {
-  removeAppearancePreviewNavigation()
-  if (!appearancePreviewRuntimeActive) return
+function installAppearancePreviewNavigation(
+  window: BrowserWindow,
+  controller: AppearancePreviewController,
+): () => void {
   const contents = window.webContents
   const forward = (frameProcessId: number, frameRoutingId: number, url?: string): void => {
     const frame = webFrameMain.fromId(frameProcessId, frameRoutingId)
     if (!frame || frame.detached) return
-    void appearancePreviewController
+    void controller
       .didNavigate({
         frameTreeNodeId: frame.frameTreeNodeId,
         url: url ?? frame.url,
@@ -183,20 +173,62 @@ function installAppearancePreviewNavigation(window: BrowserWindow): void {
   }
   contents.on("did-frame-finish-load", didFrameFinishLoad)
   contents.on("did-navigate-in-page", didNavigateInPage)
-  appearancePreviewNavigation = {
+  let removed = false
+  return () => {
+    if (removed) return
+    removed = true
+    if (contents.isDestroyed()) return
+    contents.off("did-frame-finish-load", didFrameFinishLoad)
+    contents.off("did-navigate-in-page", didNavigateInPage)
+  }
+}
+
+function createAppearancePreviewWindowRuntime(
+  window: BrowserWindow,
+): AppearancePreviewWindowRuntime {
+  const controller = createAppearancePreviewController({ frames: () => appearanceFrames(window) })
+  const removeListeners = installAppearancePreviewNavigation(window, controller)
+  let disposal: Promise<void> | undefined
+  return {
     window,
-    remove: () => {
-      if (contents.isDestroyed()) return
-      contents.off("did-frame-finish-load", didFrameFinishLoad)
-      contents.off("did-navigate-in-page", didNavigateInPage)
+    controller,
+    dispose() {
+      if (disposal) return disposal
+      removeListeners()
+      disposal = controller.dispose()
+      return disposal
     },
   }
 }
 
-async function disposeAppearancePreviewRuntime(): Promise<void> {
-  appearancePreviewRuntimeActive = false
-  removeAppearancePreviewNavigation()
-  await appearancePreviewController.dispose()
+function activateAppearancePreviewWindow(window: BrowserWindow): AppearancePreviewWindowRuntime {
+  const previous = appearancePreviewRuntime
+  const runtime = createAppearancePreviewWindowRuntime(window)
+  appearancePreviewRuntime = runtime
+  if (previous) {
+    void disposeAppearancePreviewRuntime(previous).catch((error: unknown) =>
+      console.error("Previous appearance preview cleanup failed.", error),
+    )
+  }
+  return runtime
+}
+
+async function disposeAppearancePreviewRuntime(runtime = appearancePreviewRuntime): Promise<void> {
+  if (!runtime) return
+  if (appearancePreviewRuntime === runtime) appearancePreviewRuntime = undefined
+  await runtime.dispose()
+}
+
+function installAppearancePreview(request: AppearanceFramePreviewRequest): Promise<boolean> {
+  const runtime = appearancePreviewRuntime
+  if (!runtime || runtime.window.isDestroyed() || runtime.window.webContents.isDestroyed()) {
+    return Promise.resolve(false)
+  }
+  return runtime.controller.install(request)
+}
+
+function removeAppearancePreview(request: AppearanceFrameClearRequest): Promise<boolean> {
+  return appearancePreviewRuntime?.controller.remove(request) ?? Promise.resolve(true)
 }
 
 export function previewAppearance(request: AppearanceFramePreviewRequest): Promise<boolean> {
@@ -338,14 +370,16 @@ function createWindow(): BrowserWindow {
   })
   mainWindow = window
   mainWindowTrust = trust
-  installAppearancePreviewNavigation(window)
+  const appearanceRuntime = activateAppearancePreviewWindow(window)
 
   configureTrustedRendererNavigation(window.webContents, trust)
   window.on("close", (event) => {
     void closeCoordinator.beforeWindowClose(event)
   })
   window.once("closed", () => {
-    removeAppearancePreviewNavigation(window)
+    void disposeAppearancePreviewRuntime(appearanceRuntime).catch((error: unknown) =>
+      console.error("Appearance preview window cleanup failed.", error),
+    )
     if (mainWindow === window) {
       mainWindow = undefined
       mainWindowTrust = undefined
@@ -443,7 +477,10 @@ app.whenReady().then(async () => {
     dispose: async () => {
       await blogManagement.prepareForShutdown()
       const manager = previewManager
-      if (!manager) return
+      if (!manager) {
+        await disposeAppearancePreviewRuntime()
+        return
+      }
       try {
         await runtimeShutdown(undefined, true)
       } finally {
@@ -612,8 +649,8 @@ app.whenReady().then(async () => {
       isTracked,
       preview: previewManager,
       appearanceAssetPicker: createProductionAppearanceAssetPicker(),
-      installAppearancePreview: appearancePreviewController.install,
-      removeAppearancePreview: appearancePreviewController.remove,
+      installAppearancePreview,
+      removeAppearancePreview,
       imageLibraryAdapter,
       openExternal: (url) => shell.openExternal(url),
       clearHttpCache: () => session.defaultSession.clearCache(),
@@ -625,7 +662,6 @@ app.whenReady().then(async () => {
         ? { publishCompletionMessage: "部署成功" }
         : {}),
     })
-    appearancePreviewRuntimeActive = true
     unregisterIpc = registerPublisherIpc({
       ipcMain,
       services: {
