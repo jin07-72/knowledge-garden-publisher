@@ -1084,15 +1084,80 @@ test("appearance designer previews, applies, persists, and undoes without publis
     if (!appearanceSource) throw new Error("The appearance preview iframe did not expose its URL.")
     expect(Number(new URL(appearanceSource).port)).toBe(firstPreviewPort)
     await editDraft(page)
+    const navigatedAppearanceUrl = new URL("../", appearanceSource).href
+    const appearanceSessionId = new URL(appearanceSource).searchParams.get("kgpAppearance")
+    expect(appearanceSessionId).toMatch(
+      /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/i,
+    )
+    const appearanceFrameTreeNodeId = await application.evaluate(({ BrowserWindow }, sourceUrl) => {
+      const frame = BrowserWindow.getAllWindows()[0].webContents.mainFrame.framesInSubtree.find(
+        (candidate) => candidate.url === sourceUrl,
+      )
+      if (!frame) throw new Error("The appearance preview frame was not available for navigation.")
+      return frame.frameTreeNodeId
+    }, appearanceSource)
+    await application.evaluate(
+      async ({ BrowserWindow }, { frameTreeNodeId, targetUrl }) => {
+        const frame = BrowserWindow.getAllWindows()[0].webContents.mainFrame.framesInSubtree.find(
+          (candidate) => candidate.frameTreeNodeId === frameTreeNodeId,
+        )
+        if (!frame) throw new Error("The identified appearance preview frame was detached.")
+        await frame.executeJavaScript(`location.href = ${JSON.stringify(targetUrl)}`)
+      },
+      { frameTreeNodeId: appearanceFrameTreeNodeId, targetUrl: navigatedAppearanceUrl },
+    )
+    await expect
+      .poll(() =>
+        application!.evaluate(
+          ({ BrowserWindow }, frameTreeNodeId) =>
+            BrowserWindow.getAllWindows()[0].webContents.mainFrame.framesInSubtree.find(
+              (frame) => frame.frameTreeNodeId === frameTreeNodeId,
+            )?.url,
+          appearanceFrameTreeNodeId,
+        ),
+      )
+      .toBe(navigatedAppearanceUrl)
+    await expect
+      .poll(() =>
+        page
+          .getByTitle("博客外观实时预览")
+          .contentFrame()
+          .locator("style[data-publisher-appearance-preview]")
+          .textContent(),
+      )
+      .toContain("--publisher-accent: #123456")
     await page
       .getByRole("dialog", { name: "外观设置" })
       .getByRole("button", { name: "取消" })
       .click()
     await expect(page.getByRole("dialog", { name: "外观设置" })).toHaveCount(0)
+    await expect
+      .poll(() =>
+        application!.evaluate(async ({ BrowserWindow }, sessionId) => {
+          const frames = BrowserWindow.getAllWindows()[0].webContents.mainFrame.framesInSubtree
+          const counts = await Promise.all(
+            frames.map(async (frame) => {
+              if (frame.detached) return 0
+              try {
+                const count = await frame.executeJavaScript(
+                  `document.querySelectorAll('style[data-publisher-appearance-preview="${sessionId}"]').length`,
+                )
+                return typeof count === "number" ? count : undefined
+              } catch {
+                return undefined
+              }
+            }),
+          )
+          if (!counts.every((count): count is number => typeof count === "number")) return undefined
+          return counts.reduce((total, count) => total + count, 0)
+        }, appearanceSessionId!),
+      )
+      .toBe(0)
     expect(await readFile(configPath)).toEqual(configBefore)
     expect(await readFile(customPath)).toEqual(customBefore)
     expect(await exists(manifestPath)).toBe(false)
     expect(await exists(stylesheetPath)).toBe(false)
+    expect(await gitOutput(garden.root, ["rev-parse", "origin/main"])).toBe(remoteBefore)
     await expect(
       page
         .getByTitle("博客外观实时预览")
