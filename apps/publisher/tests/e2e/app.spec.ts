@@ -2330,6 +2330,53 @@ test("clones a validated GitHub request from a local E2E bare repository", async
   }
 })
 
+test("keeps a local blog open when its origin remote is missing", async () => {
+  const garden = await createQuartzGardenFixture({
+    directoryName: "Local Startup Garden",
+    noteTitle: "Local Startup Note",
+    noteBody: "local editing remains available during Git failures",
+  })
+  const stateRoot = await createTemporaryDirectory("garden-publisher-e2e-local-startup-")
+  const registry = join(stateRoot, "blogs.json")
+  const runtimeRoot = await createE2eRuntime(stateRoot)
+  const removeOrigin = await git(garden.root, ["remote", "remove", "origin"])
+  expect(removeOrigin.exitCode).toBe(0)
+  let application: ElectronApplication | undefined
+  try {
+    application = await launchApplication(stateRoot, {
+      ...process.env,
+      GARDEN_PUBLISHER_E2E: "1",
+      GARDEN_PUBLISHER_E2E_WORKSPACE: garden.root,
+      GARDEN_PUBLISHER_E2E_RUNTIME: runtimeRoot,
+      GARDEN_PUBLISHER_E2E_REGISTRY: registry,
+    })
+    const page = await application.firstWindow()
+
+    await expect(
+      page.getByRole("button", { name: "Local Startup Note，公开", exact: true }),
+    ).toBeVisible()
+    const editor = page.locator(".cm-content")
+    await expect(editor).toHaveAttribute("contenteditable", "true")
+    await expect(editor).toContainText("local editing remains available during Git failures")
+
+    const startup = page.getByRole("region", { name: "启动检查" })
+    await expect(startup).toBeVisible()
+    await expect(
+      startup.getByText("Add an origin remote before publishing.", { exact: true }),
+    ).toBeVisible()
+    await expect(
+      startup.getByText("请在 Git 中配置名为 origin 的现有远程仓库；应用不会重写远程地址。", {
+        exact: true,
+      }),
+    ).toBeVisible()
+    await expect(page.getByRole("dialog", { name: "博客恢复" })).toHaveCount(0)
+  } finally {
+    await closeApplication(application)
+    await garden.cleanup()
+    await removeTemporaryDirectory(stateRoot)
+  }
+})
+
 test("recovers a corrupt registry through the local blog chooser", async () => {
   const garden = await createQuartzGardenFixture({
     directoryName: "Recovered Garden",
