@@ -22,6 +22,7 @@ import type {
 import type { BlogRegistry } from "./services/blogRegistry"
 import { BlogImportError, type BlogImportService } from "./services/blogImport"
 import { BlogAddressError, type BlogAddressResolver } from "./services/blogAddresses"
+import type { BlogAvailabilityInspection } from "./services/blogAvailability"
 
 export interface BlogRuntime {
   active(): Promise<BlogRecord>
@@ -35,7 +36,7 @@ export interface BlogRuntimeRegistry {
 
 export interface BlogRuntimeDependencies {
   readonly registry: BlogRuntimeRegistry
-  readonly inspect: (path: string) => Promise<BlogCandidateInspection>
+  readonly inspectAvailability: (path: string) => Promise<BlogAvailabilityInspection>
   readonly assertIdle: () => Promise<void>
   readonly dispose: () => Promise<void>
   readonly relaunch: () => void
@@ -97,9 +98,28 @@ export function createRelaunchScheduler(
   return options.relaunch
 }
 
-async function validate(
+async function validateAvailability(
   record: BlogRecord,
-  inspect: BlogRuntimeDependencies["inspect"],
+  inspect: BlogRuntimeDependencies["inspectAvailability"],
+): Promise<BlogRecord> {
+  let inspection: BlogAvailabilityInspection
+  try {
+    inspection = await inspect(record.canonicalPath)
+  } catch {
+    throw unavailable()
+  }
+  if (
+    !inspection.available ||
+    !samePath(resolve(inspection.canonicalPath), resolve(record.canonicalPath))
+  ) {
+    throw unavailable()
+  }
+  return record
+}
+
+async function validateCandidate(
+  record: BlogRecord,
+  inspect: (path: string) => Promise<BlogCandidateInspection>,
 ): Promise<BlogRecord> {
   let inspection: BlogCandidateInspection
   try {
@@ -141,7 +161,7 @@ export function createBlogRuntime(dependencies: BlogRuntimeDependencies): BlogRu
     const state = await dependencies.registry.load()
     const record = state.blogs.find((blog) => blog.id === state.activeBlogId)
     if (!record) throw unavailable()
-    return validate(record, dependencies.inspect)
+    return validateAvailability(record, dependencies.inspectAvailability)
   }
 
   return {
@@ -159,7 +179,7 @@ export function createBlogRuntime(dependencies: BlogRuntimeDependencies): BlogRu
         const state = await dependencies.registry.load()
         const target = state.blogs.find((blog) => blog.id === request.id)
         if (!target) throw unavailable()
-        await validate(target, dependencies.inspect)
+        await validateAvailability(target, dependencies.inspectAvailability)
         await dependencies.assertIdle()
         await dependencies.dispose()
         try {
@@ -261,6 +281,7 @@ export function createBlogManagementAdapter(dependencies: {
   readonly openExternal: (url: string) => Promise<void>
   readonly importer: BlogImportService | (() => BlogImportService)
   readonly inspect: (path: string) => Promise<BlogCandidateInspection>
+  readonly inspectAvailability: (path: string) => Promise<BlogAvailabilityInspection>
   readonly chooseDirectory: () => Promise<string | undefined>
   readonly openFolder: (path: string) => Promise<void>
   readonly switchTo: (request: { readonly id: string; readonly editorSaved: true }) => Promise<void>
@@ -366,9 +387,9 @@ export function createBlogManagementAdapter(dependencies: {
         let available = false
         if (active) {
           try {
-            const inspection = await dependencies.inspect(active.canonicalPath)
+            const inspection = await dependencies.inspectAvailability(active.canonicalPath)
             available =
-              inspection.valid &&
+              inspection.available &&
               samePath(resolve(inspection.canonicalPath), resolve(active.canonicalPath))
           } catch {
             // Availability is intentionally coarse; inspection errors never cross the IPC boundary.
@@ -424,7 +445,7 @@ export function createBlogManagementAdapter(dependencies: {
         const blog = state.blogs.find((candidate) => candidate.id === request.id)
         if (!blog) throw new BlogAddressError("LINK_UNAVAILABLE")
         try {
-          await validate(blog, dependencies.inspect)
+          await validateCandidate(blog, dependencies.inspect)
         } catch {
           throw new BlogAddressError("LINK_UNAVAILABLE")
         }

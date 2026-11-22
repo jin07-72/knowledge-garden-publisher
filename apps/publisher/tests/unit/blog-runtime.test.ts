@@ -18,6 +18,7 @@ import type {
   BlogRegistryView,
 } from "../../src/shared/contracts"
 import { BlogAddressError, normalizePublicWebsite } from "../../src/main/services/blogAddresses"
+import type { BlogAvailabilityInspection } from "../../src/main/services/blogAvailability"
 import { BlogImportError } from "../../src/main/services/blogImport"
 import { createPublisherCloseCoordinator } from "../../src/main/publisherServices"
 
@@ -80,6 +81,10 @@ function addressDependencies() {
   }
 }
 
+async function inspectAvailable(path: string): Promise<BlogAvailabilityInspection> {
+  return { available: true, canonicalPath: path }
+}
+
 function managementFixture() {
   const registry = {
     load: vi.fn(async () => state()),
@@ -100,6 +105,10 @@ function managementFixture() {
       canonicalPath: path,
       needsInstall: false,
     })),
+    inspectAvailability: vi.fn(async (path: string): Promise<BlogAvailabilityInspection> => ({
+      available: true,
+      canonicalPath: path,
+    })),
     chooseDirectory: vi.fn(),
     openFolder: vi.fn(),
     switchTo: vi.fn(),
@@ -108,15 +117,14 @@ function managementFixture() {
 }
 
 describe("blog runtime", () => {
-  it("validates the active registry workspace before returning it", async () => {
-    const inspect = vi.fn(async () => ({
-      valid: true as const,
+  it("uses local availability for the active blog's stored canonical path", async () => {
+    const inspectAvailability = vi.fn(async () => ({
+      available: true as const,
       canonicalPath: first.canonicalPath,
-      needsInstall: false,
     }))
     const runtime = createBlogRuntime({
       registry: { load: async () => state(), activate: vi.fn() },
-      inspect,
+      inspectAvailability,
       assertIdle: vi.fn(),
       dispose: vi.fn(),
       relaunch: vi.fn(),
@@ -124,22 +132,21 @@ describe("blog runtime", () => {
     })
 
     await expect(runtime.active()).resolves.toEqual(first)
-    expect(inspect).toHaveBeenCalledWith(first.canonicalPath)
+    expect(inspectAvailability).toHaveBeenCalledExactlyOnceWith(first.canonicalPath)
   })
 
   it.each([
-    { inspection: { valid: false as const, code: "INVALID_DIRECTORY", message: "missing" } },
+    { inspection: { available: false as const } },
     {
       inspection: {
-        valid: true as const,
+        available: true as const,
         canonicalPath: String.raw`C:\Blogs\elsewhere`,
-        needsInstall: false,
       },
     },
   ])("fails safely when the active workspace is unavailable or moved", async ({ inspection }) => {
     const runtime = createBlogRuntime({
       registry: { load: async () => state(), activate: vi.fn() },
-      inspect: async () => inspection,
+      inspectAvailability: async () => inspection,
       assertIdle: vi.fn(),
       dispose: vi.fn(),
       relaunch: vi.fn(),
@@ -147,6 +154,31 @@ describe("blog runtime", () => {
     })
 
     await expect(runtime.active()).rejects.toMatchObject({ code: "BLOG_WORKSPACE_UNAVAILABLE" })
+  })
+
+  it.each([
+    { inspection: { available: false as const } },
+    {
+      inspection: {
+        available: true as const,
+        canonicalPath: String.raw`C:\Blogs\elsewhere`,
+      },
+    },
+  ])("rejects a switch when the target is unavailable or moved", async ({ inspection }) => {
+    const activate = vi.fn()
+    const runtime = createBlogRuntime({
+      registry: { load: async () => state(), activate },
+      inspectAvailability: async () => inspection,
+      assertIdle: vi.fn(),
+      dispose: vi.fn(),
+      relaunch: vi.fn(),
+      quit: vi.fn(),
+    })
+
+    await expect(runtime.switchTo({ id: second.id, editorSaved: true })).rejects.toMatchObject({
+      code: "BLOG_WORKSPACE_UNAVAILABLE",
+    })
+    expect(activate).not.toHaveBeenCalled()
   })
 
   it("switches in the exact validate, idle, dispose, activate, relaunch, quit order", async () => {
@@ -162,9 +194,9 @@ describe("blog runtime", () => {
           return state(second.id)
         },
       },
-      inspect: async () => {
+      inspectAvailability: async () => {
         order.push("inspect")
-        return { valid: true, canonicalPath: second.canonicalPath, needsInstall: false }
+        return { available: true, canonicalPath: second.canonicalPath }
       },
       assertIdle: async () => {
         order.push("idle")
@@ -191,10 +223,9 @@ describe("blog runtime", () => {
     })
     const runtime = createBlogRuntime({
       registry: { load: async () => state(), activate: async () => state(second.id) },
-      inspect: async () => ({
-        valid: true,
+      inspectAvailability: async () => ({
+        available: true,
         canonicalPath: second.canonicalPath,
-        needsInstall: false,
       }),
       assertIdle: async () => undefined,
       dispose: async () => undefined,
@@ -222,10 +253,9 @@ describe("blog runtime", () => {
           throw activationError
         },
       },
-      inspect: async () => ({
-        valid: true,
+      inspectAvailability: async () => ({
+        available: true,
         canonicalPath: second.canonicalPath,
-        needsInstall: false,
       }),
       assertIdle: async () => undefined,
       dispose: async () => undefined,
@@ -244,7 +274,7 @@ describe("blog runtime", () => {
     const load = vi.fn(async () => state())
     const runtime = createBlogRuntime({
       registry: { load, activate: vi.fn() },
-      inspect: vi.fn(),
+      inspectAvailability: vi.fn(),
       assertIdle: vi.fn(),
       dispose: vi.fn(),
       relaunch: vi.fn(),
@@ -270,9 +300,9 @@ describe("blog runtime", () => {
       }
       const runtime = createBlogRuntime({
         registry: { load: async () => state(active), activate },
-        inspect: async () => {
+        inspectAvailability: async () => {
           await fail("inspect")
-          return { valid: true, canonicalPath: second.canonicalPath, needsInstall: false }
+          return { available: true, canonicalPath: second.canonicalPath }
         },
         assertIdle: () => fail("idle"),
         dispose: () => fail("dispose"),
@@ -298,10 +328,9 @@ describe("blog runtime", () => {
           throw new Error("registry write failed")
         },
       },
-      inspect: async () => ({
-        valid: true,
+      inspectAvailability: async () => ({
+        available: true,
         canonicalPath: second.canonicalPath,
-        needsInstall: false,
       }),
       assertIdle: async () => undefined,
       dispose: async () => {
@@ -444,7 +473,9 @@ describe("blog management adapter", () => {
       const fixture = managementFixture()
       const current = state()
       fixture.registry.load.mockResolvedValue(current)
-      if (availability === "unavailable") fixture.inspect.mockRejectedValue(new Error("missing"))
+      if (availability === "unavailable") {
+        fixture.inspectAvailability.mockRejectedValue(new Error("missing"))
+      }
 
       await expect(fixture.services.list()).resolves.toEqual({
         ...displayState(current),
@@ -452,8 +483,28 @@ describe("blog management adapter", () => {
       })
       expect(fixture.registry.load).toHaveBeenCalledOnce()
       expect(fixture.addresses.describe).toHaveBeenCalledExactlyOnceWith(current)
+      expect(fixture.inspect).not.toHaveBeenCalled()
     },
   )
+
+  it("lists a locally available blog when strict candidate inspection fails", async () => {
+    const fixture = managementFixture()
+    fixture.inspect.mockResolvedValue({
+      valid: false,
+      code: "GIT_UNAVAILABLE",
+      message: "Git unavailable",
+    })
+    fixture.inspectAvailability.mockResolvedValue({
+      available: true,
+      canonicalPath: first.canonicalPath,
+    })
+
+    await expect(fixture.services.list()).resolves.toMatchObject({
+      activeAvailability: "available",
+    })
+    expect(fixture.inspect).not.toHaveBeenCalled()
+    expect(fixture.inspectAvailability).toHaveBeenCalledExactlyOnceWith(first.canonicalPath)
+  })
 
   it("does not conceal unexpected view generation failures", async () => {
     const fixture = managementFixture()
@@ -762,45 +813,40 @@ describe("blog management adapter", () => {
     )
   })
 
-  it("reports active workspace availability without exposing inspection failures", async () => {
-    const registry = {
-      load: vi.fn(async () => state()),
-      add: vi.fn(async () => state()),
-      rename: vi.fn(async () => state()),
-      activate: vi.fn(async () => state()),
-      remove: vi.fn(async () => state()),
-      relocate: vi.fn(async () => state()),
-      recover: vi.fn(async () => state()),
-      setWebsiteUrl: vi.fn(async () => state()),
-    }
-    const inspect = vi
-      .fn()
-      .mockResolvedValueOnce({ valid: false, code: "SECRET_PATH_ERROR", message: "C:\\secret" })
-      .mockRejectedValueOnce(new Error("C:\\secret"))
-      .mockResolvedValueOnce({
-        valid: true,
-        canonicalPath: first.canonicalPath,
-        needsInstall: false,
+  it.each(["throws", "unavailable", "different path"] as const)(
+    "reports the active workspace unavailable when local inspection %s",
+    async (failure) => {
+      const fixture = managementFixture()
+      if (failure === "throws") {
+        fixture.inspectAvailability.mockRejectedValue(new Error("C:\\secret"))
+      } else if (failure === "unavailable") {
+        fixture.inspectAvailability.mockResolvedValue({ available: false })
+      } else {
+        fixture.inspectAvailability.mockResolvedValue({
+          available: true,
+          canonicalPath: second.canonicalPath,
+        })
+      }
+
+      await expect(fixture.services.list()).resolves.toMatchObject({
+        activeAvailability: "unavailable",
       })
-    const adapter = createBlogManagementAdapter({
-      ...addressDependencies(),
-      registry,
-      importer: { clone: vi.fn(), install: vi.fn() },
-      inspect,
-      chooseDirectory: vi.fn(),
-      openFolder: vi.fn(),
-      switchTo: vi.fn(),
+      expect(fixture.inspect).not.toHaveBeenCalled()
+      expect(fixture.inspectAvailability).toHaveBeenCalledExactlyOnceWith(first.canonicalPath)
+    },
+  )
+
+  it("uses platform path case semantics for local availability", async () => {
+    const fixture = managementFixture()
+    fixture.inspectAvailability.mockResolvedValue({
+      available: true,
+      canonicalPath: first.canonicalPath.toUpperCase(),
     })
 
-    await expect(adapter.services.list()).resolves.toMatchObject({
-      activeAvailability: "unavailable",
+    await expect(fixture.services.list()).resolves.toMatchObject({
+      activeAvailability: process.platform === "win32" ? "available" : "unavailable",
     })
-    await expect(adapter.services.list()).resolves.toMatchObject({
-      activeAvailability: "unavailable",
-    })
-    await expect(adapter.services.list()).resolves.toMatchObject({
-      activeAvailability: "available",
-    })
+    expect(fixture.inspect).not.toHaveBeenCalled()
   })
 
   it("keeps registry management available without constructing workspace services", async () => {
@@ -819,6 +865,7 @@ describe("blog management adapter", () => {
       registry,
       importer: { clone: vi.fn(), install: vi.fn() },
       inspect: vi.fn(),
+      inspectAvailability: vi.fn(async () => ({ available: false as const })),
       chooseDirectory: vi.fn(async () => undefined),
       openFolder: vi.fn(),
       switchTo: vi.fn(),
@@ -858,6 +905,7 @@ describe("blog management adapter", () => {
       registry,
       importer: { clone, install: vi.fn() },
       inspect,
+      inspectAvailability: inspectAvailable,
       chooseDirectory: async () => String.raw`C:\Blogs\local`,
       openFolder: vi.fn(),
       switchTo: vi.fn(),
@@ -892,6 +940,41 @@ describe("blog management adapter", () => {
   })
 
   it.each([
+    {
+      method: "addLocal",
+      request: { name: "Local", path: first.canonicalPath },
+      mutation: "add",
+    },
+    {
+      method: "recoverLocal",
+      request: { name: "Recovered", path: first.canonicalPath },
+      mutation: "recover",
+    },
+    {
+      method: "relocate",
+      request: { id: first.id, path: first.canonicalPath },
+      mutation: "relocate",
+    },
+  ] as const)(
+    "keeps strict candidate validation for $method",
+    async ({ method, request, mutation }) => {
+      const fixture = managementFixture()
+      fixture.inspect.mockResolvedValue({
+        valid: false,
+        code: "GIT_ORIGIN_MISSING",
+        message: "origin missing",
+      })
+
+      await expect(fixture.services[method](request as never)).rejects.toMatchObject({
+        code: "VALIDATION_FAILED",
+      })
+      expect(fixture.inspect).toHaveBeenCalledExactlyOnceWith(first.canonicalPath)
+      expect(fixture.inspectAvailability).not.toHaveBeenCalled()
+      expect(fixture.registry[mutation]).not.toHaveBeenCalled()
+    },
+  )
+
+  it.each([
     [undefined, "learning-notes"],
     ["   ", "learning-notes"],
     [" My Garden ", "My Garden"],
@@ -916,6 +999,7 @@ describe("blog management adapter", () => {
       registry,
       importer: { clone, install: vi.fn() },
       inspect: vi.fn(),
+      inspectAvailability: inspectAvailable,
       chooseDirectory: vi.fn(),
       openFolder: vi.fn(),
       switchTo: vi.fn(),
@@ -954,6 +1038,7 @@ describe("blog management adapter", () => {
       registry,
       importer: { clone, install: vi.fn() },
       inspect: vi.fn(),
+      inspectAvailability: inspectAvailable,
       chooseDirectory: vi.fn(),
       openFolder: vi.fn(),
       switchTo: vi.fn(),
@@ -1001,6 +1086,7 @@ describe("blog management adapter", () => {
       },
       importer: { clone, install: vi.fn() },
       inspect: vi.fn(),
+      inspectAvailability: inspectAvailable,
       chooseDirectory: vi.fn(),
       openFolder: vi.fn(),
       switchTo,
@@ -1042,6 +1128,7 @@ describe("blog management adapter", () => {
       },
       importer: { clone, install: vi.fn() },
       inspect: vi.fn(),
+      inspectAvailability: inspectAvailable,
       chooseDirectory: vi.fn(),
       openFolder: vi.fn(),
       switchTo: vi.fn(),
@@ -1056,10 +1143,9 @@ describe("blog management adapter", () => {
     const quit = vi.fn()
     const runtime = createBlogRuntime({
       registry: { load: async () => state(), activate: async () => state(second.id) },
-      inspect: async () => ({
-        valid: true,
+      inspectAvailability: async () => ({
+        available: true,
         canonicalPath: second.canonicalPath,
-        needsInstall: false,
       }),
       assertIdle: adapter.prepareForShutdown,
       dispose: adapter.prepareForShutdown,
@@ -1099,6 +1185,7 @@ describe("blog management adapter", () => {
       },
       importer: { clone: vi.fn(), install },
       inspect: vi.fn(),
+      inspectAvailability: inspectAvailable,
       chooseDirectory: vi.fn(),
       openFolder: vi.fn(),
       switchTo: vi.fn(),
@@ -1139,6 +1226,7 @@ describe("blog management adapter", () => {
       },
       importer: { clone: vi.fn(), install },
       inspect: vi.fn(),
+      inspectAvailability: inspectAvailable,
       chooseDirectory: vi.fn(),
       openFolder: vi.fn(),
       switchTo: vi.fn(),
@@ -1176,6 +1264,7 @@ describe("blog management adapter", () => {
       },
       importer: { clone: vi.fn(), install },
       inspect: vi.fn(),
+      inspectAvailability: inspectAvailable,
       chooseDirectory: vi.fn(),
       openFolder: vi.fn(),
       switchTo: vi.fn(),
@@ -1224,6 +1313,7 @@ describe("blog management adapter", () => {
       },
       importer: { clone, install: vi.fn() },
       inspect: vi.fn(),
+      inspectAvailability: inspectAvailable,
       chooseDirectory: vi.fn(),
       openFolder: vi.fn(),
       switchTo: vi.fn(),
@@ -1279,6 +1369,7 @@ describe("blog management adapter", () => {
       },
       importer: { clone, install: vi.fn() },
       inspect: vi.fn(),
+      inspectAvailability: inspectAvailable,
       chooseDirectory: vi.fn(),
       openFolder: vi.fn(),
       switchTo: vi.fn(),
@@ -1301,10 +1392,9 @@ describe("blog management adapter", () => {
     const dispose = vi.fn(async () => undefined)
     const runtime = createBlogRuntime({
       registry: { load: async () => state(), activate },
-      inspect: async () => ({
-        valid: true,
+      inspectAvailability: async () => ({
+        available: true,
         canonicalPath: second.canonicalPath,
-        needsInstall: false,
       }),
       assertIdle: adapter.prepareForShutdown,
       dispose,
@@ -1362,6 +1452,7 @@ describe("blog management adapter", () => {
       },
       importer: { clone, install: vi.fn() },
       inspect: vi.fn(),
+      inspectAvailability: inspectAvailable,
       chooseDirectory: vi.fn(),
       openFolder: vi.fn(),
       switchTo: vi.fn(),
@@ -1406,6 +1497,7 @@ describe("blog management adapter", () => {
         install: vi.fn(),
       },
       inspect: vi.fn(),
+      inspectAvailability: inspectAvailable,
       chooseDirectory: vi.fn(),
       openFolder: vi.fn(),
       switchTo: vi.fn(),

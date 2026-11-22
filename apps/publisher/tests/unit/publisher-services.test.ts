@@ -1141,7 +1141,7 @@ describe("publisher service wiring", () => {
         }),
         activate,
       },
-      inspect: async () => ({ valid: true, canonicalPath: workspace, needsInstall: false }),
+      inspectAvailability: async () => ({ available: true, canonicalPath: workspace }),
       assertIdle: services.assertSwitchSafe,
       dispose: () => disposePublisherRuntime(vi.fn(), manager, services),
       relaunch,

@@ -60,6 +60,7 @@ import type {
 import { resolveMainRuntimeFiles } from "./mainRuntime"
 import { createBlogRegistry } from "./services/blogRegistry"
 import { createBlogAddressResolver } from "./services/blogAddresses"
+import { inspectBlogAvailability } from "./services/blogAvailability"
 import {
   createBlogImportService,
   inspectBlogCandidate,
@@ -412,7 +413,7 @@ app.whenReady().then(async () => {
   let blogManagement!: ReturnType<typeof createBlogManagementAdapter>
   const blogRuntime = createBlogRuntime({
     registry,
-    inspect: (path) => inspectBlogCandidate(path, { runner: importRunner }),
+    inspectAvailability: inspectBlogAvailability,
     assertIdle: async () => {
       await blogManagement.prepareForShutdown()
       try {
@@ -449,6 +450,7 @@ app.whenReady().then(async () => {
     },
     importer: () => importer,
     inspect: (path) => inspectBlogCandidate(path, { runner: importRunner }),
+    inspectAvailability: inspectBlogAvailability,
     chooseDirectory: async () => {
       const e2eSelection = resolveE2eCloneSource({
         isPackaged: app.isPackaged,
