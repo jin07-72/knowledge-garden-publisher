@@ -24,6 +24,7 @@
 ### Task 1: Build the navigation-aware controller with unit tests
 
 **Files:**
+
 - Create: `apps/publisher/src/main/appearancePreviewController.ts`
 - Create: `apps/publisher/tests/unit/appearance-preview-controller.test.ts`
 - Modify: `apps/publisher/src/main/previewAppearance.ts`
@@ -189,6 +190,7 @@ git commit -m "fix(publisher): retain appearance preview across navigation"
 ### Task 2: Give the appearance iframe a unique initial URL
 
 **Files:**
+
 - Modify: `apps/publisher/src/renderer/src/components/AppearanceDesigner.tsx`
 - Modify: `apps/publisher/src/renderer/src/components/AppearancePreview.tsx`
 - Modify: `apps/publisher/tests/unit/appearance-designer.test.tsx`
@@ -255,6 +257,7 @@ git commit -m "fix(publisher): identify the appearance preview frame"
 ### Task 3: Wire Electron navigation events and prove the real workflow
 
 **Files:**
+
 - Modify: `apps/publisher/src/main/index.ts`
 - Modify: `apps/publisher/tests/e2e/app.spec.ts`
 
@@ -356,6 +359,7 @@ git commit -m "test(publisher): verify navigable appearance previews"
 ### Task 4: Review, package, push, and update the local installation
 
 **Files:**
+
 - Verify only.
 
 - [ ] **Step 1: Run complete appearance regression**
