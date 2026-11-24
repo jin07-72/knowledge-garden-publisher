@@ -3,6 +3,7 @@ import {
   type AppearanceGlobalColor,
   type ComponentColorOverrides,
 } from "./appearanceComponents"
+import { compileAppearanceComponentCss } from "./appearanceComponentCss"
 
 export type BlogFramework = "quartz" | "hugo" | "hexo" | "unknown"
 
@@ -559,6 +560,7 @@ export function compileAppearanceCss(
     ":where(.page > #quartz-body) :is(.sidebar, .page-header, .page-footer) { font-family: var(--publisher-font-body); line-height: var(--publisher-line-height); }",
     ":where(.page > #quartz-body) .sidebar { color: var(--publisher-secondary); }",
     sidebarCss(normalized.layout.sidebars),
+    compileAppearanceComponentCss(normalized),
     normalized.customCss.trim(),
     "",
   ]

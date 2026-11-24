@@ -463,6 +463,7 @@ describe("managed appearance CSS", () => {
 
     expect(css.endsWith('.custom {\n  content: "  exact  ";\n}')).toBe(true)
     expect(css.indexOf(".custom {")).toBeGreaterThan(css.indexOf(".center article"))
+    expect(css.indexOf("/* publisher-component:footer */")).toBeLessThan(css.indexOf(".custom {"))
   })
 
   it("is byte-for-byte deterministic", () => {
