@@ -1,3 +1,8 @@
+import {
+  normalizeComponentColors,
+  type ComponentColorOverrides,
+} from "./appearanceComponents"
+
 export type BlogFramework = "quartz" | "hugo" | "hexo" | "unknown"
 
 export type AppearanceBackground =
@@ -19,20 +24,23 @@ export type AppearanceBackground =
       readonly fixed: boolean
     }
 
+export interface GlobalAppearanceColors {
+  readonly page: string
+  readonly surface: string
+  readonly text: string
+  readonly heading: string
+  readonly accent: string
+  readonly secondary: string
+  readonly border: string
+  readonly code: string
+}
+
 export interface AppearanceSettings {
-  readonly schemaVersion: 1
+  readonly schemaVersion: 2
   readonly preset: "knowledge-garden" | "paper" | "minimal" | "custom"
   readonly background: AppearanceBackground
-  readonly colors: {
-    readonly page: string
-    readonly surface: string
-    readonly text: string
-    readonly heading: string
-    readonly accent: string
-    readonly secondary: string
-    readonly border: string
-    readonly code: string
-  }
+  readonly colors: GlobalAppearanceColors
+  readonly componentColors: ComponentColorOverrides
   readonly typography: {
     readonly header: string
     readonly body: string
@@ -53,7 +61,7 @@ export interface AppearanceSettings {
 export type AppearancePresetName = Exclude<AppearanceSettings["preset"], "custom">
 
 const KNOWLEDGE_GARDEN_APPEARANCE = {
-  schemaVersion: 1,
+  schemaVersion: 2,
   preset: "knowledge-garden",
   background: { kind: "solid", color: "#0b1120" },
   colors: {
@@ -66,6 +74,7 @@ const KNOWLEDGE_GARDEN_APPEARANCE = {
     border: "#334155",
     code: "#0f172a",
   },
+  componentColors: {},
   typography: {
     header: '"Inter", system-ui, sans-serif',
     body: '"Inter", system-ui, sans-serif',
@@ -84,7 +93,7 @@ const KNOWLEDGE_GARDEN_APPEARANCE = {
 } as const satisfies AppearanceSettings
 
 const PAPER_APPEARANCE = {
-  schemaVersion: 1,
+  schemaVersion: 2,
   preset: "paper",
   background: { kind: "solid", color: "#f4efe3" },
   colors: {
@@ -97,6 +106,7 @@ const PAPER_APPEARANCE = {
     border: "#d8cdbb",
     code: "#ebe2d3",
   },
+  componentColors: {},
   typography: {
     header: '"Iowan Old Style", Georgia, serif',
     body: '"Source Serif 4", Georgia, serif',
@@ -115,7 +125,7 @@ const PAPER_APPEARANCE = {
 } as const satisfies AppearanceSettings
 
 const MINIMAL_APPEARANCE = {
-  schemaVersion: 1,
+  schemaVersion: 2,
   preset: "minimal",
   background: { kind: "solid", color: "#ffffff" },
   colors: {
@@ -128,6 +138,7 @@ const MINIMAL_APPEARANCE = {
     border: "#e4e4e7",
     code: "#f4f4f5",
   },
+  componentColors: {},
   typography: {
     header: "Inter, system-ui, sans-serif",
     body: "Inter, system-ui, sans-serif",
@@ -149,6 +160,14 @@ function freezeAppearance<T extends AppearanceSettings>(settings: T): T {
   if (settings.background.kind === "image") Object.freeze(settings.background.asset)
   Object.freeze(settings.background)
   Object.freeze(settings.colors)
+  for (const states of Object.values(settings.componentColors)) {
+    if (states === undefined) continue
+    for (const slots of Object.values(states)) {
+      if (slots !== undefined) Object.freeze(slots)
+    }
+    Object.freeze(states)
+  }
+  Object.freeze(settings.componentColors)
   Object.freeze(settings.typography)
   Object.freeze(settings.layout)
   return Object.freeze(settings)
@@ -178,6 +197,7 @@ function cloneAppearanceSettings(settings: AppearanceSettings): AppearanceSettin
     ...settings,
     background: cloneBackground(settings.background),
     colors: { ...settings.colors },
+    componentColors: normalizeComponentColors(settings.componentColors),
     typography: { ...settings.typography },
     layout: { ...settings.layout },
   }
@@ -221,6 +241,7 @@ export function normalizeAppearanceSettings(settings: AppearanceSettings): Appea
     ...settings,
     background: normalizeBackground(settings.background),
     colors: { ...settings.colors },
+    componentColors: normalizeComponentColors(settings.componentColors),
     typography: {
       ...settings.typography,
       baseSizePx: normalizeNumber(

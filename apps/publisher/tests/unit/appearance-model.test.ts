@@ -13,6 +13,7 @@ function withSettings(overrides: Partial<AppearanceSettings>): AppearanceSetting
     ...DEFAULT_APPEARANCE,
     ...overrides,
     colors: { ...DEFAULT_APPEARANCE.colors, ...overrides.colors },
+    componentColors: overrides.componentColors ?? DEFAULT_APPEARANCE.componentColors,
     typography: { ...DEFAULT_APPEARANCE.typography, ...overrides.typography },
     layout: { ...DEFAULT_APPEARANCE.layout, ...overrides.layout },
   }
@@ -38,10 +39,16 @@ describe("appearance presets", () => {
     const first = cloneAppearancePreset("paper")
     const second = cloneAppearancePreset("paper")
 
-    expect(Object.isFrozen(APPEARANCE_PRESETS.paper)).toBe(true)
-    expect(Object.isFrozen(APPEARANCE_PRESETS.paper.colors)).toBe(true)
+    for (const preset of Object.values(APPEARANCE_PRESETS)) {
+      expect(Object.isFrozen(preset)).toBe(true)
+      expect(Object.isFrozen(preset.colors)).toBe(true)
+      expect(Object.isFrozen(preset.componentColors)).toBe(true)
+      expect(preset.schemaVersion).toBe(2)
+      expect(preset.componentColors).toEqual({})
+    }
     expect(first).not.toBe(second)
     expect(first.colors).not.toBe(second.colors)
+    expect(first.componentColors).not.toBe(second.componentColors)
     expect(first.typography).not.toBe(second.typography)
     expect(first.layout).not.toBe(second.layout)
     expect(first.background).not.toBe(second.background)
@@ -55,6 +62,9 @@ describe("appearance presets", () => {
 describe("appearance normalization", () => {
   it("clamps every numeric control without mutating the source", () => {
     const source = withSettings({
+      componentColors: {
+        domainCard: { hover: { surface: "#aabbcc80" } },
+      },
       background: {
         kind: "image",
         asset: { source: "managed", name: "background.webp" },
@@ -91,6 +101,14 @@ describe("appearance normalization", () => {
     expect(source.typography.lineHeight).toBe(Number.POSITIVE_INFINITY)
     expect(normalized).not.toBe(source)
     expect(normalized.colors).not.toBe(source.colors)
+    expect(normalized.componentColors).toEqual({
+      domainCard: { hover: { surface: "#AABBCC80" } },
+    })
+    expect(normalized.componentColors).not.toBe(source.componentColors)
+    expect(normalized.componentColors.domainCard).not.toBe(source.componentColors.domainCard)
+    expect(normalized.componentColors.domainCard?.hover).not.toBe(
+      source.componentColors.domainCard?.hover,
+    )
   })
 
   it("normalizes gradient angles to the contract range", () => {
