@@ -7,13 +7,233 @@ import {
 } from "./appearanceComponents"
 
 type ComponentCssSettings = Pick<AppearanceSettings, "componentColors">
+type SelectorContract = Readonly<
+  Record<AppearanceComponentId, Readonly<Partial<Record<AppearanceState, readonly string[]>>>>
+>
 
-interface SelectorRule {
-  readonly selector: string
-  readonly declarations: Readonly<Record<string, string>>
-}
+const forcedHover = (selector: string) => `[data-publisher-appearance-state="hover"] ${selector}`
+const forcedSelected = (selector: string) =>
+  `[data-publisher-appearance-state="selected"] ${selector}`
 
-type StateRules = Readonly<Partial<Record<AppearanceState, readonly SelectorRule[]>>>
+export const APPEARANCE_COMPONENT_SELECTORS = {
+  domainCard: {
+    normal: [".domain-card"],
+    hover: [".domain-card:hover", forcedHover(".domain-card")],
+    selected: [
+      '.domain-card[aria-current="page"]',
+      ".domain-card:focus-visible",
+      forcedSelected(".domain-card"),
+    ],
+  },
+  homeSearch: {
+    normal: [".search > .search-button"],
+    hover: [".search > .search-button:hover", forcedHover(".search > .search-button")],
+    selected: [
+      '.search > .search-button[aria-expanded="true"]',
+      forcedSelected(".search > .search-button"),
+    ],
+  },
+  homeStats: { normal: [".garden-stats", ".garden-kicker"] },
+  explorer: {
+    normal: [".explorer .tree-item-self"],
+    hover: [".explorer .tree-item-self:hover", forcedHover(".explorer .tree-item-self")],
+    selected: [
+      ".explorer .tree-item-self.active.is-active",
+      forcedSelected(".explorer .tree-item-self"),
+    ],
+  },
+  mobileMenu: {
+    normal: [".explorer > .mobile-explorer"],
+    hover: [".explorer > .mobile-explorer:hover", forcedHover(".explorer > .mobile-explorer")],
+    selected: [
+      '.explorer[aria-expanded="true"] > .mobile-explorer',
+      forcedSelected(".explorer > .mobile-explorer"),
+    ],
+  },
+  breadcrumb: {
+    normal: [".breadcrumb-container a"],
+    hover: [".breadcrumb-container a:hover", forcedHover(".breadcrumb-container a")],
+    selected: [
+      ".breadcrumb-container .breadcrumb-element:last-child a",
+      forcedSelected(".breadcrumb-container a"),
+    ],
+  },
+  tableOfContents: {
+    normal: [".toc > .toc-header", ".toc > .toc-content a"],
+    hover: [
+      ".toc > .toc-header:hover",
+      ".toc > .toc-content a:hover",
+      forcedHover(".toc > .toc-content a"),
+    ],
+    selected: [
+      ".toc > .toc-content a.in-view",
+      '.toc > .toc-header[aria-expanded="true"]',
+      forcedSelected(".toc > .toc-content a"),
+    ],
+  },
+  searchOverlay: { normal: [".search > .search-container"] },
+  searchDialog: {
+    normal: [".search > .search-container > .search-space > .search-layout"],
+  },
+  searchInput: {
+    normal: [".search > .search-container > .search-space > .search-bar"],
+    hover: [
+      ".search > .search-container > .search-space > .search-bar:hover",
+      forcedHover(".search > .search-container > .search-space > .search-bar"),
+    ],
+    selected: [
+      ".search > .search-container > .search-space > .search-bar:focus",
+      forcedSelected(".search > .search-container > .search-space > .search-bar"),
+    ],
+  },
+  searchResult: {
+    normal: [".search > .search-container > .search-space > .search-layout .result-card"],
+    hover: [
+      ".search > .search-container > .search-space > .search-layout .result-card:hover",
+      forcedHover(".search > .search-container > .search-space > .search-layout .result-card"),
+    ],
+    selected: [
+      ".search > .search-container > .search-space > .search-layout .result-card.focus",
+      ".search > .search-container > .search-space > .search-layout .result-card:focus",
+      forcedSelected(".search > .search-container > .search-space > .search-layout .result-card"),
+    ],
+  },
+  link: {
+    normal: [".center article a:not(.tag-link):not(.domain-card)"],
+    hover: [
+      ".center article a:not(.tag-link):not(.domain-card):hover",
+      forcedHover(".center article a:not(.tag-link):not(.domain-card)"),
+    ],
+    selected: [
+      '.center article a:not(.tag-link):not(.domain-card)[aria-current="page"]',
+      ".center article a:not(.tag-link):not(.domain-card):focus-visible",
+      forcedSelected(".center article a:not(.tag-link):not(.domain-card)"),
+    ],
+  },
+  button: {
+    normal: [
+      ".search > .search-button",
+      ".explorer .explorer-toggle",
+      ".explorer .folder-button",
+      ".toc > .toc-header",
+      ".graph > .graph-outer > .global-graph-icon",
+      ".darkmode",
+      ".readermode",
+    ],
+    hover: [
+      ".search > .search-button:hover",
+      ".explorer .explorer-toggle:hover",
+      ".explorer .folder-button:hover",
+      ".toc > .toc-header:hover",
+      ".graph > .graph-outer > .global-graph-icon:hover",
+      ".darkmode:hover",
+      ".readermode:hover",
+      forcedHover(".search > .search-button"),
+      forcedHover(".explorer .explorer-toggle"),
+      forcedHover(".explorer .folder-button"),
+      forcedHover(".toc > .toc-header"),
+      forcedHover(".graph > .graph-outer > .global-graph-icon"),
+      forcedHover(".darkmode"),
+      forcedHover(".readermode"),
+    ],
+    selected: [
+      '.search > .search-button[aria-expanded="true"]',
+      '.explorer[aria-expanded="true"] .explorer-toggle',
+      ".explorer .folder-container:has(+ .folder-outer.open) .folder-button",
+      '.toc > .toc-header[aria-expanded="true"]',
+      ".graph:has(> .global-graph-outer.active) > .graph-outer > .global-graph-icon",
+      'html[saved-theme="dark"] .darkmode',
+      'html[reader-mode="on"] .readermode',
+      forcedSelected(".search > .search-button"),
+      forcedSelected(".explorer .explorer-toggle"),
+      forcedSelected(".explorer .folder-button"),
+      forcedSelected(".toc > .toc-header"),
+      forcedSelected(".graph > .graph-outer > .global-graph-icon"),
+      forcedSelected(".darkmode"),
+      forcedSelected(".readermode"),
+    ],
+  },
+  tag: {
+    normal: [".tag-link"],
+    hover: [".tag-link:hover", forcedHover(".tag-link")],
+    selected: [
+      '.tag-link[aria-current="page"]',
+      ".tag-link:focus-visible",
+      forcedSelected(".tag-link"),
+    ],
+  },
+  icon: {
+    normal: [
+      ".search > .search-button svg",
+      ".explorer .explorer-toggle svg",
+      ".explorer .folder-icon",
+      ".toc > .toc-header svg",
+      ".graph > .graph-outer > .global-graph-icon svg",
+      ".darkmode svg",
+      ".readermode svg",
+    ],
+    hover: [
+      ".search > .search-button:hover svg",
+      ".explorer .explorer-toggle:hover svg",
+      ".explorer .folder-icon:hover",
+      ".toc > .toc-header:hover svg",
+      ".graph > .graph-outer > .global-graph-icon:hover svg",
+      ".darkmode:hover svg",
+      ".readermode:hover svg",
+      forcedHover(".search > .search-button svg"),
+      forcedHover(".explorer .explorer-toggle svg"),
+      forcedHover(".explorer .folder-icon"),
+      forcedHover(".toc > .toc-header svg"),
+      forcedHover(".graph > .graph-outer > .global-graph-icon svg"),
+      forcedHover(".darkmode svg"),
+      forcedHover(".readermode svg"),
+    ],
+    selected: [
+      '.search > .search-button[aria-expanded="true"] svg',
+      '.explorer[aria-expanded="true"] .explorer-toggle svg',
+      ".explorer .folder-container:has(+ .folder-outer.open) .folder-icon",
+      '.toc > .toc-header[aria-expanded="true"] svg',
+      ".graph:has(> .global-graph-outer.active) > .graph-outer > .global-graph-icon svg",
+      'html[saved-theme="dark"] .darkmode svg',
+      'html[reader-mode="on"] .readermode svg',
+      forcedSelected(".search > .search-button svg"),
+      forcedSelected(".explorer .explorer-toggle svg"),
+      forcedSelected(".explorer .folder-icon"),
+      forcedSelected(".toc > .toc-header svg"),
+      forcedSelected(".graph > .graph-outer > .global-graph-icon svg"),
+      forcedSelected(".darkmode svg"),
+      forcedSelected(".readermode svg"),
+    ],
+  },
+  codeBlock: { normal: [".center article pre"] },
+  inlineCode: { normal: [".center article :not(pre) > code"] },
+  blockquote: { normal: [".center article blockquote"] },
+  table: {
+    normal: [".center article table"],
+    hover: [".center article tbody tr:hover", forcedHover(".center article tbody tr")],
+    selected: [".center article tbody tr:focus-within", forcedSelected(".center article tbody tr")],
+  },
+  callout: { normal: [".callout"] },
+  divider: { normal: [".center article hr"] },
+  popover: { normal: [".popover > .popover-inner"] },
+  tooltip: { normal: ['[role="tooltip"]', ".tooltip"] },
+  graph: {
+    normal: [".graph > .graph-outer"],
+    hover: [".graph > .graph-outer:hover", forcedHover(".graph > .graph-outer")],
+    selected: [".graph > .global-graph-outer.active", forcedSelected(".graph > .graph-outer")],
+  },
+  footer: {
+    normal: [".page > #quartz-body > footer"],
+    hover: [".page > #quartz-body > footer a:hover", forcedHover(".page > #quartz-body > footer")],
+    selected: [
+      '.page > #quartz-body > footer a[aria-current="page"]',
+      ".page > #quartz-body > footer a:focus-visible",
+      forcedSelected(".page > #quartz-body > footer"),
+    ],
+  },
+} as const satisfies SelectorContract
+
+type DeclarationMap = Readonly<Record<string, string>>
 
 function kebabCase(value: string): string {
   return value.replace(/[A-Z]/g, (character) => `-${character.toLowerCase()}`)
@@ -27,304 +247,218 @@ function variable(
   return `var(--publisher-component-${kebabCase(componentId)}-${state}-${slot})`
 }
 
-function rule(selector: string, declarations: Readonly<Record<string, string>>): SelectorRule {
-  return { selector, declarations }
+function selectors(componentId: AppearanceComponentId, state: AppearanceState): readonly string[] {
+  const contract = APPEARANCE_COMPONENT_SELECTORS[componentId] as Readonly<
+    Partial<Record<AppearanceState, readonly string[]>>
+  >
+  return contract[state] ?? []
 }
 
-const COMPONENT_SELECTOR_RULES = {
-  domainCard: {
-    normal: [
-      rule(":where(.domain-card)", {
-        "background-color": variable("domainCard", "normal", "surface"),
-        "border-color": variable("domainCard", "normal", "border"),
-      }),
-      rule(":where(.domain-card span)", {
-        color: variable("domainCard", "normal", "number"),
-      }),
-      rule(":where(.domain-card strong)", {
-        color: variable("domainCard", "normal", "title"),
-      }),
-      rule(":where(.domain-card small)", {
-        color: variable("domainCard", "normal", "description"),
-      }),
-    ],
-    hover: [
-      rule(':where(.domain-card:hover, [data-publisher-appearance-state="hover"] .domain-card)', {
-        "background-color": variable("domainCard", "hover", "surface"),
-        "border-color": variable("domainCard", "hover", "border"),
-      }),
-      rule(
-        ':where(.domain-card:hover span, [data-publisher-appearance-state="hover"] .domain-card span)',
-        { color: variable("domainCard", "hover", "number") },
-      ),
-      rule(
-        ':where(.domain-card:hover strong, [data-publisher-appearance-state="hover"] .domain-card strong)',
-        { color: variable("domainCard", "hover", "title") },
-      ),
-      rule(
-        ':where(.domain-card:hover small, [data-publisher-appearance-state="hover"] .domain-card small)',
-        { color: variable("domainCard", "hover", "description") },
-      ),
-    ],
-    selected: [
-      rule(
-        ':where(.domain-card[aria-current="page"], [data-publisher-appearance-state="selected"] .domain-card, .domain-card:focus-visible)',
-        {
-          "background-color": variable("domainCard", "selected", "surface"),
-          "border-color": variable("domainCard", "selected", "border"),
-        },
-      ),
-      rule(
-        ':where(.domain-card[aria-current="page"] span, [data-publisher-appearance-state="selected"] .domain-card span, .domain-card:focus-visible span)',
-        { color: variable("domainCard", "selected", "number") },
-      ),
-      rule(
-        ':where(.domain-card[aria-current="page"] strong, [data-publisher-appearance-state="selected"] .domain-card strong, .domain-card:focus-visible strong)',
-        { color: variable("domainCard", "selected", "title") },
-      ),
-      rule(
-        ':where(.domain-card[aria-current="page"] small, [data-publisher-appearance-state="selected"] .domain-card small, .domain-card:focus-visible small)',
-        { color: variable("domainCard", "selected", "description") },
-      ),
-      rule(":where(.domain-card:focus-visible)", {
-        outline: "2px solid var(--publisher-accent) !important",
-        "outline-offset": "3px !important",
-      }),
-    ],
-  },
-  homeSearch: controlRules("homeSearch", ".search-button"),
-  homeStats: {
-    normal: [
-      rule(":where(.garden-stats)", { color: variable("homeStats", "normal", "text") }),
-      rule(":where(.garden-kicker)", { color: variable("homeStats", "normal", "accent") }),
-    ],
-  },
-  explorer: navigationRules("explorer", ".explorer"),
-  mobileMenu: navigationRules("mobileMenu", ".mobile-explorer"),
-  breadcrumb: textRules("breadcrumb", ".breadcrumb-container"),
-  tableOfContents: navigationRules("tableOfContents", ".toc"),
-  searchOverlay: {
-    normal: [
-      rule(":where(.search-container)", {
-        "background-color": variable("searchOverlay", "normal", "surface"),
-      }),
-    ],
-  },
-  searchDialog: panelRules("searchDialog", ".search-space"),
-  searchInput: controlRules("searchInput", ".search-space > input"),
-  searchResult: navigationRules("searchResult", ".result-card"),
-  link: textRules("link", ".page a"),
-  button: controlRules("button", "button, .darkmode, .readermode"),
-  tag: controlRules("tag", ".tag-link"),
-  icon: iconRules("icon", "svg"),
-  codeBlock: codeRules("codeBlock", ".center article pre"),
-  inlineCode: codeRules("inlineCode", ".center article :not(pre) > code"),
-  blockquote: panelRules("blockquote", ".center article blockquote"),
-  table: tableRules(),
-  callout: panelRules("callout", ".callout"),
-  divider: {
-    normal: [
-      rule(":where(.center article hr)", {
-        "background-color": variable("divider", "normal", "border"),
-        "border-color": variable("divider", "normal", "border"),
-      }),
-    ],
-  },
-  popover: panelRules("popover", ".popover-inner"),
-  tooltip: panelRules("tooltip", ".tooltip, [role=tooltip]"),
-  graph: graphRules(),
-  footer: textRules("footer", ".page-footer"),
-} satisfies Readonly<Record<AppearanceComponentId, StateRules>>
-
-function controlRules(componentId: AppearanceComponentId, selector: string): StateRules {
-  const iconSelector = selector
-    .split(",")
-    .map((item) => `${item.trim()} svg`)
-    .join(", ")
-  return mergeStateRules(
-    interactiveRules(componentId, selector, {
-      surface: "background-color",
-      border: "border-color",
-      text: "color",
-    }),
-    interactiveRules(componentId, iconSelector, { icon: "color" }),
-  )
-}
-
-function navigationRules(componentId: AppearanceComponentId, selector: string): StateRules {
-  const iconSelector = selector
-    .split(",")
-    .map((item) => `${item.trim()} svg`)
-    .join(", ")
-  return mergeStateRules(
-    interactiveRules(componentId, selector, {
-      surface: "background-color",
-      border: "border-color",
-      text: "color",
-    }),
-    interactiveRules(componentId, iconSelector, { icon: "color" }),
-  )
-}
-
-function mergeStateRules(...groups: readonly StateRules[]): StateRules {
-  return {
-    normal: groups.flatMap((group) => group.normal ?? []),
-    hover: groups.flatMap((group) => group.hover ?? []),
-    selected: groups.flatMap((group) => group.selected ?? []),
-  }
-}
-
-function textRules(componentId: AppearanceComponentId, selector: string): StateRules {
-  return interactiveRules(componentId, selector, { text: "color", accent: "text-decoration-color" })
-}
-
-function iconRules(componentId: AppearanceComponentId, selector: string): StateRules {
-  return interactiveRules(componentId, selector, { icon: "color" })
-}
-
-function interactiveRules(
-  componentId: AppearanceComponentId,
-  selector: string,
-  properties: Readonly<Record<string, string>>,
-): StateRules {
-  const selectors = selector.split(",").map((item) => item.trim())
-  const declarations = (state: AppearanceState) =>
-    Object.fromEntries(
-      Object.entries(properties).map(([slot, property]) => [
-        property,
-        variable(componentId, state, slot),
-      ]),
-    )
-  return {
-    normal: [rule(`:where(${selectors.join(", ")})`, declarations("normal"))],
-    hover: [
-      rule(
-        `:where(${[
-          ...selectors.map((item) => `${item}:hover`),
-          ...selectors.map((item) => `[data-publisher-appearance-state="hover"] ${item}`),
-        ].join(", ")})`,
-        declarations("hover"),
-      ),
-    ],
-    selected: [
-      rule(
-        `:where(${[
-          ...selectors.map((item) => `${item}[aria-current="page"]`),
-          ...selectors.map((item) => `${item}[aria-selected="true"]`),
-          ...selectors.map((item) => `[data-publisher-appearance-state="selected"] ${item}`),
-        ].join(", ")})`,
-        declarations("selected"),
-      ),
-    ],
-  }
-}
-
-function panelRules(componentId: AppearanceComponentId, selector: string): StateRules {
-  const selectors = selector.split(",").map((item) => item.trim())
-  return {
-    normal: [
-      rule(`:where(${selectors.join(", ")})`, {
-        "background-color": variable(componentId, "normal", "surface"),
-        "border-color": variable(componentId, "normal", "border"),
-        color: variable(componentId, "normal", "text"),
-      }),
-      rule(
-        `:where(${selectors.flatMap((item) => ["h1", "h2", "h3", "h4"].map((heading) => `${item} ${heading}`)).join(", ")})`,
-        {
-          color: variable(componentId, "normal", "heading"),
-        },
-      ),
-    ],
-  }
-}
-
-function codeRules(componentId: AppearanceComponentId, selector: string): StateRules {
-  return {
-    normal: [
-      rule(`:where(${selector})`, {
-        "background-color": variable(componentId, "normal", "surface"),
-        "border-color": variable(componentId, "normal", "border"),
-        color: variable(componentId, "normal", "text"),
-      }),
-    ],
-  }
-}
-
-function tableRules(): StateRules {
-  return {
-    normal: [
-      rule(":where(.center article table, .center article th, .center article td)", {
-        "background-color": variable("table", "normal", "surface"),
-        "border-color": variable("table", "normal", "border"),
-        color: variable("table", "normal", "text"),
-      }),
-      rule(":where(.center article th)", { color: variable("table", "normal", "heading") }),
-    ],
-    hover: [
-      rule(
-        ':where(.center article tr:hover, [data-publisher-appearance-state="hover"] .center article tr)',
-        {
-          "background-color": variable("table", "hover", "surface"),
-          "border-color": variable("table", "hover", "border"),
-          color: variable("table", "hover", "text"),
-        },
-      ),
-    ],
-    selected: [
-      rule(
-        ':where(.center article tr[aria-selected="true"], [data-publisher-appearance-state="selected"] .center article tr)',
-        {
-          "background-color": variable("table", "selected", "surface"),
-          "border-color": variable("table", "selected", "border"),
-          color: variable("table", "selected", "text"),
-        },
-      ),
-    ],
-  }
-}
-
-function graphRules(): StateRules {
-  const declarations = (state: AppearanceState) => ({
-    "background-color": variable("graph", state, "surface"),
-    "border-color": variable("graph", state, "border"),
-    color: variable("graph", state, "text"),
-    "--graph-node-color": variable("graph", state, "node"),
-  })
-  return {
-    normal: [
-      rule(":where(.graph)", declarations("normal")),
-      rule(":where(.graph .node, .graph circle)", {
-        fill: variable("graph", "normal", "node"),
-      }),
-    ],
-    hover: [
-      rule(
-        ':where(.graph:hover, [data-publisher-appearance-state="hover"] .graph)',
-        declarations("hover"),
-      ),
-      rule(
-        ':where(.graph:hover .node, .graph:hover circle, [data-publisher-appearance-state="hover"] .graph .node, [data-publisher-appearance-state="hover"] .graph circle)',
-        { fill: variable("graph", "hover", "node") },
-      ),
-    ],
-    selected: [
-      rule(
-        ':where(.graph[aria-selected="true"], [data-publisher-appearance-state="selected"] .graph)',
-        declarations("selected"),
-      ),
-      rule(
-        ':where(.graph[aria-selected="true"] .node, .graph[aria-selected="true"] circle, [data-publisher-appearance-state="selected"] .graph .node, [data-publisher-appearance-state="selected"] .graph circle)',
-        { fill: variable("graph", "selected", "node") },
-      ),
-    ],
-  }
-}
-
-function emitSelectorRule(selectorRule: SelectorRule): string {
-  const declarations = Object.entries(selectorRule.declarations)
+function cssRule(selectorList: readonly string[], declarations: DeclarationMap): string {
+  const body = Object.entries(declarations)
     .map(([property, value]) => `  ${property}: ${value};`)
     .join("\n")
-  return `${selectorRule.selector} {\n${declarations}\n}`
+  return `:where(${selectorList.join(", ")}) {\n${body}\n}`
+}
+
+function stateRule(
+  componentId: AppearanceComponentId,
+  state: AppearanceState,
+  declarations: DeclarationMap,
+): string {
+  return cssRule(selectors(componentId, state), declarations)
+}
+
+function descendantRule(
+  componentId: AppearanceComponentId,
+  state: AppearanceState,
+  descendant: string,
+  declarations: DeclarationMap,
+): string {
+  return cssRule(
+    selectors(componentId, state).map((selector) => `${selector} ${descendant}`),
+    declarations,
+  )
+}
+
+function controlRules(componentId: AppearanceComponentId, includeIcons = true): string[] {
+  return APPEARANCE_COMPONENTS[componentId].states.flatMap((state) => {
+    const rules = [
+      stateRule(componentId, state, {
+        "background-color": variable(componentId, state, "surface"),
+        "border-color": variable(componentId, state, "border"),
+        color: variable(componentId, state, "text"),
+      }),
+    ]
+    if (includeIcons) {
+      rules.push(
+        descendantRule(componentId, state, "svg", {
+          color: variable(componentId, state, "icon"),
+        }),
+      )
+    }
+    return rules
+  })
+}
+
+function textRules(componentId: AppearanceComponentId): string[] {
+  return APPEARANCE_COMPONENTS[componentId].states.map((state) =>
+    stateRule(componentId, state, {
+      color: variable(componentId, state, "text"),
+      "text-decoration-color": variable(componentId, state, "accent"),
+    }),
+  )
+}
+
+function panelRules(componentId: AppearanceComponentId): string[] {
+  return [
+    stateRule(componentId, "normal", {
+      "background-color": variable(componentId, "normal", "surface"),
+      "border-color": variable(componentId, "normal", "border"),
+      color: variable(componentId, "normal", "text"),
+    }),
+    descendantRule(componentId, "normal", ":is(h1, h2, h3, h4)", {
+      color: variable(componentId, "normal", "heading"),
+    }),
+  ]
+}
+
+function codeRules(componentId: AppearanceComponentId): string[] {
+  return [
+    stateRule(componentId, "normal", {
+      "background-color": variable(componentId, "normal", "surface"),
+      "border-color": variable(componentId, "normal", "border"),
+      color: variable(componentId, "normal", "text"),
+    }),
+  ]
+}
+
+function domainCardRules(): string[] {
+  const rules = APPEARANCE_COMPONENTS.domainCard.states.flatMap((state) => [
+    stateRule("domainCard", state, {
+      "background-color": variable("domainCard", state, "surface"),
+      "border-color": variable("domainCard", state, "border"),
+      color: variable("domainCard", state, "title"),
+    }),
+    descendantRule("domainCard", state, "span", {
+      color: variable("domainCard", state, "number"),
+    }),
+    descendantRule("domainCard", state, "strong", {
+      color: variable("domainCard", state, "title"),
+    }),
+    descendantRule("domainCard", state, "small", {
+      color: variable("domainCard", state, "description"),
+    }),
+  ])
+  rules.push(
+    cssRule([".domain-card:focus-visible"], {
+      outline: "2px solid var(--publisher-accent) !important",
+      "outline-offset": "3px !important",
+    }),
+  )
+  return rules
+}
+
+function homeStatsRules(): string[] {
+  return [
+    cssRule([".garden-stats"], { color: variable("homeStats", "normal", "text") }),
+    cssRule([".garden-kicker"], { color: variable("homeStats", "normal", "accent") }),
+  ]
+}
+
+function searchInputRules(): string[] {
+  return APPEARANCE_COMPONENTS.searchInput.states.map((state) =>
+    stateRule("searchInput", state, {
+      "background-color": variable("searchInput", state, "surface"),
+      "border-color": variable("searchInput", state, "border"),
+      color: variable("searchInput", state, "text"),
+      "caret-color": variable("searchInput", state, "icon"),
+    }),
+  )
+}
+
+function tableRules(): string[] {
+  return APPEARANCE_COMPONENTS.table.states.flatMap((state) => [
+    stateRule("table", state, {
+      "background-color": variable("table", state, "surface"),
+      "border-color": variable("table", state, "border"),
+      color: variable("table", state, "text"),
+    }),
+    descendantRule("table", state, ":is(th, thead)", {
+      color: variable("table", state, "heading"),
+    }),
+  ])
+}
+
+function iconRules(): string[] {
+  return APPEARANCE_COMPONENTS.icon.states.map((state) =>
+    stateRule("icon", state, { color: variable("icon", state, "icon") }),
+  )
+}
+
+function graphRules(): string[] {
+  return APPEARANCE_COMPONENTS.graph.states.flatMap((state) => [
+    stateRule("graph", state, {
+      "background-color": variable("graph", state, "surface"),
+      "border-color": variable("graph", state, "border"),
+      color: variable("graph", state, "text"),
+      "--graph-node-color": variable("graph", state, "node"),
+    }),
+    descendantRule("graph", state, ":is(.node, circle)", {
+      fill: variable("graph", state, "node"),
+    }),
+  ])
+}
+
+function componentRules(componentId: AppearanceComponentId): string[] {
+  switch (componentId) {
+    case "domainCard":
+      return domainCardRules()
+    case "homeStats":
+      return homeStatsRules()
+    case "breadcrumb":
+    case "link":
+    case "footer":
+      return textRules(componentId)
+    case "searchOverlay":
+      return [
+        stateRule(componentId, "normal", {
+          "background-color": variable(componentId, "normal", "surface"),
+        }),
+      ]
+    case "searchDialog":
+    case "blockquote":
+    case "callout":
+    case "popover":
+    case "tooltip":
+      return panelRules(componentId)
+    case "searchInput":
+      return searchInputRules()
+    case "codeBlock":
+    case "inlineCode":
+      return codeRules(componentId)
+    case "table":
+      return tableRules()
+    case "divider":
+      return [
+        stateRule(componentId, "normal", {
+          "background-color": variable(componentId, "normal", "border"),
+          "border-color": variable(componentId, "normal", "border"),
+        }),
+      ]
+    case "icon":
+      return iconRules()
+    case "graph":
+      return graphRules()
+    case "homeSearch":
+    case "explorer":
+    case "mobileMenu":
+    case "tableOfContents":
+    case "searchResult":
+    case "button":
+    case "tag":
+      return controlRules(componentId)
+  }
 }
 
 export function compileAppearanceComponentCss(settings: ComponentCssSettings): string {
@@ -352,13 +486,7 @@ export function compileAppearanceComponentCss(settings: ComponentCssSettings): s
         output.push(`  ${name}: ${value};`)
       }
     }
-    output.push("}")
-
-    const stateRules: StateRules = COMPONENT_SELECTOR_RULES[componentId]
-    for (const state of definition.states) {
-      for (const selectorRule of stateRules[state] ?? [])
-        output.push(emitSelectorRule(selectorRule))
-    }
+    output.push("}", ...componentRules(componentId))
   }
 
   return output.join("\n")
