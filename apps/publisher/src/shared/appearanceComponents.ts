@@ -2,14 +2,7 @@ export const APPEARANCE_STATES = ["normal", "hover", "selected"] as const
 
 export type AppearanceState = (typeof APPEARANCE_STATES)[number]
 export type AppearanceGlobalColor =
-  | "page"
-  | "surface"
-  | "text"
-  | "heading"
-  | "accent"
-  | "secondary"
-  | "border"
-  | "code"
+  "page" | "surface" | "text" | "heading" | "accent" | "secondary" | "border" | "code"
 export type AppearanceSlotKind = "surface" | "border" | "text" | "icon"
 
 export interface AppearanceSlotDefinition {
@@ -111,12 +104,7 @@ export const APPEARANCE_COMPONENTS = Object.freeze({
   explorer: component("导航", "左侧目录", ["normal", "hover", "selected"], navigationSlots),
   mobileMenu: component("导航", "移动菜单", ["normal", "hover", "selected"], navigationSlots),
   breadcrumb: component("导航", "面包屑", ["normal", "hover", "selected"], commonTextSlots),
-  tableOfContents: component(
-    "导航",
-    "文章目录",
-    ["normal", "hover", "selected"],
-    navigationSlots,
-  ),
+  tableOfContents: component("导航", "文章目录", ["normal", "hover", "selected"], navigationSlots),
   searchOverlay: component("搜索", "搜索遮罩", ["normal"], overlaySlots),
   searchDialog: component("搜索", "搜索对话框", ["normal"], panelSlots),
   searchInput: component("搜索", "搜索输入框", ["normal", "hover", "selected"], commonControlSlots),
@@ -187,9 +175,7 @@ function slotDefinition(
   if (!Object.prototype.hasOwnProperty.call(definition.slots, slotName)) {
     throw new Error(`Unknown appearance slot: ${componentId}.${state}.${slotName}`)
   }
-  return definition.slots[
-    slotName as keyof typeof definition.slots
-  ] as AppearanceSlotDefinition
+  return definition.slots[slotName as keyof typeof definition.slots] as AppearanceSlotDefinition
 }
 
 function normalizeColor(value: unknown, allowAlpha: boolean, path: string): string {
@@ -271,18 +257,23 @@ export function setComponentColor<
   slotName: L,
   color: string,
 ): ComponentColorOverrides {
-  slotDefinition(componentId, state, slotName)
+  const definition = slotDefinition(componentId, state, slotName)
+  const normalizedColor = normalizeColor(
+    color,
+    definition.allowAlpha,
+    `${componentId}.${state}.${slotName}`,
+  )
   const current = normalizeComponentColors(overrides) as MutableComponentColors
-  return normalizeComponentColors({
+  return {
     ...current,
     [componentId]: {
       ...current[componentId],
       [state]: {
         ...current[componentId]?.[state],
-        [slotName]: color,
+        [slotName]: normalizedColor,
       },
     },
-  })
+  } as ComponentColorOverrides
 }
 
 export function clearComponentColor<

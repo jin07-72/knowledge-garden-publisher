@@ -1,5 +1,6 @@
 import {
   normalizeComponentColors,
+  type AppearanceGlobalColor,
   type ComponentColorOverrides,
 } from "./appearanceComponents"
 
@@ -24,16 +25,7 @@ export type AppearanceBackground =
       readonly fixed: boolean
     }
 
-export interface GlobalAppearanceColors {
-  readonly page: string
-  readonly surface: string
-  readonly text: string
-  readonly heading: string
-  readonly accent: string
-  readonly secondary: string
-  readonly border: string
-  readonly code: string
-}
+export type GlobalAppearanceColors = Readonly<Record<AppearanceGlobalColor, string>>
 
 export interface AppearanceSettings {
   readonly schemaVersion: 2

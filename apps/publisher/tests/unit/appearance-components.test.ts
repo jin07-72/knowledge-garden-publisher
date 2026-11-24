@@ -6,36 +6,87 @@ import {
   normalizeComponentColors,
   resolveComponentColor,
   setComponentColor,
+  type ComponentColorOverrides,
 } from "../../src/shared/appearanceComponents"
 
 describe("appearance component registry", () => {
-  it("registers every approved Quartz component in stable order", () => {
-    expect(Object.keys(APPEARANCE_COMPONENTS)).toEqual([
-      "domainCard",
-      "homeSearch",
-      "homeStats",
-      "explorer",
-      "mobileMenu",
-      "breadcrumb",
-      "tableOfContents",
-      "searchOverlay",
-      "searchDialog",
-      "searchInput",
-      "searchResult",
-      "link",
-      "button",
-      "tag",
-      "icon",
-      "codeBlock",
-      "inlineCode",
-      "blockquote",
-      "table",
-      "callout",
-      "divider",
-      "popover",
-      "tooltip",
-      "graph",
-      "footer",
+  it("keeps the complete state and slot contract in stable order", () => {
+    expect(
+      Object.entries(APPEARANCE_COMPONENTS).map(([id, definition]) => ({
+        id,
+        states: [...definition.states],
+        slots: Object.keys(definition.slots),
+      })),
+    ).toEqual([
+      {
+        id: "domainCard",
+        states: ["normal", "hover", "selected"],
+        slots: ["surface", "border", "number", "title", "description"],
+      },
+      {
+        id: "homeSearch",
+        states: ["normal", "hover", "selected"],
+        slots: ["surface", "border", "text", "icon"],
+      },
+      { id: "homeStats", states: ["normal"], slots: ["text", "accent"] },
+      {
+        id: "explorer",
+        states: ["normal", "hover", "selected"],
+        slots: ["surface", "border", "text", "icon"],
+      },
+      {
+        id: "mobileMenu",
+        states: ["normal", "hover", "selected"],
+        slots: ["surface", "border", "text", "icon"],
+      },
+      { id: "breadcrumb", states: ["normal", "hover", "selected"], slots: ["text", "accent"] },
+      {
+        id: "tableOfContents",
+        states: ["normal", "hover", "selected"],
+        slots: ["surface", "border", "text", "icon"],
+      },
+      { id: "searchOverlay", states: ["normal"], slots: ["surface"] },
+      { id: "searchDialog", states: ["normal"], slots: ["surface", "border", "text", "heading"] },
+      {
+        id: "searchInput",
+        states: ["normal", "hover", "selected"],
+        slots: ["surface", "border", "text", "icon"],
+      },
+      {
+        id: "searchResult",
+        states: ["normal", "hover", "selected"],
+        slots: ["surface", "border", "text", "icon"],
+      },
+      { id: "link", states: ["normal", "hover", "selected"], slots: ["text", "accent"] },
+      {
+        id: "button",
+        states: ["normal", "hover", "selected"],
+        slots: ["surface", "border", "text", "icon"],
+      },
+      {
+        id: "tag",
+        states: ["normal", "hover", "selected"],
+        slots: ["surface", "border", "text", "icon"],
+      },
+      { id: "icon", states: ["normal", "hover", "selected"], slots: ["icon"] },
+      { id: "codeBlock", states: ["normal"], slots: ["surface", "border", "text"] },
+      { id: "inlineCode", states: ["normal"], slots: ["surface", "border", "text"] },
+      { id: "blockquote", states: ["normal"], slots: ["surface", "border", "text", "heading"] },
+      {
+        id: "table",
+        states: ["normal", "hover", "selected"],
+        slots: ["surface", "border", "text", "heading"],
+      },
+      { id: "callout", states: ["normal"], slots: ["surface", "border", "text", "heading"] },
+      { id: "divider", states: ["normal"], slots: ["border"] },
+      { id: "popover", states: ["normal"], slots: ["surface", "border", "text", "heading"] },
+      { id: "tooltip", states: ["normal"], slots: ["surface", "border", "text", "heading"] },
+      {
+        id: "graph",
+        states: ["normal", "hover", "selected"],
+        slots: ["surface", "border", "node", "text"],
+      },
+      { id: "footer", states: ["normal", "hover", "selected"], slots: ["text", "accent"] },
     ])
   })
 
@@ -56,7 +107,11 @@ describe("appearance component registry", () => {
     })
 
     for (const component of Object.values(APPEARANCE_COMPONENTS)) {
+      expect(Object.isFrozen(component)).toBe(true)
+      expect(Object.isFrozen(component.states)).toBe(true)
+      expect(Object.isFrozen(component.slots)).toBe(true)
       for (const slot of Object.values(component.slots)) {
+        expect(Object.isFrozen(slot)).toBe(true)
         expect(slot.allowAlpha).toBe(slot.kind === "surface" || slot.kind === "border")
       }
     }
@@ -100,6 +155,35 @@ describe("component color overrides", () => {
     expect(() =>
       normalizeComponentColors({ domainCard: { normal: { unknown: "#FFFFFF" } } }),
     ).toThrow(/slot/i)
+    for (const malformed of [
+      null,
+      [],
+      "#FFFFFF",
+      { domainCard: [] },
+      { domainCard: { normal: [] } },
+    ]) {
+      expect(() => normalizeComponentColors(malformed)).toThrow(/object/i)
+    }
+    for (const malformedHex of ["#FFF", "#GGGGGG", "#123456789", "rgb(0,0,0)"]) {
+      expect(() =>
+        normalizeComponentColors({ domainCard: { normal: { surface: malformedHex } } }),
+      ).toThrow(/hex/i)
+    }
+  })
+
+  it("validates a new color before traversing existing overrides", () => {
+    const unreadOverrides = new Proxy(
+      {},
+      {
+        ownKeys() {
+          throw new Error("existing overrides were traversed")
+        },
+      },
+    ) as ComponentColorOverrides
+
+    expect(() =>
+      setComponentColor(unreadOverrides, "domainCard", "normal", "surface", "invalid"),
+    ).toThrow(/hex/i)
   })
 
   it("sets and clears leaves immutably while pruning empty ancestors", () => {
