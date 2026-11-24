@@ -31,6 +31,17 @@ describe("appearance bridge contracts", () => {
         privateSource: "background-must-not-cross",
       },
       colors: { ...DEFAULT_APPEARANCE.colors, privateSource: "colors-must-not-cross" },
+      componentColors: {
+        domainCard: {
+          hover: {
+            surface: "#334455CC",
+            title: "#FFFFFF",
+            privateSource: "component-slot-must-not-cross",
+          },
+          privateState: { surface: "#000000" },
+        },
+        privateComponent: { normal: { surface: "#000000" } },
+      },
       typography: {
         ...DEFAULT_APPEARANCE.typography,
         privateSource: "typography-must-not-cross",
@@ -63,6 +74,9 @@ describe("appearance bridge contracts", () => {
           position: "center",
           fixed: false,
         },
+        componentColors: {
+          domainCard: { hover: { surface: "#334455CC", title: "#FFFFFF" } },
+        },
       },
       baselineHash,
       canUndo: false,
@@ -75,6 +89,76 @@ describe("appearance bridge contracts", () => {
     expect(
       appearanceSettingsSchema.safeParse({ ...DEFAULT_APPEARANCE, workspacePath: "C:/garden" })
         .success,
+    ).toBe(false)
+  })
+
+  it("accepts registered v2 component overrides and rejects unknown leaves", () => {
+    const valid = {
+      ...DEFAULT_APPEARANCE,
+      componentColors: {
+        domainCard: { hover: { surface: "#334455CC", title: "#FFFFFF" } },
+      },
+    }
+    expect(appearanceSettingsSchema.safeParse(valid).success).toBe(true)
+
+    for (const componentColors of [
+      { domainCard: { hover: { script: "#FFFFFF" } } },
+      { domainCard: { focused: { surface: "#334455" } } },
+      { unknownCard: { normal: { surface: "#334455" } } },
+      { domainCard: { hover: { title: "#FFFFFFCC" } } },
+    ]) {
+      expect(
+        appearanceSettingsSchema.safeParse({ ...valid, componentColors }).success,
+        JSON.stringify(componentColors),
+      ).toBe(false)
+    }
+  })
+
+  it("allows alpha only in alpha-capable global, background, and component colors", () => {
+    expect(
+      appearanceSettingsSchema.safeParse({
+        ...DEFAULT_APPEARANCE,
+        colors: {
+          ...DEFAULT_APPEARANCE.colors,
+          page: "#112233CC",
+          surface: "#223344AA",
+          border: "#33445588",
+          code: "#44556666",
+        },
+        background: {
+          kind: "gradient",
+          start: "#10203040",
+          end: "#50607080",
+          angle: 45,
+        },
+        componentColors: { button: { hover: { surface: "#ABCDEF80", border: "#12345678" } } },
+      }).success,
+    ).toBe(true)
+    expect(
+      appearanceSettingsSchema.safeParse({
+        ...DEFAULT_APPEARANCE,
+        background: { kind: "solid", color: "#12345678" },
+      }).success,
+    ).toBe(true)
+
+    expect(
+      appearanceSettingsSchema.safeParse({
+        ...DEFAULT_APPEARANCE,
+        colors: { ...DEFAULT_APPEARANCE.colors, text: "#112233CC" },
+      }).success,
+    ).toBe(false)
+    expect(
+      appearanceSettingsSchema.safeParse({
+        ...DEFAULT_APPEARANCE,
+        background: {
+          kind: "image",
+          asset: { source: "managed", name: "background.webp" },
+          overlay: "#00000080",
+          opacity: 0.5,
+          position: "center",
+          fixed: false,
+        },
+      }).success,
     ).toBe(false)
   })
 
@@ -151,10 +235,7 @@ describe("appearance bridge contracts", () => {
       ...DEFAULT_APPEARANCE,
       background: {
         kind: "image" as const,
-        asset:
-          source === "managed"
-            ? { source, name }
-            : { source, token: sessionId, name },
+        asset: source === "managed" ? { source, name } : { source, token: sessionId, name },
         overlay: "#000000",
         opacity: 0.35,
         position: "center" as const,
@@ -187,14 +268,18 @@ describe("appearance bridge contracts", () => {
       "background.png.exe",
       `${"a".repeat(252)}.png`,
     ]) {
-      expect.soft(
-        appearanceSettingsSchema.safeParse(withImage(name, "managed")).success,
-        `managed:${name}`,
-      ).toBe(false)
-      expect.soft(
-        appearanceSettingsSchema.safeParse(withImage(name, "staged")).success,
-        `staged:${name}`,
-      ).toBe(false)
+      expect
+        .soft(
+          appearanceSettingsSchema.safeParse(withImage(name, "managed")).success,
+          `managed:${name}`,
+        )
+        .toBe(false)
+      expect
+        .soft(
+          appearanceSettingsSchema.safeParse(withImage(name, "staged")).success,
+          `staged:${name}`,
+        )
+        .toBe(false)
     }
   })
 
@@ -209,14 +294,16 @@ describe("appearance bridge contracts", () => {
       "https://127.0.0.1/",
       "http://192.168.1.2/",
     ]) {
-      expect.soft(
-        appearancePreviewRequestSchema.safeParse({
+      expect
+        .soft(
+          appearancePreviewRequestSchema.safeParse({
+            url,
+            sessionId,
+            settings: DEFAULT_APPEARANCE,
+          }).success,
           url,
-          sessionId,
-          settings: DEFAULT_APPEARANCE,
-        }).success,
-        url,
-      ).toBe(false)
+        )
+        .toBe(false)
     }
   })
 
@@ -252,9 +339,9 @@ describe("appearance bridge contracts", () => {
   })
 
   it("requires exact baseline hashes for apply and undo", () => {
-    expect(
-      appearanceApplyRequestSchema.safeParse({ settings: DEFAULT_APPEARANCE }).success,
-    ).toBe(false)
+    expect(appearanceApplyRequestSchema.safeParse({ settings: DEFAULT_APPEARANCE }).success).toBe(
+      false,
+    )
     expect(
       appearanceApplyRequestSchema.safeParse({
         settings: DEFAULT_APPEARANCE,

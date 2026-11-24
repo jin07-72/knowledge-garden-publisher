@@ -112,7 +112,29 @@ function customizedSettings(): AppearanceSettings {
 }
 
 function manifest(settings: AppearanceSettings, assets: readonly string[] = []): string {
-  return `${JSON.stringify({ schemaVersion: 1, settings, assets }, null, 2)}\n`
+  return `${JSON.stringify({ schemaVersion: 2, settings, assets }, null, 2)}\n`
+}
+
+function legacyManifest(
+  settings: AppearanceSettings,
+  assets: readonly string[] = [],
+  extensions: Readonly<Record<string, unknown>> = {},
+): string {
+  const {
+    componentColors: _componentColors,
+    schemaVersion: _schemaVersion,
+    ...legacySettings
+  } = settings
+  return `${JSON.stringify(
+    {
+      ...extensions,
+      schemaVersion: 1,
+      settings: { ...legacySettings, schemaVersion: 1 },
+      assets,
+    },
+    null,
+    2,
+  )}\n`
 }
 
 async function applyPlan(root: string, plan: AppearancePlan): Promise<void> {
@@ -280,6 +302,100 @@ describe("QuartzAppearanceAdapter", () => {
     expect(await readFile(join(root, QUARTZ_APPEARANCE_PATHS.manifest), "utf8")).toBe(
       manifest(settings),
     )
+  })
+
+  it("migrates a v1 manifest on first apply without rewriting it on read", async () => {
+    const root = await temporaryDirectory()
+    await createQuartzWorkspace(root)
+    const legacy = legacyManifest(customizedSettings())
+    await writeWorkspaceFile(root, QUARTZ_APPEARANCE_PATHS.manifest, legacy)
+    const adapter = new QuartzAppearanceAdapter(root)
+
+    const snapshot = await adapter.read()
+
+    expect(snapshot.settings).toEqual({
+      ...customizedSettings(),
+      schemaVersion: 2,
+      componentColors: {},
+    })
+    await expect(readFile(join(root, QUARTZ_APPEARANCE_PATHS.manifest), "utf8")).resolves.toBe(
+      legacy,
+    )
+
+    const plan = await adapter.plan(snapshot.settings, snapshot.baselineHash)
+    await applyPlan(root, plan)
+    const persisted = JSON.parse(
+      await readFile(join(root, QUARTZ_APPEARANCE_PATHS.manifest), "utf8"),
+    ) as Record<string, unknown>
+    expect(persisted).toMatchObject({
+      schemaVersion: 2,
+      settings: { schemaVersion: 2, componentColors: {} },
+    })
+  })
+
+  it("preserves unknown persisted fields without exposing or compiling them", async () => {
+    const root = await temporaryDirectory()
+    await createQuartzWorkspace(root)
+    const settings = customizedSettings()
+    const {
+      componentColors: _componentColors,
+      schemaVersion: _schemaVersion,
+      ...legacySettings
+    } = settings
+    const persisted = `${JSON.stringify(
+      {
+        schemaVersion: 1,
+        settings: {
+          ...legacySettings,
+          schemaVersion: 1,
+          futureSetting: { keep: "future-settings-marker" },
+        },
+        assets: [],
+        futureManifest: { keep: "future-manifest-marker" },
+      },
+      null,
+      2,
+    )}\n`
+    await writeWorkspaceFile(root, QUARTZ_APPEARANCE_PATHS.manifest, persisted)
+    const adapter = new QuartzAppearanceAdapter(root)
+
+    const snapshot = await adapter.read()
+
+    expect(snapshot.settings).toEqual({ ...settings, schemaVersion: 2, componentColors: {} })
+    expect(JSON.stringify(snapshot)).not.toContain("future-settings-marker")
+    expect(JSON.stringify(snapshot)).not.toContain("future-manifest-marker")
+
+    const plan = await adapter.plan(snapshot.settings, snapshot.baselineHash)
+    const stylesheet = plan.writes.find(({ path }) => path === QUARTZ_APPEARANCE_PATHS.stylesheet)
+    expect(new TextDecoder().decode(stylesheet?.bytes)).not.toContain("future-settings-marker")
+    await applyPlan(root, plan)
+
+    const migrated = JSON.parse(
+      await readFile(join(root, QUARTZ_APPEARANCE_PATHS.manifest), "utf8"),
+    )
+    expect(migrated).toMatchObject({
+      schemaVersion: 2,
+      settings: {
+        schemaVersion: 2,
+        componentColors: {},
+        futureSetting: { keep: "future-settings-marker" },
+      },
+      futureManifest: { keep: "future-manifest-marker" },
+    })
+  })
+
+  it("rejects an oversized appearance manifest before parsing", async () => {
+    const root = await temporaryDirectory()
+    await createQuartzWorkspace(root)
+    await writeWorkspaceFile(
+      root,
+      QUARTZ_APPEARANCE_PATHS.manifest,
+      new Uint8Array(256 * 1024 + 1).fill("{".charCodeAt(0)),
+    )
+
+    await expect(new QuartzAppearanceAdapter(root).read()).rejects.toMatchObject({
+      code: "APPEARANCE_CONFLICT",
+    })
   })
 
   it("does not rewrite YAML when its managed values are unchanged", async () => {

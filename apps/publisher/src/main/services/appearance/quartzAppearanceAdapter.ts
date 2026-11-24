@@ -11,6 +11,7 @@ import {
   type Node,
   type YAMLMap,
 } from "yaml"
+import { z } from "zod"
 import {
   cloneAppearancePreset,
   compileAppearanceCss,
@@ -52,6 +53,7 @@ const SAFE_STAGED_EXTENSIONS = new Set([".png", ".jpg", ".jpeg", ".gif", ".webp"
 const encoder = new TextEncoder()
 const decoder = new TextDecoder("utf-8", { fatal: true })
 const customStylesheetDecoder = new TextDecoder("utf-8", { fatal: true, ignoreBOM: true })
+export const MAX_APPEARANCE_MANIFEST_BYTES = 256 * 1024
 
 interface FileState {
   readonly path: string
@@ -59,10 +61,15 @@ interface FileState {
   readonly hash: string | null
 }
 
-interface AppearanceManifest {
+type AppearanceSettingsV1 = Omit<AppearanceSettings, "schemaVersion" | "componentColors"> & {
   readonly schemaVersion: 1
+}
+
+interface AppearanceManifest {
   readonly settings: AppearanceSettings
   readonly assets: readonly string[]
+  readonly rawManifest: Readonly<Record<string, unknown>>
+  readonly rawSettings: Readonly<Record<string, unknown>>
 }
 
 interface Baseline {
@@ -121,6 +128,52 @@ function asRecord(value: unknown): Record<string, unknown> {
   return value !== null && typeof value === "object" && !Array.isArray(value)
     ? (value as Record<string, unknown>)
     : {}
+}
+
+const persistedSettingsSchema = z
+  .object({ schemaVersion: z.union([z.literal(1), z.literal(2)]) })
+  .passthrough()
+const persistedManifestSchema = z
+  .object({
+    schemaVersion: z.union([z.literal(1), z.literal(2)]),
+    settings: persistedSettingsSchema,
+    assets: z.array(z.string()),
+  })
+  .passthrough()
+
+function knownSettingsCandidate(
+  settings: Readonly<Record<string, unknown>>,
+): Record<string, unknown> {
+  return {
+    schemaVersion: 2,
+    preset: settings.preset,
+    background: settings.background,
+    colors: settings.colors,
+    componentColors: settings.componentColors,
+    typography: settings.typography,
+    layout: settings.layout,
+    customCss: settings.customCss,
+  }
+}
+
+function parseAppearanceV1(settings: Readonly<Record<string, unknown>>): AppearanceSettingsV1 {
+  const parsed = appearanceSettingsSchema.safeParse({
+    ...knownSettingsCandidate(settings),
+    componentColors: {},
+  })
+  if (!parsed.success) {
+    throw appearanceError("APPEARANCE_CONFLICT", "The Publisher appearance manifest is invalid.")
+  }
+  const {
+    componentColors: _componentColors,
+    schemaVersion: _schemaVersion,
+    ...legacy
+  } = parsed.data
+  return { ...legacy, schemaVersion: 1 }
+}
+
+function migrateAppearanceV1(settings: AppearanceSettingsV1): AppearanceSettings {
+  return normalizeAppearanceSettings({ ...settings, schemaVersion: 2, componentColors: {} })
 }
 
 interface SassDirective {
@@ -418,6 +471,9 @@ function isManagedAssetPath(path: string): boolean {
 }
 
 function parseManifest(bytes: Uint8Array): AppearanceManifest {
+  if (bytes.length > MAX_APPEARANCE_MANIFEST_BYTES) {
+    throw appearanceError("APPEARANCE_CONFLICT", "The Publisher appearance manifest is too large.")
+  }
   let value: unknown
   try {
     value = JSON.parse(decoder.decode(bytes))
@@ -427,31 +483,41 @@ function parseManifest(bytes: Uint8Array): AppearanceManifest {
       "The Publisher appearance manifest is invalid JSON.",
     )
   }
-  const parsed = asRecord(value)
-  const settings = appearanceSettingsSchema.safeParse(parsed.settings)
+  const manifest = persistedManifestSchema.safeParse(value)
   if (
-    parsed.schemaVersion !== 1 ||
-    !settings.success ||
-    !Array.isArray(parsed.assets) ||
-    !parsed.assets.every((path) => typeof path === "string" && isManagedAssetPath(path)) ||
-    new Set(parsed.assets).size !== parsed.assets.length
+    !manifest.success ||
+    manifest.data.schemaVersion !== manifest.data.settings.schemaVersion ||
+    !manifest.data.assets.every(isManagedAssetPath) ||
+    new Set(manifest.data.assets).size !== manifest.data.assets.length
   ) {
     throw appearanceError("APPEARANCE_CONFLICT", "The Publisher appearance manifest is invalid.")
   }
+  const rawSettings = manifest.data.settings as Record<string, unknown>
+  let normalized: AppearanceSettings
+  if (manifest.data.schemaVersion === 1) {
+    normalized = migrateAppearanceV1(parseAppearanceV1(rawSettings))
+  } else {
+    const settings = appearanceSettingsSchema.safeParse(knownSettingsCandidate(rawSettings))
+    if (!settings.success) {
+      throw appearanceError("APPEARANCE_CONFLICT", "The Publisher appearance manifest is invalid.")
+    }
+    normalized = normalizeAppearanceSettings(settings.data)
+  }
   if (
-    settings.data.background.kind === "image" &&
-    (settings.data.background.asset.source !== "managed" ||
-      !SAFE_ASSET_NAME.test(settings.data.background.asset.name) ||
-      !parsed.assets.includes(
-        `${QUARTZ_APPEARANCE_PATHS.backgroundDirectory}/${settings.data.background.asset.name}`,
+    normalized.background.kind === "image" &&
+    (normalized.background.asset.source !== "managed" ||
+      !SAFE_ASSET_NAME.test(normalized.background.asset.name) ||
+      !manifest.data.assets.includes(
+        `${QUARTZ_APPEARANCE_PATHS.backgroundDirectory}/${normalized.background.asset.name}`,
       ))
   ) {
     throw appearanceError("APPEARANCE_CONFLICT", "The manifest background asset is inconsistent.")
   }
   return {
-    schemaVersion: 1,
-    settings: normalizeAppearanceSettings(settings.data),
-    assets: [...parsed.assets].sort() as string[],
+    settings: normalized,
+    assets: [...manifest.data.assets].sort(),
+    rawManifest: manifest.data,
+    rawSettings,
   }
 }
 
@@ -624,8 +690,22 @@ function managedConfigurationFingerprint(configuration: ConfigurationDocument): 
   ])
 }
 
-function manifestBytes(settings: AppearanceSettings, assets: readonly string[]): Uint8Array {
-  return encoder.encode(`${JSON.stringify({ schemaVersion: 1, settings, assets }, null, 2)}\n`)
+function manifestBytes(
+  settings: AppearanceSettings,
+  assets: readonly string[],
+  previous: AppearanceManifest | undefined,
+): Uint8Array {
+  const value = {
+    ...previous?.rawManifest,
+    schemaVersion: 2,
+    settings: { ...previous?.rawSettings, ...settings },
+    assets,
+  }
+  const bytes = encoder.encode(`${JSON.stringify(value, null, 2)}\n`)
+  if (bytes.length > MAX_APPEARANCE_MANIFEST_BYTES) {
+    throw appearanceError("APPEARANCE_INVALID", "The Publisher appearance manifest is too large.")
+  }
+  return bytes
 }
 
 export class QuartzAppearanceAdapter implements AppearanceAdapter {
@@ -900,7 +980,7 @@ export class QuartzAppearanceAdapter implements AppearanceAdapter {
 
     const nextConfiguration = updatedConfiguration(baseline.configuration, settings)
     const desired = new Map<string, Uint8Array>([
-      [QUARTZ_APPEARANCE_PATHS.manifest, manifestBytes(settings, nextAssets)],
+      [QUARTZ_APPEARANCE_PATHS.manifest, manifestBytes(settings, nextAssets, baseline.manifest)],
       [
         QUARTZ_APPEARANCE_PATHS.stylesheet,
         encoder.encode(`${compileAppearanceCss(settings, { imageUrl })}\n`),

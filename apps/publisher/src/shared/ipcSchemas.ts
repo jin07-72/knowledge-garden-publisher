@@ -1,5 +1,6 @@
 import { z } from "zod"
-import type { AppearanceSettings } from "./appearance"
+import { normalizeAppearanceSettings, type AppearanceSettings } from "./appearance"
+import { APPEARANCE_COMPONENTS, type ComponentColorOverrides } from "./appearanceComponents"
 import {
   APP_ERROR_CODES,
   IMAGE_LIBRARY_MAX_GALLERY_THUMBNAIL_TOTAL_LENGTH,
@@ -271,7 +272,8 @@ const safeBitmapImageNameSchema = z
   .refine((value) => !/[. ]$/.test(value))
   .refine((value) => !windowsDeviceNamePattern.test(value))
   .regex(/^.+\.(?:png|jpe?g|gif|webp|avif)$/i)
-const appearanceColorSchema = z.string().regex(/^#[0-9a-fA-F]{6}$/)
+const appearanceOpaqueColorSchema = z.string().regex(/^#[0-9a-fA-F]{6}$/)
+const appearanceAlphaColorSchema = z.string().regex(/^#[0-9a-fA-F]{6}(?:[0-9a-fA-F]{2})?$/)
 const appearanceFontSchema = z
   .string()
   .min(1)
@@ -290,12 +292,12 @@ const appearanceAssetShape = {
   },
 } as const
 const appearanceBackgroundSchema = z.discriminatedUnion("kind", [
-  z.object({ kind: z.literal("solid"), color: appearanceColorSchema }).strict(),
+  z.object({ kind: z.literal("solid"), color: appearanceAlphaColorSchema }).strict(),
   z
     .object({
       kind: z.literal("gradient"),
-      start: appearanceColorSchema,
-      end: appearanceColorSchema,
+      start: appearanceAlphaColorSchema,
+      end: appearanceAlphaColorSchema,
       angle: z.number().finite().min(0).max(360),
     })
     .strict(),
@@ -306,7 +308,7 @@ const appearanceBackgroundSchema = z.discriminatedUnion("kind", [
         z.object(appearanceAssetShape.managed).strict(),
         z.object(appearanceAssetShape.staged).strict(),
       ]),
-      overlay: appearanceColorSchema,
+      overlay: appearanceOpaqueColorSchema,
       opacity: z.number().finite().min(0).max(1),
       position: z.enum(["center", "top", "bottom"]),
       fixed: z.boolean(),
@@ -315,16 +317,45 @@ const appearanceBackgroundSchema = z.discriminatedUnion("kind", [
 ])
 const appearanceColorsSchema = z
   .object({
-    page: appearanceColorSchema,
-    surface: appearanceColorSchema,
-    text: appearanceColorSchema,
-    heading: appearanceColorSchema,
-    accent: appearanceColorSchema,
-    secondary: appearanceColorSchema,
-    border: appearanceColorSchema,
-    code: appearanceColorSchema,
+    page: appearanceAlphaColorSchema,
+    surface: appearanceAlphaColorSchema,
+    text: appearanceOpaqueColorSchema,
+    heading: appearanceOpaqueColorSchema,
+    accent: appearanceOpaqueColorSchema,
+    secondary: appearanceOpaqueColorSchema,
+    border: appearanceAlphaColorSchema,
+    code: appearanceAlphaColorSchema,
   })
   .strict()
+type AppearanceSchemaMode = "strict" | "strip"
+type AppearanceZodShape = Record<string, z.ZodType>
+function appearanceObject(shape: AppearanceZodShape, mode: AppearanceSchemaMode) {
+  const object = z.object(shape).partial()
+  return mode === "strict" ? object.strict() : object.strip()
+}
+function createComponentColorsSchema(mode: AppearanceSchemaMode): z.ZodType {
+  const components: AppearanceZodShape = {}
+  for (const [componentId, definition] of Object.entries(APPEARANCE_COMPONENTS)) {
+    const states: AppearanceZodShape = {}
+    for (const state of definition.states) {
+      const slots: AppearanceZodShape = {}
+      for (const [slotName, slotDefinition] of Object.entries(definition.slots)) {
+        slots[slotName] = slotDefinition.allowAlpha
+          ? appearanceAlphaColorSchema
+          : appearanceOpaqueColorSchema
+      }
+      states[state] = appearanceObject(slots, mode)
+    }
+    components[componentId] = appearanceObject(states, mode)
+  }
+  return appearanceObject(components, mode)
+}
+const appearanceComponentColorsRequestSchema = createComponentColorsSchema(
+  "strict",
+) as z.ZodType<ComponentColorOverrides>
+const appearanceComponentColorsResponseSchema = createComponentColorsSchema(
+  "strip",
+) as z.ZodType<ComponentColorOverrides>
 const appearanceTypographySchema = z
   .object({
     header: appearanceFontSchema,
@@ -350,10 +381,11 @@ const appearanceCustomCssSchema = z
   .refine((value) => !/<\/style/i.test(value))
 export const appearanceSettingsSchema: z.ZodType<AppearanceSettings> = z
   .object({
-    schemaVersion: z.literal(1),
+    schemaVersion: z.literal(2),
     preset: z.enum(["knowledge-garden", "paper", "minimal", "custom"]),
     background: appearanceBackgroundSchema,
     colors: appearanceColorsSchema,
+    componentColors: appearanceComponentColorsRequestSchema,
     typography: appearanceTypographySchema,
     layout: appearanceLayoutSchema,
     customCss: appearanceCustomCssSchema,
@@ -734,12 +766,12 @@ const appearanceResponseAssetSchema = z.discriminatedUnion("source", [
   z.object(appearanceAssetShape.staged).strip(),
 ])
 const appearanceResponseBackgroundSchema = z.discriminatedUnion("kind", [
-  z.object({ kind: z.literal("solid"), color: appearanceColorSchema }).strip(),
+  z.object({ kind: z.literal("solid"), color: appearanceAlphaColorSchema }).strip(),
   z
     .object({
       kind: z.literal("gradient"),
-      start: appearanceColorSchema,
-      end: appearanceColorSchema,
+      start: appearanceAlphaColorSchema,
+      end: appearanceAlphaColorSchema,
       angle: z.number().finite().min(0).max(360),
     })
     .strip(),
@@ -747,7 +779,7 @@ const appearanceResponseBackgroundSchema = z.discriminatedUnion("kind", [
     .object({
       kind: z.literal("image"),
       asset: appearanceResponseAssetSchema,
-      overlay: appearanceColorSchema,
+      overlay: appearanceOpaqueColorSchema,
       opacity: z.number().finite().min(0).max(1),
       position: z.enum(["center", "top", "bottom"]),
       fixed: z.boolean(),
@@ -756,15 +788,17 @@ const appearanceResponseBackgroundSchema = z.discriminatedUnion("kind", [
 ])
 const appearanceResponseSettingsSchema: z.ZodType<AppearanceSettings> = z
   .object({
-    schemaVersion: z.literal(1),
+    schemaVersion: z.literal(2),
     preset: z.enum(["knowledge-garden", "paper", "minimal", "custom"]),
     background: appearanceResponseBackgroundSchema,
     colors: appearanceColorsSchema.strip(),
+    componentColors: appearanceComponentColorsResponseSchema,
     typography: appearanceTypographySchema.strip(),
     layout: appearanceLayoutSchema.strip(),
     customCss: appearanceCustomCssSchema,
   })
   .strip()
+  .transform(normalizeAppearanceSettings)
 const appearanceSnapshotSchema: z.ZodType<AppearanceSnapshot> = z
   .object({
     framework: z.enum(["quartz", "hugo", "hexo", "unknown"]),
