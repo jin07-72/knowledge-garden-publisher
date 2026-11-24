@@ -124,15 +124,28 @@ function isInside(root: string, candidate: string): boolean {
   return fromRoot === "" || (!fromRoot.startsWith("..") && !isAbsolute(fromRoot))
 }
 
-function asRecord(value: unknown): Record<string, unknown> {
-  return value !== null && typeof value === "object" && !Array.isArray(value)
-    ? (value as Record<string, unknown>)
-    : {}
-}
-
 const persistedSettingsSchema = z
   .object({ schemaVersion: z.union([z.literal(1), z.literal(2)]) })
   .passthrough()
+
+const DANGEROUS_PERSISTED_KEYS = new Set(["__proto__", "constructor", "prototype"])
+
+function hasDangerousPersistedKey(value: unknown): boolean {
+  const pending: unknown[] = [value]
+  while (pending.length > 0) {
+    const current = pending.pop()
+    if (current === null || typeof current !== "object") continue
+    if (Array.isArray(current)) {
+      for (const item of current) pending.push(item)
+      continue
+    }
+    for (const key of Object.keys(current)) {
+      if (DANGEROUS_PERSISTED_KEYS.has(key)) return true
+      pending.push((current as Record<string, unknown>)[key])
+    }
+  }
+  return false
+}
 const persistedManifestSchema = z
   .object({
     schemaVersion: z.union([z.literal(1), z.literal(2)]),
@@ -483,6 +496,9 @@ function parseManifest(bytes: Uint8Array): AppearanceManifest {
       "The Publisher appearance manifest is invalid JSON.",
     )
   }
+  if (hasDangerousPersistedKey(value)) {
+    throw appearanceError("APPEARANCE_CONFLICT", "The Publisher appearance manifest is invalid.")
+  }
   const manifest = persistedManifestSchema.safeParse(value)
   if (
     !manifest.success ||
@@ -701,7 +717,16 @@ function manifestBytes(
     settings: { ...previous?.rawSettings, ...settings },
     assets,
   }
-  const bytes = encoder.encode(`${JSON.stringify(value, null, 2)}\n`)
+  let serialized: string
+  try {
+    serialized = JSON.stringify(value, null, 2)
+  } catch {
+    throw appearanceError(
+      "APPEARANCE_INVALID",
+      "The Publisher appearance manifest could not be persisted safely.",
+    )
+  }
+  const bytes = encoder.encode(`${serialized}\n`)
   if (bytes.length > MAX_APPEARANCE_MANIFEST_BYTES) {
     throw appearanceError("APPEARANCE_INVALID", "The Publisher appearance manifest is too large.")
   }

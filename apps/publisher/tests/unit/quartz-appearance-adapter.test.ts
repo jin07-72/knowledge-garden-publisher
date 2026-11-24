@@ -384,6 +384,53 @@ describe("QuartzAppearanceAdapter", () => {
     })
   })
 
+  it("fails closed when preserved fields exceed safe serialization depth", async () => {
+    const root = await temporaryDirectory()
+    await createQuartzWorkspace(root)
+    const nested = `${'{"next":'.repeat(12_000)}null${"}".repeat(12_000)}`
+    const persisted = manifest(customizedSettings()).replace(
+      '  "assets": []',
+      `  "futureManifest": ${nested},\n  "assets": []`,
+    )
+    expect(encoder.encode(persisted).length).toBeLessThanOrEqual(256 * 1024)
+    await writeWorkspaceFile(root, QUARTZ_APPEARANCE_PATHS.manifest, persisted)
+    const adapter = new QuartzAppearanceAdapter(root)
+    const snapshot = await adapter.read()
+    const before = await readFile(join(root, QUARTZ_APPEARANCE_PATHS.manifest))
+
+    const result = adapter.plan(snapshot.settings, snapshot.baselineHash).catch((error) => error)
+
+    await expect(result).resolves.toMatchObject({
+      code: "APPEARANCE_INVALID",
+      message: expect.not.stringMatching(/RangeError|call stack|JSON/i),
+    })
+    await expect(readFile(join(root, QUARTZ_APPEARANCE_PATHS.manifest))).resolves.toEqual(before)
+  })
+
+  it.each([
+    ["top-level __proto__", "{\n", '{\n  "__proto__": { "polluted": true },\n'],
+    [
+      "nested settings constructor",
+      '  "settings": {\n',
+      '  "settings": {\n    "future": { "constructor": { "polluted": true } },\n',
+    ],
+    [
+      "nested manifest prototype",
+      "{\n",
+      '{\n  "future": { "nested": { "prototype": { "polluted": true } } },\n',
+    ],
+  ])("rejects the dangerous preserved key %s", async (_name, marker, replacement) => {
+    const root = await temporaryDirectory()
+    await createQuartzWorkspace(root)
+    const persisted = manifest(customizedSettings()).replace(marker, replacement)
+    await writeWorkspaceFile(root, QUARTZ_APPEARANCE_PATHS.manifest, persisted)
+
+    await expect(new QuartzAppearanceAdapter(root).read()).rejects.toMatchObject({
+      code: "APPEARANCE_CONFLICT",
+    })
+    expect(({} as { polluted?: boolean }).polluted).toBeUndefined()
+  })
+
   it("rejects an oversized appearance manifest before parsing", async () => {
     const root = await temporaryDirectory()
     await createQuartzWorkspace(root)
