@@ -8,6 +8,7 @@ import type {
   AppearanceClearPreviewRequest,
   AppearancePreviewReceipt,
   AppearancePreviewRequest,
+  AppearancePreviewTarget,
   AppearanceSnapshot,
   AppearanceUndoRequest,
   AppError,
@@ -26,6 +27,7 @@ interface PreviewInstallRequest {
   readonly url: string
   readonly sessionId: string
   readonly css: string
+  readonly target?: AppearancePreviewTarget
 }
 
 interface PreviewRemoveRequest {
@@ -311,6 +313,7 @@ export async function createAppearanceService(
           url: request.url,
           sessionId: request.sessionId,
           css,
+          ...(request.target ? { target: request.target } : {}),
         })
         if (revision !== previewRevision) {
           if (installed) {

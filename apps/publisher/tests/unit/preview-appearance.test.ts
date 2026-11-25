@@ -18,6 +18,9 @@ function executableFrame(url: string, executionUrl = url): PreviewFramePort {
 describe("appearance preview frame boundary", () => {
   beforeEach(() => {
     document.head.replaceChildren()
+    delete document.documentElement.dataset.publisherAppearanceSession
+    delete document.documentElement.dataset.publisherAppearanceComponent
+    delete document.documentElement.dataset.publisherAppearanceState
     delete (globalThis as { pwned?: boolean }).pwned
   })
 
@@ -259,5 +262,63 @@ describe("appearance preview frame boundary", () => {
     expect(
       document.querySelector('style[data-publisher-appearance-preview="session-2"]'),
     ).not.toBeNull()
+  })
+
+  it("sets and clears inert forced-state attributes only for the matching session", async () => {
+    const preview = executableFrame("http://127.0.0.1:8080/note")
+
+    await expect(
+      previewAppearance([preview], {
+        url: preview.url,
+        sessionId: "session-1",
+        css: "body {}",
+        target: { componentId: "domainCard", state: "hover" },
+      }),
+    ).resolves.toBe(true)
+
+    expect(document.documentElement.dataset.publisherAppearanceSession).toBe("session-1")
+    expect(document.documentElement.dataset.publisherAppearanceComponent).toBe("domainCard")
+    expect(document.documentElement.dataset.publisherAppearanceState).toBe("hover")
+
+    await expect(
+      clearAppearancePreview([preview], {
+        url: preview.url,
+        sessionId: "session-2",
+      }),
+    ).resolves.toBe(true)
+    expect(document.documentElement.dataset.publisherAppearanceSession).toBe("session-1")
+    expect(document.documentElement.dataset.publisherAppearanceComponent).toBe("domainCard")
+    expect(document.documentElement.dataset.publisherAppearanceState).toBe("hover")
+
+    await expect(
+      previewAppearance([preview], {
+        url: preview.url,
+        sessionId: "session-1",
+        css: "body {}",
+      }),
+    ).resolves.toBe(true)
+    expect(document.documentElement.dataset.publisherAppearanceSession).toBe("session-1")
+    expect(document.documentElement.dataset.publisherAppearanceComponent).toBeUndefined()
+    expect(document.documentElement.dataset.publisherAppearanceState).toBeUndefined()
+
+    await expect(
+      previewAppearance([preview], {
+        url: preview.url,
+        sessionId: "session-1",
+        css: "body {}",
+        target: { componentId: "domainCard", state: "selected" },
+      }),
+    ).resolves.toBe(true)
+    expect(document.documentElement.dataset.publisherAppearanceState).toBe("selected")
+
+    await expect(
+      clearAppearancePreview([preview], {
+        url: preview.url,
+        sessionId: "session-1",
+      }),
+    ).resolves.toBe(true)
+    expect(document.documentElement.dataset.publisherAppearanceSession).toBeUndefined()
+    expect(document.documentElement.dataset.publisherAppearanceComponent).toBeUndefined()
+    expect(document.documentElement.dataset.publisherAppearanceState).toBeUndefined()
   })
 })

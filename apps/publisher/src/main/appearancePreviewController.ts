@@ -1,3 +1,4 @@
+import type { AppearancePreviewTarget } from "../shared/contracts"
 import {
   installAppearancePreviewInFrame,
   normalizedAppearancePreviewUrl,
@@ -27,6 +28,7 @@ export interface AppearancePreviewControllerOptions {
 interface BoundPreview {
   readonly sessionId: string
   readonly css: string
+  readonly target?: AppearancePreviewTarget
   readonly origin: string
   readonly frameTreeNodeId: number
   readonly revision: number
@@ -126,6 +128,7 @@ export function createAppearancePreviewController({
       url: current.url,
       sessionId: preview.sessionId,
       css: preview.css,
+      ...(preview.target ? { target: preview.target } : {}),
     })
   }
 
@@ -149,7 +152,12 @@ export function createAppearancePreviewController({
 
           const existing = bound
           if (existing?.sessionId === request.sessionId) {
-            const target = { ...existing, css: request.css, revision: operationRevision }
+            const target: BoundPreview = {
+              ...existing,
+              css: request.css,
+              target: request.target,
+              revision: operationRevision,
+            }
             const installed = await installBoundPreview(target)
             if (!installed) return false
             if (disposed || operationRevision !== revision) {
@@ -170,6 +178,7 @@ export function createAppearancePreviewController({
           const target: BoundPreview = {
             sessionId: request.sessionId,
             css: request.css,
+            ...(request.target ? { target: request.target } : {}),
             origin,
             frameTreeNodeId: current.id,
             revision: operationRevision,
@@ -266,6 +275,7 @@ export function createAppearancePreviewController({
           url: current.url,
           sessionId: bound.sessionId,
           css: bound.css,
+          ...(bound.target ? { target: bound.target } : {}),
         })
       })
     },

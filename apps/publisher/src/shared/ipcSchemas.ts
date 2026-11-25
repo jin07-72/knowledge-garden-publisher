@@ -1,6 +1,12 @@
 import { z } from "zod"
 import { normalizeAppearanceSettings, type AppearanceSettings } from "./appearance"
-import { APPEARANCE_COMPONENTS, type ComponentColorOverrides } from "./appearanceComponents"
+import {
+  APPEARANCE_COMPONENTS,
+  APPEARANCE_STATES,
+  type AppearanceComponentId,
+  type AppearanceState,
+  type ComponentColorOverrides,
+} from "./appearanceComponents"
 import {
   APP_ERROR_CODES,
   IMAGE_LIBRARY_MAX_GALLERY_THUMBNAIL_TOTAL_LENGTH,
@@ -23,6 +29,7 @@ import {
   type AppearanceClearPreviewRequest,
   type AppearancePreviewReceipt,
   type AppearancePreviewRequest,
+  type AppearancePreviewTarget,
   type AppearanceSnapshot,
   type AppearanceUndoRequest,
   type AppError,
@@ -822,11 +829,25 @@ const appearancePreviewReceiptSchema: z.ZodType<AppearancePreviewReceipt> = z
 const appearanceApplyReceiptSchema: z.ZodType<AppearanceApplyReceipt> = z
   .object({ snapshot: appearanceSnapshotSchema })
   .strip()
+const appearanceComponentIdSchema = z.enum(
+  Object.keys(APPEARANCE_COMPONENTS) as [AppearanceComponentId, ...AppearanceComponentId[]],
+)
+const appearanceStateSchema = z.enum(APPEARANCE_STATES)
+export const appearancePreviewTargetSchema: z.ZodType<AppearancePreviewTarget> = z
+  .object({
+    componentId: appearanceComponentIdSchema,
+    state: appearanceStateSchema,
+  })
+  .strict()
+  .refine(({ componentId, state }) =>
+    (APPEARANCE_COMPONENTS[componentId].states as readonly AppearanceState[]).includes(state),
+  )
 export const appearancePreviewRequestSchema: z.ZodType<AppearancePreviewRequest> = z
   .object({
     url: loopbackUrlSchema,
     sessionId: z.string().uuid(),
     settings: appearanceSettingsSchema,
+    target: appearancePreviewTargetSchema.optional(),
   })
   .strict()
 export const appearanceClearPreviewRequestSchema: z.ZodType<AppearanceClearPreviewRequest> = z

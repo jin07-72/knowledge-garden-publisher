@@ -408,6 +408,26 @@ describe("appearance service", () => {
     })
   })
 
+  it("forwards a validated component preview target to the frame installer", async () => {
+    const installPreview = vi.fn(async () => true)
+    const service = await createAppearanceService(dependencies({ installPreview }))
+
+    await service.preview({
+      url: "http://127.0.0.1:4173/notes/a",
+      sessionId: sessionOne,
+      settings: DEFAULT_APPEARANCE,
+      target: { componentId: "domainCard", state: "hover" },
+    })
+
+    expect(installPreview).toHaveBeenCalledWith(
+      expect.objectContaining({
+        url: "http://127.0.0.1:4173/notes/a",
+        sessionId: sessionOne,
+        target: { componentId: "domainCard", state: "hover" },
+      }),
+    )
+  })
+
   it("clearing an older session does not supersede a newer preview still reading", async () => {
     const nextRead = deferred<AppearanceSnapshot>()
     const currentAdapter = adapter(snapshot())

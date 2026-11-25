@@ -317,6 +317,35 @@ describe("appearance bridge contracts", () => {
     ).toBe(true)
   })
 
+  it("validates component preview targets against registered component states", () => {
+    expect(
+      appearancePreviewRequestSchema.safeParse({
+        url: "http://127.0.0.1:8080/?kgpAppearance=session",
+        sessionId,
+        settings: DEFAULT_APPEARANCE,
+        target: { componentId: "domainCard", state: "hover" },
+      }).success,
+    ).toBe(true)
+
+    expect(
+      appearancePreviewRequestSchema.safeParse({
+        url: "http://127.0.0.1:8080/",
+        sessionId,
+        settings: DEFAULT_APPEARANCE,
+        target: { componentId: "divider", state: "hover" },
+      }).success,
+    ).toBe(false)
+
+    expect(
+      appearancePreviewRequestSchema.safeParse({
+        url: "http://127.0.0.1:8080/",
+        sessionId,
+        settings: DEFAULT_APPEARANCE,
+        target: { componentId: "unknown", state: "normal" },
+      }).success,
+    ).toBe(false)
+  })
+
   it("bounds appearance preview URLs at 2048 UTF-8 bytes", () => {
     const prefix = "http://127.0.0.1/"
     const exact = prefix + "x".repeat(2_048 - prefix.length)

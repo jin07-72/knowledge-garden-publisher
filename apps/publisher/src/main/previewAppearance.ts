@@ -1,3 +1,5 @@
+import type { AppearancePreviewTarget } from "../shared/contracts"
+
 export interface PreviewFramePort {
   readonly url: string
   executeJavaScript(source: string, userGesture?: boolean): Promise<unknown>
@@ -14,6 +16,7 @@ export interface AppearanceFramePreviewRequest {
   readonly url: string
   readonly sessionId: string
   readonly css: string
+  readonly target?: AppearancePreviewTarget
 }
 
 export interface AppearanceFrameClearRequest {
@@ -51,6 +54,7 @@ function installPreviewStyle(payload: {
   expectedUrl: string
   sessionId: string
   css: string
+  target?: AppearancePreviewTarget
   exactQuery: boolean
 }): boolean {
   const normalize = (value: string): string | undefined => {
@@ -73,6 +77,15 @@ function installPreviewStyle(payload: {
   style.dataset.publisherAppearancePreview = payload.sessionId
   style.textContent = payload.css
   document.head.append(style)
+  const root = document.documentElement
+  root.dataset.publisherAppearanceSession = payload.sessionId
+  if (payload.target) {
+    root.dataset.publisherAppearanceComponent = payload.target.componentId
+    root.dataset.publisherAppearanceState = payload.target.state
+  } else {
+    delete root.dataset.publisherAppearanceComponent
+    delete root.dataset.publisherAppearanceState
+  }
   document.dispatchEvent(new Event("themechange"))
   return true
 }
@@ -100,6 +113,12 @@ function clearPreviewStyle(payload: {
     .forEach((style) => {
       if (style.dataset.publisherAppearancePreview === payload.sessionId) style.remove()
     })
+  const root = document.documentElement
+  if (root.dataset.publisherAppearanceSession === payload.sessionId) {
+    delete root.dataset.publisherAppearanceSession
+    delete root.dataset.publisherAppearanceComponent
+    delete root.dataset.publisherAppearanceState
+  }
   document.dispatchEvent(new Event("themechange"))
   return true
 }
@@ -143,6 +162,7 @@ async function installAppearancePreviewInFrameMatchingQuery(
           expectedUrl,
           sessionId: request.sessionId,
           css: request.css,
+          ...(request.target ? { target: request.target } : {}),
           exactQuery: queryMatch === "exact",
         }),
         true,

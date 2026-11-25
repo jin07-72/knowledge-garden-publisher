@@ -1,6 +1,8 @@
 import type { AppearanceSettings, BlogFramework } from "./appearance"
+import type { AppearanceComponentId, AppearanceState } from "./appearanceComponents"
 
 export type { AppearanceBackground, AppearanceSettings, BlogFramework } from "./appearance"
+export type { AppearanceComponentId, AppearanceState } from "./appearanceComponents"
 
 export type Visibility = "public" | "private"
 
@@ -485,10 +487,16 @@ export interface AppearanceBackgroundSelection {
   readonly name: string
 }
 
+export interface AppearancePreviewTarget {
+  readonly componentId: AppearanceComponentId
+  readonly state: AppearanceState
+}
+
 export interface AppearancePreviewRequest {
   readonly url: string
   readonly sessionId: string
   readonly settings: AppearanceSettings
+  readonly target?: AppearancePreviewTarget
 }
 
 export interface AppearancePreviewReceipt {
