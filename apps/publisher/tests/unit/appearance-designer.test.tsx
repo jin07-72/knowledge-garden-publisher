@@ -545,7 +545,7 @@ describe("AppearanceDesigner", () => {
       expect(api.preview).toHaveBeenLastCalledWith(
         expect.objectContaining({
           url: expect.stringContaining("http://127.0.0.1:8080/technology/css-grid"),
-          target: { componentId: "tag", state: "hover" },
+          target: { componentId: "tag", state: "hover", focusSeq: 1 },
           settings: expect.objectContaining({
             componentColors: {
               domainCard: {

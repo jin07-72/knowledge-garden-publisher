@@ -490,6 +490,7 @@ export interface AppearanceBackgroundSelection {
 export interface AppearancePreviewTarget {
   readonly componentId: AppearanceComponentId
   readonly state: AppearanceState
+  readonly focusSeq?: number
 }
 
 export interface AppearancePreviewRequest {

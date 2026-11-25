@@ -1,4 +1,5 @@
-import { useEffect, useState } from "react"
+import { useEffect, useRef, useState } from "react"
+import { ChevronDown } from "lucide-react"
 import { HexAlphaColorPicker, HexColorPicker } from "react-colorful"
 
 export interface AppearanceColorPickerProps {
@@ -6,6 +7,8 @@ export interface AppearanceColorPickerProps {
   readonly value: string
   readonly allowAlpha: boolean
   readonly disabled?: boolean
+  readonly expanded?: boolean
+  readonly onExpandedChange?: (expanded: boolean) => void
   readonly onChange: (value: string) => void
 }
 
@@ -51,19 +54,45 @@ export function AppearanceColorPicker({
   value,
   allowAlpha,
   disabled = false,
+  expanded,
+  onExpandedChange,
   onChange,
 }: AppearanceColorPickerProps): React.JSX.Element {
+  const containerRef = useRef<HTMLDivElement>(null)
   const displayValue = formatDisplayHex(value, allowAlpha)
   const rgbHex = extractRgbHex(value)
+  const [uncontrolledExpanded, setUncontrolledExpanded] = useState(false)
   const [textDraft, setTextDraft] = useState(displayValue)
   const [textDirty, setTextDirty] = useState(false)
   const [alphaText, setAlphaText] = useState(() => String(alphaPercentFromHex(value, allowAlpha)))
+
+  const isExpanded = !disabled && (expanded ?? uncontrolledExpanded)
+
+  const setExpandedState = (next: boolean): void => {
+    if (expanded === undefined) {
+      setUncontrolledExpanded(next)
+    }
+    onExpandedChange?.(next)
+  }
 
   useEffect(() => {
     setTextDraft(formatDisplayHex(value, allowAlpha))
     setTextDirty(false)
     setAlphaText(String(alphaPercentFromHex(value, allowAlpha)))
   }, [value, allowAlpha])
+
+  useEffect(() => {
+    if (!isExpanded) return
+    const handlePointerDown = (event: PointerEvent): void => {
+      const node = containerRef.current
+      if (node && event.target instanceof Node && !node.contains(event.target)) {
+        if (expanded === undefined) setUncontrolledExpanded(false)
+        onExpandedChange?.(false)
+      }
+    }
+    document.addEventListener("pointerdown", handlePointerDown)
+    return () => document.removeEventListener("pointerdown", handlePointerDown)
+  }, [expanded, isExpanded, onExpandedChange])
 
   const handlePickerChange = (nextColor: string): void => {
     if (disabled) return
@@ -124,10 +153,40 @@ export function AppearanceColorPicker({
   }
 
   return (
-    <div className="appearance-color-picker" aria-disabled={disabled}>
-      <div className="appearance-color-picker-header">
-        <label className="appearance-color-picker-native">
-          <span>{label}</span>
+    <div
+      ref={containerRef}
+      className={
+        isExpanded
+          ? "appearance-color-picker appearance-color-picker-expanded"
+          : "appearance-color-picker"
+      }
+      aria-disabled={disabled}
+      onKeyDown={(event) => {
+        if (isExpanded && event.key === "Escape") {
+          event.stopPropagation()
+          setExpandedState(false)
+        }
+      }}
+    >
+      <label className="appearance-sr-only">
+        <span>{label}</span>
+        <input
+          type="color"
+          tabIndex={-1}
+          value={rgbHex.toLowerCase()}
+          disabled={disabled}
+          onChange={(event) => handleNativeColorChange(event.target.value)}
+        />
+      </label>
+      <button
+        type="button"
+        className="appearance-color-picker-toggle"
+        aria-expanded={isExpanded}
+        disabled={disabled}
+        onClick={() => setExpandedState(!isExpanded)}
+      >
+        <span className="appearance-color-picker-title">{label}</span>
+        <span className="appearance-color-picker-summary">
           <span
             className={
               allowAlpha
@@ -140,60 +199,68 @@ export function AppearanceColorPicker({
               style={{ backgroundColor: displayValue }}
             />
           </span>
-          <input
-            type="color"
-            value={rgbHex.toLowerCase()}
-            disabled={disabled}
-            onChange={(event) => handleNativeColorChange(event.target.value)}
+          <code className="appearance-color-picker-code">{displayValue}</code>
+          <ChevronDown
+            size={14}
+            className={
+              isExpanded
+                ? "appearance-color-chevron appearance-color-chevron-open"
+                : "appearance-color-chevron"
+            }
+            aria-hidden="true"
           />
-        </label>
-      </div>
-      <div className="appearance-color-picker-surface">
-        {allowAlpha ? (
-          <HexAlphaColorPicker color={displayValue} onChange={handlePickerChange} />
-        ) : (
-          <HexColorPicker color={rgbHex} onChange={handlePickerChange} />
-        )}
-      </div>
-      <div className="appearance-color-picker-inputs">
-        <label className="appearance-color-hex-field">
-          <span>Hex</span>
-          <input
-            type="text"
-            aria-label={`${label}颜色值`}
-            value={textDraft}
-            maxLength={16}
-            disabled={disabled}
-            onChange={(event) => {
-              setTextDraft(event.target.value)
-              setTextDirty(true)
-            }}
-            onBlur={commitTextDraft}
-            onKeyDown={(event) => {
-              if (event.key === "Enter") {
-                event.preventDefault()
-                commitTextDraft()
-              }
-            }}
-          />
-        </label>
-        {allowAlpha ? (
-          <label className="appearance-color-alpha-field">
-            <span>透明度 (%)</span>
-            <input
-              type="number"
-              aria-label={`${label}透明度`}
-              min={0}
-              max={100}
-              step={1}
-              value={alphaText}
-              disabled={disabled}
-              onChange={(event) => handleAlphaChange(event.target.value)}
-              onBlur={handleAlphaBlur}
-            />
-          </label>
-        ) : null}
-      </div>
+        </span>
+      </button>
+      {isExpanded ? (
+        <div className="appearance-color-picker-panel">
+          <div className="appearance-color-picker-surface">
+            {allowAlpha ? (
+              <HexAlphaColorPicker color={displayValue} onChange={handlePickerChange} />
+            ) : (
+              <HexColorPicker color={rgbHex} onChange={handlePickerChange} />
+            )}
+          </div>
+          <div className="appearance-color-picker-inputs">
+            <label className="appearance-color-hex-field">
+              <span>Hex</span>
+              <input
+                type="text"
+                aria-label={`${label}颜色值`}
+                value={textDraft}
+                maxLength={16}
+                disabled={disabled}
+                onChange={(event) => {
+                  setTextDraft(event.target.value)
+                  setTextDirty(true)
+                }}
+                onBlur={commitTextDraft}
+                onKeyDown={(event) => {
+                  if (event.key === "Enter") {
+                    event.preventDefault()
+                    commitTextDraft()
+                  }
+                }}
+              />
+            </label>
+            {allowAlpha ? (
+              <label className="appearance-color-alpha-field">
+                <span>透明度 (%)</span>
+                <input
+                  type="number"
+                  aria-label={`${label}透明度`}
+                  min={0}
+                  max={100}
+                  step={1}
+                  value={alphaText}
+                  disabled={disabled}
+                  onChange={(event) => handleAlphaChange(event.target.value)}
+                  onBlur={handleAlphaBlur}
+                />
+              </label>
+            ) : null}
+          </div>
+        </div>
+      ) : null}
     </div>
   )
 }

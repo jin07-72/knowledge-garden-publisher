@@ -9,7 +9,7 @@ afterEach(() => {
 })
 
 describe("ComponentColorEditor", () => {
-  it("searches components, edits a hover slot, and restores inheritance", async () => {
+  it("keeps slot color options collapsed by default, emits focusSeq on click, and restores inheritance", async () => {
     const user = userEvent.setup()
     const onChange = vi.fn()
     const onTargetChange = vi.fn()
@@ -22,12 +22,25 @@ describe("ComponentColorEditor", () => {
       />,
     )
 
+    expect(screen.queryByLabelText("卡片背景颜色值")).not.toBeInTheDocument()
+
     await user.type(screen.getByRole("searchbox", { name: "搜索组件" }), "领域")
     await user.click(screen.getByRole("button", { name: "领域卡片" }))
+    expect(onTargetChange).toHaveBeenLastCalledWith({
+      componentId: "domainCard",
+      state: "normal",
+      focusSeq: 1,
+    })
+
     await user.click(screen.getByRole("tab", { name: "悬停" }))
-    expect(onTargetChange).toHaveBeenLastCalledWith({ componentId: "domainCard", state: "hover" })
+    expect(onTargetChange).toHaveBeenLastCalledWith({
+      componentId: "domainCard",
+      state: "hover",
+      focusSeq: 1,
+    })
 
     await user.click(screen.getByRole("button", { name: "设置卡片背景覆盖" }))
+    expect(screen.getByLabelText("卡片背景颜色值")).toBeVisible()
     expect(onChange).toHaveBeenCalledWith(
       expect.objectContaining({
         preset: "custom",
@@ -42,10 +55,11 @@ describe("ComponentColorEditor", () => {
     )
 
     await user.click(screen.getByRole("button", { name: "卡片背景恢复继承" }))
+    expect(screen.queryByLabelText("卡片背景颜色值")).not.toBeInTheDocument()
     expect(onChange).toHaveBeenLastCalledWith(expect.objectContaining({ componentColors: {} }))
   })
 
-  it("disables unsupported states and resets to normal when selecting a normal-only component", async () => {
+  it("disables unsupported states and increments focusSeq on each component selection", async () => {
     const user = userEvent.setup()
     const onChange = vi.fn()
     const onTargetChange = vi.fn()
@@ -62,10 +76,21 @@ describe("ComponentColorEditor", () => {
     expect(onTargetChange).toHaveBeenLastCalledWith({ componentId: "domainCard", state: "hover" })
 
     await user.click(screen.getByRole("button", { name: "分隔线" }))
-    expect(onTargetChange).toHaveBeenLastCalledWith({ componentId: "divider", state: "normal" })
+    expect(onTargetChange).toHaveBeenLastCalledWith({
+      componentId: "divider",
+      state: "normal",
+      focusSeq: 1,
+    })
     expect(screen.getByRole("tab", { name: "正常" })).toHaveAttribute("aria-selected", "true")
     expect(screen.getByRole("tab", { name: "悬停" })).toBeDisabled()
     expect(screen.getByRole("tab", { name: "选中" })).toBeDisabled()
+
+    await user.click(screen.getByRole("button", { name: "分隔线" }))
+    expect(onTargetChange).toHaveBeenLastCalledWith({
+      componentId: "divider",
+      state: "normal",
+      focusSeq: 2,
+    })
   })
 
   it("restores all overrides for the selected component", async () => {

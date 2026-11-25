@@ -1,4 +1,4 @@
-import { useEffect, useMemo, useState } from "react"
+import { useEffect, useMemo, useRef, useState } from "react"
 import type { AppearanceSettings } from "../../../shared/appearance"
 import {
   APPEARANCE_COMPONENTS,
@@ -67,6 +67,8 @@ export function ComponentColorEditor({
   const [query, setQuery] = useState("")
   const [componentId, setComponentId] = useState<AppearanceComponentId>("domainCard")
   const [state, setState] = useState<AppearanceState>("normal")
+  const [expandedSlot, setExpandedSlot] = useState<string>()
+  const focusSeqRef = useRef(0)
 
   const currentComponent = APPEARANCE_COMPONENTS[componentId]
   const supportedStates = currentComponent.states as readonly AppearanceState[]
@@ -75,7 +77,11 @@ export function ComponentColorEditor({
   useEffect(() => {
     if (!supportedStates.includes(state)) {
       setState("normal")
-      onPreviewTargetChange({ componentId, state: "normal" })
+      onPreviewTargetChange({
+        componentId,
+        state: "normal",
+        ...(focusSeqRef.current > 0 ? { focusSeq: focusSeqRef.current } : {}),
+      })
     }
   }, [componentId, onPreviewTargetChange, state, supportedStates])
 
@@ -102,9 +108,11 @@ export function ComponentColorEditor({
   const selectComponent = (nextId: AppearanceComponentId): void => {
     const nextSupported = APPEARANCE_COMPONENTS[nextId].states as readonly AppearanceState[]
     const nextState: AppearanceState = nextSupported.includes(activeState) ? activeState : "normal"
+    const nextFocusSeq = ++focusSeqRef.current
+    setExpandedSlot(undefined)
     setComponentId(nextId)
     setState(nextState)
-    onPreviewTargetChange({ componentId: nextId, state: nextState })
+    onPreviewTargetChange({ componentId: nextId, state: nextState, focusSeq: nextFocusSeq })
   }
 
   const updateSlotColor = (slotName: string, nextColor: string): void => {
@@ -135,6 +143,7 @@ export function ComponentColorEditor({
   }
 
   const resetComponentAll = (): void => {
+    setExpandedSlot(undefined)
     onChange({
       ...settings,
       preset: "custom",
@@ -226,7 +235,11 @@ export function ComponentColorEditor({
                 onClick={() => {
                   if (!supported) return
                   setState(candidate)
-                  onPreviewTargetChange({ componentId, state: candidate })
+                  onPreviewTargetChange({
+                    componentId,
+                    state: candidate,
+                    ...(focusSeqRef.current > 0 ? { focusSeq: focusSeqRef.current } : {}),
+                  })
                 }}
               >
                 {stateLabels[candidate]}
@@ -264,19 +277,27 @@ export function ComponentColorEditor({
                   <div className="component-color-slot-actions">
                     <button
                       type="button"
-                      className="secondary-button"
+                      className="secondary-button component-slot-action-btn"
+                      aria-label={`设置${slotDefinition.label}覆盖`}
                       disabled={disabled}
-                      onClick={() => updateSlotColor(slotName, resolvedValue)}
+                      onClick={() => {
+                        updateSlotColor(slotName, resolvedValue)
+                        setExpandedSlot(slotName)
+                      }}
                     >
-                      {`设置${slotDefinition.label}覆盖`}
+                      设置覆盖
                     </button>
                     <button
                       type="button"
-                      className="secondary-button"
+                      className="secondary-button component-slot-action-btn"
+                      aria-label={`${slotDefinition.label}恢复继承`}
                       disabled={disabled}
-                      onClick={() => resetSlotColor(slotName)}
+                      onClick={() => {
+                        resetSlotColor(slotName)
+                        if (expandedSlot === slotName) setExpandedSlot(undefined)
+                      }}
                     >
-                      {`${slotDefinition.label}恢复继承`}
+                      恢复继承
                     </button>
                   </div>
                 </div>
@@ -285,6 +306,8 @@ export function ComponentColorEditor({
                   value={resolvedValue}
                   allowAlpha={slotDefinition.allowAlpha}
                   disabled={disabled}
+                  expanded={expandedSlot === slotName}
+                  onExpandedChange={(open) => setExpandedSlot(open ? slotName : undefined)}
                   onChange={(nextColor) => updateSlotColor(slotName, nextColor)}
                 />
               </div>

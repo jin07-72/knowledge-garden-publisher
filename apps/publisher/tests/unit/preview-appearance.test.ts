@@ -18,9 +18,12 @@ function executableFrame(url: string, executionUrl = url): PreviewFramePort {
 describe("appearance preview frame boundary", () => {
   beforeEach(() => {
     document.head.replaceChildren()
+    document.body.replaceChildren()
     delete document.documentElement.dataset.publisherAppearanceSession
     delete document.documentElement.dataset.publisherAppearanceComponent
     delete document.documentElement.dataset.publisherAppearanceState
+    delete document.documentElement.dataset.publisherAppearanceFocusedSeq
+    delete document.documentElement.dataset.publisherAppearanceTriedNavSeq
     delete (globalThis as { pwned?: boolean }).pwned
   })
 
@@ -320,5 +323,70 @@ describe("appearance preview frame boundary", () => {
     expect(document.documentElement.dataset.publisherAppearanceSession).toBeUndefined()
     expect(document.documentElement.dataset.publisherAppearanceComponent).toBeUndefined()
     expect(document.documentElement.dataset.publisherAppearanceState).toBeUndefined()
+  })
+
+  it("jumps to and highlights only the first matching component instance, then cleans up on clear", async () => {
+    const preview = executableFrame("http://127.0.0.1:8080/")
+    const cardOne = document.createElement("a")
+    cardOne.className = "domain-card"
+    cardOne.scrollIntoView = vi.fn()
+    const cardTwo = document.createElement("a")
+    cardTwo.className = "domain-card"
+    cardTwo.scrollIntoView = vi.fn()
+    const footer = document.createElement("footer")
+    footer.scrollIntoView = vi.fn()
+    const page = document.createElement("div")
+    page.className = "page"
+    const body = document.createElement("div")
+    body.id = "quartz-body"
+    body.append(cardOne, cardTwo, footer)
+    page.append(body)
+    document.body.append(page)
+
+    await expect(
+      previewAppearance([preview], {
+        url: preview.url,
+        sessionId: "session-1",
+        css: "body {}",
+        target: { componentId: "domainCard", state: "normal", focusSeq: 1 },
+      }),
+    ).resolves.toBe(true)
+
+    expect(cardOne.getAttribute("data-publisher-appearance-focused")).toBe("true")
+    expect(cardTwo.getAttribute("data-publisher-appearance-focused")).toBeNull()
+    expect(cardOne.scrollIntoView).toHaveBeenCalledTimes(1)
+    expect(cardTwo.scrollIntoView).not.toHaveBeenCalled()
+
+    await expect(
+      previewAppearance([preview], {
+        url: preview.url,
+        sessionId: "session-1",
+        css: "body { color: teal; }",
+        target: { componentId: "domainCard", state: "hover", focusSeq: 1 },
+      }),
+    ).resolves.toBe(true)
+    expect(cardOne.getAttribute("data-publisher-appearance-focused")).toBe("true")
+    expect(cardOne.scrollIntoView).toHaveBeenCalledTimes(1)
+
+    await expect(
+      previewAppearance([preview], {
+        url: preview.url,
+        sessionId: "session-1",
+        css: "body { color: teal; }",
+        target: { componentId: "footer", state: "normal", focusSeq: 2 },
+      }),
+    ).resolves.toBe(true)
+    expect(cardOne.getAttribute("data-publisher-appearance-focused")).toBeNull()
+    expect(footer.getAttribute("data-publisher-appearance-focused")).toBe("true")
+    expect(footer.scrollIntoView).toHaveBeenCalledTimes(1)
+
+    await expect(
+      clearAppearancePreview([preview], {
+        url: preview.url,
+        sessionId: "session-1",
+      }),
+    ).resolves.toBe(true)
+    expect(footer.getAttribute("data-publisher-appearance-focused")).toBeNull()
+    expect(document.head.querySelector("style[data-publisher-appearance-focus-style]")).toBeNull()
   })
 })

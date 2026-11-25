@@ -93,6 +93,7 @@ export function AppearanceDesigner({
   const readRequestId = useRef(0)
   const previewRequestId = useRef(0)
   const previewTimer = useRef<number | undefined>(undefined)
+  const lastFocusSeq = useRef<number | undefined>(undefined)
   const activePreviewUrl = useMemo(() => loopbackPreviewUrl(previewUrl), [previewUrl])
   const sessionPreviewUrl = useMemo(() => {
     if (!activePreviewUrl) return undefined
@@ -133,21 +134,27 @@ export function AppearanceDesigner({
       return
     }
     setPreviewState("updating")
-    const timer = window.setTimeout(() => {
-      if (previewTimer.current === timer) previewTimer.current = undefined
-      if (closing.current || requestId !== previewRequestId.current) return
-      void api
-        .preview({
-          url: sessionPreviewUrl,
-          sessionId: sessionId.current,
-          settings: draft,
-          target: previewTarget,
-        })
-        .then((result) => {
-          if (!mounted.current || requestId !== previewRequestId.current) return
-          setPreviewState(result.ok ? "ready" : "error")
-        })
-    }, 100)
+    const immediateFocus =
+      previewTarget.focusSeq !== undefined && previewTarget.focusSeq !== lastFocusSeq.current
+    lastFocusSeq.current = previewTarget.focusSeq
+    const timer = window.setTimeout(
+      () => {
+        if (previewTimer.current === timer) previewTimer.current = undefined
+        if (closing.current || requestId !== previewRequestId.current) return
+        void api
+          .preview({
+            url: sessionPreviewUrl,
+            sessionId: sessionId.current,
+            settings: draft,
+            target: previewTarget,
+          })
+          .then((result) => {
+            if (!mounted.current || requestId !== previewRequestId.current) return
+            setPreviewState(result.ok ? "ready" : "error")
+          })
+      },
+      immediateFocus ? 0 : 100,
+    )
     previewTimer.current = timer
     return () => {
       window.clearTimeout(timer)

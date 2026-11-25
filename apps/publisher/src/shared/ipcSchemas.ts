@@ -837,6 +837,7 @@ export const appearancePreviewTargetSchema: z.ZodType<AppearancePreviewTarget> =
   .object({
     componentId: appearanceComponentIdSchema,
     state: appearanceStateSchema,
+    focusSeq: z.number().int().positive().max(1_000_000_000).optional(),
   })
   .strict()
   .refine(({ componentId, state }) =>
