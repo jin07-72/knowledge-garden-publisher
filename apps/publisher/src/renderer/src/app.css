@@ -1787,6 +1787,198 @@ button {
 .appearance-success {
   color: #83d6a6;
 }
+.appearance-color-picker {
+  display: grid;
+  gap: 8px;
+  min-width: 0;
+  padding: 10px;
+  border: 1px solid #313943;
+  border-radius: 8px;
+  background: #141920;
+}
+.appearance-color-picker-header {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+}
+.appearance-color-picker-native {
+  display: flex !important;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+  width: 100%;
+  min-height: 44px;
+}
+.appearance-color-swatch {
+  position: relative;
+  display: inline-block;
+  width: 24px;
+  height: 24px;
+  flex-shrink: 0;
+  overflow: hidden;
+  border: 1px solid #46515e;
+  border-radius: 5px;
+  background: #12171c;
+}
+.appearance-color-swatch-alpha {
+  background-image:
+    linear-gradient(45deg, #2a313c 25%, transparent 25%),
+    linear-gradient(-45deg, #2a313c 25%, transparent 25%),
+    linear-gradient(45deg, transparent 75%, #2a313c 75%),
+    linear-gradient(-45deg, transparent 75%, #2a313c 75%);
+  background-position:
+    0 0,
+    0 4px,
+    4px -4px,
+    -4px 0;
+  background-size: 8px 8px;
+}
+.appearance-color-swatch-fill {
+  display: block;
+  width: 100%;
+  height: 100%;
+}
+.appearance-color-picker-surface .react-colorful {
+  width: 100%;
+  height: 130px;
+}
+.appearance-color-picker-inputs {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(110px, 1fr));
+  gap: 8px;
+}
+.appearance-color-hex-field,
+.appearance-color-alpha-field {
+  display: grid !important;
+  grid-template-columns: 1fr !important;
+  gap: 4px !important;
+}
+.appearance-color-picker input[type="number"] {
+  min-width: 0;
+  padding: 8px 9px;
+  border: 1px solid #46515e;
+  border-radius: 6px;
+  color: #eef1f4;
+  background: #12171c;
+}
+.component-color-editor {
+  display: grid;
+  grid-template-columns: minmax(150px, 200px) minmax(0, 1fr);
+  gap: 12px;
+  min-width: 0;
+  min-height: 0;
+}
+.component-color-sidebar,
+.component-color-main {
+  display: grid;
+  align-content: start;
+  gap: 10px;
+  min-width: 0;
+  min-height: 0;
+  overflow: auto;
+}
+.component-color-search {
+  display: grid !important;
+  grid-template-columns: 1fr !important;
+  gap: 6px !important;
+}
+.component-color-search input[type="search"] {
+  min-width: 0;
+  min-height: 44px;
+  padding: 8px 9px;
+  border: 1px solid #46515e;
+  border-radius: 6px;
+  color: #eef1f4;
+  background: #12171c;
+}
+.component-color-groups {
+  display: grid;
+  gap: 10px;
+  max-height: 480px;
+  overflow: auto;
+  padding-right: 4px;
+}
+.component-color-group {
+  display: grid;
+  gap: 5px;
+}
+.component-color-group-title {
+  color: #8d98a5;
+  font-size: 11px;
+}
+.component-color-group-items {
+  display: grid;
+  gap: 4px;
+}
+.component-color-nav-item,
+.component-color-state-tab {
+  min-height: 44px;
+  padding: 8px 10px;
+  border: 1px solid #36404c;
+  border-radius: 6px;
+  color: #cdd4dc;
+  background: #141920;
+  text-align: left;
+  cursor: pointer;
+}
+.component-color-nav-item-active,
+.component-color-state-tab-active {
+  border-color: #55c2ff;
+  color: #eef1f4;
+  background: #1b2836;
+}
+.component-color-nav-item:focus-visible,
+.component-color-state-tab:focus-visible {
+  outline: 2px solid #55c2ff;
+  outline-offset: 2px;
+}
+.component-color-state-tab:disabled {
+  opacity: 0.45;
+  cursor: not-allowed;
+}
+.component-color-header,
+.component-color-slot-header {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+}
+.component-color-header > div,
+.component-color-slot-header > div:first-child {
+  display: grid;
+  gap: 2px;
+}
+.component-color-state-tabs {
+  display: grid;
+  grid-template-columns: repeat(3, minmax(0, 1fr));
+  gap: 6px;
+}
+.component-color-state-tab {
+  text-align: center;
+}
+.component-color-slots {
+  display: grid;
+  gap: 10px;
+}
+.component-color-slot-card {
+  display: grid;
+  gap: 8px;
+  padding: 10px;
+  border: 1px solid #313943;
+  border-radius: 8px;
+  background: #161b22;
+}
+.component-color-slot-actions {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 6px;
+}
+.component-color-slot-actions button,
+.component-color-header button {
+  min-height: 44px;
+}
 
 @media (max-width: 1000px) {
   .appearance-dialog {
@@ -1795,6 +1987,9 @@ button {
   .appearance-body {
     grid-template-columns: 1fr;
     overflow: auto;
+  }
+  .component-color-editor {
+    grid-template-columns: 1fr;
   }
   .appearance-controls,
   .appearance-preview {

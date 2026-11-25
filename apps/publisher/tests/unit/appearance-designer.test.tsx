@@ -495,4 +495,68 @@ describe("AppearanceDesigner", () => {
       /@media\s*\(max-width:\s*1000px\)[\s\S]*\.appearance-body\s*{[^}]*grid-template-columns:\s*1fr/,
     )
   })
+
+  it("retains component color draft and selected preview target across component switches and preview navigation", async () => {
+    const api = appearanceApi()
+    const { rerender } = render(
+      <AppearanceDesigner
+        api={api}
+        previewUrl={PREVIEW_URL}
+        onClose={vi.fn()}
+        onChanged={vi.fn()}
+      />,
+    )
+    const user = userEvent.setup()
+    await screen.findByRole("dialog", { name: "外观设置" })
+
+    await user.click(screen.getByRole("tab", { name: "悬停" }))
+    await user.click(screen.getByRole("button", { name: "设置卡片背景覆盖" }))
+
+    await waitFor(() =>
+      expect(api.preview).toHaveBeenLastCalledWith(
+        expect.objectContaining({
+          target: { componentId: "domainCard", state: "hover" },
+          settings: expect.objectContaining({
+            componentColors: {
+              domainCard: {
+                hover: {
+                  surface: APPEARANCE_PRESETS.paper.colors.surface.toUpperCase(),
+                },
+              },
+            },
+          }),
+        }),
+      ),
+    )
+
+    await user.click(screen.getByRole("button", { name: "标签" }))
+    expect(screen.getByRole("tab", { name: "悬停" })).toHaveAttribute("aria-selected", "true")
+
+    rerender(
+      <AppearanceDesigner
+        api={api}
+        previewUrl="http://127.0.0.1:8080/technology/css-grid"
+        onClose={vi.fn()}
+        onChanged={vi.fn()}
+      />,
+    )
+
+    await waitFor(() =>
+      expect(api.preview).toHaveBeenLastCalledWith(
+        expect.objectContaining({
+          url: expect.stringContaining("http://127.0.0.1:8080/technology/css-grid"),
+          target: { componentId: "tag", state: "hover" },
+          settings: expect.objectContaining({
+            componentColors: {
+              domainCard: {
+                hover: {
+                  surface: APPEARANCE_PRESETS.paper.colors.surface.toUpperCase(),
+                },
+              },
+            },
+          }),
+        }),
+      ),
+    )
+  })
 })

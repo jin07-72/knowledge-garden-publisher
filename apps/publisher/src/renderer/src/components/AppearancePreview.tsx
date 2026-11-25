@@ -1,18 +1,36 @@
+import { APPEARANCE_COMPONENTS, type AppearanceState } from "../../../shared/appearanceComponents"
+import type { AppearancePreviewTarget } from "../../../shared/contracts"
+
 interface AppearancePreviewProps {
   readonly previewUrl?: string
   readonly state: "idle" | "updating" | "ready" | "error"
+  readonly previewTarget?: AppearancePreviewTarget
+}
+
+const stateLabels: Readonly<Record<AppearanceState, string>> = {
+  normal: "正常",
+  hover: "悬停",
+  selected: "选中",
 }
 
 export function AppearancePreview({
   previewUrl,
   state,
+  previewTarget,
 }: AppearancePreviewProps): React.JSX.Element {
+  const targetDescription = previewTarget
+    ? `当前强制预览：${APPEARANCE_COMPONENTS[previewTarget.componentId].label}（${stateLabels[previewTarget.state]}状态）`
+    : undefined
+
   return (
     <section className="appearance-preview" aria-label="实时预览">
       <div className="appearance-preview-heading">
         <div>
           <strong>本地实时预览</strong>
           <small>草稿不会写入博客，应用后仍需单独发布。</small>
+          {targetDescription ? (
+            <small className="appearance-preview-target">{targetDescription}</small>
+          ) : null}
         </div>
         {previewUrl && state === "updating" ? <span role="status">正在更新预览…</span> : null}
         {previewUrl && state === "ready" ? <span role="status">实时预览已更新</span> : null}

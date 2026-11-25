@@ -1,22 +1,26 @@
 import { APPEARANCE_PRESETS, cloneAppearancePreset } from "../../../shared/appearance"
 import type { AppearanceBackground, AppearanceSettings } from "../../../shared/appearance"
+import type { AppearancePreviewTarget } from "../../../shared/contracts"
+import { AppearanceColorPicker } from "./AppearanceColorPicker"
+import { ComponentColorEditor } from "./ComponentColorEditor"
 
 interface AppearanceControlsProps {
   readonly settings: AppearanceSettings
   readonly disabled: boolean
   readonly onChange: (settings: AppearanceSettings) => void
   readonly onChooseBackground: () => void
+  readonly onPreviewTargetChange?: (target: AppearancePreviewTarget) => void
 }
 
 const colorFields = [
-  ["page", "页面背景色"],
-  ["surface", "表面颜色"],
-  ["text", "正文颜色"],
-  ["heading", "标题颜色"],
-  ["accent", "强调色"],
-  ["secondary", "辅助色"],
-  ["border", "边框颜色"],
-  ["code", "代码块颜色"],
+  ["page", "页面背景色", true],
+  ["surface", "表面颜色", true],
+  ["text", "正文颜色", false],
+  ["heading", "标题颜色", false],
+  ["accent", "强调色", false],
+  ["secondary", "辅助色", false],
+  ["border", "边框颜色", true],
+  ["code", "代码块颜色", true],
 ] as const
 
 const presetLabels = {
@@ -59,6 +63,7 @@ export function AppearanceControls({
   disabled,
   onChange,
   onChooseBackground,
+  onPreviewTargetChange = () => undefined,
 }: AppearanceControlsProps): React.JSX.Element {
   const update = (next: AppearanceSettings): void => onChange(custom(next))
   const updateBackground = (background: AppearanceBackground): void =>
@@ -124,36 +129,30 @@ export function AppearanceControls({
           </select>
         </label>
         {settings.background.kind === "solid" ? (
-          <label>
-            <span>背景颜色</span>
-            <input
-              type="color"
-              value={settings.background.color}
-              disabled={disabled}
-              onChange={(event) => updateBackground({ kind: "solid", color: event.target.value })}
-            />
-          </label>
+          <AppearanceColorPicker
+            label="背景颜色"
+            value={settings.background.color}
+            allowAlpha={true}
+            disabled={disabled}
+            onChange={(color) => updateBackground({ kind: "solid", color })}
+          />
         ) : null}
         {settings.background.kind === "gradient" ? (
           <>
-            <label>
-              <span>渐变起始色</span>
-              <input
-                type="color"
-                value={settings.background.start}
-                disabled={disabled}
-                onChange={(event) => updateGradient({ start: event.target.value })}
-              />
-            </label>
-            <label>
-              <span>渐变结束色</span>
-              <input
-                type="color"
-                value={settings.background.end}
-                disabled={disabled}
-                onChange={(event) => updateGradient({ end: event.target.value })}
-              />
-            </label>
+            <AppearanceColorPicker
+              label="渐变起始色"
+              value={settings.background.start}
+              allowAlpha={true}
+              disabled={disabled}
+              onChange={(start) => updateGradient({ start })}
+            />
+            <AppearanceColorPicker
+              label="渐变结束色"
+              value={settings.background.end}
+              allowAlpha={true}
+              disabled={disabled}
+              onChange={(end) => updateGradient({ end })}
+            />
             <label>
               <span>渐变角度</span>
               <input
@@ -182,15 +181,13 @@ export function AppearanceControls({
               </button>
               <span>{settings.background.asset.name || "尚未选择图片"}</span>
             </div>
-            <label>
-              <span>图片遮罩颜色</span>
-              <input
-                type="color"
-                value={settings.background.overlay}
-                disabled={disabled}
-                onChange={(event) => updateImage({ overlay: event.target.value })}
-              />
-            </label>
+            <AppearanceColorPicker
+              label="图片遮罩颜色"
+              value={settings.background.overlay}
+              allowAlpha={false}
+              disabled={disabled}
+              onChange={(overlay) => updateImage({ overlay })}
+            />
             <label>
               <span>图片遮罩强度</span>
               <input
@@ -234,25 +231,34 @@ export function AppearanceControls({
       </fieldset>
 
       <fieldset className="appearance-section">
-        <legend>颜色</legend>
+        <legend>全局颜色</legend>
         <div className="appearance-color-grid">
-          {colorFields.map(([key, label]) => (
-            <label key={key}>
-              <span>{label}</span>
-              <input
-                type="color"
-                value={settings.colors[key]}
-                disabled={disabled}
-                onChange={(event) =>
-                  update({
-                    ...settings,
-                    colors: { ...settings.colors, [key]: event.target.value },
-                  })
-                }
-              />
-            </label>
+          {colorFields.map(([key, label, allowAlpha]) => (
+            <AppearanceColorPicker
+              key={key}
+              label={label}
+              value={settings.colors[key]}
+              allowAlpha={allowAlpha}
+              disabled={disabled}
+              onChange={(nextColor) =>
+                update({
+                  ...settings,
+                  colors: { ...settings.colors, [key]: nextColor },
+                })
+              }
+            />
           ))}
         </div>
+      </fieldset>
+
+      <fieldset className="appearance-section">
+        <legend>组件颜色</legend>
+        <ComponentColorEditor
+          settings={settings}
+          disabled={disabled}
+          onChange={onChange}
+          onPreviewTargetChange={onPreviewTargetChange}
+        />
       </fieldset>
 
       <fieldset className="appearance-section">

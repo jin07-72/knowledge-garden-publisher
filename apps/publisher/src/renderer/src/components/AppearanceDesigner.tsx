@@ -2,7 +2,13 @@ import { useEffect, useMemo, useRef, useState } from "react"
 import { RotateCcw, Undo2, X } from "lucide-react"
 import { cloneAppearancePreset } from "../../../shared/appearance"
 import type { AppearanceSettings } from "../../../shared/appearance"
-import type { AppError, AppearanceSnapshot, GardenApi, IpcResult } from "../../../shared/contracts"
+import type {
+  AppError,
+  AppearancePreviewTarget,
+  AppearanceSnapshot,
+  GardenApi,
+  IpcResult,
+} from "../../../shared/contracts"
 import { appearanceSettingsSchema } from "../../../shared/ipcSchemas"
 import { AppearanceControls } from "./AppearanceControls"
 import { AppearancePreview } from "./AppearancePreview"
@@ -73,6 +79,10 @@ export function AppearanceDesigner({
 }: AppearanceDesignerProps): React.JSX.Element {
   const [loadState, setLoadState] = useState<LoadState>({ kind: "loading" })
   const [draft, setDraft] = useState<AppearanceSettings>()
+  const [previewTarget, setPreviewTarget] = useState<AppearancePreviewTarget>({
+    componentId: "domainCard",
+    state: "normal",
+  })
   const [busy, setBusy] = useState<"apply" | "undo" | "image" | "close">()
   const [notice, setNotice] = useState<Notice>()
   const [previewState, setPreviewState] = useState<"idle" | "updating" | "ready" | "error">("idle")
@@ -127,7 +137,12 @@ export function AppearanceDesigner({
       if (previewTimer.current === timer) previewTimer.current = undefined
       if (closing.current || requestId !== previewRequestId.current) return
       void api
-        .preview({ url: sessionPreviewUrl, sessionId: sessionId.current, settings: draft })
+        .preview({
+          url: sessionPreviewUrl,
+          sessionId: sessionId.current,
+          settings: draft,
+          target: previewTarget,
+        })
         .then((result) => {
           if (!mounted.current || requestId !== previewRequestId.current) return
           setPreviewState(result.ok ? "ready" : "error")
@@ -138,7 +153,7 @@ export function AppearanceDesigner({
       window.clearTimeout(timer)
       if (previewTimer.current === timer) previewTimer.current = undefined
     }
-  }, [api, draft, sessionPreviewUrl, snapshot?.supported, validation?.success])
+  }, [api, draft, previewTarget, sessionPreviewUrl, snapshot?.supported, validation?.success])
 
   const close = async (): Promise<void> => {
     if (busy || closing.current) return
@@ -300,8 +315,13 @@ export function AppearanceDesigner({
               setDraft(settings)
             }}
             onChooseBackground={() => void chooseBackground()}
+            onPreviewTargetChange={setPreviewTarget}
           />
-          <AppearancePreview previewUrl={sessionPreviewUrl} state={previewState} />
+          <AppearancePreview
+            previewUrl={sessionPreviewUrl}
+            state={previewState}
+            previewTarget={previewTarget}
+          />
         </div>
       ) : null}
 
