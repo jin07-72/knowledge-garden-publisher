@@ -95,9 +95,9 @@ body:not([data-slug="index"]) .recent-notes {
   padding: 1.15rem;
   color: var(--publisher-component-domain-card-normal-title, var(--dark));
   text-decoration: none;
-  border: 1px solid var(--publisher-component-domain-card-normal-border, var(--lightgray));
+  border: 1px solid var(--publisher-component-domain-card-normal-border, rgba(184, 76, 57, 0.38));
   border-radius: 0.65rem;
-  background: var(--publisher-component-domain-card-normal-surface, var(--lightgray));
+  background: var(--publisher-component-domain-card-normal-surface, rgba(24, 29, 36, 0.82));
   transition:
     transform 140ms ease,
     border-color 140ms ease,
@@ -106,8 +106,8 @@ body:not([data-slug="index"]) .recent-notes {
 
 .domain-card:hover {
   transform: translateY(-2px);
-  border-color: var(--publisher-component-domain-card-hover-border, var(--secondary));
-  background: var(--publisher-component-domain-card-hover-surface, var(--highlight));
+  border-color: var(--publisher-component-domain-card-hover-border, rgba(184, 76, 57, 0.72));
+  background: var(--publisher-component-domain-card-hover-surface, rgba(37, 43, 52, 0.9));
 }
 
 .domain-card span {

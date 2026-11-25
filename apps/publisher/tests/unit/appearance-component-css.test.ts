@@ -45,11 +45,11 @@ const EXPECTED_SELECTORS = {
     ],
   },
   homeSearch: {
-    normal: [".search > .search-button"],
-    hover: [".search > .search-button:hover", forcedHover(".search > .search-button")],
+    normal: [".search > button.search-button"],
+    hover: [".search > button.search-button:hover", forcedHover(".search > button.search-button")],
     selected: [
-      '.search > .search-button[aria-expanded="true"]',
-      forcedSelected(".search > .search-button"),
+      '.search > button.search-button[aria-expanded="true"]',
+      forcedSelected(".search > button.search-button"),
     ],
   },
   homeStats: { normal: [".garden-stats", ".garden-kicker"] },
@@ -62,11 +62,14 @@ const EXPECTED_SELECTORS = {
     ],
   },
   mobileMenu: {
-    normal: [".explorer > .mobile-explorer"],
-    hover: [".explorer > .mobile-explorer:hover", forcedHover(".explorer > .mobile-explorer")],
+    normal: [".explorer > button.mobile-explorer"],
+    hover: [
+      ".explorer > button.mobile-explorer:hover",
+      forcedHover(".explorer > button.mobile-explorer"),
+    ],
     selected: [
-      '.explorer[aria-expanded="true"] > .mobile-explorer',
-      forcedSelected(".explorer > .mobile-explorer"),
+      '.explorer[aria-expanded="true"] > button.mobile-explorer',
+      forcedSelected(".explorer > button.mobile-explorer"),
     ],
   },
   breadcrumb: {
@@ -78,16 +81,16 @@ const EXPECTED_SELECTORS = {
     ],
   },
   tableOfContents: {
-    normal: [".toc > .toc-header", ".toc > .toc-content a"],
+    normal: [".toc > .toc-header", ".toc > .toc-content.overflow > li > a"],
     hover: [
       ".toc > .toc-header:hover",
-      ".toc > .toc-content a:hover",
-      forcedHover(".toc > .toc-content a"),
+      ".toc > .toc-content.overflow > li > a:hover",
+      forcedHover(".toc > .toc-content.overflow > li > a"),
     ],
     selected: [
-      ".toc > .toc-content a.in-view",
+      ".toc > .toc-content.overflow > li > a.in-view",
       '.toc > .toc-header[aria-expanded="true"]',
-      forcedSelected(".toc > .toc-content a"),
+      forcedSelected(".toc > .toc-content.overflow > li > a"),
     ],
   },
   searchOverlay: { normal: [".search > .search-container"] },
@@ -130,43 +133,19 @@ const EXPECTED_SELECTORS = {
     ],
   },
   button: {
-    normal: [
-      ".search > .search-button",
-      ".explorer .explorer-toggle",
-      ".explorer .folder-button",
-      ".toc > .toc-header",
-      ".graph > .graph-outer > .global-graph-icon",
-      ".darkmode",
-      ".readermode",
-    ],
+    normal: [".graph > .graph-outer > .global-graph-icon", ".darkmode", ".readermode"],
     hover: [
-      ".search > .search-button:hover",
-      ".explorer .explorer-toggle:hover",
-      ".explorer .folder-button:hover",
-      ".toc > .toc-header:hover",
       ".graph > .graph-outer > .global-graph-icon:hover",
       ".darkmode:hover",
       ".readermode:hover",
-      forcedHover(".search > .search-button"),
-      forcedHover(".explorer .explorer-toggle"),
-      forcedHover(".explorer .folder-button"),
-      forcedHover(".toc > .toc-header"),
       forcedHover(".graph > .graph-outer > .global-graph-icon"),
       forcedHover(".darkmode"),
       forcedHover(".readermode"),
     ],
     selected: [
-      '.search > .search-button[aria-expanded="true"]',
-      '.explorer[aria-expanded="true"] .explorer-toggle',
-      ".explorer .folder-container:has(+ .folder-outer.open) .folder-button",
-      '.toc > .toc-header[aria-expanded="true"]',
       ".graph:has(> .global-graph-outer.active) > .graph-outer > .global-graph-icon",
       'html[saved-theme="dark"] .darkmode',
       'html[reader-mode="on"] .readermode',
-      forcedSelected(".search > .search-button"),
-      forcedSelected(".explorer .explorer-toggle"),
-      forcedSelected(".explorer .folder-button"),
-      forcedSelected(".toc > .toc-header"),
       forcedSelected(".graph > .graph-outer > .global-graph-icon"),
       forcedSelected(".darkmode"),
       forcedSelected(".readermode"),
@@ -182,43 +161,19 @@ const EXPECTED_SELECTORS = {
     ],
   },
   icon: {
-    normal: [
-      ".search > .search-button svg",
-      ".explorer .explorer-toggle svg",
-      ".explorer .folder-icon",
-      ".toc > .toc-header svg",
-      ".graph > .graph-outer > .global-graph-icon svg",
-      ".darkmode svg",
-      ".readermode svg",
-    ],
+    normal: [".graph > .graph-outer > .global-graph-icon svg", ".darkmode svg", ".readermode svg"],
     hover: [
-      ".search > .search-button:hover svg",
-      ".explorer .explorer-toggle:hover svg",
-      ".explorer .folder-icon:hover",
-      ".toc > .toc-header:hover svg",
       ".graph > .graph-outer > .global-graph-icon:hover svg",
       ".darkmode:hover svg",
       ".readermode:hover svg",
-      forcedHover(".search > .search-button svg"),
-      forcedHover(".explorer .explorer-toggle svg"),
-      forcedHover(".explorer .folder-icon"),
-      forcedHover(".toc > .toc-header svg"),
       forcedHover(".graph > .graph-outer > .global-graph-icon svg"),
       forcedHover(".darkmode svg"),
       forcedHover(".readermode svg"),
     ],
     selected: [
-      '.search > .search-button[aria-expanded="true"] svg',
-      '.explorer[aria-expanded="true"] .explorer-toggle svg',
-      ".explorer .folder-container:has(+ .folder-outer.open) .folder-icon",
-      '.toc > .toc-header[aria-expanded="true"] svg',
       ".graph:has(> .global-graph-outer.active) > .graph-outer > .global-graph-icon svg",
       'html[saved-theme="dark"] .darkmode svg',
       'html[reader-mode="on"] .readermode svg',
-      forcedSelected(".search > .search-button svg"),
-      forcedSelected(".explorer .explorer-toggle svg"),
-      forcedSelected(".explorer .folder-icon"),
-      forcedSelected(".toc > .toc-header svg"),
       forcedSelected(".graph > .graph-outer > .global-graph-icon svg"),
       forcedSelected(".darkmode svg"),
       forcedSelected(".readermode svg"),
@@ -239,7 +194,10 @@ const EXPECTED_SELECTORS = {
   graph: {
     normal: [".graph > .graph-outer"],
     hover: [".graph > .graph-outer:hover", forcedHover(".graph > .graph-outer")],
-    selected: [".graph > .global-graph-outer.active", forcedSelected(".graph > .graph-outer")],
+    selected: [
+      ".graph > .global-graph-outer.active > .global-graph-container",
+      forcedSelected(".graph > .graph-outer"),
+    ],
   },
   footer: {
     normal: [".page > #quartz-body > footer"],
@@ -253,6 +211,145 @@ const EXPECTED_SELECTORS = {
 } as const
 
 describe("component appearance CSS", () => {
+  it("wins the real Quartz cascade for specialized controls and content panels", () => {
+    const managed = compileAppearanceComponentCss({
+      componentColors: {
+        homeSearch: { normal: { text: "#112233" } },
+        tableOfContents: { normal: { text: "#223344" } },
+        graph: { normal: { text: "#334455" } },
+        callout: { normal: { text: "#445566" } },
+        table: { normal: { text: "#556677" } },
+      },
+    })
+    const style = document.createElement("style")
+    style.textContent = `
+      .search-button, .toc-header, .graph-outer, .callout, article table {
+        color: rgb(1, 2, 3);
+      }
+      .search > .search-button > p,
+      ul.toc-content.overflow > li > a {
+        color: rgb(1, 2, 3);
+      }
+      .search > .search-button svg .search-path {
+        stroke: rgb(1, 2, 3);
+      }
+      ${managed}
+    `
+    const fixture = document.createElement("div")
+    fixture.innerHTML = `
+      <div class="search"><button class="search-button"><svg><path class="search-path"></path></svg><p>search</p></button></div>
+      <div class="toc"><button class="toc-header">toc</button><ul class="toc-content overflow"><li><a>section</a></li></ul></div>
+      <div class="graph"><div class="graph-outer">graph</div></div>
+      <div class="callout">callout</div>
+      <div class="center"><article><table><tbody><tr><td>table</td></tr></tbody></table></article></div>
+    `
+    document.head.append(style)
+    document.body.append(fixture)
+
+    try {
+      for (const selector of [
+        ".search-button",
+        ".toc-header",
+        ".graph-outer",
+        ".callout",
+        "table",
+      ]) {
+        expect(
+          getComputedStyle(fixture.querySelector<HTMLElement>(selector)!).color,
+          selector,
+        ).toMatch(/^var\(--publisher-component-/)
+      }
+      expect(getComputedStyle(fixture.querySelector(".search-path")!).stroke).toMatch(
+        /^var\(--publisher-component-home-search-/,
+      )
+      expect(managed).toContain(
+        ".search > button.search-button > p {\n  color: var(--publisher-component-home-search-normal-text);",
+      )
+      expect(managed).toContain(
+        ".toc > .toc-content.overflow > li > a {\n  background-color: var(--publisher-component-table-of-contents-normal-surface);",
+      )
+    } finally {
+      fixture.remove()
+      style.remove()
+    }
+  })
+
+  it("keeps specialized controls authoritative when generic colors differ", () => {
+    const managed = compileAppearanceComponentCss({
+      componentColors: {
+        homeSearch: { normal: { text: "#112233", icon: "#223344" } },
+        mobileMenu: { normal: { text: "#334455", icon: "#445566" } },
+        tableOfContents: { normal: { text: "#556677", icon: "#667788" } },
+        button: { normal: { text: "#AABBCC" } },
+        icon: { normal: { icon: "#DDEEFF" } },
+      },
+    })
+    const style = document.createElement("style")
+    style.textContent = `
+      .explorer .mobile-explorer .lucide-menu { stroke: rgb(1, 2, 3); }
+      ${managed}
+    `
+    const fixture = document.createElement("div")
+    fixture.innerHTML = `
+      <div class="search"><button class="search-button"><svg></svg></button></div>
+      <div class="explorer"><button class="explorer-toggle mobile-explorer"><svg class="lucide-menu"></svg></button></div>
+      <div class="toc"><button class="toc-header"><svg></svg></button></div>
+    `
+    document.head.append(style)
+    document.body.append(fixture)
+
+    try {
+      const expectations = [
+        [".search-button", "home-search"],
+        [".mobile-explorer", "mobile-menu"],
+        [".toc-header", "table-of-contents"],
+      ] as const
+      for (const [selector, owner] of expectations) {
+        const control = fixture.querySelector<HTMLElement>(selector)!
+        expect(getComputedStyle(control).color).toBe(
+          `var(--publisher-component-${owner}-normal-text)`,
+        )
+        expect(getComputedStyle(control.querySelector("svg")!).color).toBe(
+          `var(--publisher-component-${owner}-normal-icon)`,
+        )
+      }
+      expect(getComputedStyle(fixture.querySelector(".lucide-menu")!).stroke).toBe(
+        "var(--publisher-component-mobile-menu-normal-icon)",
+      )
+    } finally {
+      fixture.remove()
+      style.remove()
+    }
+  })
+
+  it("publishes graph colors for the Pixi container without fake DOM nodes", () => {
+    const css = compileAppearanceComponentCss({
+      componentColors: {
+        graph: {
+          normal: { surface: "#112233CC", border: "#223344", node: "#334455", text: "#445566" },
+          selected: {
+            surface: "#556677CC",
+            border: "#667788",
+            node: "#778899",
+            text: "#8899AA",
+          },
+        },
+      },
+    })
+
+    expect(css).toContain(".graph > .graph-outer {")
+    expect(css).toContain(".graph > .global-graph-outer.active > .global-graph-container")
+    expect(css).toContain(
+      "--publisher-graph-surface: var(--publisher-component-graph-normal-surface);",
+    )
+    expect(css).toContain(
+      "--publisher-graph-border: var(--publisher-component-graph-normal-border);",
+    )
+    expect(css).toContain("--publisher-graph-node: var(--publisher-component-graph-normal-node);")
+    expect(css).toContain("--publisher-graph-text: var(--publisher-component-graph-normal-text);")
+    expect(css).not.toMatch(/:is\(\.node, circle\)|\s\.node(?:\W|$)|\scircle(?:\W|$)/)
+  })
+
   it("resolves concrete domain-card overrides and state fallbacks in registry order", () => {
     const css = compileAppearanceComponentCss(settingsWithComponentOverrides)
 
@@ -263,13 +360,10 @@ describe("component appearance CSS", () => {
       "--publisher-component-domain-card-selected-title: var(--publisher-component-domain-card-normal-title);",
     )
     expect(css).toContain(
-      "--publisher-component-home-search-normal-surface: var(--publisher-surface);",
+      ".domain-card {\n  background-color: var(--publisher-component-domain-card-normal-surface);\n  border-color: var(--publisher-component-domain-card-normal-border);\n  color: var(--publisher-component-domain-card-normal-title);",
     )
     expect(css).toContain(
-      ":where(.domain-card) {\n  background-color: var(--publisher-component-domain-card-normal-surface);\n  border-color: var(--publisher-component-domain-card-normal-border);\n  color: var(--publisher-component-domain-card-normal-title);",
-    )
-    expect(css).toContain(
-      ':where(.domain-card:hover, [data-publisher-appearance-state="hover"] .domain-card) {\n  background-color: var(--publisher-component-domain-card-hover-surface);\n  border-color: var(--publisher-component-domain-card-hover-border);\n  color: var(--publisher-component-domain-card-hover-title);',
+      '.domain-card:hover, [data-publisher-appearance-state="hover"] .domain-card {\n  background-color: var(--publisher-component-domain-card-hover-surface);\n  border-color: var(--publisher-component-domain-card-hover-border);\n  color: var(--publisher-component-domain-card-hover-title);',
     )
 
     const normal = css.indexOf("--publisher-component-domain-card-normal-surface:")
@@ -279,7 +373,7 @@ describe("component appearance CSS", () => {
     expect(hover).toBeLessThan(selected)
   })
 
-  it("emits markers and variables in exact registry, state, and slot order", () => {
+  it("emits markers and concrete or inherited variables in deterministic order", () => {
     const first = compileAppearanceComponentCss(DEFAULT_APPEARANCE)
     const second = compileAppearanceComponentCss(DEFAULT_APPEARANCE)
 
@@ -289,21 +383,17 @@ describe("component appearance CSS", () => {
     )
     expect(markers).toEqual(Object.keys(APPEARANCE_COMPONENTS))
     expect(markers).toHaveLength(25)
-    const variableNames = [...first.matchAll(/^  (--publisher-component-[^:]+):/gm)].map(
+    expect(first).not.toMatch(/^  --publisher-component-/m)
+
+    const overridden = compileAppearanceComponentCss(settingsWithComponentOverrides)
+    const variableNames = [...overridden.matchAll(/^  (--publisher-component-[^:]+):/gm)].map(
       (match) => match[1],
     )
-    const expectedVariableNames = Object.entries(APPEARANCE_COMPONENTS).flatMap(
-      ([componentId, definition]) => {
-        const kebabId = componentId.replace(/[A-Z]/g, (character) => `-${character.toLowerCase()}`)
-        return definition.states.flatMap((state) =>
-          Object.keys(definition.slots).map(
-            (slot) => `--publisher-component-${kebabId}-${state}-${slot}`,
-          ),
-        )
-      },
+    const domainSlots = Object.keys(APPEARANCE_COMPONENTS.domainCard.slots)
+    const expectedVariableNames = APPEARANCE_COMPONENTS.domainCard.states.flatMap((state) =>
+      domainSlots.map((slot) => `--publisher-component-domain-card-${state}-${slot}`),
     )
     expect(variableNames).toEqual(expectedVariableNames)
-    expect(variableNames).toHaveLength(expectedVariableNames.length)
   })
 
   it.each(Object.entries(EXPECTED_SELECTORS))(
@@ -332,7 +422,7 @@ describe("component appearance CSS", () => {
     const css = compileAppearanceComponentCss(settingsWithComponentOverrides)
 
     expect(css).toContain(
-      ':where(.domain-card:hover, [data-publisher-appearance-state="hover"] .domain-card)',
+      '.domain-card:hover, [data-publisher-appearance-state="hover"] .domain-card',
     )
     expect(css).toContain('.domain-card[aria-current="page"]')
     expect(css).toContain('[data-publisher-appearance-state="selected"] .domain-card')
@@ -340,16 +430,15 @@ describe("component appearance CSS", () => {
     expect(css).toContain("outline: 2px solid var(--publisher-accent) !important;")
     expect(css).toContain("outline-offset: 3px !important;")
     expect(css).toContain("color: var(--publisher-component-domain-card-selected-title);")
-    expect(css).toContain(".explorer .tree-item-self.active.is-active")
     for (const state of ["normal", "hover", "selected"]) {
       expect(css).toMatch(
         new RegExp(
-          `:where\\([^}]+\\) \\{\\n  background-color: var\\(--publisher-component-domain-card-${state}-surface\\);\\n  border-color: var\\(--publisher-component-domain-card-${state}-border\\);\\n  color: var\\(--publisher-component-domain-card-${state}-title\\);`,
+          `(?:^|\\n)[^}]+ \\{\\n  background-color: var\\(--publisher-component-domain-card-${state}-surface\\);\\n  border-color: var\\(--publisher-component-domain-card-${state}-border\\);\\n  color: var\\(--publisher-component-domain-card-${state}-title\\);`,
         ),
       )
       expect(css).toMatch(
         new RegExp(
-          `:where\\([^}]+strong[^}]*\\) \\{\\n  color: var\\(--publisher-component-domain-card-${state}-title\\);`,
+          `(?:^|\\n)[^}]+strong[^}]* \\{\\n  color: var\\(--publisher-component-domain-card-${state}-title\\);`,
         ),
       )
     }
@@ -361,30 +450,53 @@ describe("component appearance CSS", () => {
     expect(css).not.toMatch(/(?:^|[,(]\s*)(?:button|svg)(?=\s*(?:[,):]|$))/gm)
   })
 
-  it("keeps component rules before appended custom CSS", () => {
-    const customCss = ".domain-card { background: hotpink; }"
-    const css = compileAppearanceCss({ ...DEFAULT_APPEARANCE, customCss })
+  it("keeps component rules before appended custom CSS with equal specificity", () => {
+    const customCss = ".domain-card { background-color: rgb(255, 105, 180); }"
+    const css = compileAppearanceCss({ ...settingsWithComponentOverrides, customCss })
+    const style = document.createElement("style")
+    const card = document.createElement("a")
+    card.className = "domain-card"
+    style.textContent = css
+    document.head.append(style)
+    document.body.append(card)
 
-    expect(css).toContain("/* publisher-component:domainCard */")
-    expect(css.indexOf("/* publisher-component:domainCard */")).toBeLessThan(css.indexOf(customCss))
-    expect(css.endsWith(customCss)).toBe(true)
-    expect(css).toContain(":where(.domain-card)")
+    try {
+      expect(css).toContain("/* publisher-component:domainCard */")
+      expect(css.indexOf("/* publisher-component:domainCard */")).toBeLessThan(
+        css.indexOf(customCss),
+      )
+      expect(css.endsWith(customCss)).toBe(true)
+      expect(getComputedStyle(card).backgroundColor).toBe("rgb(255, 105, 180)")
+    } finally {
+      card.remove()
+      style.remove()
+    }
   })
 
-  it("uses managed variables in custom.scss without the old domain-card rgba literals", () => {
+  it("preserves legacy domain-card values when no component override exists", () => {
+    const css = compileAppearanceComponentCss(DEFAULT_APPEARANCE)
     const customScss = readFileSync(
       resolve(process.cwd(), "../../quartz/styles/custom.scss"),
       "utf8",
     )
 
-    expect(customScss).not.toContain("rgba(24, 29, 36, 0.82)")
-    expect(customScss).not.toContain("rgba(37, 43, 52, 0.9)")
+    expect(css).not.toContain("--publisher-component-domain-card-normal-surface:")
+    expect(css).not.toContain("--publisher-component-domain-card-hover-surface:")
     expect(customScss).toContain(
-      "var(--publisher-component-domain-card-normal-surface, var(--lightgray))",
+      "var(--publisher-component-domain-card-normal-surface, rgba(24, 29, 36, 0.82))",
     )
     expect(customScss).toContain(
-      "var(--publisher-component-domain-card-hover-surface, var(--highlight))",
+      "var(--publisher-component-domain-card-normal-border, rgba(184, 76, 57, 0.38))",
     )
-    expect(customScss).toContain("--publisher-component-domain-card-selected-title")
+    expect(customScss).toContain(
+      "var(--publisher-component-domain-card-hover-surface, rgba(37, 43, 52, 0.9))",
+    )
+    expect(customScss).toContain(
+      "var(--publisher-component-domain-card-hover-border, rgba(184, 76, 57, 0.72))",
+    )
+
+    const overrideCss = compileAppearanceComponentCss(settingsWithComponentOverrides)
+    expect(overrideCss).toContain("--publisher-component-domain-card-normal-surface: #112233CC;")
+    expect(overrideCss).toContain("--publisher-component-domain-card-hover-surface: #667788DD;")
   })
 })

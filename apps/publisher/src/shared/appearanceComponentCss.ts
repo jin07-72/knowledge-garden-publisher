@@ -26,11 +26,11 @@ export const APPEARANCE_COMPONENT_SELECTORS = {
     ],
   },
   homeSearch: {
-    normal: [".search > .search-button"],
-    hover: [".search > .search-button:hover", forcedHover(".search > .search-button")],
+    normal: [".search > button.search-button"],
+    hover: [".search > button.search-button:hover", forcedHover(".search > button.search-button")],
     selected: [
-      '.search > .search-button[aria-expanded="true"]',
-      forcedSelected(".search > .search-button"),
+      '.search > button.search-button[aria-expanded="true"]',
+      forcedSelected(".search > button.search-button"),
     ],
   },
   homeStats: { normal: [".garden-stats", ".garden-kicker"] },
@@ -43,11 +43,14 @@ export const APPEARANCE_COMPONENT_SELECTORS = {
     ],
   },
   mobileMenu: {
-    normal: [".explorer > .mobile-explorer"],
-    hover: [".explorer > .mobile-explorer:hover", forcedHover(".explorer > .mobile-explorer")],
+    normal: [".explorer > button.mobile-explorer"],
+    hover: [
+      ".explorer > button.mobile-explorer:hover",
+      forcedHover(".explorer > button.mobile-explorer"),
+    ],
     selected: [
-      '.explorer[aria-expanded="true"] > .mobile-explorer',
-      forcedSelected(".explorer > .mobile-explorer"),
+      '.explorer[aria-expanded="true"] > button.mobile-explorer',
+      forcedSelected(".explorer > button.mobile-explorer"),
     ],
   },
   breadcrumb: {
@@ -59,16 +62,16 @@ export const APPEARANCE_COMPONENT_SELECTORS = {
     ],
   },
   tableOfContents: {
-    normal: [".toc > .toc-header", ".toc > .toc-content a"],
+    normal: [".toc > .toc-header", ".toc > .toc-content.overflow > li > a"],
     hover: [
       ".toc > .toc-header:hover",
-      ".toc > .toc-content a:hover",
-      forcedHover(".toc > .toc-content a"),
+      ".toc > .toc-content.overflow > li > a:hover",
+      forcedHover(".toc > .toc-content.overflow > li > a"),
     ],
     selected: [
-      ".toc > .toc-content a.in-view",
+      ".toc > .toc-content.overflow > li > a.in-view",
       '.toc > .toc-header[aria-expanded="true"]',
-      forcedSelected(".toc > .toc-content a"),
+      forcedSelected(".toc > .toc-content.overflow > li > a"),
     ],
   },
   searchOverlay: { normal: [".search > .search-container"] },
@@ -111,43 +114,19 @@ export const APPEARANCE_COMPONENT_SELECTORS = {
     ],
   },
   button: {
-    normal: [
-      ".search > .search-button",
-      ".explorer .explorer-toggle",
-      ".explorer .folder-button",
-      ".toc > .toc-header",
-      ".graph > .graph-outer > .global-graph-icon",
-      ".darkmode",
-      ".readermode",
-    ],
+    normal: [".graph > .graph-outer > .global-graph-icon", ".darkmode", ".readermode"],
     hover: [
-      ".search > .search-button:hover",
-      ".explorer .explorer-toggle:hover",
-      ".explorer .folder-button:hover",
-      ".toc > .toc-header:hover",
       ".graph > .graph-outer > .global-graph-icon:hover",
       ".darkmode:hover",
       ".readermode:hover",
-      forcedHover(".search > .search-button"),
-      forcedHover(".explorer .explorer-toggle"),
-      forcedHover(".explorer .folder-button"),
-      forcedHover(".toc > .toc-header"),
       forcedHover(".graph > .graph-outer > .global-graph-icon"),
       forcedHover(".darkmode"),
       forcedHover(".readermode"),
     ],
     selected: [
-      '.search > .search-button[aria-expanded="true"]',
-      '.explorer[aria-expanded="true"] .explorer-toggle',
-      ".explorer .folder-container:has(+ .folder-outer.open) .folder-button",
-      '.toc > .toc-header[aria-expanded="true"]',
       ".graph:has(> .global-graph-outer.active) > .graph-outer > .global-graph-icon",
       'html[saved-theme="dark"] .darkmode',
       'html[reader-mode="on"] .readermode',
-      forcedSelected(".search > .search-button"),
-      forcedSelected(".explorer .explorer-toggle"),
-      forcedSelected(".explorer .folder-button"),
-      forcedSelected(".toc > .toc-header"),
       forcedSelected(".graph > .graph-outer > .global-graph-icon"),
       forcedSelected(".darkmode"),
       forcedSelected(".readermode"),
@@ -163,43 +142,19 @@ export const APPEARANCE_COMPONENT_SELECTORS = {
     ],
   },
   icon: {
-    normal: [
-      ".search > .search-button svg",
-      ".explorer .explorer-toggle svg",
-      ".explorer .folder-icon",
-      ".toc > .toc-header svg",
-      ".graph > .graph-outer > .global-graph-icon svg",
-      ".darkmode svg",
-      ".readermode svg",
-    ],
+    normal: [".graph > .graph-outer > .global-graph-icon svg", ".darkmode svg", ".readermode svg"],
     hover: [
-      ".search > .search-button:hover svg",
-      ".explorer .explorer-toggle:hover svg",
-      ".explorer .folder-icon:hover",
-      ".toc > .toc-header:hover svg",
       ".graph > .graph-outer > .global-graph-icon:hover svg",
       ".darkmode:hover svg",
       ".readermode:hover svg",
-      forcedHover(".search > .search-button svg"),
-      forcedHover(".explorer .explorer-toggle svg"),
-      forcedHover(".explorer .folder-icon"),
-      forcedHover(".toc > .toc-header svg"),
       forcedHover(".graph > .graph-outer > .global-graph-icon svg"),
       forcedHover(".darkmode svg"),
       forcedHover(".readermode svg"),
     ],
     selected: [
-      '.search > .search-button[aria-expanded="true"] svg',
-      '.explorer[aria-expanded="true"] .explorer-toggle svg',
-      ".explorer .folder-container:has(+ .folder-outer.open) .folder-icon",
-      '.toc > .toc-header[aria-expanded="true"] svg',
       ".graph:has(> .global-graph-outer.active) > .graph-outer > .global-graph-icon svg",
       'html[saved-theme="dark"] .darkmode svg',
       'html[reader-mode="on"] .readermode svg',
-      forcedSelected(".search > .search-button svg"),
-      forcedSelected(".explorer .explorer-toggle svg"),
-      forcedSelected(".explorer .folder-icon"),
-      forcedSelected(".toc > .toc-header svg"),
       forcedSelected(".graph > .graph-outer > .global-graph-icon svg"),
       forcedSelected(".darkmode svg"),
       forcedSelected(".readermode svg"),
@@ -220,7 +175,10 @@ export const APPEARANCE_COMPONENT_SELECTORS = {
   graph: {
     normal: [".graph > .graph-outer"],
     hover: [".graph > .graph-outer:hover", forcedHover(".graph > .graph-outer")],
-    selected: [".graph > .global-graph-outer.active", forcedSelected(".graph > .graph-outer")],
+    selected: [
+      ".graph > .global-graph-outer.active > .global-graph-container",
+      forcedSelected(".graph > .graph-outer"),
+    ],
   },
   footer: {
     normal: [".page > #quartz-body > footer"],
@@ -258,7 +216,7 @@ function cssRule(selectorList: readonly string[], declarations: DeclarationMap):
   const body = Object.entries(declarations)
     .map(([property, value]) => `  ${property}: ${value};`)
     .join("\n")
-  return `:where(${selectorList.join(", ")}) {\n${body}\n}`
+  return `${selectorList.join(", ")} {\n${body}\n}`
 }
 
 function stateRule(
@@ -366,6 +324,31 @@ function homeStatsRules(): string[] {
   ]
 }
 
+function homeSearchRules(): string[] {
+  return [
+    ...controlRules("homeSearch"),
+    ...APPEARANCE_COMPONENTS.homeSearch.states.flatMap((state) => [
+      descendantRule("homeSearch", state, "> p", {
+        color: variable("homeSearch", state, "text"),
+      }),
+      descendantRule("homeSearch", state, "svg .search-path", {
+        stroke: variable("homeSearch", state, "icon"),
+      }),
+    ]),
+  ]
+}
+
+function mobileMenuRules(): string[] {
+  return [
+    ...controlRules("mobileMenu"),
+    ...APPEARANCE_COMPONENTS.mobileMenu.states.map((state) =>
+      descendantRule("mobileMenu", state, ".lucide-menu", {
+        stroke: variable("mobileMenu", state, "icon"),
+      }),
+    ),
+  ]
+}
+
 function searchInputRules(): string[] {
   return APPEARANCE_COMPONENTS.searchInput.states.map((state) =>
     stateRule("searchInput", state, {
@@ -397,17 +380,17 @@ function iconRules(): string[] {
 }
 
 function graphRules(): string[] {
-  return APPEARANCE_COMPONENTS.graph.states.flatMap((state) => [
+  return APPEARANCE_COMPONENTS.graph.states.map((state) =>
     stateRule("graph", state, {
       "background-color": variable("graph", state, "surface"),
       "border-color": variable("graph", state, "border"),
       color: variable("graph", state, "text"),
-      "--graph-node-color": variable("graph", state, "node"),
+      "--publisher-graph-surface": variable("graph", state, "surface"),
+      "--publisher-graph-node": variable("graph", state, "node"),
+      "--publisher-graph-border": variable("graph", state, "border"),
+      "--publisher-graph-text": variable("graph", state, "text"),
     }),
-    descendantRule("graph", state, ":is(.node, circle)", {
-      fill: variable("graph", state, "node"),
-    }),
-  ])
+  )
 }
 
 function componentRules(componentId: AppearanceComponentId): string[] {
@@ -451,8 +434,10 @@ function componentRules(componentId: AppearanceComponentId): string[] {
     case "graph":
       return graphRules()
     case "homeSearch":
-    case "explorer":
+      return homeSearchRules()
     case "mobileMenu":
+      return mobileMenuRules()
+    case "explorer":
     case "tableOfContents":
     case "searchResult":
     case "button":
@@ -473,20 +458,25 @@ export function compileAppearanceComponentCss(settings: ComponentCssSettings): s
     (typeof APPEARANCE_COMPONENTS)[AppearanceComponentId],
   ][]) {
     const kebabId = kebabCase(componentId)
-    output.push(`/* publisher-component:${componentId} */`, ":root {")
+    output.push(`/* publisher-component:${componentId} */`)
+    const variables: string[] = []
     for (const state of definition.states) {
-      for (const [slotName, slotDefinition] of Object.entries(definition.slots)) {
+      for (const slotName of Object.keys(definition.slots)) {
         const name = `--publisher-component-${kebabId}-${state}-${slotName}`
         const concrete = overrides[componentId]?.[state]?.[slotName]
+        const inherited =
+          state === "normal" ? undefined : overrides[componentId]?.normal?.[slotName]
         const value =
           concrete ??
-          (state === "normal"
-            ? `var(--publisher-${slotDefinition.fallback})`
+          (inherited === undefined
+            ? undefined
             : `var(--publisher-component-${kebabId}-normal-${slotName})`)
-        output.push(`  ${name}: ${value};`)
+        if (value !== undefined) variables.push(`  ${name}: ${value};`)
       }
     }
-    output.push("}", ...componentRules(componentId))
+    if (variables.length > 0) {
+      output.push(":root {", ...variables, "}", ...componentRules(componentId))
+    }
   }
 
   return output.join("\n")
