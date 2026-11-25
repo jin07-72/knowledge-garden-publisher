@@ -95,7 +95,7 @@ body:not([data-slug="index"]) .recent-notes {
   padding: 1.15rem;
   color: var(--publisher-component-domain-card-normal-title, var(--dark));
   text-decoration: none;
-  border: 1px solid var(--publisher-component-domain-card-normal-border, rgba(184, 76, 57, 0.38));
+  border: 1px solid var(--publisher-component-domain-card-normal-border, var(--lightgray));
   border-radius: 0.65rem;
   background: var(--publisher-component-domain-card-normal-surface, rgba(24, 29, 36, 0.82));
   transition:
@@ -106,7 +106,7 @@ body:not([data-slug="index"]) .recent-notes {
 
 .domain-card:hover {
   transform: translateY(-2px);
-  border-color: var(--publisher-component-domain-card-hover-border, rgba(184, 76, 57, 0.72));
+  border-color: var(--publisher-component-domain-card-hover-border, var(--secondary));
   background: var(--publisher-component-domain-card-hover-surface, rgba(37, 43, 52, 0.9));
 }
 
@@ -139,32 +139,6 @@ body:not([data-slug="index"]) .recent-notes {
 
 .domain-card:hover small {
   color: var(--publisher-component-domain-card-hover-description, var(--darkgray));
-}
-
-.domain-card[aria-current="page"],
-[data-publisher-appearance-state="selected"] .domain-card,
-.domain-card:focus-visible {
-  color: var(--publisher-component-domain-card-selected-title, var(--dark));
-  border-color: var(--publisher-component-domain-card-selected-border, var(--secondary));
-  background: var(--publisher-component-domain-card-selected-surface, var(--highlight));
-}
-
-.domain-card[aria-current="page"] span,
-[data-publisher-appearance-state="selected"] .domain-card span,
-.domain-card:focus-visible span {
-  color: var(--publisher-component-domain-card-selected-number, var(--secondary));
-}
-
-.domain-card[aria-current="page"] strong,
-[data-publisher-appearance-state="selected"] .domain-card strong,
-.domain-card:focus-visible strong {
-  color: var(--publisher-component-domain-card-selected-title, var(--dark));
-}
-
-.domain-card[aria-current="page"] small,
-[data-publisher-appearance-state="selected"] .domain-card small,
-.domain-card:focus-visible small {
-  color: var(--publisher-component-domain-card-selected-description, var(--darkgray));
 }
 
 @media all and ($desktop) {

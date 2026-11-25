@@ -486,14 +486,17 @@ describe("component appearance CSS", () => {
       "var(--publisher-component-domain-card-normal-surface, rgba(24, 29, 36, 0.82))",
     )
     expect(customScss).toContain(
-      "var(--publisher-component-domain-card-normal-border, rgba(184, 76, 57, 0.38))",
+      "var(--publisher-component-domain-card-normal-border, var(--lightgray))",
     )
     expect(customScss).toContain(
       "var(--publisher-component-domain-card-hover-surface, rgba(37, 43, 52, 0.9))",
     )
     expect(customScss).toContain(
-      "var(--publisher-component-domain-card-hover-border, rgba(184, 76, 57, 0.72))",
+      "var(--publisher-component-domain-card-hover-border, var(--secondary))",
     )
+    expect(customScss).not.toContain('.domain-card[aria-current="page"]')
+    expect(customScss).not.toContain('[data-publisher-appearance-state="selected"] .domain-card')
+    expect(customScss).not.toContain(".domain-card:focus-visible span")
 
     const overrideCss = compileAppearanceComponentCss(settingsWithComponentOverrides)
     expect(overrideCss).toContain("--publisher-component-domain-card-normal-surface: #112233CC;")

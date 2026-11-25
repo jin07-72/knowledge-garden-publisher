@@ -213,6 +213,29 @@ describe("appearance preview frame boundary", () => {
     expect((globalThis as { pwned?: boolean }).pwned).toBeUndefined()
   })
 
+  it("notifies canvas components after installing and clearing preview styles", async () => {
+    const preview = executableFrame("http://127.0.0.1:8080/note")
+    const themeChanges: Event[] = []
+    document.addEventListener("themechange", (event) => themeChanges.push(event))
+
+    await expect(
+      previewAppearance([preview], {
+        url: preview.url,
+        sessionId: "session-1",
+        css: ".graph { color: teal; }",
+      }),
+    ).resolves.toBe(true)
+    await expect(
+      clearAppearancePreview([preview], {
+        url: preview.url,
+        sessionId: "session-1",
+      }),
+    ).resolves.toBe(true)
+
+    expect(themeChanges).toHaveLength(2)
+    expect(themeChanges.every((event) => event.bubbles === false)).toBe(true)
+  })
+
   it("clears only the matching session in the exact frame", async () => {
     const unrelated = executableFrame("http://127.0.0.1:8080/other")
     const preview = executableFrame("http://127.0.0.1:8080/note/?draft=1")

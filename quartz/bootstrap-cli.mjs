@@ -30,6 +30,12 @@ import {
 } from "./cli/plugin-git-handlers.js"
 import { CommonArgv, BuildArgv, CreateArgv, SyncArgv } from "./cli/args.js"
 import { version } from "./cli/constants.js"
+import { patchQuartzGraphComponentColors } from "../scripts/patch-quartz-graph-component-colors.mjs"
+
+const cliArguments = hideBin(process.argv)
+if (cliArguments[0] === "build") {
+  await patchQuartzGraphComponentColors(process.cwd())
+}
 
 async function launchTui() {
   const { join } = await import("path")
@@ -72,7 +78,7 @@ async function launchTui() {
   })
 }
 
-yargs(hideBin(process.argv))
+yargs(cliArguments)
   .scriptName("quartz")
   .version(version)
   .usage("$0 <cmd> [args]")

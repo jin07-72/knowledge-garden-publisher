@@ -73,6 +73,7 @@ function installPreviewStyle(payload: {
   style.dataset.publisherAppearancePreview = payload.sessionId
   style.textContent = payload.css
   document.head.append(style)
+  document.dispatchEvent(new Event("themechange"))
   return true
 }
 
@@ -99,6 +100,7 @@ function clearPreviewStyle(payload: {
     .forEach((style) => {
       if (style.dataset.publisherAppearancePreview === payload.sessionId) style.remove()
     })
+  document.dispatchEvent(new Event("themechange"))
   return true
 }
 
