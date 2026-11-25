@@ -1,6 +1,6 @@
-import { mkdtemp, mkdir, rm, symlink, writeFile } from "node:fs/promises"
+import { mkdtemp, mkdir, readFile, rm, symlink, writeFile } from "node:fs/promises"
 import { tmpdir } from "node:os"
-import { join } from "node:path"
+import { dirname, join } from "node:path"
 import { describe, expect, it, vi } from "vitest"
 import { DEFAULT_APPEARANCE } from "../../src/shared/appearance"
 import type { AppearanceSnapshot, PreviewStatus } from "../../src/shared/contracts"
@@ -9,6 +9,10 @@ import type {
   AppearancePlan,
 } from "../../src/main/services/appearance/appearanceAdapter"
 import type { AppearanceAssetService } from "../../src/main/services/appearance/appearanceAssets"
+import {
+  QUARTZ_APPEARANCE_PATHS,
+  QuartzAppearanceAdapter,
+} from "../../src/main/services/appearance/quartzAppearanceAdapter"
 import {
   createAppearanceService,
   hasAppearanceUndoHistory,
@@ -932,6 +936,199 @@ describe("appearance service", () => {
     expect(removePreview).toHaveBeenCalledOnce()
     expect(assetService.dispose).toHaveBeenCalledOnce()
     await expect(service.read()).rejects.toMatchObject({ code: "APPEARANCE_CONFLICT" })
+  })
+
+  it("applies component overrides from schema v1 and rolls back failed builds without touching notes or images", async () => {
+    const root = await mkdtemp(join(tmpdir(), "appearance-component-boundary-"))
+    const write = async (relativePath: string, content: string | Uint8Array) => {
+      const target = join(root, ...relativePath.split("/"))
+      await mkdir(dirname(target), { recursive: true })
+      await writeFile(target, content)
+    }
+    try {
+      await write(
+        "package.json",
+        JSON.stringify({
+          name: "@jackyzha0/quartz",
+          scripts: { quartz: "./quartz/bootstrap-cli.mjs" },
+        }),
+      )
+      await write("quartz/bootstrap-cli.mjs", "")
+      await write(
+        QUARTZ_APPEARANCE_PATHS.config,
+        [
+          "configuration:",
+          "  pageTitle: Garden",
+          "  theme:",
+          "    fontOrigin: local",
+          "    typography:",
+          "      header: Inter",
+          "      body: Inter",
+          "      code: JetBrains Mono",
+          "    colors:",
+          "      lightMode:",
+          '        light: "#0b1120"',
+          '        lightgray: "#111827"',
+          '        gray: "#334155"',
+          '        darkgray: "#d1d5db"',
+          '        dark: "#f9fafb"',
+          '        secondary: "#22d3ee"',
+          '        tertiary: "#94a3b8"',
+          "      darkMode:",
+          '        light: "#0b1120"',
+          '        lightgray: "#111827"',
+          '        gray: "#334155"',
+          '        darkgray: "#d1d5db"',
+          '        dark: "#f9fafb"',
+          '        secondary: "#22d3ee"',
+          '        tertiary: "#94a3b8"',
+          "plugins: []",
+          "",
+        ].join("\n"),
+      )
+      await write(
+        QUARTZ_APPEARANCE_PATHS.customStylesheet,
+        '@use "./variables.scss" as *;\n\n.domain-card { border-radius: 14px; }\n',
+      )
+      const {
+        componentColors: _ignoredColors,
+        schemaVersion: _ignoredVersion,
+        ...v1Settings
+      } = DEFAULT_APPEARANCE
+      await write(
+        QUARTZ_APPEARANCE_PATHS.manifest,
+        `${JSON.stringify(
+          {
+            schemaVersion: 1,
+            settings: { ...v1Settings, schemaVersion: 1 },
+            assets: [],
+          },
+          null,
+          2,
+        )}\n`,
+      )
+      await write(QUARTZ_APPEARANCE_PATHS.stylesheet, "/* initial v1 stylesheet */\n")
+      await write("content/technology/public-note.md", "---\ntitle: Public\n---\nBody\n")
+      await write("private/life/private-note.md", "---\ntitle: Private\n---\nSecret\n")
+      await write("content/_assets/public-note/diagram.png", new Uint8Array([137, 80, 78, 71]))
+
+      const snapshotState = async () => ({
+        publicNote: await readFile(join(root, "content", "technology", "public-note.md")),
+        privateNote: await readFile(join(root, "private", "life", "private-note.md")),
+        image: await readFile(join(root, "content", "_assets", "public-note", "diagram.png")),
+        config: await readFile(join(root, ...QUARTZ_APPEARANCE_PATHS.config.split("/"))),
+        customScss: await readFile(
+          join(root, ...QUARTZ_APPEARANCE_PATHS.customStylesheet.split("/")),
+        ),
+        manifestBytes: await readFile(join(root, ...QUARTZ_APPEARANCE_PATHS.manifest.split("/"))),
+        stylesheetBytes: await readFile(
+          join(root, ...QUARTZ_APPEARANCE_PATHS.stylesheet.split("/")),
+        ),
+      })
+
+      const before = await snapshotState()
+      const realAdapter = new QuartzAppearanceAdapter(root)
+      let buildShouldFail = false
+      let generation = 1
+      const runtime = previewRuntime({
+        getStatus: vi.fn(() => ({
+          state: "ready" as const,
+          generation,
+          port: 4173,
+          url: "http://127.0.0.1:4173/",
+        })),
+        stop: vi.fn(async () => ({ state: "stopped" as const, generation })),
+        start: vi.fn(async () => {
+          generation += 1
+          if (buildShouldFail) {
+            buildShouldFail = false
+            return {
+              state: "error" as const,
+              generation,
+              error: { code: "PREVIEW_BUILD_FAILED" as const, message: "Quartz build failed" },
+            }
+          }
+          return {
+            state: "ready" as const,
+            generation,
+            port: 4173,
+            url: "http://127.0.0.1:4173/",
+          }
+        }),
+      })
+      const service = await createAppearanceService({
+        workspace: root,
+        adapter: realAdapter,
+        assets: assets(),
+        preview: runtime,
+        installPreview: vi.fn(async () => true),
+        removePreview: vi.fn(async () => true),
+      })
+
+      const initialSnapshot = await service.read()
+      const updatedSettings = {
+        ...initialSnapshot.settings,
+        preset: "custom" as const,
+        componentColors: {
+          domainCard: {
+            hover: {
+              surface: "#303741E6",
+            },
+          },
+        },
+      }
+      const applied = await service.apply({
+        settings: updatedSettings,
+        baselineHash: initialSnapshot.baselineHash,
+      })
+
+      const after = {
+        ...(await snapshotState()),
+        manifest: JSON.parse(
+          await readFile(join(root, ...QUARTZ_APPEARANCE_PATHS.manifest.split("/")), "utf8"),
+        ),
+        stylesheet: await readFile(
+          join(root, ...QUARTZ_APPEARANCE_PATHS.stylesheet.split("/")),
+          "utf8",
+        ),
+      }
+      expect(after.publicNote).toEqual(before.publicNote)
+      expect(after.privateNote).toEqual(before.privateNote)
+      expect(after.image).toEqual(before.image)
+      expect(after.manifest.settings.schemaVersion).toBe(2)
+      expect(after.manifest.settings.componentColors.domainCard.hover.surface).toBe("#303741E6")
+      expect(after.stylesheet).toContain(
+        "--publisher-component-domain-card-hover-surface: #303741E6;",
+      )
+
+      buildShouldFail = true
+      await expect(
+        service.apply({
+          settings: {
+            ...applied.snapshot.settings,
+            componentColors: {
+              domainCard: {
+                hover: {
+                  surface: "#998877CC",
+                },
+              },
+            },
+          },
+          baselineHash: applied.snapshot.baselineHash,
+        }),
+      ).rejects.toMatchObject({ code: "APPEARANCE_TRANSACTION_FAILED" })
+
+      const rolledBack = await snapshotState()
+      expect(rolledBack.publicNote).toEqual(before.publicNote)
+      expect(rolledBack.privateNote).toEqual(before.privateNote)
+      expect(rolledBack.image).toEqual(before.image)
+      expect(rolledBack.config).toEqual(after.config)
+      expect(rolledBack.customScss).toEqual(after.customScss)
+      expect(rolledBack.manifestBytes).toEqual(after.manifestBytes)
+      expect(rolledBack.stylesheetBytes).toEqual(after.stylesheetBytes)
+    } finally {
+      await rm(root, { recursive: true, force: true })
+    }
   })
 
   it("lets an already committed mutation return its receipt while disposal waits", async () => {

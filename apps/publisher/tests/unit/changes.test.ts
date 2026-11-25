@@ -330,6 +330,38 @@ describe("listChanges", () => {
     )
   })
 
+  it("classifies component appearance manifest, managed stylesheet, and custom.scss migration exclusively under appearance", async () => {
+    const fixture = await repository()
+    const status = raw(
+      [
+        "? quartz/styles/publisher-appearance.json",
+        "? quartz/styles/publisher-appearance.scss",
+        `1 .M N... 100644 100644 100644 ${oidA} ${oidA} quartz/styles/custom.scss`,
+        "",
+      ].join("\0"),
+    )
+
+    const review = await listChanges({ workspace: fixture.root, statusOutput: status })
+
+    expect(review.groups).toEqual([
+      expect.objectContaining({
+        kind: "appearance",
+        label: "外观修改",
+        selection: "optional",
+        paths: [
+          "quartz/styles/publisher-appearance.json",
+          "quartz/styles/publisher-appearance.scss",
+          "quartz/styles/custom.scss",
+        ],
+      }),
+    ])
+    expect(
+      review.groups.some((group) =>
+        ["modified", "private", "unpublish", "config"].includes(group.kind),
+      ),
+    ).toBe(false)
+  })
+
   it("keeps the custom stylesheet under config until both ownership files are present", async () => {
     const fixture = await repository()
 
