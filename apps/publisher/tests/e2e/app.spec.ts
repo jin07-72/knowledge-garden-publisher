@@ -1042,12 +1042,27 @@ test("appearance designer previews, applies, persists, and undoes without publis
     await dialog.getByLabel("背景类型").selectOption("gradient")
     await dialog.getByLabel("强调色").fill("#123456")
     await dialog.getByLabel("正文宽度").fill("76")
+    await dialog.getByRole("button", { name: "领域卡片" }).click()
+    await dialog.getByRole("tab", { name: "悬停" }).click()
+    await dialog.getByLabel("卡片背景颜色值").fill("#303741E6")
+    await dialog.getByLabel("卡片背景颜色值").press("Enter")
     await expect(dialog.getByText("实时预览已更新", { exact: true })).toBeVisible()
     const appearanceDocument = page.getByTitle("博客外观实时预览").contentFrame()
     const previewStyle = appearanceDocument.locator("style[data-publisher-appearance-preview]")
     await expect.poll(() => previewStyle.textContent()).toContain("--publisher-accent: #123456")
     await expect.poll(() => previewStyle.textContent()).toContain("--publisher-article-width: 76ch")
     await expect.poll(() => previewStyle.textContent()).toContain("linear-gradient(135deg")
+    await expect
+      .poll(() => previewStyle.textContent())
+      .toContain("--publisher-component-domain-card-hover-surface: #303741E6")
+    await expect(appearanceDocument.locator("html")).toHaveAttribute(
+      "data-publisher-appearance-component",
+      "domainCard",
+    )
+    await expect(appearanceDocument.locator("html")).toHaveAttribute(
+      "data-publisher-appearance-state",
+      "hover",
+    )
     await expect(
       page
         .getByTitle("Appearance Note的 Quartz 精确预览")
@@ -1214,6 +1229,10 @@ test("appearance designer previews, applies, persists, and undoes without publis
     ).toHaveCount(0)
 
     await page.getByRole("button", { name: "外观" }).click()
+    const reopened = page.getByRole("dialog", { name: "外观设置" })
+    await reopened.getByRole("button", { name: "领域卡片" }).click()
+    await reopened.getByRole("tab", { name: "悬停" }).click()
+    await expect(reopened.getByLabel("卡片背景颜色值")).toHaveValue("#202020")
     await editDraft(page)
     const appearance = page.getByRole("dialog", { name: "外观设置" })
     const transitionsBeforeApply = await realPreviewTransitions()
@@ -1253,10 +1272,16 @@ test("appearance designer previews, applies, persists, and undoes without publis
     expect(appliedConfiguration.configuration.theme.colors.lightMode.tertiary).toBe("#94a3b8")
     expect(appliedConfiguration.configuration.theme.colors.darkMode.tertiary).toBe("#94a3b8")
     expect(JSON.parse(await readFile(manifestPath, "utf8"))).toMatchObject({
-      schemaVersion: 1,
+      schemaVersion: 2,
       settings: {
+        schemaVersion: 2,
         background: { kind: "gradient" },
         colors: { accent: "#123456" },
+        componentColors: {
+          domainCard: {
+            hover: { surface: "#303741E6" },
+          },
+        },
         layout: { articleWidthCh: 76 },
       },
     })
