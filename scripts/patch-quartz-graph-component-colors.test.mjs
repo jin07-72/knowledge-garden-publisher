@@ -14,10 +14,16 @@ const originalColorRead =
 const previousPatchedColorRead =
   'var publisherGraphStyle=getComputedStyle(_),Z=getComputedStyle(document.documentElement),publisherGraphNode=publisherGraphStyle.getPropertyValue("--publisher-graph-node").trim(),Ie=h(publisherGraphNode||Z.getPropertyValue("--secondary").trim(),"#c792ea"),Qu=h(publisherGraphNode||Z.getPropertyValue("--tertiary").trim(),"#82aaff"),ue=h(publisherGraphNode||Z.getPropertyValue("--gray").trim(),"#6c6c6c"),ee=h(publisherGraphStyle.getPropertyValue("--publisher-graph-border").trim()||Z.getPropertyValue("--lightgray").trim(),"#d4d4d4"),ze=h(publisherGraphStyle.getPropertyValue("--publisher-graph-text").trim()||Z.getPropertyValue("--dark").trim(),"#1a1a1a"),He=h(publisherGraphStyle.getPropertyValue("--publisher-graph-surface").trim()||Z.getPropertyValue("--light").trim(),"#f5f5f5"),Ne=Z.getPropertyValue("--bodyFont").trim()||"inherit"'
 const originalRefreshAnchor = "function Au(){Ke(),Ve(),qe()}for(var k=0;k<ru.length;k++)"
+const previousRefreshAnchor =
+  'function Au(){Ke(),Ve(),qe()}function publisherGraphRefreshColors(){publisherGraphReadColors();for(var publisherGraphIndex=0;publisherGraphIndex<P.length;publisherGraphIndex++){var publisherGraphItem=P[publisherGraphIndex],publisherGraphData=publisherGraphItem.simulationData,publisherGraphTag=publisherGraphData.id.startsWith("tags/");publisherGraphItem.color=$e(publisherGraphData),publisherGraphItem.label.style.fill=ze,publisherGraphItem.gfx.clear(),publisherGraphItem.gfx.circle(0,0,oe(publisherGraphData)),publisherGraphItem.gfx.fill({color:publisherGraphTag?He:publisherGraphItem.color}),publisherGraphTag&&publisherGraphItem.gfx.stroke({width:2,color:Qu})}for(var publisherGraphIndex=0;publisherGraphIndex<I.length;publisherGraphIndex++){var publisherGraphLink=I[publisherGraphIndex];publisherGraphLink.color=publisherGraphLink.active?ue:ee}Au()}for(var k=0;k<ru.length;k++)'
 const originalPointerAnchor =
   'for(var k=0;k<z.length;k++){var W=z[k],U=new a.Graphics;U.eventMode="none",te.addChild(U),I.push({simulationData:W,gfx:U,color:ee,alpha:1,active:!1})}if(fu)'
+const previousPointerAnchor =
+  'for(var k=0;k<z.length;k++){var W=z[k],U=new a.Graphics;U.eventMode="none",te.addChild(U),I.push({simulationData:W,gfx:U,color:ee,alpha:1,active:!1})}_.addEventListener("pointerenter",publisherGraphRefreshColors),_.addEventListener("pointerleave",publisherGraphRefreshColors);if(fu)'
 const originalCleanupAnchor =
   'return ou.on("tick",function(){}),ou.restart(),Au(),se(),function(){le=!0,ou.stop();try{Q.destroy(!0)}catch{}}}'
+const previousCleanupAnchor =
+  'return ou.on("tick",function(){}),ou.restart(),Au(),se(),function(){le=!0,ou.stop(),_.removeEventListener("pointerenter",publisherGraphRefreshColors),_.removeEventListener("pointerleave",publisherGraphRefreshColors);try{Q.destroy(!0)}catch{}}}'
 const verifiedRuntime = [
   originalColorRead,
   originalRefreshAnchor,
@@ -58,8 +64,15 @@ test("patches the Pixi runtime without mutating a shared package-store hardlink"
     assert.match(patched, /--publisher-graph-node/)
     assert.match(patched, /--publisher-graph-text/)
     assert.match(patched, /publisherGraphRefreshColors/)
-    assert.match(patched, /addEventListener\("pointerenter",publisherGraphRefreshColors\)/)
-    assert.match(patched, /removeEventListener\("pointerleave",publisherGraphRefreshColors\)/)
+    assert.match(patched, /publisherGraphHoverTarget=_\.closest\("\.graph-outer"\)\|\|_/)
+    assert.match(
+      patched,
+      /publisherGraphHoverTarget\.addEventListener\("pointerenter",publisherGraphRefreshColors\)/,
+    )
+    assert.match(
+      patched,
+      /publisherGraphHoverTarget\.removeEventListener\("pointerleave",publisherGraphRefreshColors\)/,
+    )
     assert.match(
       patched,
       /publisherGraphNode=publisherGraphStyle\.getPropertyValue\("--publisher-graph-node"\)\.trim\(\)/,
@@ -100,6 +113,21 @@ test("upgrades the earlier color-only patch without requiring a reinstall", asyn
     const patched = await readFile(runtimePath, "utf8")
     assert.match(patched, /publisherGraphReadColors/)
     assert.match(patched, /publisherGraphRefreshColors/)
+  })
+})
+
+test("upgrades the earlier container-bound hover patch without requiring a reinstall", async () => {
+  const earlierRuntime = verifiedRuntime
+    .replace(originalColorRead, previousPatchedColorRead)
+    .replace(originalRefreshAnchor, previousRefreshAnchor)
+    .replace(originalPointerAnchor, previousPointerAnchor)
+    .replace(originalCleanupAnchor, previousCleanupAnchor)
+  await withGraphPackage({ source: earlierRuntime }, async ({ root, runtimePath }) => {
+    assert.equal(await patchQuartzGraphComponentColors(root), "patched")
+    const patched = await readFile(runtimePath, "utf8")
+    assert.match(patched, /publisherGraphHoverTarget=_\.closest\("\.graph-outer"\)\|\|_/)
+    assert.doesNotMatch(patched, /_\.addEventListener\("pointerenter"/)
+    assert.doesNotMatch(patched, /_\.removeEventListener\("pointerleave"/)
   })
 })
 

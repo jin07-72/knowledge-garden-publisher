@@ -15,12 +15,16 @@ const patchedRefreshAnchor =
   'function Au(){Ke(),Ve(),qe()}function publisherGraphRefreshColors(){publisherGraphReadColors();for(var publisherGraphIndex=0;publisherGraphIndex<P.length;publisherGraphIndex++){var publisherGraphItem=P[publisherGraphIndex],publisherGraphData=publisherGraphItem.simulationData,publisherGraphTag=publisherGraphData.id.startsWith("tags/");publisherGraphItem.color=$e(publisherGraphData),publisherGraphItem.label.style.fill=ze,publisherGraphItem.gfx.clear(),publisherGraphItem.gfx.circle(0,0,oe(publisherGraphData)),publisherGraphItem.gfx.fill({color:publisherGraphTag?He:publisherGraphItem.color}),publisherGraphTag&&publisherGraphItem.gfx.stroke({width:2,color:Qu})}for(var publisherGraphIndex=0;publisherGraphIndex<I.length;publisherGraphIndex++){var publisherGraphLink=I[publisherGraphIndex];publisherGraphLink.color=publisherGraphLink.active?ue:ee}Au()}for(var k=0;k<ru.length;k++)'
 const originalPointerAnchor =
   'for(var k=0;k<z.length;k++){var W=z[k],U=new a.Graphics;U.eventMode="none",te.addChild(U),I.push({simulationData:W,gfx:U,color:ee,alpha:1,active:!1})}if(fu)'
-const patchedPointerAnchor =
+const previousPatchedPointerAnchor =
   'for(var k=0;k<z.length;k++){var W=z[k],U=new a.Graphics;U.eventMode="none",te.addChild(U),I.push({simulationData:W,gfx:U,color:ee,alpha:1,active:!1})}_.addEventListener("pointerenter",publisherGraphRefreshColors),_.addEventListener("pointerleave",publisherGraphRefreshColors);if(fu)'
+const patchedPointerAnchor =
+  'for(var k=0;k<z.length;k++){var W=z[k],U=new a.Graphics;U.eventMode="none",te.addChild(U),I.push({simulationData:W,gfx:U,color:ee,alpha:1,active:!1})}var publisherGraphHoverTarget=_.closest(".graph-outer")||_;publisherGraphHoverTarget.addEventListener("pointerenter",publisherGraphRefreshColors),publisherGraphHoverTarget.addEventListener("pointerleave",publisherGraphRefreshColors);if(fu)'
 const originalCleanupAnchor =
   'return ou.on("tick",function(){}),ou.restart(),Au(),se(),function(){le=!0,ou.stop();try{Q.destroy(!0)}catch{}}}'
-const patchedCleanupAnchor =
+const previousPatchedCleanupAnchor =
   'return ou.on("tick",function(){}),ou.restart(),Au(),se(),function(){le=!0,ou.stop(),_.removeEventListener("pointerenter",publisherGraphRefreshColors),_.removeEventListener("pointerleave",publisherGraphRefreshColors);try{Q.destroy(!0)}catch{}}}'
+const patchedCleanupAnchor =
+  'return ou.on("tick",function(){}),ou.restart(),Au(),se(),function(){le=!0,ou.stop(),publisherGraphHoverTarget.removeEventListener("pointerenter",publisherGraphRefreshColors),publisherGraphHoverTarget.removeEventListener("pointerleave",publisherGraphRefreshColors);try{Q.destroy(!0)}catch{}}}'
 
 const defaultOperations = { readFile, rename, rm, writeFile }
 
@@ -52,11 +56,26 @@ export async function patchQuartzGraphComponentColors(
     : source.includes(previousPatchedColorRead)
       ? previousPatchedColorRead
       : undefined
+  const refreshAnchor = source.includes(patchedRefreshAnchor)
+    ? undefined
+    : source.includes(originalRefreshAnchor)
+      ? originalRefreshAnchor
+      : undefined
+  const pointerAnchor = source.includes(previousPatchedPointerAnchor)
+    ? previousPatchedPointerAnchor
+    : source.includes(originalPointerAnchor)
+      ? originalPointerAnchor
+      : undefined
+  const cleanupAnchor = source.includes(previousPatchedCleanupAnchor)
+    ? previousPatchedCleanupAnchor
+    : source.includes(originalCleanupAnchor)
+      ? originalCleanupAnchor
+      : undefined
   if (
-    colorAnchor === undefined ||
-    !source.includes(originalRefreshAnchor) ||
-    !source.includes(originalPointerAnchor) ||
-    !source.includes(originalCleanupAnchor)
+    (!source.includes(patchedColorRead) && colorAnchor === undefined) ||
+    (!source.includes(patchedRefreshAnchor) && refreshAnchor === undefined) ||
+    pointerAnchor === undefined ||
+    cleanupAnchor === undefined
   ) {
     throw new Error("The verified Quartz graph color fragment was not found; refusing to patch")
   }
@@ -66,10 +85,10 @@ export async function patchQuartzGraphComponentColors(
   const backupPath = join(dirname(runtimePath), `.publisher-graph-${suffix}.backup`)
   try {
     const patched = source
-      .replace(colorAnchor, patchedColorRead)
-      .replace(originalRefreshAnchor, patchedRefreshAnchor)
-      .replace(originalPointerAnchor, patchedPointerAnchor)
-      .replace(originalCleanupAnchor, patchedCleanupAnchor)
+      .replace(colorAnchor ?? patchedColorRead, patchedColorRead)
+      .replace(refreshAnchor ?? patchedRefreshAnchor, patchedRefreshAnchor)
+      .replace(pointerAnchor, patchedPointerAnchor)
+      .replace(cleanupAnchor, patchedCleanupAnchor)
     await operations.writeFile(temporaryPath, patched)
     await operations.rename(runtimePath, backupPath)
     try {
