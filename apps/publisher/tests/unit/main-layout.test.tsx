@@ -590,24 +590,29 @@ describe("publisher main layout", () => {
     ).not.toContain("http://127.0.0.1:8080/current-build/")
   })
 
-  it("flushes the current Markdown before appearance apply and invalidates changes without publishing", async () => {
+  it("flushes the current Markdown before appearance apply and refreshes changes without publishing", async () => {
     const user = userEvent.setup()
     enableAppearance(garden)
-    vi.mocked(garden.changes.list).mockResolvedValue(
-      ok({
-        groups: [
-          {
-            id: "note:appearance",
-            label: "Appearance",
-            kind: "modified",
-            selection: "default",
-            description: "外观变化",
-            paths: ["quartz/styles/custom.scss"],
-            attachments: [],
-          },
-        ],
-      }),
-    )
+    vi.mocked(garden.changes.list)
+      .mockResolvedValueOnce(ok({ groups: [] }))
+      .mockResolvedValue(
+        ok({
+          groups: [
+            {
+              id: "appearance:publisher-appearance",
+              label: "外观修改",
+              kind: "appearance",
+              selection: "optional",
+              description: "博客背景、主题配色与排版；选择后发布到线上站点。",
+              paths: [
+                "quartz/styles/publisher-appearance.json",
+                "quartz/styles/publisher-appearance.scss",
+              ],
+              attachments: [],
+            },
+          ],
+        }),
+      )
     vi.mocked(garden.notes.save).mockImplementation(async (request) =>
       ok({
         path: request.path,
@@ -636,8 +641,8 @@ describe("publisher main layout", () => {
       vi.mocked(garden.appearance.apply).mock.invocationCallOrder[0],
     )
     expect(garden.publish.start).not.toHaveBeenCalled()
-    expect(screen.getByText("可发布变化：暂不可用")).toBeVisible()
-    expect(garden.changes.list).toHaveBeenCalledTimes(1)
+    await waitFor(() => expect(garden.changes.list).toHaveBeenCalledTimes(2))
+    expect(await screen.findByText("可发布变化：1")).toBeVisible()
   })
 
   it("disables appearance while publication is preparing the current Markdown", async () => {
@@ -3483,5 +3488,53 @@ describe("publisher main layout", () => {
     const stylesheet = readFileSync("src/renderer/src/app.css", "utf8")
     expect(stylesheet).toMatch(/\.publish-summary small\s*\{[^}]*font-size:\s*11px/s)
     expect(stylesheet).toMatch(/\.status-more-button\s*\{[^}]*font-size:\s*11px/s)
+  })
+
+  it("refreshes publishable count on public note save and ignores cancelled scan races", async () => {
+    const user = userEvent.setup()
+    vi.mocked(garden.changes.list)
+      .mockResolvedValueOnce(ok({ groups: [] }))
+      .mockResolvedValueOnce({
+        ok: false,
+        error: { code: "CHANGE_SCAN_CANCELLED", message: "Change scan was cancelled." },
+      })
+      .mockResolvedValue(
+        ok({
+          groups: [
+            {
+              id: "note:css-grid",
+              label: "css-grid",
+              kind: "modified",
+              selection: "default",
+              description: "公开文章已修改",
+              paths: [notes[0].path],
+              attachments: [],
+            },
+          ],
+        }),
+      )
+    vi.mocked(garden.notes.save).mockImplementation(async (request) =>
+      ok({
+        path: request.path,
+        updatedAt: "2026-10-30T10:00:00.000Z",
+        mtimeMs: 9,
+        contentHash: markdownHash(request.markdown),
+      }),
+    )
+    render(<App />)
+
+    expect(await screen.findByText("可发布变化：0")).toBeVisible()
+    await user.click(await screen.findByRole("button", { name: /CSS Grid 布局/ }))
+    const textbox = await screen.findByRole("textbox")
+    const editor = EditorView.findFromDOM(textbox)
+    if (!editor) throw new Error("CodeMirror view not found")
+
+    act(() => editor.dispatch({ changes: { from: editor.state.doc.length, insert: "\nfirst" } }))
+    await waitFor(() => expect(garden.changes.list).toHaveBeenCalledTimes(2), { timeout: 3_000 })
+    expect(screen.getByText("可发布变化：0")).toBeVisible()
+    expect(screen.queryByText(/Change scan was cancelled/)).not.toBeInTheDocument()
+
+    act(() => editor.dispatch({ changes: { from: editor.state.doc.length, insert: "\nsecond" } }))
+    expect(await screen.findByText("可发布变化：1", {}, { timeout: 3_000 })).toBeVisible()
   })
 })

@@ -52,7 +52,7 @@ input,
 }
 
 .garden-kicker {
-  color: var(--secondary);
+  color: var(--publisher-component-home-stats-normal-accent, var(--secondary));
   font-family: var(--codeFont);
   font-size: 0.78rem;
   letter-spacing: 0.12em;
@@ -60,7 +60,7 @@ input,
 }
 
 .garden-stats {
-  color: var(--darkgray);
+  color: var(--publisher-component-home-stats-normal-text, var(--darkgray));
   font-family: var(--codeFont);
   font-size: 0.8rem;
 }
@@ -106,6 +106,7 @@ body:not([data-slug="index"]) .recent-notes {
 
 .domain-card:hover {
   transform: translateY(-2px);
+  color: var(--publisher-component-domain-card-hover-title, var(--dark));
   border-color: var(--publisher-component-domain-card-hover-border, var(--secondary));
   background: var(--publisher-component-domain-card-hover-surface, rgba(37, 43, 52, 0.9));
 }

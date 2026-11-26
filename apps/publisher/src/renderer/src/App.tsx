@@ -135,6 +135,17 @@ function movedPath(note: NoteSummary, visibility: Visibility): string {
   return `${root}/${note.domain}/${note.slug}.md`
 }
 
+function statusMessageForReview(review: ChangeReview | undefined): string {
+  if (!review) return "正在检查可发布变化…"
+  if (review.blockedReason) return review.blockedReason
+  const visibleGroups = review.groups.filter((group) => group.kind !== "private")
+  if (visibleGroups.length === 0) return "当前没有可发布变化"
+  const publishable = visibleGroups.filter(
+    (group) => group.selection === "default" || group.kind === "appearance",
+  ).length
+  return publishable === 0 ? "当前没有默认可发布变化（含高级配置修改）" : "可查看并选择要发布的变化"
+}
+
 function PaneSeparator({
   label,
   value,
@@ -275,6 +286,8 @@ export function PublisherApp({
   const previewNavigationId = useRef(0)
   const latestPreviewNavigation = useRef<PreviewNavigationRequest | undefined>(undefined)
   const changesRequest = useRef(0)
+  const changeRetryTimer = useRef<ReturnType<typeof setTimeout> | undefined>(undefined)
+  const internalFlushCount = useRef(0)
   const hasChangeReview = useRef(false)
   const pendingPublishRequest = useRef<PublishRequest | undefined>(undefined)
   const publishAttempt = useRef(0)
@@ -374,6 +387,15 @@ export function PublisherApp({
     [api],
   )
 
+  const flushEditorBeforeMutation = useCallback(async (): Promise<boolean> => {
+    internalFlushCount.current += 1
+    try {
+      return (await markdownEditor.current?.flush()) ?? true
+    } finally {
+      internalFlushCount.current -= 1
+    }
+  }, [])
+
   const appearanceApi = useMemo<GardenApi["appearance"]>(
     () => ({
       ...api.appearance,
@@ -384,7 +406,7 @@ export function PublisherApp({
       clearPreview: clearAppearancePreview,
       apply: async (request) => {
         const generation = appearanceGeneration.current
-        const saved = (await markdownEditor.current?.flush()) ?? true
+        const saved = await flushEditorBeforeMutation()
         if (!saved || !appMounted.current || generation !== appearanceGeneration.current) {
           return {
             ok: false,
@@ -399,7 +421,7 @@ export function PublisherApp({
         return api.appearance.apply(request)
       },
     }),
-    [api, clearAppearancePreview],
+    [api, clearAppearancePreview, flushEditorBeforeMutation],
   )
 
   const switchBlog = useCallback(
@@ -559,6 +581,10 @@ export function PublisherApp({
     })
     return () => {
       appMounted.current = false
+      if (changeRetryTimer.current !== undefined) {
+        clearTimeout(changeRetryTimer.current)
+        changeRetryTimer.current = undefined
+      }
       appearanceGeneration.current += 1
       const sessionId = appearanceSession.current
       if (sessionId) void clearAppearancePreview({ sessionId }).catch(() => undefined)
@@ -672,6 +698,10 @@ export function PublisherApp({
 
   const loadChanges = useCallback(
     async (expectedPublishGeneration?: number): Promise<ChangeReview | undefined> => {
+      if (changeRetryTimer.current !== undefined) {
+        clearTimeout(changeRetryTimer.current)
+        changeRetryTimer.current = undefined
+      }
       const request = ++changesRequest.current
       const stale = (): boolean =>
         request !== changesRequest.current ||
@@ -702,6 +732,21 @@ export function PublisherApp({
       }
       if (stale()) return
       if (!result.ok) {
+        if (result.error.code === "CHANGE_SCAN_CANCELLED") {
+          if (!hasChangeReview.current && appMounted.current) {
+            changeRetryTimer.current = setTimeout(() => {
+              changeRetryTimer.current = undefined
+              if (
+                appMounted.current &&
+                request === changesRequest.current &&
+                !hasChangeReview.current
+              ) {
+                void loadChanges(expectedPublishGeneration)
+              }
+            }, 120)
+          }
+          return
+        }
         const message = messageFor(result.error, "发布检查暂不可用。")
         if (hasChangeReview.current) {
           setChangeRefreshError(message)
@@ -719,13 +764,10 @@ export function PublisherApp({
       setChangeReviewState("ready")
       setChangeRefreshError(undefined)
       const publishable = result.value.groups.filter(
-        (group) => group.selection === "default",
+        (group) => group.selection === "default" || group.kind === "appearance",
       ).length
       setChangeCount(publishable)
-      setPublishMessage(
-        result.value.blockedReason ??
-          (result.value.groups.length === 0 ? "当前没有可发布变化" : "可查看并选择要发布的变化"),
-      )
+      setPublishMessage(statusMessageForReview(result.value))
       return result.value
     },
     [api],
@@ -734,10 +776,9 @@ export function PublisherApp({
   const appearanceChanged = useCallback(
     (generation: number): void => {
       if (generation !== appearanceGeneration.current) return
-      setChangeCount(undefined)
-      if (changeReviewOpen) void loadChanges()
+      void loadChanges()
     },
-    [changeReviewOpen, loadChanges],
+    [loadChanges],
   )
 
   useEffect(() => {
@@ -745,6 +786,10 @@ export function PublisherApp({
     publishBlogId.current = registry.activeBlogId
     publishAttempt.current += 1
     changesRequest.current += 1
+    if (changeRetryTimer.current !== undefined) {
+      clearTimeout(changeRetryTimer.current)
+      changeRetryTimer.current = undefined
+    }
     pendingPublishRequest.current = undefined
     cancelPublishDeployment()
     setPublishProgress(undefined)
@@ -1022,7 +1067,7 @@ export function PublisherApp({
   }, [api, documentRetry, selectedPath])
 
   const createNote = async (request: NoteCreateRequest): Promise<string | undefined> => {
-    if (!((await markdownEditor.current?.flush()) ?? true)) {
+    if (!(await flushEditorBeforeMutation())) {
       return "当前笔记保存失败，已保留编辑内容。"
     }
     const result = await api.notes.create(request)
@@ -1048,6 +1093,7 @@ export function PublisherApp({
       contentHash: result.value.contentHash,
     })
     void loadDomains()
+    if (request.visibility === "public") void loadChanges()
     return undefined
   }
 
@@ -1055,7 +1101,7 @@ export function PublisherApp({
     if (visibility === note.visibility || visibilityBusy) return
     let flushedMarkdown: string | undefined
     if (note.path === selectedPath) {
-      if (!((await markdownEditor.current?.flush()) ?? true)) {
+      if (!(await flushEditorBeforeMutation())) {
         setVisibilityError({
           path: note.path,
           title: note.title,
@@ -1133,7 +1179,7 @@ export function PublisherApp({
   }
 
   const deleteNote = async (note: NoteSummary): Promise<NoteTrashReceipt> => {
-    if (note.path === selectedPath && !((await markdownEditor.current?.flush()) ?? true)) {
+    if (note.path === selectedPath && !(await flushEditorBeforeMutation())) {
       throw new Error("当前笔记保存失败，编辑内容已保留；未执行删除。")
     }
     const result = await api.notes.trash({ path: note.path })
@@ -1280,6 +1326,7 @@ export function PublisherApp({
         setDomainsState("ready")
         setDomainError(undefined)
         if (reloadNotes) void loadNotes()
+        void loadChanges()
       }
       return result.value
     } catch (failure) {
@@ -1287,6 +1334,27 @@ export function PublisherApp({
       throw failure
     }
   }
+
+  const editorImages = useMemo<GardenApi["images"]>(
+    () => ({
+      ...api.images,
+      commit: async (request) => {
+        const result = await api.images.commit(request)
+        if (result.ok && appMounted.current && request.path.startsWith("content/")) {
+          void loadChanges()
+        }
+        return result
+      },
+      delete: async (request) => {
+        const result = await api.images.delete(request)
+        if (result.ok && appMounted.current && request.path.startsWith("content/")) {
+          void loadChanges()
+        }
+        return result
+      },
+    }),
+    [api, loadChanges],
+  )
 
   const renderedAppearanceGeneration = appearanceGeneration.current
 
@@ -1478,7 +1546,7 @@ export function PublisherApp({
                     write: api.notes.recovery.write,
                     discard: api.notes.recovery.discard,
                   }}
-                  images={api.images}
+                  images={editorImages}
                   readOnly={switchPreparing}
                   onSaved={(receipt) => {
                     setDocument((current) =>
@@ -1497,6 +1565,9 @@ export function PublisherApp({
                           : note,
                       ),
                     )
+                    if (internalFlushCount.current === 0 && receipt.path.startsWith("content/")) {
+                      void loadChanges()
+                    }
                   }}
                   onSaveStateChange={setSaveStateLabel}
                   onPreviewChange={(markdown) => setLocalPreview({ path: document.path, markdown })}
@@ -1649,8 +1720,6 @@ export function PublisherApp({
           submitError={publishSubmitError}
           onClose={() => {
             publishAttempt.current += 1
-            changesRequest.current += 1
-            void api.changes.cancel()
             pendingPublishRequest.current = undefined
             setPublishSubmitError(undefined)
             setChangeReviewOpen(false)
@@ -1664,12 +1733,7 @@ export function PublisherApp({
             pendingPublishRequest.current = undefined
             setPublishSubmitError(undefined)
             setPublishProgress(undefined)
-            setPublishMessage(
-              changeReview?.blockedReason ??
-                (changeReview?.groups.length === 0
-                  ? "当前没有可发布变化"
-                  : "可查看并选择要发布的变化"),
-            )
+            setPublishMessage(statusMessageForReview(changeReview))
           }}
           onPublish={async (changeGroupIds) => {
             cancelPublishDeployment()
@@ -1678,7 +1742,7 @@ export function PublisherApp({
             const attempt = ++publishAttempt.current
             setPublishPreparing(true)
             try {
-              const saved = (await markdownEditor.current?.flush()) ?? true
+              const saved = await flushEditorBeforeMutation()
               if (attempt !== publishAttempt.current) return
               if (!saved) {
                 showPublishError(
@@ -1694,6 +1758,7 @@ export function PublisherApp({
                 changeGroupIds: Object.freeze([...changeGroupIds]),
               })
               pendingPublishRequest.current = request
+              changesRequest.current += 1
               publishStatusGeneration.current += 1
               setPublishOperationActive(true)
               const result = await api.publish.start(request)
@@ -1701,6 +1766,7 @@ export function PublisherApp({
               if (attempt !== publishAttempt.current) return
               if (!result.ok) {
                 showPublishError(result.error, "无法开始发布。")
+                if (!hasChangeReview.current) void loadChanges()
                 return
               }
               pendingPublishRequest.current = undefined
