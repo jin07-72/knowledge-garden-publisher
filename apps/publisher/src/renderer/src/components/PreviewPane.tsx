@@ -3,6 +3,7 @@ import { Monitor, RefreshCw, TriangleAlert } from "lucide-react"
 import type { NoteSummary, PreviewStatus } from "../../../shared/contracts"
 import { HistoryView, type HistorySnapshot } from "./HistoryView"
 import { LocalNotePreview } from "./PrivateNotePreview"
+import { ScaledPreviewFrame } from "./ScaledPreviewFrame"
 import {
   revealPreviewSelection,
   type PreviewNavigationRequest,
@@ -212,7 +213,7 @@ export function PreviewPane({
                 <span>仅在这台电脑上预览，不会发布。</span>
               </div>
             ) : null}
-            <iframe
+            <ScaledPreviewFrame
               title={`${note.title}的 Quartz 精确预览`}
               src={noteUrl}
               sandbox="allow-same-origin allow-scripts"
@@ -251,7 +252,7 @@ export function PreviewPane({
           </div>
         ) : null}
         {tab === "site" && baseUrl ? (
-          <iframe
+          <ScaledPreviewFrame
             title="Quartz 本地全站预览"
             src={baseUrl}
             sandbox="allow-same-origin allow-scripts"
@@ -275,7 +276,7 @@ export function PreviewPane({
                 刷新线上站
               </button>
             </div>
-            <iframe
+            <ScaledPreviewFrame
               key={publicRefresh}
               title="线上公开站"
               src={publicUrl}

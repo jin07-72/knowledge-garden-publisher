@@ -1,10 +1,12 @@
 import { APPEARANCE_COMPONENTS, type AppearanceState } from "../../../shared/appearanceComponents"
 import type { AppearancePreviewTarget } from "../../../shared/contracts"
+import { ScaledPreviewFrame } from "./ScaledPreviewFrame"
 
 interface AppearancePreviewProps {
   readonly previewUrl?: string
   readonly state: "idle" | "updating" | "ready" | "error"
   readonly previewTarget?: AppearancePreviewTarget
+  readonly pageWidthPx?: number
 }
 
 const stateLabels: Readonly<Record<AppearanceState, string>> = {
@@ -17,10 +19,12 @@ export function AppearancePreview({
   previewUrl,
   state,
   previewTarget,
+  pageWidthPx,
 }: AppearancePreviewProps): React.JSX.Element {
   const targetDescription = previewTarget
     ? `当前强制预览：${APPEARANCE_COMPONENTS[previewTarget.componentId].label}（${stateLabels[previewTarget.state]}状态）`
     : undefined
+  const desktopWidth = Math.max(1280, (pageWidthPx ?? 1440) + 48)
 
   return (
     <section className="appearance-preview" aria-label="实时预览">
@@ -37,10 +41,11 @@ export function AppearancePreview({
         {previewUrl && state === "error" ? <span role="alert">实时预览暂时无法更新</span> : null}
       </div>
       {previewUrl ? (
-        <iframe
+        <ScaledPreviewFrame
           title="博客外观实时预览"
           sandbox="allow-same-origin allow-scripts"
           src={previewUrl}
+          desktopWidth={desktopWidth}
         />
       ) : (
         <div className="appearance-preview-unavailable">

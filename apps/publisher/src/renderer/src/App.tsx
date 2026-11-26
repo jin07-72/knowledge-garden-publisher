@@ -200,6 +200,9 @@ export function PublisherApp({
   const [domainManagerOpen, setDomainManagerOpen] = useState(false)
   const [appearanceOpen, setAppearanceOpen] = useState(false)
   const [appearanceClearError, setAppearanceClearError] = useState<string>()
+  const [statusDetailOpen, setStatusDetailOpen] = useState(false)
+  const statusMoreButton = useRef<HTMLButtonElement>(null)
+  const statusDetailPopover = useRef<HTMLDivElement>(null)
   const [blogBusy, setBlogBusy] = useState(false)
   const [switchPreparing, setSwitchPreparing] = useState(false)
   const [publishPreparing, setPublishPreparing] = useState(false)
@@ -933,6 +936,32 @@ export function PublisherApp({
     }
   }, [customPaneSizes, paneSizes, safePaneSizes])
 
+  useEffect(() => {
+    if (!statusDetailOpen) return
+    const handlePointerDown = (event: PointerEvent): void => {
+      const target = event.target
+      if (!(target instanceof Node)) return
+      if (
+        statusDetailPopover.current?.contains(target) ||
+        statusMoreButton.current?.contains(target)
+      ) {
+        return
+      }
+      setStatusDetailOpen(false)
+    }
+    const handleKeyDown = (event: KeyboardEvent): void => {
+      if (event.key === "Escape") {
+        setStatusDetailOpen(false)
+      }
+    }
+    window.document.addEventListener("pointerdown", handlePointerDown)
+    window.document.addEventListener("keydown", handleKeyDown)
+    return () => {
+      window.document.removeEventListener("pointerdown", handlePointerDown)
+      window.document.removeEventListener("keydown", handleKeyDown)
+    }
+  }, [statusDetailOpen])
+
   const resizeSidebar = (sidebar: number): void => {
     setCustomPaneSizes(true)
     setPaneSizes((current) => ({
@@ -1519,10 +1548,25 @@ export function PublisherApp({
             )}
             <span>{previewLabel[preview.state]}</span>
           </div>
-          <div className="status-item publish-summary" title={publishMessage}>
+          <div
+            className="status-item publish-summary"
+            title={publishProgress?.message ?? publishMessage}
+          >
             <GitBranch size={14} aria-hidden="true" />
             <span>可发布变化：{changeCount === undefined ? "暂不可用" : changeCount}</span>
             <small>{publishProgress?.message ?? publishMessage}</small>
+            {(publishProgress?.message ?? publishMessage) ? (
+              <button
+                ref={statusMoreButton}
+                type="button"
+                className="status-more-button"
+                aria-label="显示完整状态"
+                aria-expanded={statusDetailOpen}
+                onClick={() => setStatusDetailOpen((open) => !open)}
+              >
+                ...
+              </button>
+            ) : null}
             {publishActionsUrl ? (
               <button
                 className="publish-actions-link"
@@ -1550,6 +1594,31 @@ export function PublisherApp({
             ) : null}
           </div>
         </div>
+        {statusDetailOpen && (publishProgress?.message ?? publishMessage) ? (
+          <div
+            ref={statusDetailPopover}
+            className="status-detail-popover"
+            role="dialog"
+            aria-label="完整状态信息"
+          >
+            <div className="status-detail-header">
+              <strong>完整状态</strong>
+              <button
+                type="button"
+                className="status-detail-close"
+                onClick={() => setStatusDetailOpen(false)}
+              >
+                收起
+              </button>
+            </div>
+            <p className="status-detail-message">{publishProgress?.message ?? publishMessage}</p>
+            <div className="status-detail-meta">
+              <span>保存：{saveStateLabel}</span>
+              <span>预览：{previewLabel[preview.state]}</span>
+              <span>可发布变化：{changeCount === undefined ? "暂不可用" : changeCount}</span>
+            </div>
+          </div>
+        ) : null}
         <button
           className="publish-button"
           type="button"

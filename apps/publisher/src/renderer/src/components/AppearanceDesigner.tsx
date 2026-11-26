@@ -328,6 +328,7 @@ export function AppearanceDesigner({
             previewUrl={sessionPreviewUrl}
             state={previewState}
             previewTarget={previewTarget}
+            pageWidthPx={draft.layout.pageWidthPx}
           />
         </div>
       ) : null}

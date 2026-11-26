@@ -30,6 +30,12 @@ const stateLabels: Readonly<Record<AppearanceState, string>> = {
   selected: "选中",
 }
 
+const stateDescriptions: Readonly<Record<AppearanceState, string>> = {
+  normal: "正常：组件平时的默认静止显示颜色。",
+  hover: "悬停：鼠标指针移到组件上方但尚未点击时的反馈颜色。",
+  selected: "选中：当前所在页面项、已展开状态或键盘焦点激活时的颜色。",
+}
+
 const globalTokenLabels: Readonly<Record<AppearanceGlobalColor, string>> = {
   page: "页面背景色",
   surface: "表面颜色",
@@ -247,6 +253,7 @@ export function ComponentColorEditor({
             )
           })}
         </div>
+        <small className="component-color-state-hint">{stateDescriptions[activeState]}</small>
 
         <div className="component-color-slots">
           {slots.map(([slotName, slotDefinition]) => {

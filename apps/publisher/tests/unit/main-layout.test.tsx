@@ -3456,4 +3456,32 @@ describe("publisher main layout", () => {
     fireEvent.keyDown(sidebar, { key: "ArrowRight" })
     expect(sidebar).toHaveAttribute("aria-valuenow", "252")
   })
+
+  it("provides a '...' button matching status font size to reveal the full status message", async () => {
+    const user = userEvent.setup()
+    const progress = capturePublishProgress(garden)
+    const longMessage =
+      "发布失败：网站验证未通过，请检查站点构建。本地修改与未发布内容已完整保留，可修正问题后重新发布。"
+    render(<App />)
+
+    progress.emit({ phase: "failed", message: longMessage })
+    expect(await screen.findByText(longMessage)).toBeVisible()
+
+    const moreButton = screen.getByRole("button", { name: "显示完整状态" })
+    expect(moreButton).toHaveTextContent("...")
+    expect(moreButton).toHaveAttribute("aria-expanded", "false")
+
+    await user.click(moreButton)
+    expect(moreButton).toHaveAttribute("aria-expanded", "true")
+    const dialog = screen.getByRole("dialog", { name: "完整状态信息" })
+    expect(within(dialog).getByText(longMessage)).toBeVisible()
+
+    await user.keyboard("{Escape}")
+    expect(screen.queryByRole("dialog", { name: "完整状态信息" })).not.toBeInTheDocument()
+    expect(moreButton).toHaveAttribute("aria-expanded", "false")
+
+    const stylesheet = readFileSync("src/renderer/src/app.css", "utf8")
+    expect(stylesheet).toMatch(/\.publish-summary small\s*\{[^}]*font-size:\s*11px/s)
+    expect(stylesheet).toMatch(/\.status-more-button\s*\{[^}]*font-size:\s*11px/s)
+  })
 })
